@@ -904,6 +904,10 @@ void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k, ggml_type type
         iqk_quantize_row_q8_K_T<0>(x, vy, k);
     } else if (type == GGML_TYPE_Q8_K32) {
         iqk_quantize_row_q8_K_T<1>(x, vy, k);
+    } else if (type == GGML_TYPE_F32) {
+        memcpy(vy, x, k * sizeof(float));
+    } else if (type == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(x, (ggml_fp16_t *)vy, k);
     } else {
         printf("iqk_quantize_row_q8_K error with type %s (vec dot type = %s)", ggml_type_name(oriType), ggml_type_name(type));
         exit(0);
@@ -2633,6 +2637,10 @@ void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k, ggml_type type
         iqk_quantize_row_q8_K_T<0>(x, vy, k);
     } else if (type == GGML_TYPE_Q8_K32) {
         iqk_quantize_row_q8_K_T<1>(x, vy, k);
+    } else if (type == GGML_TYPE_F32) {
+        memcpy(vy, x, k * sizeof(float));
+    } else if (type == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(x, (ggml_fp16_t *)vy, k);
     } else {
         printf("iqk_quantize_row_q8_K error with type %s (vec dot type = %s)", ggml_type_name(oriType), ggml_type_name(type));
         exit(0);

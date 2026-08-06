@@ -357,9 +357,9 @@ namespace fastllm {
             memcpy(downInput, swiglu, (size_t)interDim * sizeof(float));
         } else if (downInputType == DataType::FLOAT16) {
             Float32ToFloat16(swiglu, (uint16_t*)downInput, interDim);
-        } else {
-            ErrorInFastLLM("DeepSeek-V4 NUMA MoE requires a floating-point down activation type.\n");
         }
+        // Non-float types: swiglu stays in float32; caller converts via
+        // RunMultiThreadConvertFromFloat32.
     }
 
     struct MultiThreadDeepSeekV4NumasDownPrepareOp : MultiThreadBaseOp {
@@ -449,11 +449,8 @@ namespace fastllm {
                 Float32ToFloat16(
                     swigluData + st,
                     (uint16_t*)downInputData + st, end - st);
-            } else {
-                ErrorInFastLLM(
-                    "DeepSeek-V4 NUMA MoE requires a floating-point "
-                    "down activation type.\n");
             }
+            // Non-float types: swiglu stays in float32; caller converts.
         }
     };
 
@@ -5017,6 +5014,24 @@ namespace fastllm {
                     offset += lines;
                 }
             }
+            if (downInputDataType != DataType::FLOAT32 &&
+                downInputDataType != DataType::FLOAT16 &&
+                downInputDataType != DataType::BFLOAT16) {
+                offset = 0;
+                for (int e = 0; e < (int)expertTasks.size(); e++) {
+                    if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+                        int lines = expertTasks[e].size();
+                        for (int line = 0; line < lines; line++) {
+                            RunMultiThreadConvertFromFloat32(
+                                downInput.data() + (size_t)(offset + line) * downRowBytes,
+                                downInputDataType,
+                                swigluOutput.data() + (size_t)(offset + line) * interDim,
+                                1, interDim, GetAlivePool());
+                        }
+                        offset += lines;
+                    }
+                }
+            }
         } else if (!canFuseDstConvert) {
             offset = 0;
             for (int e = 0; e < (int)expertTasks.size(); e++) {
@@ -6199,6 +6214,22 @@ namespace fastllm {
                         }
                         ScheduleDeepSeekV4NumasMoeTasks(
                             prepareTasks, false);
+                        if (downInputDataType != DataType::FLOAT32 &&
+                            downInputDataType != DataType::FLOAT16 &&
+                            downInputDataType != DataType::BFLOAT16) {
+                            const size_t downRowBytes =
+                                GetDataBytes(downInputDataType, 1, interDim);
+                            for (int expertIdx = 0;
+                                 expertIdx < totalExperts; expertIdx++) {
+                                RunMultiThreadConvertFromFloat32(
+                                    (uint8_t*)downInput.data() +
+                                        expertIdx * downRowBytes,
+                                    downInputDataType,
+                                    swigluOutput.data() +
+                                        expertIdx * interDim,
+                                    1, interDim, GetAlivePool());
+                            }
+                        }
                     } else if (deepSeekV4Mode) {
                         const size_t downRowBytes =
                             GetDataBytes(
@@ -6214,6 +6245,22 @@ namespace fastllm {
                                 e != 0, e == 0 ? 1.0f : v[expertIdx].second,
                                 swigluLimit
                             );
+                        }
+                        if (downInputDataType != DataType::FLOAT32 &&
+                            downInputDataType != DataType::FLOAT16 &&
+                            downInputDataType != DataType::BFLOAT16) {
+                            const size_t downRowBytes =
+                                GetDataBytes(downInputDataType, 1, interDim);
+                            for (int expertIdx = 0;
+                                 expertIdx < totalExperts; expertIdx++) {
+                                RunMultiThreadConvertFromFloat32(
+                                    (uint8_t*)downInput.data() +
+                                        expertIdx * downRowBytes,
+                                    downInputDataType,
+                                    swigluOutput.data() +
+                                        expertIdx * interDim,
+                                    1, interDim, GetAlivePool());
+                            }
                         }
                     } else if (!canFuseDstConvert) {
                         for (int expertIdx = 0; expertIdx < totalExperts; expertIdx++) {
