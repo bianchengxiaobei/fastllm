@@ -1,6 +1,9 @@
 #include "gguf.h"
 #include <assert.h>
 
+typedef uint16_t ggml_fp16_t;
+extern void ggml_fp32_to_fp16_row(const float *, ggml_fp16_t *, int64_t);
+
 #ifdef __aarch64__
 
 #define restrict GGML_RESTRICT
