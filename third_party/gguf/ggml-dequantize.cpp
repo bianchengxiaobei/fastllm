@@ -3,10 +3,17 @@
 
 #define restrict GGML_RESTRICT
 extern float GGML_FP16_TO_FP32(ggml_half f);
+extern ggml_half GGML_FP32_TO_FP16(float x);
 
 void ggml_fp16_to_fp32_row(const uint16_t * x, float * y, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         y[i] = GGML_FP16_TO_FP32(x[i]);
+    }
+}
+
+void ggml_fp32_to_fp16_row(const float * x, uint16_t * y, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        y[i] = GGML_FP32_TO_FP16(x[i]);
     }
 }
 
