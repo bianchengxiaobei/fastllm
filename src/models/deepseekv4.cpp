@@ -7654,13 +7654,16 @@ namespace fastllm {
                 weight[pre + ".hc_attn_base"], hc_mult,
                 hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                 attnMix.y, attnMix.postData, attnMix.combData);
+            dumpStageFinite(stage, attnMix.y, "attn-hcpre-y");
             RMSNormReference(
                 attnMix.y, weight[pre + ".attn_norm.weight"],
                 rms_norm_eps, attnInput, DataType::BFLOAT16);
+            dumpStageFinite(stage, attnInput, "attn-rmsnorm-in");
 
             DeepSeekV4Linear(
                 attnInput, weight[pre + ".attn.wq_a.weight"],
                 Data(), qr, true);
+            dumpStageFinite(stage, qr, "attn-wqa-qr");
             RMSNormReference(
                 qr, weight[pre + ".attn.q_norm.weight"],
                 rms_norm_eps, qNorm, DataType::BFLOAT16);
@@ -7669,6 +7672,7 @@ namespace fastllm {
             DeepSeekV4Linear(
                 qNorm, weight[pre + ".attn.wq_b.weight"],
                 Data(), q);
+            dumpStageFinite(stage, q, "attn-wqb-q");
             q.Reshape(
                 {1, dsparkTokens, num_attention_heads, head_dim_full});
             if (decodeMeta != nullptr) {
@@ -7694,6 +7698,7 @@ namespace fastllm {
             DeepSeekV4Linear(
                 attnInput, weight[pre + ".attn.wkv.weight"],
                 Data(), kv, true);
+            dumpStageFinite(stage, kv, "attn-wkv-kv");
             kv.Reshape({1, dsparkTokens, 1, head_dim_full});
             RMSNormReference(
                 kv, weight[pre + ".attn.kv_norm.weight"],
@@ -7720,6 +7725,7 @@ namespace fastllm {
                     head_dim_full - qk_rope_head_dim, 64);
             }
             kv.Reshape({1, dsparkTokens, head_dim_full});
+            dumpStageFinite(stage, kv, "attn-kv-rotary");
 
             const int prefixLen = activeMainWindowKV[stage].dims.empty() ?
                 0 : activeMainWindowKV[stage].dims[1];
@@ -7740,6 +7746,7 @@ namespace fastllm {
                 1.0f / std::sqrt((float)head_dim_full), attnOut4,
                 0, 0, rope_factor, rope_scaling_beta_fast,
                 rope_scaling_beta_slow, prefixLen, true, decodeMeta);
+            dumpStageFinite(stage, attnOut4, "attn-sparse-out");
             DeepSeekV4WoA(
                 attnOut4, weight[pre + ".attn.wo_a.weight"],
                 o_groups, o_lora_rank, woAOut);
