@@ -2648,15 +2648,13 @@ namespace fastllm {
             if (sparseDbgOn) {
                 std::fprintf(stderr,
                     "[DSpark sparse #%d] q dev=%d kv dev=%d "
-                    "qDims=%zu kvDims=%zu q[0]=%g kv[0]=%g "
+                    "qDims=%zu kvDims=%zu "
                     "windowSize=%d prefixLen=%d "
                     "compressRatio=%d startPos=%d "
                     "preferCuda=%d disableEnv=%d\n",
                     sparseDbg,
                     (int)q.dataDevice, (int)kv.dataDevice,
                     q.dims.size(), kv.dims.size(),
-                    q.Count(0) > 0 ? ((const float*)q.cpuData)[0] : 0.0f,
-                    kv.Count(0) > 0 ? ((const float*)kv.cpuData)[0] : 0.0f,
                     windowSize, prefixLen, compressRatio, startPos,
                     (int)DeepSeekV4PreferCuda(),
                     (int)EnvFlagEnabled(
