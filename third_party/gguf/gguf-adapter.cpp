@@ -313,6 +313,148 @@ namespace fastllm {
                         "ignore"
                     ), // ignore
                 }
+            },
+            {
+                "deepseek4",
+                {
+                    // embeddings / output
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(token_embd.weight)"),
+                        "embed.weight",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(output.weight)"),
+                        "head.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(output_norm.weight)"),
+                        "norm.weight"
+                    ),
+                    // layer norms
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_norm\.weight)"),
+                        "layers.$1.attn_norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_norm\.weight)"),
+                        "layers.$1.ffn_norm.weight"
+                    ),
+                    // attention main projections (MLA: q_a/q_b/kv/output_a/output_b)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_q_a\.(weight|bias))"),
+                        "layers.$1.attn.wq_a.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_q_b\.(weight|bias))"),
+                        "layers.$1.attn.wq_b.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_kv\.(weight|bias))"),
+                        "layers.$1.attn.wkv.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_output_a\.(weight|bias))"),
+                        "layers.$1.attn.wo_a.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_output_b\.(weight|bias))"),
+                        "layers.$1.attn.wo_b.$2"
+                    ),
+                    // compressor (per-layer)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_compressor_kv\.(weight|bias))"),
+                        "layers.$1.attn.compressor.wkv.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_compressor_gate\.(weight|bias))"),
+                        "layers.$1.attn.compressor.wgate.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_compressor_ape\.weight)"),
+                        "layers.$1.attn.compressor.ape"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_compressor_norm\.weight)"),
+                        "layers.$1.attn.compressor.norm.weight"
+                    ),
+                    // indexer
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.indexer\.attn_q_b\.(weight|bias))"),
+                        "layers.$1.attn.indexer.wq_b.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.indexer\.proj\.(weight|bias))"),
+                        "layers.$1.attn.indexer.weights_proj.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.indexer_compressor_kv\.(weight|bias))"),
+                        "layers.$1.attn.indexer.compressor.wkv.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.indexer_compressor_gate\.(weight|bias))"),
+                        "layers.$1.attn.indexer.compressor.wgate.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.indexer_compressor_ape\.weight)"),
+                        "layers.$1.attn.indexer.compressor.ape"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.indexer_compressor_norm\.weight)"),
+                        "layers.$1.attn.indexer.compressor.norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.indexer\..*)"),
+                        "ignore"
+                    ),
+                    // moe gate
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_gate_inp\.weight)"),
+                        "layers.$1.ffn.gate.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.exp_probs_b\.bias)"),
+                        "ignore"
+                    ),
+                    // routed experts (packed: ffn_gate_exps/ffn_up_exps/ffn_down_exps)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_gate_exps\.weight)"),
+                        std::vector <std::string> ({"layers.$1.ffn.experts.", ".w1.weight"}),
+                        GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_up_exps\.weight)"),
+                        std::vector <std::string> ({"layers.$1.ffn.experts.", ".w3.weight"}),
+                        GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_down_exps\.weight)"),
+                        std::vector <std::string> ({"layers.$1.ffn.experts.", ".w2.weight"}),
+                        GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                    ),
+                    // shared expert (shexp): gate=w1, up=w3, down=w2
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_gate_shexp\.(weight|bias))"),
+                        "layers.$1.ffn.shared_experts.w1.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_up_shexp\.(weight|bias))"),
+                        "layers.$1.ffn.shared_experts.w3.$2"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_down_shexp\.(weight|bias))"),
+                        "layers.$1.ffn.shared_experts.w2.$2"
+                    ),
+                    // V4-specific tensors fastllm does not yet wire (hyper-connection, sinks, tid2eid, hashes)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.(hc_attn_|hc_ffn_|attn_sinks|ffn_gate_tid2eid).*)"),
+                        "ignore"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"((output_hc_|masked_embd_|markov_|conf_proj|rope_freqs|per_layer_|d2t|^fc$).*)"),
+                        "ignore"
+                    ),
+                }
             }
         };
 
@@ -355,6 +497,7 @@ namespace fastllm {
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > archRulesDict = {
             {"qwen2", originalArchRulesDict["default"]},
             {"kimi_k2", originalArchRulesDict["deepseek_v2"]},
+            {"deepseek_v4", originalArchRulesDict["deepseek4"]},
         };
 
         for (auto &it : originalArchRulesDict) {

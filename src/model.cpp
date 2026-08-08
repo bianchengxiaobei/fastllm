@@ -2615,7 +2615,8 @@ namespace fastllm {
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2
-            {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
+            {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"}, // deepseek_v2
+            {"deepseek4", "deepseek_v4"}, {"deepseek_v4", "deepseek_v4"} // deepseek_v4
         };
         if (ggufTypeToFastllmTypeDict.find(type) != ggufTypeToFastllmTypeDict.end()) {
             return ggufTypeToFastllmTypeDict[type];
@@ -2830,6 +2831,76 @@ namespace fastllm {
                                    0 : params[arch + ".attention.key_length_mla"].int_value();
                 if (qkMlaHeadDim > qkRopeHeadDim) {
                     model->weight.AddDict("qk_nope_head_dim", std::to_string(qkMlaHeadDim - qkRopeHeadDim));
+                }
+            }
+
+            if (arch == "deepseek4" || arch == "deepseek_v4") {
+                auto addIntDict = [&](const std::string &dictKey, const std::string &ggufKey) {
+                    if (!params[arch + "." + ggufKey].is_null()) {
+                        model->weight.AddDict(dictKey, std::to_string(params[arch + "." + ggufKey].int_value()));
+                    }
+                };
+                auto addFloatDict = [&](const std::string &dictKey, const std::string &ggufKey) {
+                    if (!params[arch + "." + ggufKey].is_null()) {
+                        model->weight.AddDict(dictKey, std::to_string(params[arch + "." + ggufKey].number_value()));
+                    }
+                };
+                auto addStringDict = [&](const std::string &dictKey, const std::string &ggufKey, const std::string &fallback) {
+                    if (!params[arch + "." + ggufKey].is_null()) {
+                        model->weight.AddDict(dictKey, params[arch + "." + ggufKey].string_value());
+                    } else {
+                        model->weight.AddDict(dictKey, fallback);
+                    }
+                };
+
+                model->weight.AddDict("model_type", "deepseek_v4");
+                model->weight.AddDict("num_hidden_layers", std::to_string(model->block_cnt));
+                addIntDict("hidden_size", "embedding_length");
+                addIntDict("num_attention_heads", "attention.head_count");
+                addIntDict("num_key_value_heads", "attention.head_count_kv");
+                addIntDict("q_lora_rank", "attention.q_lora_rank");
+                addIntDict("o_lora_rank", "attention.output_lora_rank");
+                addIntDict("o_groups", "attention.output_group_count");
+                addIntDict("head_dim", "attention.key_length");
+                addIntDict("qk_rope_head_dim", "rope.dimension_count");
+                addIntDict("n_routed_experts", "expert_count");
+                addIntDict("n_shared_experts", "expert_shared_count");
+                addIntDict("num_experts_per_tok", "expert_used_count");
+                addIntDict("moe_intermediate_size", "expert_feed_forward_length");
+                addIntDict("max_position_embeddings", "context_length");
+                addIntDict("sliding_window", "attention.sliding_window");
+                addIntDict("index_n_heads", "attention.indexer.head_count");
+                addIntDict("index_head_dim", "attention.indexer.key_length");
+                addIntDict("index_topk", "attention.indexer.top_k");
+                addIntDict("num_hash_layers", "hash_layer_count");
+                addIntDict("num_nextn_predict_layers", "nextn_predict_layers");
+                addIntDict("hc_mult", "hyper_connection.count");
+                addIntDict("hc_sinkhorn_iters", "hyper_connection.sinkhorn_iterations");
+                addFloatDict("rms_norm_eps", "attention.layer_norm_rms_epsilon");
+                addFloatDict("rope_theta", "rope.freq_base");
+                addFloatDict("routed_scaling_factor", "expert_weights_scale");
+                addFloatDict("swiglu_limit", "swiglu_clamp_exp");
+                addFloatDict("compress_rope_theta", "attention.compress_rope_freq_base");
+                addFloatDict("hc_eps", "hyper_connection.epsilon");
+                // rope scaling (YaRN)
+                if (!params[arch + ".rope.scaling.type"].is_null()) {
+                    model->weight.AddDict("rope_scaling.type", params[arch + ".rope.scaling.type"].string_value());
+                }
+                addFloatDict("rope_scaling.factor", "rope.scaling.factor");
+                addIntDict("rope_scaling.beta_fast", "rope.scaling.yarn_beta_fast");
+                addIntDict("rope_scaling.beta_slow", "rope.scaling.yarn_beta_slow");
+                addIntDict("rope_scaling.original_max_position_embeddings", "rope.scaling.original_context_length");
+                if (!params[arch + ".expert_weights_norm"].is_null()) {
+                    model->weight.AddDict("norm_topk_prob",
+                                          params[arch + ".expert_weights_norm"].bool_value() ? "true" : "false");
+                }
+                int gatingFunc = params[arch + ".expert_gating_func"].is_null() ?
+                                 4 : params[arch + ".expert_gating_func"].int_value();
+                model->weight.AddDict("scoring_func", gatingFunc == 4 ? "sqrtsoftplus" : (gatingFunc == 2 ? "sigmoid" : "softmax"));
+                addStringDict("topk_method", "topk_method", "noaux_tc");
+                // compress_ratios is a per-layer int array — store as JSON string for InitParams to parse
+                if (!params[arch + ".attention.compress_ratios"].is_null()) {
+                    model->weight.AddDict("compress_ratios", params[arch + ".attention.compress_ratios"].dump());
                 }
             }
 

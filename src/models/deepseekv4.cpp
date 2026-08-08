@@ -2644,18 +2644,24 @@ namespace fastllm {
             static std::atomic<int> sparseDebugCount{0};
             int sparseDbg = sparseDebugCount.fetch_add(
                 1, std::memory_order_relaxed);
-            bool sparseDbgOn = sparseDbg < 3;
+            static const bool sparseDbgEnv =
+                EnvFlagEnabled("FASTLLM_DSPARK_SPARSE_DBG");
+            bool sparseDbgOn = sparseDbgEnv && sparseDbg < 16;
             if (sparseDbgOn) {
                 std::fprintf(stderr,
                     "[DSpark sparse #%d] q dev=%d kv dev=%d "
+                    "sink dev=%d sink dtype=%d "
                     "qDims=%zu kvDims=%zu "
                     "windowSize=%d prefixLen=%d "
                     "compressRatio=%d startPos=%d "
+                    "nonCausalBlock=%d "
                     "preferCuda=%d disableEnv=%d\n",
                     sparseDbg,
                     (int)q.dataDevice, (int)kv.dataDevice,
+                    (int)attnSink.dataDevice, (int)attnSink.dataType,
                     q.dims.size(), kv.dims.size(),
                     windowSize, prefixLen, compressRatio, startPos,
+                    (int)nonCausalBlock,
                     (int)DeepSeekV4PreferCuda(),
                     (int)EnvFlagEnabled(
                         "FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL"));
@@ -2724,8 +2730,10 @@ namespace fastllm {
                             (const int32_t *)decodeMeta->cudaData);
                 if (sparseDbgOn) {
                     std::fprintf(stderr,
-                        "[DSpark sparse #%d] CUDA kernel result=%d\n",
-                        sparseDbg, (int)cudaOk);
+                        "[DSpark sparse #%d] CUDA kernel result=%d "
+                        "out dev=%d out dtype=%d\n",
+                        sparseDbg, (int)cudaOk,
+                        (int)output.dataDevice, (int)output.dataType);
                     std::fflush(stderr);
                 }
                 if (cudaOk) {
