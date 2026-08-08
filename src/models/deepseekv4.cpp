@@ -2641,10 +2641,38 @@ namespace fastllm {
                                              const Data *decodeMeta = nullptr,
                                              const Data *compressedTopK = nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseAttention");
+            static std::atomic<int> sparseDebugCount{0};
+            int sparseDbg = sparseDebugCount.fetch_add(
+                1, std::memory_order_relaxed);
+            bool sparseDbgOn = sparseDbg < 3;
+            if (sparseDbgOn) {
+                std::fprintf(stderr,
+                    "[DSpark sparse #%d] q dev=%d kv dev=%d "
+                    "qDims=%zu kvDims=%zu q[0]=%g kv[0]=%g "
+                    "windowSize=%d prefixLen=%d "
+                    "compressRatio=%d startPos=%d "
+                    "preferCuda=%d disableEnv=%d\n",
+                    sparseDbg,
+                    (int)q.dataDevice, (int)kv.dataDevice,
+                    q.dims.size(), kv.dims.size(),
+                    q.Count(0) > 0 ? ((const float*)q.cpuData)[0] : 0.0f,
+                    kv.Count(0) > 0 ? ((const float*)kv.cpuData)[0] : 0.0f,
+                    windowSize, prefixLen, compressRatio, startPos,
+                    (int)DeepSeekV4PreferCuda(),
+                    (int)EnvFlagEnabled(
+                        "FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL"));
+                std::fflush(stderr);
+            }
 #ifdef USE_CUDA
             std::vector<int> tpDevices;
             if (compressedTopK == nullptr &&
                 PrepareDeepSeekV4AttentionTp(q, kv, attnSink, output, tpDevices)) {
+                if (sparseDbgOn) {
+                    std::fprintf(stderr,
+                        "[DSpark sparse #%d] branch=TP-multicuda\n",
+                        sparseDbg);
+                    std::fflush(stderr);
+                }
                 std::vector<char> ok(tpDevices.size(), 0);
                 RunDeepSeekV4MultiCuda(tpDevices, [&](int rank, int device) {
                     const Data *localMeta = decodeMeta == nullptr ? nullptr :
@@ -2667,6 +2695,15 @@ namespace fastllm {
             if (compressedTopK == nullptr &&
                 !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL") &&
                 DeepSeekV4PreferCuda() && q.dims.size() == 4 && kv.dims.size() == 3) {
+                if (sparseDbgOn) {
+                    std::fprintf(stderr,
+                        "[DSpark sparse #%d] branch=CUDA-single "
+                        "qCudaNeeded=%d kvCudaNeeded=%d\n",
+                        sparseDbg,
+                        (int)(q.dataDevice != DataDevice::CUDA),
+                        (int)(kv.dataDevice != DataDevice::CUDA));
+                    std::fflush(stderr);
+                }
                 Data qCuda, kvCuda;
                 const Data *qForCuda = &q;
                 const Data *kvForCuda = &kv;
@@ -2681,16 +2718,28 @@ namespace fastllm {
                     kvForCuda = &kvCuda;
                 }
                 attnSink.ToDevice(DataDevice::CUDA);
-                if (FastllmCudaDeepSeekV4SparseAttentionPrefill(
+                bool cudaOk = FastllmCudaDeepSeekV4SparseAttentionPrefill(
                         *qForCuda, *kvForCuda, attnSink, windowSize, startPos, compressRatio,
                         ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow,
                         softmaxScale, output, prefixLen, nonCausalBlock,
                         decodeMeta == nullptr ? nullptr :
-                            (const int32_t *)decodeMeta->cudaData)) {
+                            (const int32_t *)decodeMeta->cudaData);
+                if (sparseDbgOn) {
+                    std::fprintf(stderr,
+                        "[DSpark sparse #%d] CUDA kernel result=%d\n",
+                        sparseDbg, (int)cudaOk);
+                    std::fflush(stderr);
+                }
+                if (cudaOk) {
                     return;
                 }
             }
 #endif
+            if (sparseDbgOn) {
+                std::fprintf(stderr,
+                    "[DSpark sparse #%d] branch=CPU-ref\n", sparseDbg);
+                std::fflush(stderr);
+            }
             if (compressedTopK != nullptr) {
                 DeepSeekV4SparseAttention(
                     q, kv, attnSink, windowSize, ropeDim, ropeBase,
