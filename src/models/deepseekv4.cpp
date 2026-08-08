@@ -9117,7 +9117,7 @@ namespace fastllm {
             int dbgIter = dsparkDebugCount.fetch_add(
                 1, std::memory_order_relaxed);
             if (dbgIter < 3) {
-                auto finiteRatio = [](const float *p, int n) {
+                auto finiteHead = [](const float *p, int n) {
                     int finite = 0;
                     for (int i = 0; i < n; ++i) {
                         if (std::isfinite(p[i])) finite++;
@@ -9126,32 +9126,34 @@ namespace fastllm {
                 };
                 confidenceHidden.ToDevice(DataDevice::CPU);
                 confidenceMarkov.ToDevice(DataDevice::CPU);
-                int hidN = (int)confidenceHidden.Count();
-                int mkvN = (int)confidenceMarkov.Count();
-                int hidFinite = finiteRatio(
+                uint64_t hidN = confidenceHidden.Count(0);
+                uint64_t mkvN = confidenceMarkov.Count(0);
+                int hidFinite = finiteHead(
                     (const float*)confidenceHidden.cpuData,
-                    std::min(hidN, 8));
-                int mkvFinite = finiteRatio(
+                    (int)std::min<uint64_t>(hidN, 8));
+                int mkvFinite = finiteHead(
                     (const float*)confidenceMarkov.cpuData,
-                    std::min(mkvN, 8));
+                    (int)std::min<uint64_t>(mkvN, 8));
                 const auto &dbgW =
                     weight["mtp.2.confidence_head.proj.weight"];
-                dbgW.ToDevice(DataDevice::CPU);
-                int wFinite = 0, wChecked = 0;
                 const float *wData = (const float*)dbgW.cpuData;
-                int wN = (int)dbgW.Count();
-                for (int i = 0; i < wN && wChecked < 8; ++i, ++wChecked) {
+                uint64_t wN = dbgW.Count(0);
+                int wFinite = 0;
+                for (uint64_t i = 0; i < wN && i < 8; ++i) {
                     if (std::isfinite(wData[i])) wFinite++;
                 }
                 std::fprintf(stderr,
-                    "[DSpark debug #%d] hidden dtype=%d count=%d "
-                    "finite(head8)=%d, markov dtype=%d count=%d "
-                    "finite(head8)=%d, proj.weight dtype=%d count=%d "
+                    "[DSpark debug #%d] hidden dtype=%d count=%llu "
+                    "finite(head8)=%d, markov dtype=%d count=%llu "
+                    "finite(head8)=%d, proj.weight dtype=%d count=%llu "
                     "finite(head8)=%d\n",
                     dbgIter,
-                    (int)confidenceHidden.dataType, hidN, hidFinite,
-                    (int)confidenceMarkov.dataType, mkvN, mkvFinite,
-                    (int)dbgW.dataType, wN, wFinite);
+                    (int)confidenceHidden.dataType,
+                    (unsigned long long)hidN, hidFinite,
+                    (int)confidenceMarkov.dataType,
+                    (unsigned long long)mkvN, mkvFinite,
+                    (int)dbgW.dataType,
+                    (unsigned long long)wN, wFinite);
                 std::fflush(stderr);
             }
             Data confidenceFeatures;
