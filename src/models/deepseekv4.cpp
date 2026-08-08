@@ -9113,6 +9113,47 @@ namespace fastllm {
             Copy(markovEmbeddings, confidenceMarkov);
             ToDataType(confidenceHidden, DataType::FLOAT32);
             ToDataType(confidenceMarkov, DataType::FLOAT32);
+            static std::atomic<int> dsparkDebugCount{0};
+            int dbgIter = dsparkDebugCount.fetch_add(
+                1, std::memory_order_relaxed);
+            if (dbgIter < 3) {
+                auto finiteRatio = [](const float *p, int n) {
+                    int finite = 0;
+                    for (int i = 0; i < n; ++i) {
+                        if (std::isfinite(p[i])) finite++;
+                    }
+                    return finite;
+                };
+                confidenceHidden.ToDevice(DataDevice::CPU);
+                confidenceMarkov.ToDevice(DataDevice::CPU);
+                int hidN = (int)confidenceHidden.Count();
+                int mkvN = (int)confidenceMarkov.Count();
+                int hidFinite = finiteRatio(
+                    (const float*)confidenceHidden.cpuData,
+                    std::min(hidN, 8));
+                int mkvFinite = finiteRatio(
+                    (const float*)confidenceMarkov.cpuData,
+                    std::min(mkvN, 8));
+                const auto &dbgW =
+                    weight["mtp.2.confidence_head.proj.weight"];
+                dbgW.ToDevice(DataDevice::CPU);
+                int wFinite = 0, wChecked = 0;
+                const float *wData = (const float*)dbgW.cpuData;
+                int wN = (int)dbgW.Count();
+                for (int i = 0; i < wN && wChecked < 8; ++i, ++wChecked) {
+                    if (std::isfinite(wData[i])) wFinite++;
+                }
+                std::fprintf(stderr,
+                    "[DSpark debug #%d] hidden dtype=%d count=%d "
+                    "finite(head8)=%d, markov dtype=%d count=%d "
+                    "finite(head8)=%d, proj.weight dtype=%d count=%d "
+                    "finite(head8)=%d\n",
+                    dbgIter,
+                    (int)confidenceHidden.dataType, hidN, hidFinite,
+                    (int)confidenceMarkov.dataType, mkvN, mkvFinite,
+                    (int)dbgW.dataType, wN, wFinite);
+                std::fflush(stderr);
+            }
             Data confidenceFeatures;
             Cat(confidenceHidden, confidenceMarkov, -1,
                 confidenceFeatures);
