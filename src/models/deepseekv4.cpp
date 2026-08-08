@@ -7608,6 +7608,40 @@ namespace fastllm {
             Data *curHiddenStates = &hiddenStates;
             Data *nextHiddenStates = &hiddenStatesTemp;
 
+            static std::atomic<int> dsparkStageDebugCount{0};
+            int stageDbgBase = dsparkStageDebugCount.fetch_add(
+                1, std::memory_order_relaxed) * dsparkLayers;
+            auto dumpStageFinite = [&](int stage,
+                                        const Data &hs,
+                                        const char *tag) {
+                if (stageDbgBase + stage >= 3 * dsparkLayers) return;
+                Data tmp;
+                Copy(hs, tmp);
+                ToDataType(tmp, DataType::FLOAT32);
+                tmp.ToDevice(DataDevice::CPU);
+                uint64_t cn = tmp.Count(0);
+                const float *cp = (const float*)tmp.cpuData;
+                int cfinite = 0;
+                float cmin = cn > 0 ? cp[0] : 0.0f;
+                float cmax = cmin;
+                for (uint64_t i = 0; i < cn; ++i) {
+                    if (std::isfinite(cp[i])) {
+                        cfinite++;
+                        if (cp[i] < cmin) cmin = cp[i];
+                        if (cp[i] > cmax) cmax = cp[i];
+                    }
+                }
+                std::fprintf(stderr,
+                    "[DSpark stage debug #%d.%d] %s "
+                    "dtype=%d count=%llu finite=%d/%llu "
+                    "range=[%g,%g]\n",
+                    stageDbgBase, stage, tag, (int)tmp.dataType,
+                    (unsigned long long)cn, cfinite,
+                    (unsigned long long)cn, cmin, cmax);
+                std::fflush(stderr);
+            };
+            dumpStageFinite(-1, *curHiddenStates, "after-embed");
+
             for (int stage = 0; stage < dsparkLayers; stage++) {
             const int layerId = std::max(
                 0, block_cnt - dsparkLayers + stage);
@@ -7796,6 +7830,7 @@ namespace fastllm {
                 return false;
             }
 #endif
+            dumpStageFinite(stage, *curHiddenStates, "after-stage");
             }
 
 #ifdef USE_CUDA
@@ -7816,34 +7851,6 @@ namespace fastllm {
                 // The eager LM-head path normalizes headInput in place, so
                 // preserve this small [1, block, hidden] tensor first.
                 Copy(headInput, *confidenceHidden);
-            }
-            static std::atomic<int> dsparkHcDebugCount{0};
-            int hcDbg = dsparkHcDebugCount.fetch_add(
-                1, std::memory_order_relaxed);
-            if (hcDbg < 3) {
-                ToDataType(*curHiddenStates, DataType::FLOAT32);
-                curHiddenStates->ToDevice(DataDevice::CPU);
-                uint64_t cn = curHiddenStates->Count(0);
-                const float *cp =
-                    (const float*)curHiddenStates->cpuData;
-                int cfinite = 0;
-                float cmin = cn > 0 ? cp[0] : 0.0f;
-                float cmax = cmin;
-                for (uint64_t i = 0; i < cn; ++i) {
-                    if (std::isfinite(cp[i])) {
-                        cfinite++;
-                        if (cp[i] < cmin) cmin = cp[i];
-                        if (cp[i] > cmax) cmax = cp[i];
-                    }
-                }
-                std::fprintf(stderr,
-                    "[DSpark hc debug #%d] stage input "
-                    "curHiddenStates dtype=%d count=%llu "
-                    "finite=%d/%llu range=[%g,%g]\n",
-                    hcDbg, (int)curHiddenStates->dataType,
-                    (unsigned long long)cn, cfinite,
-                    (unsigned long long)cn, cmin, cmax);
-                std::fflush(stderr);
             }
             Data *normalizedHead = &headInput;
 #ifdef USE_CUDA
@@ -9141,49 +9148,6 @@ namespace fastllm {
             Copy(markovEmbeddings, confidenceMarkov);
             ToDataType(confidenceHidden, DataType::FLOAT32);
             ToDataType(confidenceMarkov, DataType::FLOAT32);
-            static std::atomic<int> dsparkDebugCount{0};
-            int dbgIter = dsparkDebugCount.fetch_add(
-                1, std::memory_order_relaxed);
-            if (dbgIter < 3) {
-                auto finiteHead = [](const float *p, int n) {
-                    int finite = 0;
-                    for (int i = 0; i < n; ++i) {
-                        if (std::isfinite(p[i])) finite++;
-                    }
-                    return finite;
-                };
-                confidenceHidden.ToDevice(DataDevice::CPU);
-                confidenceMarkov.ToDevice(DataDevice::CPU);
-                uint64_t hidN = confidenceHidden.Count(0);
-                uint64_t mkvN = confidenceMarkov.Count(0);
-                int hidFinite = finiteHead(
-                    (const float*)confidenceHidden.cpuData,
-                    (int)std::min<uint64_t>(hidN, 8));
-                int mkvFinite = finiteHead(
-                    (const float*)confidenceMarkov.cpuData,
-                    (int)std::min<uint64_t>(mkvN, 8));
-                const auto &dbgW =
-                    weight["mtp.2.confidence_head.proj.weight"];
-                const float *wData = (const float*)dbgW.cpuData;
-                uint64_t wN = dbgW.Count(0);
-                int wFinite = 0;
-                for (uint64_t i = 0; i < wN && i < 8; ++i) {
-                    if (std::isfinite(wData[i])) wFinite++;
-                }
-                std::fprintf(stderr,
-                    "[DSpark debug #%d] hidden dtype=%d count=%llu "
-                    "finite(head8)=%d, markov dtype=%d count=%llu "
-                    "finite(head8)=%d, proj.weight dtype=%d count=%llu "
-                    "finite(head8)=%d\n",
-                    dbgIter,
-                    (int)confidenceHidden.dataType,
-                    (unsigned long long)hidN, hidFinite,
-                    (int)confidenceMarkov.dataType,
-                    (unsigned long long)mkvN, mkvFinite,
-                    (int)dbgW.dataType,
-                    (unsigned long long)wN, wFinite);
-                std::fflush(stderr);
-            }
             Data confidenceFeatures;
             Cat(confidenceHidden, confidenceMarkov, -1,
                 confidenceFeatures);
