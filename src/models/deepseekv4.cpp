@@ -9114,6 +9114,31 @@ namespace fastllm {
                 Data(), confidenceLogits);
             ToDataType(confidenceLogits, DataType::FLOAT32);
             confidenceLogits.ToDevice(DataDevice::CPU);
+            static std::atomic<int> dsparkDebugCount{0};
+            if (dsparkDebugCount.fetch_add(1, std::memory_order_relaxed) < 3) {
+                const float *dbgData =
+                    (const float*)confidenceLogits.cpuData;
+                const auto &dbgW = weight["mtp.2.confidence_head.proj.weight"];
+                std::fprintf(stderr,
+                    "[DSpark debug] confidenceHidden dtype=%d "
+                    "(orig from HcHead), markovEmbeddings dtype=%d, "
+                    "proj.weight dtype=%d dims=[",
+                    (int)confidenceHiddenPtr->dataType,
+                    (int)markovEmbeddings.dataType,
+                    (int)dbgW.dataType);
+                for (size_t i = 0; i < dbgW.dims.size(); ++i) {
+                    std::fprintf(stderr, "%s%d", i ? "," : "",
+                                 dbgW.dims[i]);
+                }
+                std::fprintf(stderr, "], confidenceLogits dtype=%d, "
+                    "values=[", (int)confidenceLogits.dataType);
+                for (int step = 0; step < dsparkTokens; ++step) {
+                    std::fprintf(stderr, "%s%g", step ? "," : "",
+                                 dbgData[step]);
+                }
+                std::fprintf(stderr, "]\n");
+                std::fflush(stderr);
+            }
             AssertInFastLLM(
                 confidenceLogits.dims ==
                     std::vector<int>({1, dsparkTokens, 1}),
