@@ -708,6 +708,7 @@ namespace fastllm {
     template int32_t GGUFBuffer::Read<int32_t>();
     template int64_t GGUFBuffer::Read<int64_t>();
     template float GGUFBuffer::Read<float>();
+    template double GGUFBuffer::Read<double>();
 
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
 
@@ -857,22 +858,82 @@ namespace fastllm {
                 bool value = ggufBuffer.ReadBool();
                 paramsConfig[key] = value;
             } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
+                int arrayType = ggufBuffer.Read <int> ();
                 uint64_t n = ggufBuffer.Read <uint64_t> ();
-                if (type == GGUF_TYPE_STRING) {
+                if (arrayType == GGUF_TYPE_STRING) {
                     std::vector <std::string> value;
                     for (int i = 0; i < n; i++) {
                         value.push_back(ggufBuffer.ReadString());
                     }
-                    paramsConfig[key] = value; // std::vector <std::string> ({value[0], value[1]});
-                } else if (type == GGUF_TYPE_INT32) {
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_INT32) {
                     std::vector <int> value;
                     for (int i = 0; i < n; i++) {
                         value.push_back(ggufBuffer.Read <int> ());
                     }
-                    paramsConfig[key] = value; // std::vector <int> ({value[0], value[1]});
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_FLOAT32) {
+                    std::vector <double> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back((double)ggufBuffer.Read <float> ());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_UINT32) {
+                    std::vector <int> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back((int)ggufBuffer.Read <uint32_t> ());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_UINT8) {
+                    std::vector <int> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back((int)ggufBuffer.Read <int8_t> ());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_INT8) {
+                    std::vector <int> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back((int)ggufBuffer.Read <int8_t> ());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_UINT16) {
+                    std::vector <int> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back((int)ggufBuffer.Read <uint16_t> ());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_INT16) {
+                    std::vector <int> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back((int)ggufBuffer.Read <int16_t> ());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_BOOL) {
+                    std::vector <bool> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back(ggufBuffer.ReadBool());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_UINT64) {
+                    std::vector <long long> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back((long long)ggufBuffer.Read <uint64_t> ());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_INT64) {
+                    std::vector <long long> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back((long long)ggufBuffer.Read <int64_t> ());
+                    }
+                    paramsConfig[key] = value;
+                } else if (arrayType == GGUF_TYPE_FLOAT64) {
+                    std::vector <double> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back(ggufBuffer.Read <double> ());
+                    }
+                    paramsConfig[key] = value;
                 } else {
-                    ErrorInFastLLM("Read GGUF_TYPE_ARRAY type " + std::to_string(type) + " error.\n");
+                    ErrorInFastLLM("Read GGUF_TYPE_ARRAY type " + std::to_string(arrayType) + " error.\n");
                 }
             } else {
                 ErrorInFastLLM("Read GGUF_TYPE type " + std::to_string(type) + " error.\n");
@@ -909,13 +970,31 @@ namespace fastllm {
             } else if (type == GGUF_TYPE_BOOL) {
                 bool value = ggufBuffer.ReadBool();
             } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
+                int arrayType = ggufBuffer.Read <int> ();
                 uint64_t n = ggufBuffer.Read <uint64_t> ();
                 for (int i = 0; i < n; i++) {
-                    if (type == GGUF_TYPE_STRING) {
+                    if (arrayType == GGUF_TYPE_STRING) {
                         std::string value = ggufBuffer.ReadString();
-                    } else if (type == GGUF_TYPE_INT32) {
+                    } else if (arrayType == GGUF_TYPE_INT32) {
                         int a = ggufBuffer.Read <int> ();
+                    } else if (arrayType == GGUF_TYPE_FLOAT32) {
+                        float a = ggufBuffer.Read <float> ();
+                    } else if (arrayType == GGUF_TYPE_UINT32) {
+                        uint32_t a = ggufBuffer.Read <uint32_t> ();
+                    } else if (arrayType == GGUF_TYPE_UINT8 || arrayType == GGUF_TYPE_INT8) {
+                        int8_t a = ggufBuffer.Read <int8_t> ();
+                    } else if (arrayType == GGUF_TYPE_UINT16) {
+                        uint16_t a = ggufBuffer.Read <uint16_t> ();
+                    } else if (arrayType == GGUF_TYPE_INT16) {
+                        int16_t a = ggufBuffer.Read <int16_t> ();
+                    } else if (arrayType == GGUF_TYPE_BOOL) {
+                        bool a = ggufBuffer.ReadBool();
+                    } else if (arrayType == GGUF_TYPE_UINT64) {
+                        uint64_t a = ggufBuffer.Read <uint64_t> ();
+                    } else if (arrayType == GGUF_TYPE_INT64) {
+                        int64_t a = ggufBuffer.Read <int64_t> ();
+                    } else if (arrayType == GGUF_TYPE_FLOAT64) {
+                        double a = ggufBuffer.Read <double> ();
                     }
                 }
             } else {
@@ -1086,14 +1165,32 @@ namespace fastllm {
                 bool value = ggufBuffer.ReadBool();
                 printf("value = %d\n", value);
             } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
+                int arrayType = ggufBuffer.Read <int> ();
                 uint64_t n = ggufBuffer.Read <uint64_t> ();
-                printf("type = %d\n", type);
+                printf("type = %d\n", arrayType);
                 for (int i = 0; i < n; i++) {
-                    if (type == GGUF_TYPE_STRING) {
+                    if (arrayType == GGUF_TYPE_STRING) {
                         std::string value = ggufBuffer.ReadString();
-                    } else if (type == GGUF_TYPE_INT32) {
+                    } else if (arrayType == GGUF_TYPE_INT32) {
                         int a = ggufBuffer.Read <int> ();
+                    } else if (arrayType == GGUF_TYPE_FLOAT32) {
+                        float a = ggufBuffer.Read <float> ();
+                    } else if (arrayType == GGUF_TYPE_UINT32) {
+                        uint32_t a = ggufBuffer.Read <uint32_t> ();
+                    } else if (arrayType == GGUF_TYPE_UINT8 || arrayType == GGUF_TYPE_INT8) {
+                        int8_t a = ggufBuffer.Read <int8_t> ();
+                    } else if (arrayType == GGUF_TYPE_UINT16) {
+                        uint16_t a = ggufBuffer.Read <uint16_t> ();
+                    } else if (arrayType == GGUF_TYPE_INT16) {
+                        int16_t a = ggufBuffer.Read <int16_t> ();
+                    } else if (arrayType == GGUF_TYPE_BOOL) {
+                        bool a = ggufBuffer.ReadBool();
+                    } else if (arrayType == GGUF_TYPE_UINT64) {
+                        uint64_t a = ggufBuffer.Read <uint64_t> ();
+                    } else if (arrayType == GGUF_TYPE_INT64) {
+                        int64_t a = ggufBuffer.Read <int64_t> ();
+                    } else if (arrayType == GGUF_TYPE_FLOAT64) {
+                        double a = ggufBuffer.Read <double> ();
                     }
                 }
             } else {
