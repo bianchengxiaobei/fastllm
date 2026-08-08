@@ -7817,6 +7817,34 @@ namespace fastllm {
                 // preserve this small [1, block, hidden] tensor first.
                 Copy(headInput, *confidenceHidden);
             }
+            static std::atomic<int> dsparkHcDebugCount{0};
+            int hcDbg = dsparkHcDebugCount.fetch_add(
+                1, std::memory_order_relaxed);
+            if (hcDbg < 3) {
+                ToDataType(*curHiddenStates, DataType::FLOAT32);
+                curHiddenStates->ToDevice(DataDevice::CPU);
+                uint64_t cn = curHiddenStates->Count(0);
+                const float *cp =
+                    (const float*)curHiddenStates->cpuData;
+                int cfinite = 0;
+                float cmin = cn > 0 ? cp[0] : 0.0f;
+                float cmax = cmin;
+                for (uint64_t i = 0; i < cn; ++i) {
+                    if (std::isfinite(cp[i])) {
+                        cfinite++;
+                        if (cp[i] < cmin) cmin = cp[i];
+                        if (cp[i] > cmax) cmax = cp[i];
+                    }
+                }
+                std::fprintf(stderr,
+                    "[DSpark hc debug #%d] stage input "
+                    "curHiddenStates dtype=%d count=%llu "
+                    "finite=%d/%llu range=[%g,%g]\n",
+                    hcDbg, (int)curHiddenStates->dataType,
+                    (unsigned long long)cn, cfinite,
+                    (unsigned long long)cn, cmin, cmax);
+                std::fflush(stderr);
+            }
             Data *normalizedHead = &headInput;
 #ifdef USE_CUDA
             if (decodeMeta != nullptr &&
