@@ -90,8 +90,27 @@ namespace fastllm {
                 ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");    
             }
             memcpy(dst, src, len * unitSize);
-        } else if (srcDtype == DataType::FP8_E4M3 && dstDtype == DataType::FLOAT16) {
-            ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");
+        } else if (srcDtype == DataType::FP8_E4M3) {
+            static const FP8E4M3ToFP32Manager fp8e4m3tofp32;
+            uint8_t *usrc = (uint8_t*)src;
+            if (dstDtype == DataType::FLOAT32) {
+                float *fdst = (float*)dst;
+                for (size_t i = 0; i < len; i++) {
+                    fdst[i] = fp8e4m3tofp32.dict[usrc[i]];
+                }
+            } else if (dstDtype == DataType::FLOAT16) {
+                uint16_t *hdst = (uint16_t*)dst;
+                for (size_t i = 0; i < len; i++) {
+                    hdst[i] = float_to_half(fp8e4m3tofp32.dict[usrc[i]]);
+                }
+            } else if (dstDtype == DataType::BFLOAT16) {
+                uint16_t *hdst = (uint16_t*)dst;
+                for (size_t i = 0; i < len; i++) {
+                    hdst[i] = Float32ToBFloat16RNEBits(fp8e4m3tofp32.dict[usrc[i]]);
+                }
+            } else {
+                ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");
+            }
         } else if (srcDtype == DataType::BFLOAT16 && dstDtype == DataType::FLOAT32) {
             uint16_t *u16dst = (uint16_t*)dst;
             uint16_t *u16src = (uint16_t*)src;
