@@ -6599,6 +6599,19 @@ namespace fastllm {
     DeepSeekV4Model::GetTensorMap(
             const std::vector<std::string> &tensorNames) {
         auto mapped = basellm::GetTensorMap(tensorNames);
+        // The confidence head produces a sigmoid scheduling probability, not
+        // an activation passed to the next layer.  Its BF16 checkpoint tensor
+        // must be promoted to FP32 on every code path (CUDA TP, single-CUDA,
+        // and CPU/NUMA fallbacks); otherwise the auto dtype policy converts
+        // it to FP16 and the Linear overflows to NaN under the sigmoid.
+        for (auto &source : mapped) {
+            for (auto &destination : source.second) {
+                if (destination.first ==
+                        "mtp.2.confidence_head.proj.weight") {
+                    destination.second = DataType::FLOAT32;
+                }
+            }
+        }
 #ifdef USE_CUDA
         // vLLM keeps the unquantized DSv4 auxiliary projections in BF16 and
         // requests FP32 accumulation/output for the compressor GEMMs.  The
@@ -6631,10 +6644,6 @@ namespace fastllm {
                 for (auto &destination : source.second) {
                     if (destination.first ==
                         "mtp.2.confidence_head.proj.weight") {
-                        // The reference implementation promotes this tiny
-                        // BF16 checkpoint tensor to FP32 because its sigmoid
-                        // output is a scheduling probability, not an
-                        // activation passed into the next model layer.
                         destination.second = DataType::FLOAT32;
                     } else if (isDsparkAux(destination.first)) {
                         destination.second = DataType::BFLOAT16;
@@ -9114,31 +9123,6 @@ namespace fastllm {
                 Data(), confidenceLogits);
             ToDataType(confidenceLogits, DataType::FLOAT32);
             confidenceLogits.ToDevice(DataDevice::CPU);
-            static std::atomic<int> dsparkDebugCount{0};
-            if (dsparkDebugCount.fetch_add(1, std::memory_order_relaxed) < 3) {
-                const float *dbgData =
-                    (const float*)confidenceLogits.cpuData;
-                const auto &dbgW = weight["mtp.2.confidence_head.proj.weight"];
-                std::fprintf(stderr,
-                    "[DSpark debug] confidenceHidden dtype=%d "
-                    "(orig from HcHead), markovEmbeddings dtype=%d, "
-                    "proj.weight dtype=%d dims=[",
-                    (int)confidenceHiddenPtr->dataType,
-                    (int)markovEmbeddings.dataType,
-                    (int)dbgW.dataType);
-                for (size_t i = 0; i < dbgW.dims.size(); ++i) {
-                    std::fprintf(stderr, "%s%d", i ? "," : "",
-                                 dbgW.dims[i]);
-                }
-                std::fprintf(stderr, "], confidenceLogits dtype=%d, "
-                    "values=[", (int)confidenceLogits.dataType);
-                for (int step = 0; step < dsparkTokens; ++step) {
-                    std::fprintf(stderr, "%s%g", step ? "," : "",
-                                 dbgData[step]);
-                }
-                std::fprintf(stderr, "]\n");
-                std::fflush(stderr);
-            }
             AssertInFastLLM(
                 confidenceLogits.dims ==
                     std::vector<int>({1, dsparkTokens, 1}),
