@@ -7750,6 +7750,7 @@ namespace fastllm {
                 attnOut, *curHiddenStates, attnMix.postData,
                 attnMix.combData, *nextHiddenStates);
             std::swap(curHiddenStates, nextHiddenStates);
+            dumpStageFinite(stage, *curHiddenStates, "after-attn");
 
             DeepSeekV4HcPre(
                 *curHiddenStates, weight[pre + ".hc_ffn_fn"],
