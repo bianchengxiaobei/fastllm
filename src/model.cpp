@@ -2499,14 +2499,15 @@ namespace fastllm {
             for (auto &it : dataTypeNames) {
                 for (auto &dataTypeName : it.second) {
                     if (DefaultGroupCnts.find(it.first) != DefaultGroupCnts.end()) {
-                        if (StringStartWith(matchedType, dataTypeName)) {
-                            dataType = it.first;
-                            if (matchedType != dataTypeName) {
-                                groupCnt = std::atoi(matchedType.substr(dataTypeName.size()).c_str());
-                            } else {
-                                groupCnt = DefaultGroupCnts[it.first];
+                            if (StringStartWith(matchedType, dataTypeName)) {
+                                dataType = it.first;
+                                if (matchedType != dataTypeName) {
+                                    int parsed = std::atoi(matchedType.substr(dataTypeName.size()).c_str());
+                                    groupCnt = parsed > 0 ? parsed : DefaultGroupCnts[it.first];
+                                } else {
+                                    groupCnt = DefaultGroupCnts[it.first];
+                                }
                             }
-                        }
                     } else {
                         if (matchedType == dataTypeName) {
                             dataType = it.first;
@@ -2986,17 +2987,17 @@ namespace fastllm {
                                 for (auto &it : rule.rules) {
                                     for (auto input : it.inputs) {
                                         if (model->weight[input].dims.size() == 2) {
-                                            if (model->weight[input].groupCnt != -1 && 
+                                            if (model->weight[input].groupCnt > 0 &&
                                                 model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
                                                 canMerge = false;
                                                 break;
                                             }
-                                            if (model->weight[input].blockK != -1 && 
+                                            if (model->weight[input].blockK > 0 &&
                                                 model->weight[input].dims[0] % model->weight[input].blockK != 0) {
                                                 canMerge = false;
                                                 break;
                                             }
-                                            if (model->weight[input].blockM != -1 && 
+                                            if (model->weight[input].blockM > 0 &&
                                                 model->weight[input].dims[1] % model->weight[input].blockM != 0) {
                                                 canMerge = false;
                                                 break;
@@ -3958,17 +3959,17 @@ namespace fastllm {
                                 for (auto &it : rule.rules) {
                                     for (auto input : it.inputs) {
                                         if (model->weight[input].dims.size() == 2) {
-                                            if (model->weight[input].groupCnt != -1 && 
+                                            if (model->weight[input].groupCnt > 0 &&
                                                 model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
                                                 canMerge = false;
                                                 break;
                                             }
-                                            if (model->weight[input].blockK != -1 && 
+                                            if (model->weight[input].blockK > 0 &&
                                                 model->weight[input].dims[0] % model->weight[input].blockK != 0) {
                                                 canMerge = false;
                                                 break;
                                             }
-                                            if (model->weight[input].blockM != -1 && 
+                                            if (model->weight[input].blockM > 0 &&
                                                 model->weight[input].dims[1] % model->weight[input].blockM != 0) {
                                                 canMerge = false;
                                                 break;
