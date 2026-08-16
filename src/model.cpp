@@ -14,6 +14,14 @@
 #include <algorithm>
 #include <cctype>
 #include <mutex>
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #if defined(__linux__) && defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -541,7 +549,7 @@ namespace fastllm {
     }
 
     static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName) {
-        if (model == nullptr) {
+        if (model == nullptr || model->moeDeviceMap.empty()) {
             return "";
         }
         std::string selectedDevice = GetSpecialWeightSelectedDevice(model, weightName);
@@ -899,6 +907,8 @@ namespace fastllm {
         std::vector <std::uint64_t> shape;
         std::vector <int> intShape;
         std::vector <std::uint64_t> data_offsets;
+        uint8_t *fileBase = nullptr;
+        uint64_t fileSize = 0;
 
         uint64_t len, bytes;
         uint8_t *buffer = nullptr;
@@ -911,9 +921,11 @@ namespace fastllm {
             ClearBuffer();
         }
 
-        SafeTensorItem(const std::string &tensorName, const std::string &fileName, const json11::Json &config, uint64_t baseOffset) {
+        SafeTensorItem(const std::string &tensorName, const std::string &fileName, const json11::Json &config, uint64_t baseOffset, uint8_t *fileBase, uint64_t fileSize) {
             this->tensorName = tensorName;
             this->fileName = fileName;
+            this->fileBase = fileBase;
+            this->fileSize = fileSize;
 
             this->dtype = config["dtype"].string_value();
             for (auto &it : config["data_offsets"].array_items()) {
@@ -929,6 +941,16 @@ namespace fastllm {
                 len *= it;
             }
             bytes = this->data_offsets[1] - this->data_offsets[0];
+        }
+
+        void ReadRaw(void *dst, size_t len) {
+            ReadRawAt(this->data_offsets[0], dst, len);
+        }
+
+        void ReadRawAt(uint64_t offset, void *dst, size_t len) {
+            AssertInFastLLM(fileBase != nullptr && offset + len <= fileSize,
+                            "SafeTensorItem read out of range: " + tensorName);
+            memcpy(dst, fileBase + offset, len);
         }
 
         struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
@@ -1042,26 +1064,8 @@ namespace fastllm {
                     size_t outputBytes = GetDataBytes(dstType, n, m);
                     std::vector<uint8_t> packed(this->bytes);
                     std::vector<uint8_t> scaleBytes(scale.bytes);
-                    FILE *fw = fopen(this->fileName.c_str(), "rb");
-#if defined(_WIN32) || defined(_WIN64)
-                    _fseeki64(fw, this->data_offsets[0], 0);
-#else
-                    fseek(fw, this->data_offsets[0], 0);
-#endif
-                    size_t ret = fread(packed.data(), 1, this->bytes, fw);
-                    fclose(fw);
-                    AssertInFastLLM(ret == this->bytes,
-                                    "CreateBufferWithScale error: read NVFP4_BLOCK_16 weight failed.");
-                    FILE *fs = fopen(scale.fileName.c_str(), "rb");
-#if defined(_WIN32) || defined(_WIN64)
-                    _fseeki64(fs, scale.data_offsets[0], 0);
-#else
-                    fseek(fs, scale.data_offsets[0], 0);
-#endif
-                    ret = fread(scaleBytes.data(), 1, scale.bytes, fs);
-                    fclose(fs);
-                    AssertInFastLLM(ret == scale.bytes,
-                                    "CreateBufferWithScale error: read NVFP4_BLOCK_16 scale failed.");
+                    ReadRaw(packed.data(), this->bytes);
+                    scale.ReadRaw(scaleBytes.data(), scale.bytes);
 
                     buffer = new uint8_t[outputBytes];
                     memset(buffer, 0, outputBytes);
@@ -1087,30 +1091,14 @@ namespace fastllm {
                 size_t dataBytes = dstType == DataType::NVFP4 ? GetNVFP4WeightBytes(n, m) : (size_t)n * m;
                 size_t scaleBytes = dstType == DataType::NVFP4 ? scale.bytes : 0;
                 buffer = new uint8_t[dataBytes + scaleBytes];
-                FILE *fi = fopen(this->fileName.c_str(), "rb");
-#if defined(_WIN32) || defined(_WIN64)
-                _fseeki64(fi, this->data_offsets[0], 0);
-#else
-                fseek(fi, this->data_offsets[0], 0);
-#endif
-                size_t ret = fread(buffer, 1, this->bytes, fi);
-                fclose(fi);
-                AssertInFastLLM(ret == this->bytes && this->bytes == dataBytes,
+                ReadRaw(buffer, this->bytes);
+                AssertInFastLLM(this->bytes == dataBytes,
                                 "CreateBufferWithScale error: scaled data bytes mismatch.");
 
                 if (dstType == DataType::NVFP4) {
                     AssertInFastLLM(scale.bytes == GetNVFP4ScaleBytes(n, m, blockN, blockM),
                                     "CreateBufferWithScale error: NVFP4 scale bytes mismatch.");
-                    FILE *fs = fopen(scale.fileName.c_str(), "rb");
-#if defined(_WIN32) || defined(_WIN64)
-                    _fseeki64(fs, scale.data_offsets[0], 0);
-#else
-                    fseek(fs, scale.data_offsets[0], 0);
-#endif
-                    ret = fread(buffer + dataBytes, 1, scale.bytes, fs);
-                    fclose(fs);
-                    AssertInFastLLM(ret == scale.bytes,
-                                    "CreateBufferWithScale error: read NVFP4 scale failed.");
+                    scale.ReadRaw(buffer + dataBytes, scale.bytes);
                 } else {
                     AssertInFastLLM(scale.buffer != nullptr,
                                     "CreateBufferWithScale error: scale buffer is empty.");
@@ -1127,15 +1115,8 @@ namespace fastllm {
                 buffer = new uint8_t[n * m * sizeof(float)];
                 float *floatBuffer = (float*)buffer;
 
-                FILE *fi = fopen(this->fileName.c_str(), "rb");
-                int ret;
-    #if defined(_WIN32) || defined(_WIN64)
-                _fseeki64(fi, this->data_offsets[0], 0);
-    #else
-                fseek(fi, this->data_offsets[0], 0);
-    #endif
                 uint8_t *ori = new uint8_t[this->bytes];
-                ret = fread(ori, 1, this->bytes, fi);
+                ReadRaw(ori, this->bytes);
                 for (int bi = 0; bi < ns; bi++) {
                     for (int bj = 0; bj < ms; bj++) {
                         float curScale = isScalarScale ?
@@ -1155,7 +1136,6 @@ namespace fastllm {
                 }
 
                 delete[] ori;
-                fclose(fi);
             }
         }
 
@@ -1171,20 +1151,10 @@ namespace fastllm {
             int n = this->shape[0], m = this->shape[1];
 
             ClearBuffer();
-            FILE *fweight = fopen(this->fileName.c_str(), "rb");
-            FILE *fqzero  = fopen(qzero.fileName.c_str(), "rb");
-#if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fweight, this->data_offsets[0], 0);
-            _fseeki64(fqzero,  qzero.data_offsets[0], 0);
-#else
-            fseek(fweight, this->data_offsets[0], 0);
-            fseek(fqzero,  qzero.data_offsets[0], 0);
-#endif
             uint8_t *ori_weight = new uint8_t[this->bytes];
             uint8_t *ori_qzero  = new uint8_t[qzero.bytes];
-            int ret;
-            ret = fread(ori_weight, 1, this->bytes, fweight);
-            ret = fread(ori_qzero , 1, qzero.bytes, fqzero);
+            ReadRaw(ori_weight, this->bytes);
+            qzero.ReadRaw(ori_qzero, qzero.bytes);
             unsigned int* weight_int32 = (unsigned int*)ori_weight;
             unsigned int* qzero_int32  = (unsigned int*)ori_qzero;
             float* scale_f32 = (float*)scale.buffer;
@@ -1232,8 +1202,6 @@ namespace fastllm {
             }
             delete[] ori_weight;
             delete[] ori_qzero;
-            fclose(fweight);
-            fclose(fqzero);
         }
 
         void CreateBufferWithPackedInt4Group(SafeTensorItem &scale, int groupCnt,
@@ -1263,14 +1231,6 @@ namespace fastllm {
                             "CreateBufferWithPackedInt4Group error: tensor byte size does not match its shape.");
 
             ClearBuffer();
-            FILE *file = fopen(this->fileName.c_str(), "rb");
-            AssertInFastLLM(file != nullptr,
-                            "CreateBufferWithPackedInt4Group error: cannot open weight file.");
-#if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(file, this->data_offsets[0], 0);
-#else
-            fseek(file, this->data_offsets[0], 0);
-#endif
             const size_t packedBytesPerRow = (size_t)logicalCols / 2;
             if (dstType == DataType::INT4_GROUP32) {
                 AssertInFastLLM(groupCnt == 32 && scale.dtype == "BF16",
@@ -1282,9 +1242,8 @@ namespace fastllm {
                 std::vector<uint8_t> packedRow(packedBytesPerRow);
                 for (size_t row = 0; row < (size_t)rows; row++) {
                     uint8_t *dstRow = buffer + row * rowBytes;
-                    size_t ret = fread(packedRow.data(), 1, packedBytesPerRow, file);
-                    AssertInFastLLM(ret == packedBytesPerRow,
-                                    "CreateBufferWithPackedInt4Group error: read packed row failed.");
+                    ReadRawAt(this->data_offsets[0] + row * packedBytesPerRow,
+                              packedRow.data(), packedBytesPerRow);
                     // compressed-tensors stores q0 in the low nibble. Keep the
                     // normal FastLLM convention (q0 in the high nibble).
                     for (size_t group = 0; group < (size_t)groups; group++) {
@@ -1304,9 +1263,7 @@ namespace fastllm {
                 AssertInFastLLM(dstType == DataType::INT4_GROUP,
                                 "CreateBufferWithPackedInt4Group error: unsupported destination type.");
                 buffer = new uint8_t[this->bytes];
-                size_t ret = fread(buffer, 1, this->bytes, file);
-                AssertInFastLLM(ret == this->bytes,
-                                "CreateBufferWithPackedInt4Group error: read packed weight failed.");
+                ReadRaw(buffer, this->bytes);
                 for (size_t i = 0; i < this->bytes; i++) {
                     uint8_t value = buffer[i];
                     buffer[i] = (uint8_t)((value << 4) | (value >> 4));
@@ -1320,24 +1277,15 @@ namespace fastllm {
                     minsBuffer[i] = -8.0f * sourceScales[i];
                 }
             }
-            fclose(file);
         }
 
         void CreateBuffer(DataType dstType) {
             //printf("read %s from %s [%llu %llu] (%f M)\n", this->tensorName.c_str(), this->fileName.c_str(), this->data_offsets[0], this->data_offsets[0] + this->bytes, (float)this->bytes / 1e6);
-            FILE *fi = fopen(this->fileName.c_str(), "rb");
-            int ret;
-#if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, this->data_offsets[0], 0);
-#else
-            fseek(fi, this->data_offsets[0], 0);
-#endif
             DataType srcType;
             if (this->dtype == "fastllm") {
                 ClearBuffer();
                 buffer = new uint8_t[this->bytes];
-                ret = fread(buffer, 1, this->bytes, fi);
-                fclose(fi);
+                ReadRaw(buffer, this->bytes);
                 return;
             } else if (this->dtype == "F8_E4M3") {
                 srcType = DataType::FP8_E4M3;
@@ -1363,12 +1311,11 @@ namespace fastllm {
                 ClearBuffer();
                 buffer = new uint8_t[(size_t)len * sizeof(float)];
                 std::vector<uint8_t> ori(len);
-                ret = fread(ori.data(), sizeof(uint8_t), len, fi);
+                ReadRaw(ori.data(), len);
                 float *dst = (float*)buffer;
                 for (int i = 0; i < len; i++) {
                     dst[i] = FP8E8M0ToFloat(ori[i]);
                 }
-                fclose(fi);
                 return;
             } else if (this->dtype == "I64") {
                 if (dstType != DataType::INT32 && dstType != DataType::INT32PARAM) {
@@ -1377,12 +1324,11 @@ namespace fastllm {
                 ClearBuffer();
                 buffer = new uint8_t[(size_t)len * sizeof(int32_t)];
                 std::vector<int64_t> ori(len);
-                ret = fread(ori.data(), sizeof(int64_t), len, fi);
+                ReadRaw(ori.data(), len * sizeof(int64_t));
                 int32_t *dst = (int32_t*)buffer;
                 for (int i = 0; i < len; i++) {
                     dst[i] = (int32_t)ori[i];
                 }
-                fclose(fi);
                 return;
             } else {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
@@ -1401,14 +1347,13 @@ namespace fastllm {
             ClearBuffer();
             buffer = new uint8_t[(size_t)len * unitSize];
             if (dstType == srcType) {
-                ret = fread(buffer, 1, this->bytes, fi);
+                ReadRaw(buffer, this->bytes);
             } else {
                 uint8_t *ori = new uint8_t[this->bytes];
-                ret = fread(ori, 1, this->bytes, fi);
+                ReadRaw(ori, this->bytes);
                 ConvertDataType(ori, srcType, buffer, dstType, len);
                 delete[] ori;
             }
-            fclose(fi);
         }
 
         void Transpose(DataType type) {
@@ -1442,24 +1387,94 @@ namespace fastllm {
         std::set <std::string> fileNames;
         std::map <std::string, SafeTensorItem> itmeDict;
 
+        struct FileMapping {
+            uint64_t size = 0;
+            uint8_t *base = nullptr;
+#if defined(_WIN32) || defined(_WIN64)
+            HANDLE hFile = INVALID_HANDLE_VALUE;
+            HANDLE hMapping = nullptr;
+#endif
+        };
+        std::map <std::string, FileMapping> mappings;
+
+        static FileMapping MapFile(const std::string &fileName) {
+            FileMapping mapping;
+#if defined(_WIN32) || defined(_WIN64)
+            mapping.hFile = CreateFileA(fileName.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            AssertInFastLLM(mapping.hFile != INVALID_HANDLE_VALUE, "cannot open file " + fileName);
+            LARGE_INTEGER fileSize;
+            AssertInFastLLM(GetFileSizeEx(mapping.hFile, &fileSize), "cannot get file size " + fileName);
+            mapping.size = (uint64_t)fileSize.QuadPart;
+            mapping.hMapping = CreateFileMappingA(mapping.hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            AssertInFastLLM(mapping.hMapping != nullptr, "cannot create file mapping " + fileName);
+            mapping.base = (uint8_t*)MapViewOfFile(mapping.hMapping, FILE_MAP_READ, 0, 0, 0);
+            AssertInFastLLM(mapping.base != nullptr, "cannot map file view " + fileName);
+#else
+            int fd = open(fileName.c_str(), O_RDONLY);
+            AssertInFastLLM(fd >= 0, "cannot open file " + fileName);
+            struct stat st;
+            AssertInFastLLM(fstat(fd, &st) == 0, "fstat error " + fileName);
+            mapping.size = (uint64_t)st.st_size;
+            AssertInFastLLM(mapping.size > 0, "empty file " + fileName);
+            mapping.base = (uint8_t*)mmap(nullptr, mapping.size, PROT_READ, MAP_PRIVATE, fd, 0);
+            AssertInFastLLM(mapping.base != MAP_FAILED, "mmap failed " + fileName);
+            close(fd);
+#endif
+            return mapping;
+        }
+
+        static void UnmapFile(FileMapping &mapping) {
+#if defined(_WIN32) || defined(_WIN64)
+            if (mapping.base != nullptr) {
+                UnmapViewOfFile(mapping.base);
+            }
+            if (mapping.hMapping != nullptr) {
+                CloseHandle(mapping.hMapping);
+            }
+            if (mapping.hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(mapping.hFile);
+            }
+#else
+            if (mapping.base != nullptr) {
+                munmap(mapping.base, mapping.size);
+            }
+#endif
+            mapping.base = nullptr;
+        }
+
         SafeTensors (const std::set <std::string> &fileNames) {
             std::string error;
             this->fileNames = fileNames;
             for (auto &fileName : fileNames) {
-                FILE *f = fopen(fileName.c_str(), "rb");
+                FileMapping mapping = MapFile(fileName);
+                mappings[fileName] = mapping;
+                AssertInFastLLM(mapping.size > 8, "safetensors file too small: " + fileName);
                 uint64_t configBytes;
-                int ret = fread(&configBytes, 8, 1, f);
+                memcpy(&configBytes, mapping.base, sizeof(configBytes));
+                AssertInFastLLM(8 + configBytes <= mapping.size,
+                                "safetensors header out of range: " + fileName);
                 char *configString = new char[configBytes + 5];
-                ret = fread(configString, 1, configBytes, f);
+                memcpy(configString, mapping.base + 8, configBytes);
                 configString[configBytes] = 0;
                 auto config = json11::Json::parse(configString, error);
                 for (auto it : config.object_items()) {
                     if (it.first != "__metadata__" ) {
-                        itmeDict[it.first] = SafeTensorItem(it.first, fileName, it.second, 8 + configBytes);
+                        itmeDict[it.first] = SafeTensorItem(it.first, fileName, it.second,
+                                                            8 + configBytes, mapping.base, mapping.size);
                     }
                 }
 
                 delete[] configString;
+            }
+        }
+
+        SafeTensors(const SafeTensors &) = delete;
+        SafeTensors &operator=(const SafeTensors &) = delete;
+
+        ~SafeTensors() {
+            for (auto &it : mappings) {
+                UnmapFile(it.second);
             }
         }
 
