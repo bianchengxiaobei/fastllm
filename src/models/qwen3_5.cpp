@@ -874,10 +874,7 @@ namespace fastllm {
 
         static bool Qwen35GpuTokenHandoffEnabled() {
             const char *value =
-                std::getenv("FASTLLM_QWEN35_GPU_TOKEN_HANDOFF");
-            if (value == nullptr) {
-                value = std::getenv("FASTLLM_GPU_TOKEN_HANDOFF");
-            }
+                std::getenv("FASTLLM_GPU_TOKEN_HANDOFF");
             return value != nullptr && Qwen35MoeIsTrueString(value);
         }
 
@@ -5222,6 +5219,7 @@ namespace fastllm {
             size_t packedRankBytes = (size_t)batch * 2 * sizeof(int);
             if (handoffSampling) {
                 int rootDevice = devices.front();
+                FastllmCudaSetDevice(rootDevice);
                 Data &cudaGather =
                     Qwen35ThreadLocalCudaShardedGreedyGather();
                 Qwen3CudaPrepareLocalOutput(cudaGather, rootDevice);
@@ -5314,6 +5312,12 @@ namespace fastllm {
                                 handoffGatherBase != nullptr,
                                 "Qwen3.5 CUDA greedy shard gather is missing.\n");
 
+                // The shard loop leaves the scheduler thread on the last TP
+                // device. Data::Allocate uses the current CUDA device rather
+                // than Data::dataDeviceIds, so switch back before allocating
+                // root-only merge outputs. Otherwise a non-P2P topology gives
+                // the root merge kernel a pointer owned by the last rank.
+                FastllmCudaSetDevice(rootDevice);
                 Data &cudaOutput = Qwen35ThreadLocalCudaSamplingOutput();
                 Qwen3CudaPrepareLocalOutput(cudaOutput, rootDevice);
                 cudaOutput.dataType = DataType::INT32;
@@ -13504,6 +13508,17 @@ namespace fastllm {
             }
         };
 
+        auto copyTensorMetaIntoExistingStorage = [&](Data &dst, const Data &src) {
+            dst.isKVCache = src.isKVCache;
+            dst.isLinearAttention = src.isLinearAttention;
+            dst.isLinearAttentionTransposed = src.isLinearAttentionTransposed;
+            dst.cacheUid = src.cacheUid;
+            dst.strides = src.strides;
+            dst.expansionDims = src.expansionDims;
+            dst.expansionSize = src.expansionSize;
+            dst.expansionBytes = src.expansionBytes;
+        };
+
         auto adoptTensorIntoExistingStorage = [&](Data &dst, Data &src) {
             if (dst.isFake || src.isFake ||
                 dst.multiDeviceData || src.multiDeviceData ||
@@ -13995,13 +14010,15 @@ namespace fastllm {
                     }
                     localKey->dataDeviceIds = {localDevice};
                     localValue->dataDeviceIds = {localDevice};
-                    int oldDevice = FastllmCudaGetDevice();
-                    FastllmCudaSetDevice(localDevice);
-                    if (!Qwen35EnsureCudaLinearAttnStateTransposed(*localValue)) {
+                    if (!localValue->isLinearAttentionTransposed) {
+                        int oldDevice = FastllmCudaGetDevice();
+                        FastllmCudaSetDevice(localDevice);
+                        if (!Qwen35EnsureCudaLinearAttnStateTransposed(*localValue)) {
+                            FastllmCudaSetDevice(oldDevice);
+                            return false;
+                        }
                         FastllmCudaSetDevice(oldDevice);
-                        return false;
                     }
-                    FastllmCudaSetDevice(oldDevice);
                 }
             }
             return true;
@@ -14150,6 +14167,16 @@ namespace fastllm {
             std::vector<std::exception_ptr> linearBackupErrors(devices.size());
             threadTpWorkerGroup.Run(devices, [&](int deviceIndex) {
                 int localDevice = devices[deviceIndex];
+                FastllmCudaSetDevice(localDevice);
+                thread_local std::vector<void*> linearBackupDsts;
+                thread_local std::vector<const void*> linearBackupSrcs;
+                thread_local std::vector<size_t> linearBackupSizes;
+                linearBackupDsts.clear();
+                linearBackupSrcs.clear();
+                linearBackupSizes.clear();
+                linearBackupDsts.reserve(block_cnt * 2);
+                linearBackupSrcs.reserve(block_cnt * 2);
+                linearBackupSizes.reserve(block_cnt * 2);
                 for (int i = 0; i < block_cnt; i++) {
                     if (isAttentionLayerAt(i)) {
                         continue;
@@ -14178,7 +14205,10 @@ namespace fastllm {
                             backup.dims == real.dims &&
                             backup.GetBytes() == real.GetBytes();
                         if (reusable) {
-                            copyTensorIntoExistingStorage(backup, real);
+                            linearBackupDsts.push_back(backup.cudaData);
+                            linearBackupSrcs.push_back(real.cudaData);
+                            linearBackupSizes.push_back(real.GetBytes());
+                            copyTensorMetaIntoExistingStorage(backup, real);
                         } else {
                             copyTensorForValidationLocal(backup, real, localDevice);
                         }
@@ -14186,7 +14216,16 @@ namespace fastllm {
                     backupLinearState(*backupKey, *realKey);
                     backupLinearState(*backupValue, *realValue);
                 }
-                FastllmCudaSetDevice(localDevice);
+                if (!linearBackupDsts.empty() &&
+                    !FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                        linearBackupDsts.data(), linearBackupSrcs.data(),
+                        linearBackupSizes.data(), (int)linearBackupDsts.size())) {
+                    for (int i = 0; i < (int)linearBackupDsts.size(); i++) {
+                        FastllmCudaCopyFromDeviceToDevice(
+                            linearBackupDsts[i], (void*)linearBackupSrcs[i],
+                            linearBackupSizes[i]);
+                    }
+                }
                 ForceDeviceSync();
             }, linearBackupErrors);
             for (auto &error : linearBackupErrors) {
@@ -17261,6 +17300,8 @@ namespace fastllm {
                 }
                 return a.handle < b.handle;
             });
+            bool gpuTokenHandoffHasWaitingPrefill =
+                gpuTokenHandoffPending && hasPrefill;
             if (!forcedGpuTokenHandoffHandles.empty()) {
                 std::vector<DecodeOrder> forcedOrders;
                 forcedOrders.reserve(forcedGpuTokenHandoffHandles.size());
@@ -17344,6 +17385,14 @@ namespace fastllm {
             bool selectingGpuTokenHandoffPending =
                 gpuTokenHandoffPending &&
                 !forcedGpuTokenHandoffHandles.empty();
+            // A pending handoff has already advanced the current decode batch.
+            // Consume it first, but leave the next launch to the scheduler when
+            // a waiting prefill can occupy a free lane.  The following
+            // iteration will prefill the newcomer, rebuild the decode batch,
+            // and then resume handoff without starving request admission.
+            bool yieldGpuTokenHandoffToPrefill =
+                selectingGpuTokenHandoffPending &&
+                gpuTokenHandoffHasWaitingPrefill && canAddPrefill;
             if (!forcedGpuTokenHandoffHandles.empty()) {
                 canAddPrefill = false;
                 hasPrefill = false;
@@ -17623,6 +17672,7 @@ namespace fastllm {
                         oldTokensReady = true;
                     }
                     if (oldCanChain && unchangedBatch &&
+                        !yieldGpuTokenHandoffToPrefill &&
                         gpuTokenHandoffAllRunnable &&
                         canPrelaunchGpuTokenBatch(tokenContexts)) {
                         int nextDeviceSlot = 1 - oldDeviceSlot;
