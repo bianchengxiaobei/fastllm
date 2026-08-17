@@ -485,7 +485,11 @@ namespace fastllm {
     }
 
     extern CPUInstructInfo cpuInstructInfo;
+#ifdef __linux__
     extern void InitAMX();
+#else
+    inline void InitAMX() {}
+#endif
     void EnableAMX(bool enable) {
         enableAMX = enable && cpuInstructInfo.hasAMX;
         if (enableAMX) {

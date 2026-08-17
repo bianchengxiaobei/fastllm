@@ -114,6 +114,11 @@ namespace fastllm {
     public:
         using value_type = T;
         
+        alignedAllocator() = default;
+        
+        template<typename U>
+        alignedAllocator(const alignedAllocator<U, Alignment>&) noexcept {}
+        
         T* allocate(std::size_t n) {
             std::size_t size = n * sizeof(T);
             
@@ -147,6 +152,11 @@ namespace fastllm {
         struct rebind {
             using other = alignedAllocator<U, Alignment>;
         };
+        
+        template<typename U>
+        bool operator==(const alignedAllocator<U, Alignment>&) const { return true; }
+        template<typename U>
+        bool operator!=(const alignedAllocator<U, Alignment>&) const { return false; }
     };
 
     struct GenerationConfig {

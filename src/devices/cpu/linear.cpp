@@ -497,6 +497,36 @@ namespace fastllm {
                     outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);
                 } 
             }
+        } else if (vec_dot_type == GGML_TYPE_F32 || !ggml_is_quantized(tensor->type)) {
+            float *inputFloatData = (float *)q8kInputData;
+            float *weightFloatData = (float *)weightData;
+            for (int i = 0; i < n; i++) {
+                for (int j = st; j < end; j++) {
+                    float now = biasData ? biasData[j] : 0.0f;
+                    int l = 0;
+#ifdef __aarch64__
+                    float32x4_t sum = {0, 0, 0, 0};
+                    for (; l + 3 < m; l += 4) {
+                        sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(inputFloatData + i * m + l), vld1q_f32(weightFloatData + j * m + l)));
+                    }
+                    now += sum[0] + sum[1] + sum[2] + sum[3];
+#else
+#ifdef __AVX2__
+                    __m256 vsum = _mm256_setzero_ps();
+                    for (; l + 7 < m; l += 8) {
+                        __m256 vi = _mm256_loadu_ps(inputFloatData + i * m + l);
+                        __m256 vw = _mm256_loadu_ps(weightFloatData + j * m + l);
+                        vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                    }
+                    now += Floatsum(vsum);
+#endif
+#endif
+                    for (; l < m; l++) {
+                        now += inputFloatData[i * m + l] * weightFloatData[j * m + l];
+                    }
+                    outputData[i * k + j] = now;
+                }
+            }
         } else {
             ErrorInFastLLM("Linear error: unsupport GGUF's dataType " + std::string(ggml_type_name(tensor->type)) + ".\n");
         }
@@ -653,9 +683,12 @@ namespace fastllm {
                         int n, int m, int k, int st, int end);
     extern bool LinearBFloat16BFloat16_AVX2_Kernel(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
+#ifdef __linux__
     extern bool LinearBFloat16BFloat16_AMX_Kernel(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
+#endif
     void MultiThreadLinearBFloat16BFloat16Op::Run() {
+#ifdef __linux__
         if (cpuInstructInfo.hasAMX && GetEnableAMX() && n > 7) {
             if (LinearBFloat16BFloat16_AMX_Kernel(
                 inputData, weightData, biasData, outputData, n, m, k, st, end
@@ -663,6 +696,7 @@ namespace fastllm {
                 return;
             }
         }
+#endif
         
         if (cpuInstructInfo.hasAVX512BF16) {
             if (LinearBFloat16BFloat16_AVX512BF16_Kernel(

@@ -14,6 +14,7 @@
 #else
 #include <unistd.h>
 #endif
+#include <chrono>
 #include <cstring>
 
 namespace fastllm {

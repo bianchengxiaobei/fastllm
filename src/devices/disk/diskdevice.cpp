@@ -10,14 +10,29 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
-#include <fcntl.h>
 #include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#include <malloc.h>
+#include <windows.h>
+#define O_RDONLY _O_RDONLY
+#define ssize_t long
+#define open _open
+#define close _close
+inline ssize_t pread(int fd, void *buf, size_t count, long long offset) {
+    _lseeki64(fd, offset, SEEK_SET);
+    return _read(fd, buf, (unsigned int)count);
+}
+#else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <unordered_set>
 
@@ -136,6 +151,26 @@ namespace fastllm {
         return threads;
     }
 
+    static inline void *FastllmAlignedAlloc(size_t alignment, size_t size) {
+#ifdef _WIN32
+        return _aligned_malloc(size, alignment);
+#else
+        void *ptr = nullptr;
+        if (posix_memalign(&ptr, alignment, size) != 0) {
+            return nullptr;
+        }
+        return ptr;
+#endif
+    }
+
+    static inline void FastllmAlignedFree(void *ptr) {
+#ifdef _WIN32
+        _aligned_free(ptr);
+#else
+        free(ptr);
+#endif
+    }
+
     class DiskFileCache {
     public:
         ~DiskFileCache() {
@@ -184,7 +219,7 @@ namespace fastllm {
     class DiskDirectScratch {
     public:
         ~DiskDirectScratch() {
-            free(buffer);
+            FastllmAlignedFree(buffer);
         }
 
         uint8_t *Acquire(size_t bytes) {
@@ -192,14 +227,13 @@ namespace fastllm {
                 return nullptr;
             }
             if (bytes > capacity) {
-                free(buffer);
+                FastllmAlignedFree(buffer);
                 buffer = nullptr;
                 capacity = 0;
-                void *ptr = nullptr;
-                if (posix_memalign(&ptr, 4096, bytes) != 0) {
+                buffer = (uint8_t*)FastllmAlignedAlloc(4096, bytes);
+                if (buffer == nullptr) {
                     return nullptr;
                 }
-                buffer = (uint8_t*)ptr;
                 capacity = bytes;
             }
             inUse = true;
@@ -245,10 +279,9 @@ namespace fastllm {
             if (buffer != nullptr) {
                 usesScratch = true;
             } else {
-                void *ptr = nullptr;
-                AssertInFastLLM(posix_memalign(&ptr, alignment, bufferBytes) == 0 && ptr != nullptr,
+                buffer = (uint8_t*)FastllmAlignedAlloc(alignment, bufferBytes);
+                AssertInFastLLM(buffer != nullptr,
                                 "Disk direct read buffer allocation failed.\n");
-                buffer = (uint8_t*)ptr;
             }
 
             int fd = GetDiskFileCache().Get(part.fileName, true);
@@ -288,7 +321,7 @@ namespace fastllm {
             if (usesScratch) {
                 diskDirectScratch.Release();
             } else {
-                free(buffer);
+                FastllmAlignedFree(buffer);
             }
             buffer = nullptr;
         }
@@ -558,19 +591,44 @@ namespace fastllm {
                             fileOffset >= 0 && bytes > 0,
                             "Disk Linear mmap range is invalid: " + part.fileName + "\n");
             int fd = GetDiskFileCache().Get(part.fileName);
+#ifdef _WIN32
+            SYSTEM_INFO sysInfo;
+            GetSystemInfo(&sysInfo);
+            size_t pageSize = (size_t)sysInfo.dwAllocationGranularity;
+#else
             long pageSizeValue = sysconf(_SC_PAGESIZE);
             size_t pageSize = pageSizeValue > 0 ? (size_t)pageSizeValue : 4096;
+#endif
             uint64_t alignedOffset = (uint64_t)fileOffset / pageSize * pageSize;
             size_t delta = (size_t)((uint64_t)fileOffset - alignedOffset);
             AssertInFastLLM(bytes <= std::numeric_limits<size_t>::max() - delta,
                             "Disk Linear mmap range is too large.\n");
             mappedBytes = (size_t)bytes + delta;
+#ifdef _WIN32
+            HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+            HANDLE hMapping = hFile != INVALID_HANDLE_VALUE
+                                  ? CreateFileMapping(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr)
+                                  : nullptr;
+            mapped = nullptr;
+            if (hMapping != nullptr) {
+                mapped = MapViewOfFile(hMapping, FILE_MAP_READ,
+                                       (DWORD)((uint64_t)alignedOffset >> 32),
+                                       (DWORD)((uint64_t)alignedOffset & 0xFFFFFFFF),
+                                       mappedBytes);
+                CloseHandle(hMapping);
+            }
+            if (mapped == nullptr) {
+                mappedBytes = 0;
+                return;
+            }
+#else
             mapped = mmap(nullptr, mappedBytes, PROT_READ, MAP_PRIVATE, fd, (off_t)alignedOffset);
             if (mapped == MAP_FAILED) {
                 mapped = nullptr;
                 mappedBytes = 0;
                 return;
             }
+#endif
             data = (uint8_t*)mapped + delta;
 #ifdef MADV_SEQUENTIAL
             madvise(mapped, mappedBytes, MADV_SEQUENTIAL);
@@ -581,7 +639,11 @@ namespace fastllm {
             if (mapped == nullptr) {
                 return;
             }
+#ifdef _WIN32
+            UnmapViewOfFile(mapped);
+#else
             munmap(mapped, mappedBytes);
+#endif
         }
 
         uint8_t *Get() const {
@@ -598,8 +660,10 @@ namespace fastllm {
         if (DiskDirectIoEnabled() || bytes == 0 || offset > part.bytes || bytes > part.bytes - offset) {
             return;
         }
+#ifndef _WIN32
         int fd = GetDiskFileCache().Get(part.fileName);
         posix_fadvise(fd, (off_t)(part.fileOffset + offset), (off_t)bytes, POSIX_FADV_WILLNEED);
+#endif
     }
 
     static size_t DiskPartRows(const DiskWeightPart &part) {
