@@ -10,11 +10,14 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <sstream>
 
 #include <cfloat>
 #include <cmath>
 #include <atomic>
 #include <set>
+#include <mutex>
+#include <unordered_map>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -1615,7 +1618,99 @@ namespace fastllm {
     struct FastllmMoeDataManager {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
+            // 块转置权重的缓存，key 为原始权重的 cpuData 指针（加载后固定）
+            std::mutex weightTLock;
+            std::unordered_map <const uint16_t *, std::vector <uint8_t, alignedAllocator<uint8_t, 64> > > transposedWeights;
     } fastllmMoeDataManager;
+
+    // 将 BF16 权重 [k][m]（行主序）转置为 [k/64][m/8][64][8] 的块布局：
+    // 一个 (m/8) 块内 64 列 × 8 元素 = 1024B 连续，decode 单 token GEMV 可单流连续读
+    static void TransposeBF16MoEWeightsBlock64(const uint16_t *src, uint16_t *dst,
+                                               int k, int m) {
+        const int numCb = k / 64;
+        for (int cb = 0; cb < numCb; cb++) {
+            uint16_t *dstBase = dst + (size_t)cb * (m / 8) * 512;
+            for (int mb = 0; mb < m; mb += 8) {
+                uint16_t *d = dstBase + (mb / 8) * 512;
+                for (int c = 0; c < 64; c++) {
+                    memcpy(d + c * 8, src + (size_t)(cb * 64 + c) * m + mb, 16);
+                }
+            }
+        }
+    }
+
+    // 获取（或生成）块转置权重，返回转置后的指针；不支持时返回 nullptr
+    static const uint16_t *GetTransposedBF16Weight(const uint16_t *src, int k, int m) {
+        if (src == nullptr || k <= 0 || m <= 0 || k % 64 != 0 || m % 8 != 0) {
+            return nullptr;
+        }
+        {
+            std::lock_guard <std::mutex> lock(fastllmMoeDataManager.weightTLock);
+            auto it = fastllmMoeDataManager.transposedWeights.find(src);
+            if (it != fastllmMoeDataManager.transposedWeights.end()) {
+                return (const uint16_t*)it->second.data();
+            }
+        }
+        std::vector <uint8_t, alignedAllocator<uint8_t, 64> > buf((size_t)k * m * 2);
+        TransposeBF16MoEWeightsBlock64(src, (uint16_t*)buf.data(), k, m);
+        std::lock_guard <std::mutex> lock(fastllmMoeDataManager.weightTLock);
+        auto ret = fastllmMoeDataManager.transposedWeights.emplace(src, std::move(buf));
+        return (const uint16_t*)ret.first->second.data();
+    }
+
+    // decode 专用 GEMV：1 个 token × 64 输出列，权重为块转置布局，外层按 m 连续读 1024B
+    static inline __m256 FastllmBF16ToFP32AVX2(__m128i bf16_data) {
+        __m256i fp32_data = _mm256_cvtepu16_epi32(bf16_data);
+        fp32_data = _mm256_slli_epi32(fp32_data, 16);
+        return _mm256_castsi256_ps(fp32_data);
+    }
+
+    static void GemvBF16Block64AVX2(const uint16_t *input, const uint16_t *weightT,
+                                    float *output, int m, int cb) {
+#ifdef __AVX2__
+        const uint16_t *base = weightT + (size_t)cb * (m / 8) * 512;
+        for (int g = 0; g < 8; g++) {
+            __m256 acc[8];
+            for (int c = 0; c < 8; c++) {
+                acc[c] = _mm256_setzero_ps();
+            }
+            for (int mb = 0; mb < m; mb += 8) {
+                __m128i a = _mm_loadu_si128((const __m128i*)(input + mb));
+                __m256 af = FastllmBF16ToFP32AVX2(a);
+                const uint16_t *wp = base + (mb / 8) * 512 + g * 64;
+                for (int c = 0; c < 8; c++) {
+                    __m128i w = _mm_loadu_si128((const __m128i*)(wp + c * 8));
+                    acc[c] = _mm256_fmadd_ps(af, FastllmBF16ToFP32AVX2(w), acc[c]);
+                }
+            }
+            for (int c = 0; c < 8; c++) {
+                output[g * 8 + c] = Floatsum(acc[c]);
+            }
+        }
+#else
+        for (int j = 0; j < 64; j++) {
+            float sum = 0.0f;
+            for (int l = 0; l < m; l++) {
+                sum += bf16tofp32.dict[input[l]] * bf16tofp32.dict[weightT[cb * (m / 8) * 512 + (l / 8) * 512 + j * 8 + (l % 8)]];
+            }
+            output[j] = sum;
+        }
+#endif
+    }
+
+    struct MultiThreadGemvBF16Block64Op : MultiThreadBaseOp {
+        const uint16_t *input, *weightT;
+        float *output;
+        int m, cb;
+
+        MultiThreadGemvBF16Block64Op(const uint16_t *input, const uint16_t *weightT,
+                                     float *output, int m, int cb)
+                : input(input), weightT(weightT), output(output), m(m), cb(cb) {}
+
+        void Run() override {
+            GemvBF16Block64AVX2(input, weightT, output + cb * 64, m, cb);
+        }
+    };
 
     void FastllmGemm (int n, int m, int k, 
         const void *A, long lda, // A [n * m], lda = bytes for 1 row in A
@@ -2745,7 +2840,7 @@ namespace fastllm {
         
         // 为每个线程分配任务状态
         for (int i = 0; i < numThreads; i++) {
-            taskStates[i] = new (std::align_val_t{64}) TaskState();
+            taskStates[i] = new TaskState();
             taskStates[i]->curr.store(0, std::memory_order_relaxed);
             taskStates[i]->end = 0;
             taskStates[i]->completed.store(false, std::memory_order_relaxed);
@@ -2799,11 +2894,7 @@ namespace fastllm {
             delete wsOps[i];
             if (taskStates[i] != nullptr) {
                 taskStates[i]->~TaskState();
-                #if __cpp_aligned_new >= 201606
-                    operator delete(taskStates[i], std::align_val_t{64});
-                #else
-                    free_aligned(taskStates[i], sizeof(TaskState));
-                #endif
+                delete taskStates[i];
             }
         }
         
@@ -4182,14 +4273,27 @@ long long ops = 0;
                             // Get weight data (assuming weights are stored as BFloat16)
                             uint16_t* weightPtr = (uint16_t*)(weights[e * 2]->cpuData);
 
-                            for (int st = 0; st < interDim * 2; st += stride) {
-                                int end = std::min(st + stride, interDim * 2);
-                                gemmOps.push_back(new MultiThreadGemmOp(
-                                    (uint8_t*)expertInputPtr, DataType::BFLOAT16,
-                                    (uint8_t*)weightPtr, DataType::BFLOAT16,
-                                    (uint8_t*)expertGateUpOutputPtr, DataType::FLOAT32,
-                                    lines, inputDim, interDim * 2, st, end
-                                ));
+                            const uint16_t *weightT = nullptr;
+                            if (lines == 1 && weights[e * 2]->dataType == DataType::BFLOAT16) {
+                                weightT = GetTransposedBF16Weight(weightPtr, interDim * 2, inputDim);
+                            }
+                            if (weightT != nullptr) {
+                                for (int cb = 0; cb < interDim * 2 / 64; cb++) {
+                                    gemmOps.push_back(new MultiThreadGemvBF16Block64Op(
+                                        expertInputPtr, weightT, expertGateUpOutputPtr,
+                                        inputDim, cb
+                                    ));
+                                }
+                            } else {
+                                for (int st = 0; st < interDim * 2; st += stride) {
+                                    int end = std::min(st + stride, interDim * 2);
+                                    gemmOps.push_back(new MultiThreadGemmOp(
+                                        (uint8_t*)expertInputPtr, DataType::BFLOAT16,
+                                        (uint8_t*)weightPtr, DataType::BFLOAT16,
+                                        (uint8_t*)expertGateUpOutputPtr, DataType::FLOAT32,
+                                        lines, inputDim, interDim * 2, st, end
+                                    ));
+                                }
                             }
 ops += (long long)lines * inputDim * interDim * 2;
                             offset += lines;
@@ -4232,14 +4336,27 @@ ops += (long long)lines * inputDim * interDim * 2;
                             // Get weight data (assuming weights are stored as BFloat16)
                             uint16_t* weightPtr = (uint16_t*)(weights[e * 2 + 1]->cpuData);
 
-                            for (int st = 0; st < dim; st += stride) {
-                                int end = std::min(st + stride, dim);
-                                gemmOps.push_back(new MultiThreadGemmOp (
-                                    (uint8_t*)expertDownInputPtr, DataType::BFLOAT16, 
-                                    (uint8_t*)weightPtr, DataType::BFLOAT16, 
-                                    (uint8_t*)expertDownOutputPtr, DataType::FLOAT32, 
-                                    lines, interDim, dim, st, end
-                                ));
+                            const uint16_t *weightT = nullptr;
+                            if (lines == 1 && weights[e * 2 + 1]->dataType == DataType::BFLOAT16) {
+                                weightT = GetTransposedBF16Weight(weightPtr, dim, interDim);
+                            }
+                            if (weightT != nullptr) {
+                                for (int cb = 0; cb < dim / 64; cb++) {
+                                    gemmOps.push_back(new MultiThreadGemvBF16Block64Op(
+                                        (const uint16_t*)expertDownInputPtr, weightT,
+                                        (float*)expertDownOutputPtr, interDim, cb
+                                    ));
+                                }
+                            } else {
+                                for (int st = 0; st < dim; st += stride) {
+                                    int end = std::min(st + stride, dim);
+                                    gemmOps.push_back(new MultiThreadGemmOp (
+                                        (uint8_t*)expertDownInputPtr, DataType::BFLOAT16, 
+                                        (uint8_t*)weightPtr, DataType::BFLOAT16, 
+                                        (uint8_t*)expertDownOutputPtr, DataType::FLOAT32, 
+                                        lines, interDim, dim, st, end
+                                    ));
+                                }
                             }
                             offset += lines;
                         }
@@ -5276,6 +5393,113 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    struct MultiThreadRMSNormFloat16Op : MultiThreadBaseOp {
+        uint16_t *input, *output;
+        float *weight;
+        int outer, channels;
+        float eps;
+
+        MultiThreadRMSNormFloat16Op (uint16_t *output, uint16_t *input, float *weight, int outer, int channels, float eps) :
+            input(input), output(output), weight(weight), outer(outer), channels(channels), eps(eps) {}
+
+        void Run() {
+            for (int i = 0; i < outer; i++) {
+                float mean = 0.f;
+                int j = 0;
+                for (; j < channels; j++) {
+                    float x = fp16tofp32.dict[input[j]];
+                    mean += x * x;
+                }
+                float scale = 1.0 / sqrt(mean / channels + eps);
+                j = 0;
+                for (; j < channels; j++) {
+                    output[j] = float_to_half(fp16tofp32.dict[input[j]] * scale * weight[j]);
+                }
+
+                input += channels;
+                output += channels;
+            }
+        }
+    };
+
+    static void RunMultiThreadRMSNormFloat16(uint16_t *output, uint16_t *input, float *weight, int outer, int channels, float eps, AliveThreadPool *pool) {
+        if (outer == 1) {
+            (MultiThreadRMSNormFloat16Op(output, input, weight, outer, channels, eps)).Run();
+            return;
+        }
+        int threadNum = pool->threads.size();
+        int per = outer / pool->threads.size();
+        int cur = 0;
+        std::vector<fastllm::MultiThreadRMSNormFloat16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? outer : cur + per + (cur + per * (threadNum - i) < outer));
+            ops.push_back(new MultiThreadRMSNormFloat16Op(output + cur * channels, input + cur * channels, weight, end - cur, channels, eps));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    struct MultiThreadRMSNormBFloat16Op : MultiThreadBaseOp {
+        uint16_t *input, *output;
+        float *weight;
+        int outer, channels;
+        float eps;
+
+        MultiThreadRMSNormBFloat16Op (uint16_t *output, uint16_t *input, float *weight, int outer, int channels, float eps) :
+            input(input), output(output), weight(weight), outer(outer), channels(channels), eps(eps) {}
+
+        void Run() {
+            for (int i = 0; i < outer; i++) {
+                float mean = 0.f;
+                int j = 0;
+                for (; j < channels; j++) {
+                    float x = bf16tofp32.dict[input[j]];
+                    mean += x * x;
+                }
+                float scale = 1.0 / sqrt(mean / channels + eps);
+                j = 0;
+                for (; j < channels; j++) {
+                    float val = bf16tofp32.dict[input[j]] * scale * weight[j];
+                    uint32_t tmp;
+                    memcpy(&tmp, &val, sizeof(tmp));
+                    output[j] = (uint16_t)(tmp >> 16);
+                }
+
+                input += channels;
+                output += channels;
+            }
+        }
+    };
+
+    static void RunMultiThreadRMSNormBFloat16(uint16_t *output, uint16_t *input, float *weight, int outer, int channels, float eps, AliveThreadPool *pool) {
+        if (outer == 1) {
+            (MultiThreadRMSNormBFloat16Op(output, input, weight, outer, channels, eps)).Run();
+            return;
+        }
+        int threadNum = pool->threads.size();
+        int per = outer / pool->threads.size();
+        int cur = 0;
+        std::vector<fastllm::MultiThreadRMSNormBFloat16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? outer : cur + per + (cur + per * (threadNum - i) < outer));
+            ops.push_back(new MultiThreadRMSNormBFloat16Op(output + cur * channels, input + cur * channels, weight, end - cur, channels, eps));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void CpuRMSNormOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -5299,46 +5523,13 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint16_t *outputData = (uint16_t *) output.cpuData;
             float *weightData = (float *) weight.cpuData;
 
-            for (int i = 0; i < outer; i++) {
-                float mean = 0.f;
-                int j = 0;
-                for (; j < channels; j++) {
-                    float x = fp16tofp32.dict[inputData[j]];
-                    mean += x * x;
-                }
-                float scale = 1.0 / sqrt(mean / channels + eps);
-                j = 0;
-                for (; j < channels; j++) {
-                    outputData[j] = float_to_half(fp16tofp32.dict[inputData[j]] * scale * weightData[j]);
-                }
-
-                inputData += channels;
-                outputData += channels;
-            }
+            RunMultiThreadRMSNormFloat16(outputData, inputData, weightData, outer, channels, eps, GetAlivePool());
         } else if (input.dataType == DataType::BFLOAT16) {
             uint16_t *inputData = (uint16_t *) input.cpuData;
             uint16_t *outputData = (uint16_t *) output.cpuData;
             float *weightData = (float *) weight.cpuData;
 
-            for (int i = 0; i < outer; i++) {
-                float mean = 0.f;
-                int j = 0;
-                for (; j < channels; j++) {
-                    float x = bf16tofp32.dict[inputData[j]];
-                    mean += x * x;
-                }
-                float scale = 1.0 / sqrt(mean / channels + eps);
-                j = 0;
-                for (; j < channels; j++) {
-                    float val = bf16tofp32.dict[inputData[j]] * scale * weightData[j];
-                    uint32_t tmp;
-                    memcpy(&tmp, &val, sizeof(tmp));
-                    outputData[j] = (uint16_t)(tmp >> 16);
-                }
-
-                inputData += channels;
-                outputData += channels;
-            }
+            RunMultiThreadRMSNormBFloat16(outputData, inputData, weightData, outer, channels, eps, GetAlivePool());
         } else {
             ErrorInFastLLM("RMSNorm error: unsupport dataType.\n");
         }
