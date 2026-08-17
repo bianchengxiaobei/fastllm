@@ -6621,22 +6621,22 @@ ops += (long long)lines * inputDim * interDim * 2;
                 int threadNum = pool->threads.size();
                 int per = k / threadNum;
                 int cur = 0;
-                std::vector<fastllm::MultiThreadBase3GroupLinearOp*> ops;
+                std::vector<fastllm::MultiThreadBase3GroupLinearOp> ops;
+                ops.reserve(threadNum);
                 for (int i = 0; i < threadNum; i++) {
                     int end = cur + per + (cur + per * (threadNum - i) < k);
                     if (i == threadNum - 1) {
                         end = k;
                     }
-                    ops.push_back(new MultiThreadBase3GroupLinearOp(inputData, weightData, biasData, outputData,
-                                                   n, m, k, cur, end, weight.group, weight.groupCnt, weight.halfScales.data()));
+                    ops.emplace_back(inputData, weightData, biasData, outputData,
+                                     n, m, k, cur, end, weight.group, weight.groupCnt, weight.halfScales.data());
                     cur = end;
                 }
                 for (int i = 0; i < threadNum; i++) {
-                    pool->PushOp(i, ops[i]);
+                    pool->PushOp(i, &ops[i]);
                 }
                 for (int i = 0; i < threadNum; i++) {
                     pool->Wait(i);
-                    delete ops[i];
                 }
             } else if (weight.dataType == DataType::INT4) {
                 // 目前已经不用这种数据类型了
@@ -6674,11 +6674,22 @@ ops += (long long)lines * inputDim * interDim * 2;
                 RunLinearBFloat16BFloat16((uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, (float*)output.cpuData,
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::FLOAT16) {
-                std::vector<float> floatInput;
-                floatInput.resize(n * m);
-                BFloat16ToFloat32((uint16_t*)input.cpuData, floatInput.data(), n * m);
-                RunLinearFloat32Float16(floatInput.data(), (uint16_t*)weight.cpuData, (float*)output.cpuData,
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                if ((cpuInstructInfo.hasAVX512F &&
+                     LinearBFloat16Float16Decode_AVX512F_Kernel(
+                        (uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, biasData, (float*)output.cpuData,
+                        n, m, k, 0, k)) ||
+                    (cpuInstructInfo.hasAVX2 &&
+                     LinearBFloat16Float16_AVX2_Kernel(
+                        (uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, biasData, (float*)output.cpuData,
+                        n, m, k, 0, k))) {
+                } else {
+                    std::vector<float> floatInput;
+                    floatInput.resize(n * m);
+                    BFloat16ToFloat32((uint16_t*)input.cpuData, floatInput.data(), n * m);
+                    RunLinearFloat32Float16(floatInput.data(), (uint16_t*)weight.cpuData, (float*)output.cpuData,
+                        biasData, n, m, k, GetAlivePool(), threadSt, threadLen);
+                }
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 RunLinearBFloat16FP8E4M3((uint16_t*)input.cpuData, weight, (float*)output.cpuData,
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
@@ -6698,11 +6709,22 @@ ops += (long long)lines * inputDim * interDim * 2;
                 RunLinearBFloat16BFloat16((uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, floatOutput.data(),
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::FLOAT16) {
-                std::vector<float> floatInput;
-                floatInput.resize(n * m);
-                BFloat16ToFloat32((uint16_t*)input.cpuData, floatInput.data(), n * m);
-                RunLinearFloat32Float16(floatInput.data(), (uint16_t*)weight.cpuData, floatOutput.data(),
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                if ((cpuInstructInfo.hasAVX512F &&
+                     LinearBFloat16Float16Decode_AVX512F_Kernel(
+                        (uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, biasData, floatOutput.data(),
+                        n, m, k, 0, k)) ||
+                    (cpuInstructInfo.hasAVX2 &&
+                     LinearBFloat16Float16_AVX2_Kernel(
+                        (uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, biasData, floatOutput.data(),
+                        n, m, k, 0, k))) {
+                } else {
+                    std::vector<float> floatInput;
+                    floatInput.resize(n * m);
+                    BFloat16ToFloat32((uint16_t*)input.cpuData, floatInput.data(), n * m);
+                    RunLinearFloat32Float16(floatInput.data(), (uint16_t*)weight.cpuData, floatOutput.data(),
+                        biasData, n, m, k, GetAlivePool(), threadSt, threadLen);
+                }
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 RunLinearBFloat16FP8E4M3((uint16_t*)input.cpuData, weight, floatOutput.data(),
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);

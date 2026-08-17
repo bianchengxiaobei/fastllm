@@ -464,6 +464,13 @@ namespace fastllm {
                             Data *weight, int n, int m, int k, 
                             AliveThreadPool *pool, int startTid, int threadNum);
 
+    bool LinearBFloat16Float16Decode_AVX512F_Kernel(uint16_t *inputData, uint16_t *weightData,
+                            float *biasData, float *outputData,
+                            int n, int m, int k, int st, int end);
+    bool LinearBFloat16Float16_AVX2_Kernel(uint16_t *inputData, uint16_t *weightData,
+                            float *biasData, float *outputData,
+                            int n, int m, int k, int st, int end);
+
     void MatMulFloat16Float16(uint16_t *inputData, uint16_t *weightData, float *biasData, uint16_t *outputData, 
                             int n, int m, int k, int st, int end);
 

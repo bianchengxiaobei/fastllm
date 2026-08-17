@@ -52,6 +52,10 @@ namespace fastllm {
         uint16_t *inputData, uint16_t *weightData,
         float *biasData, float *outputData,
         int n, int m, int k, int st, int end);
+    extern bool LinearBFloat16Float16_AVX2_Kernel(
+        uint16_t *inputData, uint16_t *weightData,
+        float *biasData, float *outputData,
+        int n, int m, int k, int st, int end);
 
     static double NumasProfileNowMs() {
         using Clock = std::chrono::steady_clock;
@@ -454,6 +458,33 @@ namespace fastllm {
         }
     };
 
+    // In-place round-to-nearest-even to BF16 precision, keeping the result in
+    // FP32 storage.  Bit-identical to RoundFloat32ToBFloat16RNE but AVX2
+    // processes eight lanes at once.
+    static inline void RoundFloat32ArrayToBFloat16RNE(
+        float *data, size_t len) {
+        size_t i = 0;
+#ifdef __AVX2__
+        const __m256i half = _mm256_set1_epi32(0x7FFF);
+        const __m256i one = _mm256_set1_epi32(1);
+        for (; i + 7 < len; i += 8) {
+            __m256i v = _mm256_loadu_si256(
+                (const __m256i*)(data + i));
+            __m256i lsb = _mm256_and_si256(
+                _mm256_srli_epi32(v, 16), one);
+            __m256i rounded = _mm256_add_epi32(
+                v, _mm256_add_epi32(half, lsb));
+            __m256i bf = _mm256_srli_epi32(rounded, 16);
+            _mm256_storeu_si256(
+                (__m256i*)(data + i),
+                _mm256_slli_epi32(bf, 16));
+        }
+#endif
+        for (; i < len; i++) {
+            data[i] = RoundFloat32ToBFloat16RNE(data[i]);
+        }
+    }
+
     struct MultiThreadDeepSeekV4NumasRoundOutputOp : MultiThreadBaseOp {
         float *data;
         size_t st, end;
@@ -463,9 +494,7 @@ namespace fastllm {
         ) : data(data), st(st), end(end) {}
 
         void Run() override {
-            for (size_t i = st; i < end; i++) {
-                data[i] = RoundFloat32ToBFloat16RNE(data[i]);
-            }
+            RoundFloat32ArrayToBFloat16RNE(data + st, end - st);
         }
     };
 
@@ -479,9 +508,9 @@ namespace fastllm {
         ) : input(input), output(output), st(st), end(end) {}
 
         void Run() override {
-            for (size_t i = st; i < end; i++) {
-                output[i] = Float32ToBFloat16RNEBits(input[i]);
-            }
+            Float32ToBFloat16(
+                (float*)(input + st), output + st,
+                (int)(end - st));
         }
     };
 
@@ -503,17 +532,15 @@ namespace fastllm {
             }
 
             float *first = downOutput;
-            for (int d = st; d < end; d++) {
-                first[d] = RoundFloat32ToBFloat16RNE(first[d]);
-                output[d] = first[d];
-            }
+            RoundFloat32ArrayToBFloat16RNE(first + st, end - st);
+            memcpy(
+                output + st, first + st,
+                (size_t)(end - st) * sizeof(float));
             for (int expert = 1; expert < expertCount; expert++) {
                 float *curOutput =
                     downOutput + (size_t)expert * outputDim;
-                for (int d = st; d < end; d++) {
-                    curOutput[d] =
-                        RoundFloat32ToBFloat16RNE(curOutput[d]);
-                }
+                RoundFloat32ArrayToBFloat16RNE(
+                    curOutput + st, end - st);
                 int d = st;
 #ifdef __AVX2__
                 for (; d + 7 < end; d += 8) {
@@ -1278,6 +1305,18 @@ namespace fastllm {
         }
     }
 
+    static bool ShouldConvertFP8LinearToBFloat16(
+            const std::string &weightType) {
+        // FP8 packed formats only have fast kernels on AVX512/VNNI/BF16.
+        // On AVX2-only CPUs the numas prefill path otherwise dequantizes the
+        // weight to BF16 on every call; convert once at registration instead.
+        return weightType == "linearColumn" &&
+               GetCPUInstructInfo()->hasAVX2 &&
+               !GetCPUInstructInfo()->hasAVX512F &&
+               !GetCPUInstructInfo()->hasAVX512BF16 &&
+               !GetCPUInstructInfo()->hasAVX512VNNI;
+    }
+
     static void RegisterNumasImpl(fastllm::Data *data,
                                   const std::string &weightType,
                                   bool allowPinned) {
@@ -1326,7 +1365,47 @@ namespace fastllm {
             } else {
                 data->Repack();
 
-                if (data->dataType == DataType::FLOAT32 ||
+                auto registerFP8AsBFloat16 = [&](const uint8_t *packedData,
+                                                 DataType packedType) {
+                    const int blockSize =
+                        packedType == DataType::FP8_E4M3_BLOCK_128 ? 128 : m;
+                    const size_t srcBytesPerRow =
+                        GetDataBytes(packedType, 1, m);
+                    const int numBlocks = (m + blockSize - 1) / blockSize;
+                    static const FP8E4M3ToFP32Manager fp8;
+                    for (int i = 0; i < numaConfig->numaCnt; i++) {
+                        uint16_t *dst = (uint16_t*)allocFunc(
+                            (size_t)kPerNuma * m * sizeof(uint16_t), i);
+                        data->numasData[i] = (uint8_t*)dst;
+                        const uint8_t *src = packedData +
+                            (size_t)i * kPerNuma * srcBytesPerRow;
+                        for (int row = 0; row < kPerNuma; row++) {
+                            const uint8_t *rowStart = src +
+                                (size_t)row * srcBytesPerRow;
+                            uint16_t *dstRow = dst + (size_t)row * m;
+                            for (int block = 0; block < numBlocks; block++) {
+                                const uint8_t *fp8Ptr = rowStart +
+                                    (size_t)block * (blockSize + sizeof(float));
+                                float scale = *(const float*)(fp8Ptr + blockSize);
+                                int base = block * blockSize;
+                                int cnt = std::min(blockSize, m - base);
+                                for (int l = 0; l < cnt; l++) {
+                                    float v = fp8.dict[fp8Ptr[l]] * scale;
+                                    uint32_t bits;
+                                    memcpy(&bits, &v, sizeof(bits));
+                                    dstRow[base + l] = (uint16_t)(bits >> 16);
+                                }
+                            }
+                        }
+                    }
+                    data->dataType = DataType::BFLOAT16;
+                };
+
+                if (ShouldConvertFP8LinearToBFloat16(weightType) &&
+                    (data->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                     data->dataType == DataType::FP8_E4M3_PERCHANNEL)) {
+                    registerFP8AsBFloat16(data->cpuData, data->dataType);
+                } else if (data->dataType == DataType::FLOAT32 ||
                     data->dataType == DataType::BFLOAT16 ||
                     data->dataType == DataType::FLOAT16 ||
                     data->dataType == DataType::FP8_E4M3_BLOCK_128 ||
@@ -1367,9 +1446,13 @@ namespace fastllm {
                         CrossSwigluReorder(fp8Packed.data(), k, bytesPerRow, reordered);
                         fp8Packed.swap(reordered);
                     }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    if (ShouldConvertFP8LinearToBFloat16(weightType)) {
+                        registerFP8AsBFloat16(fp8Packed.data(), data->dataType);
+                    } else {
+                        for (int i = 0; i < numaConfig->numaCnt; i++) {
+                            data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
+                            memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                        }
                     }
                 } else if (data->dataType == DataType::NVFP4) {
                     if (data->blockM < 16 || (data->blockM % 16 != 0 && data->blockM != m)) {
@@ -1570,8 +1653,14 @@ namespace fastllm {
 
             void Run() override {
                 if (inputType == DataType::BFLOAT16) {
-                    AssertInFastLLM(
+                    if (GetCPUInstructInfo()->hasAVX512F &&
                         LinearBFloat16Float16Decode_AVX512F_Kernel(
+                            (uint16_t*)input, weight, nullptr, output,
+                            tokens, groupDim, oRank, rowBegin, rowEnd)) {
+                        return;
+                    }
+                    AssertInFastLLM(
+                        LinearBFloat16Float16_AVX2_Kernel(
                             (uint16_t*)input, weight, nullptr, output,
                             tokens, groupDim, oRank, rowBegin, rowEnd),
                         "NUMA DeepSeekV4WoA BF16 decode kernel is unavailable.\n");
@@ -2118,8 +2207,16 @@ namespace fastllm {
                         n, m, k, localStart, localEnd).Run();
                 } else if (inputType == DataType::BFLOAT16 &&
                            weightType == DataType::FLOAT16) {
-                    AssertInFastLLM(
+                    if (GetCPUInstructInfo()->hasAVX512F &&
                         LinearBFloat16Float16Decode_AVX512F_Kernel(
+                            (uint16_t*)inputData,
+                            (uint16_t*)weightData, nullptr,
+                            outputData + globalStart,
+                            n, m, k, localStart, localEnd)) {
+                        return;
+                    }
+                    AssertInFastLLM(
+                        LinearBFloat16Float16_AVX2_Kernel(
                             (uint16_t*)inputData,
                             (uint16_t*)weightData, nullptr,
                             outputData + globalStart,
@@ -2286,6 +2383,7 @@ namespace fastllm {
             gemmInputType = DataType::BFLOAT16;
         } else if (input.dataType == DataType::BFLOAT16 &&
                    weightType == DataType::FLOAT16 &&
+                   !GetCPUInstructInfo()->hasAVX2 &&
                    (n != 1 ||
                     !GetCPUInstructInfo()->hasAVX512F)) {
             float *converted = workspace.EnsureConvertedFloatInput(
@@ -2318,11 +2416,13 @@ namespace fastllm {
             // Only collapse extreme one-column/two-column shards.  Wider
             // projections still benefit from all available memory channels.
             if (columnsPerNode < workers * 2) {
-                constexpr int minColumnsPerTask = 8;
+                // AVX2 processes 5 output columns per kernel block; larger
+                // tasks amortize input-row reuse and scheduling overhead.
+                constexpr int minColumnsPerTask = 32;
                 int usefulTasks =
                     (columnsPerNode + minColumnsPerTask - 1) /
                     minColumnsPerTask;
-                taskCount = std::min(workers, usefulTasks);
+                taskCount = std::min(workers, std::max(1, usefulTasks));
             }
             int columnsPerTask =
                 (columnsPerNode + taskCount - 1) / taskCount;
@@ -2332,7 +2432,7 @@ namespace fastllm {
                  start += columnsPerTask) {
                 storage.emplace_back(
                     gemmInput, gemmInputType,
-                    weight.numasData[node], weight.GetDataType(),
+                    weight.numasData[node], weightType,
                     floatOutput, output.cpuData, output.dataType,
                     biasData, finalizeBias, n, m, k, start,
                     std::min(start + columnsPerTask, columnsPerNode),
@@ -2606,10 +2706,20 @@ namespace fastllm {
         };
 
         DataType PredictRegisteredNumasLinearType(const Data &weight) {
+            const bool convertFP8ToBFloat16 =
+                ShouldConvertFP8LinearToBFloat16("linearColumn");
             if (weight.dataType == DataType::FP8_E4M3) {
+                if (convertFP8ToBFloat16) {
+                    return DataType::BFLOAT16;
+                }
                 return weight.blockM == 128 ?
                     DataType::FP8_E4M3_BLOCK_128 :
                     DataType::FP8_E4M3_PERCHANNEL;
+            }
+            if ((weight.dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                 weight.dataType == DataType::FP8_E4M3_PERCHANNEL) &&
+                convertFP8ToBFloat16) {
+                return DataType::BFLOAT16;
             }
             if (weight.dataType == DataType::NVFP4) {
                 if (GetNVFP4ScaleData(weight) == nullptr) {
@@ -4859,7 +4969,7 @@ namespace fastllm {
             canFuseGroup32;
         const bool useDeepSeekV4LargeFast =
             deepSeekV4Mode &&
-            GetCPUInstructInfo()->hasAVX512BF16 &&
+            GetCPUInstructInfo()->hasAVX2 &&
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST") == nullptr;
         const bool useDeepSeekV4GroupedDecodeFast =
@@ -5017,20 +5127,15 @@ namespace fastllm {
             if (downInputDataType != DataType::FLOAT32 &&
                 downInputDataType != DataType::FLOAT16 &&
                 downInputDataType != DataType::BFLOAT16) {
-                offset = 0;
-                for (int e = 0; e < (int)expertTasks.size(); e++) {
-                    if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
-                        int lines = expertTasks[e].size();
-                        for (int line = 0; line < lines; line++) {
-                            RunMultiThreadConvertFromFloat32(
-                                downInput.data() + (size_t)(offset + line) * downRowBytes,
-                                downInputDataType,
-                                swigluOutput.data() + (size_t)(offset + line) * interDim,
-                                1, interDim, GetAlivePool());
-                        }
-                        offset += lines;
-                    }
-                }
+                // downInput and swigluOutput are each contiguous over all
+                // routed lines, so convert the whole batch in one
+                // multi-threaded pass instead of one single-threaded call per
+                // line (rows=1 falls back to a scalar convert).
+                RunMultiThreadConvertFromFloat32(
+                    (uint8_t*)downInput.data(),
+                    downInputDataType,
+                    swigluOutput.data(),
+                    offset, interDim, GetAlivePool());
             }
         } else if (!canFuseDstConvert) {
             offset = 0;
@@ -5119,9 +5224,8 @@ namespace fastllm {
                 pool->Wait(tid);
             }
         } else if (deepSeekV4Mode) {
-            for (size_t i = 0; i < (size_t)totalLines * dim; i++) {
-                downOutput[i] = RoundFloat32ToBFloat16RNE(downOutput[i]);
-            }
+            RoundFloat32ArrayToBFloat16RNE(
+                downOutput.data(), (size_t)totalLines * dim);
         }
 
         // debug: 输出指定token关联的所有专家计算结果（通过环境变量 FASTLLM_DEBUG_TOKEN_ID 指定token id，逗号分隔）
@@ -5278,10 +5382,11 @@ namespace fastllm {
                             pool->Wait(tid);
                         }
                     } else {
-                        for (size_t i = 0; i < (size_t)bs * dim; i++) {
-                            dst[i] = Float32ToBFloat16RNEBits(
-                                reduceOutput[i]);
-                        }
+                        // Float32ToBFloat16 uses the same RNE bit rounding as
+                        // Float32ToBFloat16RNEBits but is AVX2-vectorized.
+                        Float32ToBFloat16(
+                            reduceOutput.data(), dst,
+                            (int)((size_t)bs * dim));
                     }
                 } else {
                     RunMultiThreadConvertFromFloat32((uint16_t*)finalCpuOutput, DataType::BFLOAT16,
@@ -5566,7 +5671,8 @@ namespace fastllm {
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
 
-        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
+        auto sharedScaleIt = floatParams.find("sharedScale");
+        float sharedScale = sharedScaleIt != floatParams.end() ? sharedScaleIt->second : 1.0f;
         float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
                             floatParams.find("swigluLimit")->second : 0.0f;
         bool deepSeekV4Mode = intParams.find("deepSeekV4Mode") != intParams.end() &&
@@ -5712,6 +5818,34 @@ namespace fastllm {
                 int interDim = weights[2]->dims[0] / 2;
                 int outputDim = output.dims[1];
 
+                // Row-invariant values hoisted out of the per-token loop.
+                auto *numaConfig = GetNumaConfig();
+                DataType startDataType =
+                    GetNumasLinearActDataType(weights[2], 1);
+                DataType downInputDataType =
+                    GetNumasLinearActDataType(weights[3], 1);
+                bool useDeepSeekV4MoeFast =
+                    deepSeekV4Mode &&
+                    GetCPUInstructInfo()->hasAVX2 &&
+                    std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST") == nullptr;
+                bool reuseMoeTaskStorage =
+                    useDeepSeekV4MoeFast &&
+                    std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_TASK_CACHE") ==
+                        nullptr;
+                bool useDirectGemmQueue =
+                    useDeepSeekV4MoeFast &&
+                    std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_DIRECT_GEMM") ==
+                        nullptr;
+                bool useBFloat16SiluLookup =
+                    useDeepSeekV4MoeFast;
+                bool useDirectBFloat16Prepare =
+                    useDeepSeekV4MoeFast;
+                const bool hasAvx512 =
+                    GetCPUInstructInfo()->hasAVX512BF16;
+
                 for (int o = 0; o < bs; o++) {
                     if (profileDetail) {
                         profileLast = NumasProfileNowMs();
@@ -5761,9 +5895,6 @@ namespace fastllm {
                     }
                     profileExpertCalls += (int)v.size();
                     profileLap(profileRegisterMs);
-
-                    DataType startDataType = GetNumasLinearActDataType(weights[2], 1);
-                    DataType downInputDataType = GetNumasLinearActDataType(weights[3], 1);
 
                     // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                     auto& realInput = fastllmMoeDataManagerNumas.realInput;
@@ -5832,43 +5963,42 @@ namespace fastllm {
 // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                     // 1. gateUp + swiglu
-                    auto *numaConfig = GetNumaConfig();
-
-                    bool useDeepSeekV4MoeFast =
-                        deepSeekV4Mode &&
-                        GetCPUInstructInfo()->hasAVX512BF16 &&
-                        std::getenv(
-                            "FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST") == nullptr;
-                    bool reuseMoeTaskStorage =
-                        useDeepSeekV4MoeFast &&
-                        std::getenv(
-                            "FASTLLM_DSV4_DISABLE_NUMAS_MOE_TASK_CACHE") ==
-                            nullptr;
-                    bool useDirectGemmQueue =
-                        useDeepSeekV4MoeFast &&
-                        std::getenv(
-                            "FASTLLM_DSV4_DISABLE_NUMAS_MOE_DIRECT_GEMM") ==
-                            nullptr;
-                    bool useBFloat16SiluLookup =
-                        useDeepSeekV4MoeFast;
-                    bool useDirectBFloat16Prepare =
-                        useDeepSeekV4MoeFast;
-                    // On the 20 workers per NUMA node used by -t 40, the gate
-                    // uses ten chunks per expert (60 tasks, three waves).
-                    // The smaller down chunks trade a little queue overhead
-                    // for a much more even tail across those workers.
+                    // AVX512 hosts tuned these chunks for 20 workers per NUMA
+                    // node (-t 40), yielding about seven gate waves and six
+                    // down waves.  Derive the same waves-per-worker target
+                    // from the local topology so AVX2 hosts with fewer threads
+                    // keep a full, even task queue instead of a few oversized
+                    // single-wave chunks.
                     int gateRowsPerTask = 208;
                     int downRowsPerTask = 128;
-                    // Keep each activation task on one gate-output NUMA
-                    // shard. For DeepSeek-V4-Flash this is 2048 / 2 = 1024
-                    // rows, while FP8 quantization remains block-128.
                     int swigluRowsPerTask = std::max(
                         128,
                         interDim / std::max(1, numaConfig->numaCnt));
-
-                    int totalExperts = v.size();
+                    int totalExperts = (int)v.size();
                     int k = interDim * 2;
-                    int kPer = k / numaConfig->numaCnt;
+                    int kPer = k / std::max(1, numaConfig->numaCnt);
+                    if (!hasAvx512) {
+                        int workersPerNode =
+                            numaConfig->numaToCpuDict[0].size();
+                        int experts = std::max(1, totalExperts);
+                        int gateKPer =
+                            k / std::max(1, numaConfig->numaCnt);
+                        int downKPer = outputDim /
+                            std::max(1, numaConfig->numaCnt);
+                        gateRowsPerTask = std::max(
+                            64, (gateKPer * experts) /
+                                std::max(1, workersPerNode * 7));
+                        downRowsPerTask = std::max(
+                            64, (downKPer * experts) /
+                                std::max(1, workersPerNode * 6));
+                        // Keep activation chunks aligned to the 128-value FP8
+                        // quantization block so every task starts and ends at
+                        // a complete scale group.
+                        swigluRowsPerTask = std::max(
+                            128,
+                            (interDim / std::max(1, workersPerNode) / 128) *
+                                128);
+                    }
                     // With one NUMA node and 30 workers, six routed experts
                     // use 210 down tasks.  These are exactly seven full worker
                     // waves, avoiding the decode tail left by the two-NUMA
@@ -6217,59 +6347,96 @@ namespace fastllm {
                         if (downInputDataType != DataType::FLOAT32 &&
                             downInputDataType != DataType::FLOAT16 &&
                             downInputDataType != DataType::BFLOAT16) {
-                            const size_t downRowBytes =
-                                GetDataBytes(downInputDataType, 1, interDim);
-                            for (int expertIdx = 0;
-                                 expertIdx < totalExperts; expertIdx++) {
-                                RunMultiThreadConvertFromFloat32(
-                                    (uint8_t*)downInput.data() +
-                                        expertIdx * downRowBytes,
-                                    downInputDataType,
-                                    swigluOutput.data() +
-                                        expertIdx * interDim,
-                                    1, interDim, GetAlivePool());
-                            }
+                            RunMultiThreadConvertFromFloat32(
+                                (uint8_t*)downInput.data(),
+                                downInputDataType,
+                                swigluOutput.data(),
+                                totalExperts, interDim,
+                                GetAlivePool());
                         }
                     } else if (deepSeekV4Mode) {
+                        // Serial fallback for FASTLLM_DSV4_DISABLE_NUMAS_MOE_
+                        // FAST: still split every expert's activation range
+                        // across the pool (minus the BF16 silu lookup) so the
+                        // AVX2 path never degrades to one thread per expert.
                         const size_t downRowBytes =
                             GetDataBytes(
                                 downInputDataType, 1, interDim);
+                        std::vector<std::vector<
+                            MultiThreadDeepSeekV4NumasDownPrepareOp>>
+                            localPrepareTaskStorage;
+                        std::vector<std::vector<MultiThreadBaseOp*>>
+                            localPrepareTasks;
+                        auto &prepareTaskStorage = reuseMoeTaskStorage ?
+                            fastllmMoeDataManagerNumas.prepareTaskStorage :
+                            localPrepareTaskStorage;
+                        auto &prepareTasks = reuseMoeTaskStorage ?
+                            fastllmMoeDataManagerNumas.taskPointers :
+                            localPrepareTasks;
+                        prepareTaskStorage.resize(numaConfig->numaCnt);
+                        prepareTasks.resize(numaConfig->numaCnt);
+                        for (int nid = 0;
+                             nid < numaConfig->numaCnt; nid++) {
+                            prepareTaskStorage[nid].clear();
+                            prepareTasks[nid].clear();
+                        }
+                        size_t taskIndex = 0;
                         for (int expertIdx = 0;
                              expertIdx < totalExperts; expertIdx++) {
                             int e = v[expertIdx].first;
-                            PrepareDeepSeekV4DownInput(
-                                gateUpOutput.data() + (size_t)expertIdx * interDim * 2,
-                                swigluOutput.data() + (size_t)expertIdx * interDim,
-                                downInput.data() + (size_t)expertIdx * downRowBytes,
-                                downInputDataType, *weights[e * 2 + 1], interDim,
-                                e != 0, e == 0 ? 1.0f : v[expertIdx].second,
-                                swigluLimit
-                            );
+                            bool routed = e != 0;
+                            float routeWeight =
+                                routed ? v[expertIdx].second : 1.0f;
+                            bool quantize =
+                                IsDeepSeekV4QuantizedWeight(
+                                    *weights[e * 2 + 1]);
+                            for (int row = 0; row < interDim;
+                                 row += swigluRowsPerTask) {
+                                int end = std::min(
+                                    row + swigluRowsPerTask,
+                                    interDim);
+                                int nid = taskIndex++ %
+                                    numaConfig->numaCnt;
+                                prepareTaskStorage[nid].emplace_back(
+                                    gateUpOutput.data() +
+                                        (size_t)expertIdx *
+                                            interDim * 2,
+                                    swigluOutput.data() +
+                                        (size_t)expertIdx * interDim,
+                                    downInput.data() +
+                                        (size_t)expertIdx *
+                                            downRowBytes,
+                                    downInputDataType, row, end,
+                                    routed, routeWeight, swigluLimit,
+                                    quantize, false, false);
+                            }
                         }
+                        for (int nid = 0;
+                             nid < numaConfig->numaCnt; nid++) {
+                            for (auto &task :
+                                 prepareTaskStorage[nid]) {
+                                prepareTasks[nid].push_back(&task);
+                            }
+                        }
+                        ScheduleDeepSeekV4NumasMoeTasks(
+                            prepareTasks, false);
                         if (downInputDataType != DataType::FLOAT32 &&
                             downInputDataType != DataType::FLOAT16 &&
                             downInputDataType != DataType::BFLOAT16) {
-                            const size_t downRowBytes =
-                                GetDataBytes(downInputDataType, 1, interDim);
-                            for (int expertIdx = 0;
-                                 expertIdx < totalExperts; expertIdx++) {
-                                RunMultiThreadConvertFromFloat32(
-                                    (uint8_t*)downInput.data() +
-                                        expertIdx * downRowBytes,
-                                    downInputDataType,
-                                    swigluOutput.data() +
-                                        expertIdx * interDim,
-                                    1, interDim, GetAlivePool());
-                            }
+                            RunMultiThreadConvertFromFloat32(
+                                (uint8_t*)downInput.data(),
+                                downInputDataType,
+                                swigluOutput.data(),
+                                totalExperts, interDim,
+                                GetAlivePool());
                         }
                     } else if (!canFuseDstConvert) {
-                        for (int expertIdx = 0; expertIdx < totalExperts; expertIdx++) {
-                            RunMultiThreadConvertFromFloat32(
-                                (uint8_t*)downInput.data() + expertIdx * GetDataBytes(downInputDataType, 1, interDim),
-                                downInputDataType,
-                                swigluOutput.data() + expertIdx * interDim,
-                                1, interDim, GetAlivePool());
-                        }
+                        RunMultiThreadConvertFromFloat32(
+                            (uint8_t*)downInput.data(),
+                            downInputDataType,
+                            swigluOutput.data(),
+                            totalExperts, interDim,
+                            GetAlivePool());
                     }
                     profileLap(profileSwigluConvertMs);
 
@@ -6528,9 +6695,9 @@ namespace fastllm {
 
                     if (deepSeekV4Mode &&
                         !useDeepSeekV4MoeFast) {
-                        for (size_t i = 0; i < (size_t)totalExperts * outputDim; i++) {
-                            downOutput[i] = RoundFloat32ToBFloat16RNE(downOutput[i]);
-                        }
+                        RoundFloat32ArrayToBFloat16RNE(
+                            downOutput.data(),
+                            (size_t)totalExperts * outputDim);
                     }
 
 // printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
@@ -6577,18 +6744,40 @@ namespace fastllm {
                             float *curOutput =
                                 downOutput.data() +
                                 (size_t)i * outputDim;
+                            int j = 0;
+#ifdef __AVX2__
+                            const __m256 vvalue =
+                                _mm256_set1_ps(value);
                             if (i == 0) {
-                                for (int j = 0;
-                                     j < outputDim; j++) {
-                                    fLastOutput[j] =
-                                        curOutput[j] * value;
+                                for (; j + 7 < outputDim;
+                                     j += 8) {
+                                    _mm256_storeu_ps(
+                                        fLastOutput + j,
+                                        _mm256_mul_ps(
+                                            _mm256_loadu_ps(
+                                                curOutput + j),
+                                            vvalue));
                                 }
                             } else {
-                                for (int j = 0;
-                                     j < outputDim; j++) {
-                                    fLastOutput[j] +=
-                                        curOutput[j] * value;
+                                for (; j + 7 < outputDim;
+                                     j += 8) {
+                                    _mm256_storeu_ps(
+                                        fLastOutput + j,
+                                        _mm256_add_ps(
+                                            _mm256_loadu_ps(
+                                                fLastOutput + j),
+                                            _mm256_mul_ps(
+                                                _mm256_loadu_ps(
+                                                    curOutput + j),
+                                                vvalue)));
                                 }
+                            }
+#endif
+                            for (; j < outputDim; j++) {
+                                fLastOutput[j] =
+                                    (i == 0 ? 0.0f :
+                                     fLastOutput[j]) +
+                                    curOutput[j] * value;
                             }
                         }
                     }
@@ -6601,13 +6790,9 @@ namespace fastllm {
                             Float32ToFloat16(reduceOutput.data(), ((uint16_t*)output.cpuData) + o * outputDim, outputDim);
                         } else if (output.dataType == DataType::BFLOAT16) {
                             uint16_t *dst = (uint16_t*)output.cpuData + o * outputDim;
-                            if (deepSeekV4Mode) {
-                                for (int d = 0; d < outputDim; d++) {
-                                    dst[d] = Float32ToBFloat16RNEBits(reduceOutput[d]);
-                                }
-                            } else {
-                                Float32ToBFloat16(reduceOutput.data(), dst, outputDim);
-                            }
+                            // Float32ToBFloat16 uses the same RNE bit rounding
+                            // as Float32ToBFloat16RNEBits but is AVX2-vectorized.
+                            Float32ToBFloat16(reduceOutput.data(), dst, outputDim);
                         }
                     }
                     profileLap(profileOutputMs);

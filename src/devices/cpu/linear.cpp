@@ -611,7 +611,7 @@ namespace fastllm {
                 return;
             }
         }
-        if (cpuInstructInfo.hasAVX2 && (n > 1 || std::getenv("FASTLLM_DSV4_ENABLE_CPU_F32_F16_AVX2_N1") != nullptr)) {
+        if (cpuInstructInfo.hasAVX2) {
             if (LinearFloat32Float16_AVX2_Kernel(
                 inputData, weightData, biasData, outputData, n, m, k, st, end
                 )) {
