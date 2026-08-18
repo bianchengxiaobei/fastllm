@@ -2,7 +2,13 @@ cmake_minimum_required(VERSION 3.5)
 
 project(fastllm LANGUAGES CXX)
 
-option(USE_NUMAS "use numas" ON)
+if(WIN32)
+    option(USE_NUMAS "use numas" OFF)
+    option(USE_CPU_NUMA "use numa binding + per-node sharding in CPU-only builds" OFF)
+else()
+    option(USE_NUMAS "use numas" ON)
+    option(USE_CPU_NUMA "use numa binding + per-node sharding in CPU-only builds" ON)
+endif()
 
 option(USE_CUDA "use CUDA" OFF)
 option(CUDA_NO_TENSOR_CORE "Optimize for legacy CUDA GPUs which has Tensor Core." OFF)
@@ -137,7 +143,9 @@ message(STATUS "USE_IVCOREX: ${USE_IVCOREX}")
 
 message(STATUS "MAKE_WHL_X86: ${MAKE_WHL_X86}")
 
-set(CMAKE_BUILD_TYPE "Release")
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release")
+endif()
 
 string(REGEX REPLACE "^([0-9]+)\\.[0-9]+\\.[0-9]+$" "\\1" CXX_MAJOR_VERSION "${CMAKE_CXX_COMPILER_VERSION}")
 
@@ -205,6 +213,9 @@ message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
+if(WIN32)
+    list(REMOVE_ITEM CPU_DEVICE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cpu/amx.cpp")
+endif()
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
@@ -219,6 +230,16 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executo
         ${CPU_DEVICE_FILES}
         ${BLOCK_FILES}
         ${GRAPH_MODEL_FILES})
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    set_source_files_properties(
+        third_party/gguf/gguf.cpp
+        third_party/gguf/gguf-adapter.cpp
+        third_party/gguf/ggml-quant.cpp
+        third_party/gguf/ggml-iqk.cpp
+        third_party/gguf/ggml-dequantize.cpp
+        PROPERTIES COMPILE_FLAGS "/std:c++20")
+endif()
 
 include_directories(include)
 include_directories(include/utils)
@@ -518,6 +539,11 @@ if (USE_NUMAS)
     add_compile_definitions(USE_NUMAS)
     set(FASTLLM_CXX_SOURCES ${FASTLLM_CXX_SOURCES} src/devices/numas/numasdevice.cpp src/devices/numas/numas.cpp)
     include_directories(include/devices/numas)
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} numa)
+endif()
+
+if (USE_CPU_NUMA AND NOT USE_NUMAS)
+    add_compile_definitions(USE_CPU_NUMA)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} numa)
 endif()
 

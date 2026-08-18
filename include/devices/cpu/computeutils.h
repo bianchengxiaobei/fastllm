@@ -78,19 +78,22 @@ namespace fastllm {
         int hidden_size;
         int batch_st, batch_end;  // batch维度的范围
         int hidden_st, hidden_end; // hidden维度的范围
+        bool preZeroed;  // lastOutput 已被调用方清零，跳过首专家 mul 与尾部清零
         
         MultiThreadReduceBatchOp(uint8_t *downOutData, DataType downOutDataType,
             float *weights, float *lastOutput,
             int *pos, int bsz, int k, 
             int hidden_size, 
             int batch_st, int batch_end,
-            int hidden_st, int hidden_end) : 
+            int hidden_st, int hidden_end,
+            bool preZeroed = false) : 
             downOutData(downOutData), downOutDataType(downOutDataType),
             weights(weights), lastOutput(lastOutput),
             pos(pos), bsz(bsz), k(k),
             hidden_size(hidden_size), 
             batch_st(batch_st), batch_end(batch_end),
-            hidden_st(hidden_st), hidden_end(hidden_end) {}
+            hidden_st(hidden_st), hidden_end(hidden_end),
+            preZeroed(preZeroed) {}
         
         void Run();
     };
@@ -106,7 +109,8 @@ namespace fastllm {
     };
 
     void MultiThreadReduceBatch(uint8_t *downOutData, DataType downOutDataType,
-                    float *weights, float *lastOutput, int *pos, int bsz, int k, int hidden_size);
+                    float *weights, float *lastOutput, int *pos, int bsz, int k, int hidden_size,
+                    bool preZeroed = false);
 
     void ConvertFromFloat32(void *dstData, DataType dstDataType, const float *floatData, size_t rows, size_t columns);
 

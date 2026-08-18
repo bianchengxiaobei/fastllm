@@ -264,7 +264,17 @@ namespace fastllm {
     extern void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
 
     static void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len) {
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+#ifdef __AVX2__
+        for (; i + 7 < len; i += 8) {
+            __m128i bf16 = _mm_loadu_si128(
+                (const __m128i*)(bfloat16 + i));
+            __m256i fp32 = _mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(bf16), 16);
+            _mm256_storeu_si256((__m256i*)(float32 + i), fp32);
+        }
+#endif
+        for (; i < len; i++) {
             uint32_t x = (uint32_t)bfloat16[i] << 16;
             float32[i] = *(float*)&x;
         }
@@ -1178,6 +1188,8 @@ namespace fastllm {
             std::vector<std::pair<int, float>> selectedExperts;
             std::vector<int> expertOrder;
             std::vector<std::vector<MultiThreadGemmOp>> gemmTaskStorage;
+            std::vector<std::vector<MultiThreadGemmAndCrossSwigluOp>>
+                gateUpTaskStorage;
             std::vector<std::vector<MultiThreadDeepSeekV4NumasDownPrepareOp>>
                 prepareTaskStorage;
             std::vector<std::vector<MultiThreadBaseOp*>> taskPointers;
@@ -1590,46 +1602,52 @@ namespace fastllm {
     namespace {
         struct NumasDeepSeekV4WoAPackOp : MultiThreadBaseOp {
             const uint8_t *input;
-            float *packed;
+            uint8_t *packed;
+            bool bf16Pack;
             DataType inputType;
             int tokens, inputStride, groupDim, group;
             int tokenBegin, tokenEnd;
 
             NumasDeepSeekV4WoAPackOp(
-                    const uint8_t *input, float *packed,
+                    const uint8_t *input, uint8_t *packed, bool bf16Pack,
                     DataType inputType, int tokens, int inputStride,
                     int groupDim, int group,
                     int tokenBegin, int tokenEnd)
-                : input(input), packed(packed), inputType(inputType),
-                  tokens(tokens), inputStride(inputStride),
-                  groupDim(groupDim), group(group),
-                  tokenBegin(tokenBegin), tokenEnd(tokenEnd) {}
+                : input(input), packed(packed), bf16Pack(bf16Pack),
+                  inputType(inputType), tokens(tokens),
+                  inputStride(inputStride), groupDim(groupDim),
+                  group(group), tokenBegin(tokenBegin),
+                  tokenEnd(tokenEnd) {}
 
             void Run() override {
                 for (int token = tokenBegin; token < tokenEnd; token++) {
                     size_t sourceOffset =
                         (size_t)token * inputStride +
                         (size_t)group * groupDim;
-                    float *destination = packed +
+                    size_t dstOffset =
                         ((size_t)group * tokens + token) * groupDim;
+                    if (bf16Pack) {
+                        memcpy(
+                            packed + dstOffset * sizeof(uint16_t),
+                            (const uint16_t*)input + sourceOffset,
+                            (size_t)groupDim * sizeof(uint16_t));
+                        continue;
+                    }
+                    float *destination =
+                        (float*)(packed + dstOffset * sizeof(float));
                     if (inputType == DataType::FLOAT32) {
                         memcpy(
                             destination,
                             (const float*)input + sourceOffset,
                             (size_t)groupDim * sizeof(float));
                     } else if (inputType == DataType::BFLOAT16) {
-                        const uint16_t *source =
-                            (const uint16_t*)input + sourceOffset;
-                        for (int d = 0; d < groupDim; d++) {
-                            destination[d] =
-                                BFloat16BitsToFloat32(source[d]);
-                        }
+                        BFloat16ToFloat32(
+                            (uint16_t*)input + sourceOffset,
+                            destination, groupDim);
                     } else {
-                        const uint16_t *source =
-                            (const uint16_t*)input + sourceOffset;
-                        for (int d = 0; d < groupDim; d++) {
-                            destination[d] = half_to_float(source[d]);
-                        }
+                        Float16ToFloat32(
+                            (uint16_t*)input + sourceOffset,
+                            destination, groupDim);
                     }
                 }
             }
@@ -1694,10 +1712,8 @@ namespace fastllm {
                         ((size_t)group * tokens + token) * oRank;
                     uint16_t *destination = output +
                         ((size_t)token * groups + group) * oRank;
-                    for (int row = 0; row < oRank; row++) {
-                        destination[row] =
-                            Float32ToBFloat16RNEBits(source[row]);
-                    }
+                    Float32ToBFloat16(
+                        (float*)source, destination, oRank);
                 }
             }
         };
@@ -1705,6 +1721,8 @@ namespace fastllm {
         struct NumasDeepSeekV4WoAWorkspace {
             std::unique_ptr<float[]> groupInput;
             size_t groupInputCapacity = 0;
+            std::unique_ptr<uint16_t[]> groupInputBF16;
+            size_t groupInputBF16Capacity = 0;
             std::unique_ptr<float[]> groupOutput;
             size_t groupOutputCapacity = 0;
             std::vector<std::vector<NumasDeepSeekV4WoAPackOp>> pack;
@@ -1718,6 +1736,14 @@ namespace fastllm {
                     groupInputCapacity = count;
                 }
                 return groupInput.get();
+            }
+
+            uint16_t *EnsureGroupInputBF16(size_t count) {
+                if (groupInputBF16Capacity < count) {
+                    groupInputBF16.reset(new uint16_t[count]);
+                    groupInputBF16Capacity = count;
+                }
+                return groupInputBF16.get();
             }
 
             float *EnsureGroupOutput(size_t count) {
@@ -1852,9 +1878,16 @@ namespace fastllm {
         const int inputStride = heads * headDim;
         const int groupDim = heads / groups * headDim;
         const int groupsPerNode = groups / numaConfig->numaCnt;
-        const bool directBFloat16Decode =
-            tokens == 1 && input.dataType == DataType::BFLOAT16 &&
-            GetCPUInstructInfo()->hasAVX512F;
+        const bool bf16Input = input.dataType == DataType::BFLOAT16;
+        const bool hasAVX512F = GetCPUInstructInfo()->hasAVX512F;
+        const bool directBFloat16Decode = bf16Input && tokens == 1;
+        // prefill 的 BF16 直通只在 AVX2-only 机器启用：AVX2 的
+        // BF16xFP16 内核比 pack 成 FP32 后跑 FP32xFP16 少一半输入带宽。
+        // AVX-512 机器保留 FP32 pack + 更宽的 AVX-512 FP32xFP16 内核。
+        const bool bf16PrefillDirect =
+            bf16Input && tokens > 1 && !hasAVX512F;
+        const bool useBf16Gemm =
+            directBFloat16Decode || bf16PrefillDirect;
 
         EnsureNumasDeepSeekV4WoAWeightRegistered(
             weight, groups, oRank, groupDim, numaConfig);
@@ -1863,9 +1896,12 @@ namespace fastllm {
             std::chrono::steady_clock::time_point();
 
         static thread_local NumasDeepSeekV4WoAWorkspace workspace;
-        float *groupInput = directBFloat16Decode ? nullptr :
+        float *groupInput = useBf16Gemm ? nullptr :
             workspace.EnsureGroupInput(
                 (size_t)groups * tokens * groupDim);
+        uint16_t *groupInputBF16 = bf16PrefillDirect ?
+            workspace.EnsureGroupInputBF16(
+                (size_t)groups * tokens * groupDim) : nullptr;
         float *groupOutput = workspace.EnsureGroupOutput(
             (size_t)groups * tokens * oRank);
         if (!directBFloat16Decode) {
@@ -1875,10 +1911,13 @@ namespace fastllm {
             if (tokens == 1) {
                 for (int group = 0; group < groups; group++) {
                     NumasDeepSeekV4WoAPackOp(
-                        input.cpuData, groupInput, input.dataType,
+                        input.cpuData, (uint8_t*)groupInput, false,
+                        input.dataType,
                         tokens, inputStride, groupDim, group, 0, 1).Run();
                 }
             } else {
+                uint8_t *packTarget = bf16PrefillDirect ?
+                    (uint8_t*)groupInputBF16 : (uint8_t*)groupInput;
                 for (int node = 0; node < numaConfig->numaCnt; node++) {
                     int workers = std::max(
                         1, (int)numaConfig->numaToCpuDict[node].size());
@@ -1897,7 +1936,8 @@ namespace fastllm {
                                 chunksPerGroup);
                             if (tokenBegin < tokenEnd) {
                                 tasks.emplace_back(
-                                    input.cpuData, groupInput,
+                                    input.cpuData, packTarget,
+                                    bf16PrefillDirect,
                                     input.dataType, tokens, inputStride,
                                     groupDim, group, tokenBegin, tokenEnd);
                             }
@@ -1928,12 +1968,15 @@ namespace fastllm {
             for (int localGroup = 0;
                  localGroup < groupsPerNode; localGroup++) {
                 int group = node * groupsPerNode + localGroup;
-                uint8_t *gemmInput = directBFloat16Decode ?
-                    input.cpuData +
-                        (size_t)group * groupDim * sizeof(uint16_t) :
+                uint8_t *gemmInput = useBf16Gemm ?
+                    (directBFloat16Decode ?
+                        input.cpuData +
+                            (size_t)group * groupDim * sizeof(uint16_t) :
+                        (uint8_t*)(groupInputBF16 +
+                            (size_t)group * tokens * groupDim)) :
                     (uint8_t*)(groupInput +
                         (size_t)group * tokens * groupDim);
-                DataType gemmInputType = directBFloat16Decode ?
+                DataType gemmInputType = useBf16Gemm ?
                     DataType::BFLOAT16 : DataType::FLOAT32;
                 for (int row = 0; row < oRank; row += rowsPerTask) {
                     tasks.emplace_back(
@@ -2151,28 +2194,38 @@ namespace fastllm {
             void Finalize() {
                 const int start = globalStart + localStart;
                 const int end = globalStart + localEnd;
+                const int count = end - start;
                 if (outputType == DataType::BFLOAT16) {
                     uint16_t *destination = (uint16_t*)finalOutput;
                     for (int row = 0; row < n; row++) {
-                        const float *source =
+                        float *scratch =
                             outputData + (size_t)row * k;
                         uint16_t *current =
                             destination + (size_t)row * k;
                         if (finalizeBias == nullptr) {
-                            for (int column = start; column < end;
-                                 column++) {
-                                current[column] =
-                                    Float32ToBFloat16RNEBits(
-                                        source[column]);
-                            }
+                            Float32ToBFloat16(
+                                scratch + start,
+                                current + start, count);
                         } else {
-                            for (int column = start; column < end;
-                                 column++) {
-                                current[column] =
-                                    Float32ToBFloat16RNEBits(
-                                        source[column] +
-                                        finalizeBias[column]);
+                            int column = start;
+#ifdef __AVX2__
+                            for (; column + 7 < end; column += 8) {
+                                __m256 v = _mm256_loadu_ps(
+                                    scratch + column);
+                                __m256 b = _mm256_loadu_ps(
+                                    finalizeBias + column);
+                                _mm256_storeu_ps(
+                                    scratch + column,
+                                    _mm256_add_ps(v, b));
                             }
+#endif
+                            for (; column < end; column++) {
+                                scratch[column] +=
+                                    finalizeBias[column];
+                            }
+                            Float32ToBFloat16(
+                                scratch + start,
+                                current + start, count);
                         }
                     }
                 } else if (finalizeBias != nullptr) {
@@ -2180,9 +2233,21 @@ namespace fastllm {
                     for (int row = 0; row < n; row++) {
                         float *current =
                             destination + (size_t)row * k;
-                        for (int column = start; column < end;
-                             column++) {
-                            current[column] += finalizeBias[column];
+                        int column = start;
+#ifdef __AVX2__
+                        for (; column + 7 < end; column += 8) {
+                            __m256 v = _mm256_loadu_ps(
+                                current + column);
+                            __m256 b = _mm256_loadu_ps(
+                                finalizeBias + column);
+                            _mm256_storeu_ps(
+                                current + column,
+                                _mm256_add_ps(v, b));
+                        }
+#endif
+                        for (; column < end; column++) {
+                            current[column] +=
+                                finalizeBias[column];
                         }
                     }
                 }
@@ -2586,19 +2651,47 @@ namespace fastllm {
     };
     
     // 重构的动态任务调度函数，支持work-stealing
-    void DynamicScheduleTasks(std::vector<std::vector<MultiThreadBaseOp*>>& ops) {
+    void DynamicScheduleTasks(std::vector<std::vector<MultiThreadBaseOp*>>& ops, bool deleteOps = true) {
         auto *pool = GetAlivePool();
         auto *numaConfig = GetNumaConfig();
         
         // 创建任务状态数组
         using TaskState = typename NumaWorkStealingOp::TaskState;
+
+        struct TaskStateDeleter {
+            void operator()(TaskState *p) const {
+                if (p == nullptr) {
+                    return;
+                }
+                p->~TaskState();
+                #if __cpp_aligned_new >= 201606
+                    operator delete(p, std::align_val_t{64});
+                #else
+                    free_aligned(p, sizeof(TaskState));
+                #endif
+            }
+        };
+
+        // 复用任务状态与 work-stealing op，避免每个 token 反复对齐 new/delete
+        static thread_local std::vector<std::unique_ptr<TaskState, TaskStateDeleter>> taskStateCache;
+        static thread_local std::vector<std::unique_ptr<NumaWorkStealingOp>> wsOpCache;
+        if ((int)taskStateCache.size() < numaConfig->threads) {
+            taskStateCache.resize(numaConfig->threads);
+        }
+        if ((int)wsOpCache.size() < numaConfig->threads) {
+            wsOpCache.resize(numaConfig->threads);
+        }
+
         std::vector<TaskState*> taskStates(numaConfig->threads, nullptr);
-        
-        // 为每个线程分配任务状态
         for (int i = 0; i < numaConfig->threads; i++) {
-            taskStates[i] = new (std::align_val_t{64}) TaskState();
+            if (taskStateCache[i] == nullptr) {
+                taskStateCache[i].reset(
+                    new (std::align_val_t{64}) TaskState());
+            }
+            taskStates[i] = taskStateCache[i].get();
             taskStates[i]->curr.store(0, std::memory_order_relaxed);
             taskStates[i]->end = 0;
+            taskStates[i]->tasks.clear();
             taskStates[i]->completed.store(false, std::memory_order_relaxed);
         }
         
@@ -2638,13 +2731,21 @@ namespace fastllm {
             }
         }
         
-        // 创建work-stealing ops并提交到线程池
+        // 创建/复用 work-stealing ops 并提交到线程池
         std::vector<NumaWorkStealingOp*> wsOps(numaConfig->threads);
         for (int i = 0; i < numaConfig->threads; i++) {
             int numaId = numaConfig->threadIdToNumaDict[i];
-            wsOps[i] = new NumaWorkStealingOp (
-                i, numaId, &taskStates, taskStates[i], numaConfig
-            );
+            if (wsOpCache[i] == nullptr) {
+                wsOpCache[i].reset(new NumaWorkStealingOp(
+                    i, numaId, &taskStates, taskStates[i], numaConfig));
+            } else {
+                wsOpCache[i]->threadId = i;
+                wsOpCache[i]->numaId = numaId;
+                wsOpCache[i]->allStates = &taskStates;
+                wsOpCache[i]->myState = taskStates[i];
+                wsOpCache[i]->numaConfig = numaConfig;
+            }
+            wsOps[i] = wsOpCache[i].get();
             
             // 只有有任务的线程才启动
             if (taskStates[i] != nullptr && taskStates[i]->end > 0) {
@@ -2660,23 +2761,12 @@ namespace fastllm {
             pool->Wait(i);
         }
         
-        // 清理资源
-        for (int i = 0; i < numaConfig->threads; i++) {
-            delete wsOps[i];
-            if (taskStates[i] != nullptr) {
-                taskStates[i]->~TaskState();
-                #if __cpp_aligned_new >= 201606
-                    operator delete(taskStates[i], std::align_val_t{64});
-                #else
-                    free_aligned(taskStates[i], sizeof(TaskState));
-                #endif
-            }
-        }
-        
-        // 删除原始ops
-        for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
-            for (auto* op : ops[nid]) {
-                delete op;
+        // 删除原始ops（缓存复用时跳过）
+        if (deleteOps) {
+            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                for (auto* op : ops[nid]) {
+                    delete op;
+                }
             }
         }
     }
@@ -4749,12 +4839,33 @@ namespace fastllm {
 
         std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
         expertTasks.resize(m + 1);
+        {
+            std::vector<int> expertCounts(m + 1, 0);
+            expertCounts[0] = bs;
+            for (int b = 0; b < bs; b++) {
+                for (int j = 0; j < topk; j++) {
+                    expertCounts[indexData[b * topk + j] + 1]++;
+                }
+            }
+            for (int e = 0; e <= m; e++) {
+                expertTasks[e].reserve(expertCounts[e]);
+            }
+        }
         for (int b = 0; b < bs; b++) {
             expertTasks[0].push_back(std::make_pair(b, sharedScale));
             for (int j = 0; j < topk; j++) {
                 int expertIdx = indexData[b * topk + j];
                 float value = scoreData[b * topk + j];
                 expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
+            }
+        }
+
+        // cpuExperts 转为位图：专家 id 密集，位图 O(1) 且 cache 友好，
+        // 避免后续大量 unordered_set 哈希查找。
+        std::vector<uint8_t> isCpuExpert(expertTasks.size(), 0);
+        for (int e : cpuExperts) {
+            if (e >= 0 && e < (int)expertTasks.size()) {
+                isCpuExpert[e] = 1;
             }
         }
 
@@ -4813,7 +4924,7 @@ namespace fastllm {
 
         int totalLines = 0;
         for (int e = 0; e < (int)expertTasks.size(); e++) {
-            if (weights[e * 2] != nullptr && cpuExperts.count(e)) {
+            if (weights[e * 2] != nullptr && isCpuExpert[e]) {
                 totalLines += expertTasks[e].size();
             }
         }
@@ -4914,7 +5025,7 @@ namespace fastllm {
             {
                 int base = 0;
                 for (int e = 0; e < (int)expertTasks.size(); e++) {
-                    if (weights[e * 2] != nullptr && cpuExperts.count(e)) {
+                    if (weights[e * 2] != nullptr && isCpuExpert[e]) {
                         curPos[e] = base;
                         base += expertTasks[e].size();
                     }
@@ -4998,10 +5109,18 @@ namespace fastllm {
         const bool useDirectBFloat16Prepare =
             useParallelDeepSeekV4Prepare;
 
-        std::vector<std::vector <fastllm::MultiThreadBaseOp*> > ops;
+        auto &gateUpTaskStorage =
+            fastllmMoeDataManagerNumas.gateUpTaskStorage;
+        std::vector<std::vector<MultiThreadBaseOp*>> &ops =
+            fastllmMoeDataManagerNumas.taskPointers;
+        gateUpTaskStorage.resize(numaConfig->numaCnt);
         ops.resize(numaConfig->numaCnt);
+        for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+            gateUpTaskStorage[nid].clear();
+            ops[nid].clear();
+        }
         for (int e = 0; e < (int)expertTasks.size(); e++) {
-            if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+            if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && isCpuExpert[e]) {
                 if (weights[e * 2]->numasData.empty() && weights[e * 2]->cpuData != nullptr) {
                     RegisterNumas(weights[e * 2], "linearSwiglu");
                 }
@@ -5028,7 +5147,7 @@ namespace fastllm {
 
                     for (int st = 0; st < kPer; st += stride) {
                         int end = std::min(st + stride, kPer);
-                        ops[nid].push_back(new MultiThreadGemmAndCrossSwigluOp(
+                        gateUpTaskStorage[nid].emplace_back(
                             (uint8_t*)expertInputPtr, startDataType,
                             weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
                             (uint8_t*)expertGateUpOutputPtr + outputOffset, DataType::FLOAT32,
@@ -5036,17 +5155,22 @@ namespace fastllm {
                             lines, inputDim, k, st, end, base,
                             expertDstOutputPtr, downInputDataType,
                             skipRedundantCrossSwiglu
-                        ));
+                        );
                     }
                 }
                 offset += lines;
             }
         }
+        for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+            for (auto &task : gateUpTaskStorage[nid]) {
+                ops[nid].push_back(&task);
+            }
+        }
 
         if (useDeepSeekV4GroupedDecodeFast) {
-            ScheduleDeepSeekV4NumasMoeTasks(ops);
+            ScheduleDeepSeekV4NumasMoeTasks(ops, false);
         } else {
-            DynamicScheduleTasks(ops);
+            DynamicScheduleTasks(ops, false);
         }
 
         // 4. swigluOutput -> downInput. DeepSeek-V4 must redo the fused
@@ -5072,7 +5196,7 @@ namespace fastllm {
             }
             for (int e = 0; e < (int)expertTasks.size(); e++) {
                 if (weights[e * 2] == nullptr ||
-                    expertTasks[e].empty() || !cpuExperts.count(e)) {
+                    expertTasks[e].empty() || !isCpuExpert[e]) {
                     continue;
                 }
                 int lines = expertTasks[e].size();
@@ -5109,7 +5233,7 @@ namespace fastllm {
             offset = 0;
             const size_t downRowBytes = GetDataBytes(downInputDataType, 1, interDim);
             for (int e = 0; e < (int)expertTasks.size(); e++) {
-                if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+                if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && isCpuExpert[e]) {
                     int lines = expertTasks[e].size();
                     for (int line = 0; line < lines; line++) {
                         PrepareDeepSeekV4DownInput(
@@ -5140,7 +5264,7 @@ namespace fastllm {
         } else if (!canFuseDstConvert) {
             offset = 0;
             for (int e = 0; e < (int)expertTasks.size(); e++) {
-                if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+                if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && isCpuExpert[e]) {
                     int lines = expertTasks[e].size();
                     float* expertSwigluOutputPtr = swigluOutput.data() + offset * interDim;
                     uint8_t* expertDstOutputPtr = (uint8_t*)downInput.data() + offset * GetDataBytes(downInputDataType, 1, interDim);
@@ -5154,13 +5278,19 @@ namespace fastllm {
         // 5. down
         offset = 0;
         stride = useDeepSeekV4GroupedDecodeFast ? 128 : 64;
-        ops.resize(numaConfig->numaCnt);
-        for (int i = 0; i < (int)ops.size(); i++) {
-            ops[i].clear();
+        auto &downTaskStorage =
+            fastllmMoeDataManagerNumas.gemmTaskStorage;
+        std::vector<std::vector<MultiThreadBaseOp*>> &downOps =
+            fastllmMoeDataManagerNumas.taskPointers;
+        downTaskStorage.resize(numaConfig->numaCnt);
+        downOps.resize(numaConfig->numaCnt);
+        for (int i = 0; i < numaConfig->numaCnt; i++) {
+            downTaskStorage[i].clear();
+            downOps[i].clear();
         }
 
         for (int e = 0; e < (int)expertTasks.size(); e++) {
-            if (weights[e * 2 + 1] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+            if (weights[e * 2 + 1] != nullptr && expertTasks[e].size() > 0 && isCpuExpert[e]) {
                 if (weights[e * 2 + 1]->numasData.empty() && weights[e * 2 + 1]->cpuData != nullptr) {
                     RegisterNumas(weights[e * 2 + 1], "linearColumn");
                 }
@@ -5184,22 +5314,27 @@ namespace fastllm {
 
                     for (int st = 0; st < kPer; st += stride) {
                         int end = std::min(st + stride, kPer);
-                        ops[nid].push_back(new MultiThreadGemmOp(
+                        downTaskStorage[nid].emplace_back(
                             (uint8_t*)expertDownInputPtr, downInputDataType,
                             weights[e * 2 + 1]->numasData[nid], weights[e * 2 + 1]->GetDataType(),
                             (uint8_t*)expertDownOutputPtr + outputOffset, DataType::FLOAT32,
                             lines, interDim, k, st, end
-                        ));
+                        );
                     }
                 }
                 offset += lines;
             }
         }
+        for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+            for (auto &task : downTaskStorage[nid]) {
+                downOps[nid].push_back(&task);
+            }
+        }
 
         if (useDeepSeekV4GroupedDecodeFast) {
-            ScheduleDeepSeekV4NumasMoeTasks(ops);
+            ScheduleDeepSeekV4NumasMoeTasks(downOps, false);
         } else {
-            DynamicScheduleTasks(ops);
+            DynamicScheduleTasks(downOps, false);
         }
 
         if (deepSeekV4Mode && useParallelDeepSeekV4Round) {
@@ -5249,7 +5384,7 @@ namespace fastllm {
             if (!debugTokenIds.empty()) {
                 int debugOffset = 0;
                 for (int e = 0; e < (int)expertTasks.size(); e++) {
-                    if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+                    if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && isCpuExpert[e]) {
                         float* debugDownOutput = downOutput.data() + debugOffset * dim;
                         for (int i = 0; i < (int)expertTasks[e].size(); i++) {
                             int rowIdx = expertTasks[e][i].first;
@@ -5283,7 +5418,7 @@ namespace fastllm {
             int k = 0;
             std::vector<int> samples_expert_count(bs, 0);
             for (int e = 0; e < (int)expertTasks.size(); e++) {
-                if (weights[e * 2] != nullptr && cpuExperts.count(e)) {
+                if (weights[e * 2] != nullptr && isCpuExpert[e]) {
                     for (auto& task : expertTasks[e]) {
                         int rowIdx = task.first;
                         samples_expert_count[rowIdx]++;
@@ -5300,7 +5435,7 @@ namespace fastllm {
             std::vector<int> expertOffsets(expertTasks.size(), -1);
             int reduceOffset = 0;
             for (int e = 0; e < (int)expertTasks.size(); e++) {
-                if (weights[e * 2] != nullptr && cpuExperts.count(e)) {
+                if (weights[e * 2] != nullptr && isCpuExpert[e]) {
                     expertOffsets[e] = reduceOffset;
                     reduceOffset += expertTasks[e].size();
                 }
@@ -5317,7 +5452,7 @@ namespace fastllm {
                 }
             }
             for (int e : reduceExpertOrder) {
-                if (weights[e * 2] != nullptr && cpuExperts.count(e)) {
+                if (weights[e * 2] != nullptr && isCpuExpert[e]) {
                     int line = 0;
                     for (auto& task : expertTasks[e]) {
                         int rowIdx = task.first;
@@ -5343,7 +5478,8 @@ namespace fastllm {
                 pos.data(),                    // pos
                 bs,                           // bsz
                 k,                            // k (每个样本的专家数)
-                dim                           // hidden_size
+                dim,                          // hidden_size
+                true                          // lastOutput 已 memset 清零
             );
         }
 
@@ -5604,13 +5740,15 @@ namespace fastllm {
 
     void NumasFusedMOE::Run(const std::string &opType, const DataDict &datas,
                             const FloatDict &floatParams, const IntDict &intParams) {
-        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
-            (MoeGateType)intParams.find("gateType")->second : MoeGateSwiglu;
+        auto gateTypeIt = intParams.find("gateType");
+        MoeGateType gateType = gateTypeIt != intParams.end() ?
+            (MoeGateType)gateTypeIt->second : MoeGateSwiglu;
         if (gateType != MoeGateSwiglu) {
             ErrorInFastLLM("NumasFusedMOE only supports swiglu gate type.\n");
         }
-        float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
-            floatParams.find("swigluLimit")->second : 0.0f;
+        auto swigluLimitIt = floatParams.find("swigluLimit");
+        float swigluLimit = swigluLimitIt != floatParams.end() ?
+            swigluLimitIt->second : 0.0f;
         if (swigluLimit != 0.0f) {
             ErrorInFastLLM("NumasFusedMOE does not support non-zero swigluLimit.\n");
         }
@@ -5628,7 +5766,8 @@ namespace fastllm {
         Data &down = *(datas.find("down")->second);
         Data &output = *(datas.find("output")->second);
 
-        int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
+        auto layerIt = intParams.find("layer");
+        int layer = layerIt != intParams.end() ? layerIt->second : 0;
         auto &layerWeights = GetNumasFusedMoeLayerWeights(layer, gate, up, down);
         FastllmMoeDataManagerNumas &manager =
             GetNumasMoeRuntimeCache()[layer % 2];

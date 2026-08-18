@@ -410,7 +410,75 @@ namespace fastllm {
     }
 
     void MultiThreadLinearFloat32Float32Op::Run() {
-        for (int i = 0; i < n; i++) {
+        int i = 0;
+#ifdef __AVX2__
+        // 4 input rows x 3 output cols = 12 independent accumulators,
+        // enough to hide FMA latency (Broadwell FMA latency 5 cycles).
+        constexpr int AROW = 4, BROW = 3;
+        constexpr int MBLOCK = 512;
+
+        for (; i + AROW - 1 < n; i += AROW) {
+            int j = st;
+            for (; j + BROW - 1 < end; j += BROW) {
+                __m256 acc[AROW][BROW];
+                float tailSum[AROW][BROW];
+                for (int x = 0; x < AROW; x++) {
+                    for (int y = 0; y < BROW; y++) {
+                        acc[x][y] = _mm256_setzero_ps();
+                        tailSum[x][y] = 0.0f;
+                    }
+                }
+                for (int l = 0; l < m; l += MBLOCK) {
+                    int lend = std::min(l + MBLOCK, m);
+                    int l2 = l;
+                    for (; l2 + 7 < lend; l2 += 8) {
+                        for (int y = 0; y < BROW; y++) {
+                            __m256 vw = _mm256_loadu_ps(weightData + (j + y) * m + l2);
+                            for (int x = 0; x < AROW; x++) {
+                                __m256 vi = _mm256_loadu_ps(inputData + (i + x) * m + l2);
+                                acc[x][y] = _mm256_fmadd_ps(vi, vw, acc[x][y]);
+                            }
+                        }
+                    }
+                    for (; l2 < lend; l2++) {
+                        for (int y = 0; y < BROW; y++) {
+                            float w = weightData[(j + y) * m + l2];
+                            for (int x = 0; x < AROW; x++) {
+                                tailSum[x][y] += inputData[(i + x) * m + l2] * w;
+                            }
+                        }
+                    }
+                }
+                for (int x = 0; x < AROW; x++) {
+                    for (int y = 0; y < BROW; y++) {
+                        float now = Floatsum(acc[x][y]) + tailSum[x][y];
+                        if (biasData) {
+                            now += biasData[j + y];
+                        }
+                        outputData[(i + x) * k + (j + y)] = now;
+                    }
+                }
+            }
+            for (; j < end; j++) {
+                for (int x = 0; x < AROW; x++) {
+                    float now = biasData ? biasData[j] : 0.0f;
+                    int l = 0;
+                    __m256 vsum = _mm256_setzero_ps();
+                    for (; l + 7 < m; l += 8) {
+                        __m256 vi = _mm256_loadu_ps(inputData + (i + x) * m + l);
+                        __m256 vw = _mm256_loadu_ps(weightData + j * m + l);
+                        vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                    }
+                    now += Floatsum(vsum);
+                    for (; l < m; l++) {
+                        now += inputData[(i + x) * m + l] * weightData[j * m + l];
+                    }
+                    outputData[(i + x) * k + j] = now;
+                }
+            }
+        }
+#endif
+        for (; i < n; i++) {
             for (int j = st; j < end; j++) {
                 float now = biasData ? biasData[j] : 0.0f;
                 int l = 0;
@@ -1326,31 +1394,36 @@ namespace fastllm {
              if (cpuInstructInfo.hasAVX512VNNI && 
                 MatMulInt8Int4_AVX512VNNI(a, b, values.data(), n, m, k)) {
             } else  {
-                block = 0;
-                for (; block + 3 < n; block += 4) {
-                    uint8_t *weightWalk = b;
-                    uint8_t *inputStart = a + block * m;
+                const __m256i lowMask = _mm256_set1_epi8(0xf);
+                const __m256i ones = _mm256_set1_epi16(1);
+                thread_local std::vector<uint8_t> decoded;
+                if (decoded.size() < (size_t)m) {
+                    decoded.resize(m);
+                }
+                for (int i = 0; i < k; i++) {
+                    uint8_t *src = b + (i * m) / 2;
+                    uint8_t *dst = decoded.data();
+                    for (int j = 0; j + 31 < m; j += 32) {
+                        __m128i orix = _mm_loadu_si128((const __m128i *) (src + j / 2));
+                        __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                        _mm256_storeu_si256((__m256i *) (dst + j), _mm256_and_si256(lowMask, bytex));
+                    }
 
-                    for (int i = 0; i < k; i++) {
-                        uint8_t *a = weightWalk + (i * m) / 2;
-                        uint8_t *b = inputStart;
+                    int block = 0;
+                    for (; block + 3 < n; block += 4) {
+                        uint8_t *inputStart = a + block * m;
 
                         __m256i acc0 = _mm256_setzero_si256();
                         __m256i acc1 = _mm256_setzero_si256();
                         __m256i acc2 = _mm256_setzero_si256();
                         __m256i acc3 = _mm256_setzero_si256();
 
-                        const __m256i lowMask = _mm256_set1_epi8(0xf);
-                        const __m256i ones = _mm256_set1_epi16(1);
-                        int j = 0, ans = 0;
-                        for (; j + 31 < m; j += 32) {
-                            __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
-                            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-                            __m256i bx = _mm256_and_si256(lowMask, bytex);
-                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
-                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
-                            __m256i by2 = _mm256_loadu_si256((const __m256i *) (b + m * 2 + j));
-                            __m256i by3 = _mm256_loadu_si256((const __m256i *) (b + m * 3 + j));
+                        for (int j2 = 0; j2 + 31 < m; j2 += 32) {
+                            __m256i bx = _mm256_loadu_si256((const __m256i *) (dst + j2));
+                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (inputStart + j2));
+                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (inputStart + m * 1 + j2));
+                            __m256i by2 = _mm256_loadu_si256((const __m256i *) (inputStart + m * 2 + j2));
+                            __m256i by3 = _mm256_loadu_si256((const __m256i *) (inputStart + m * 3 + j2));
 
                             acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
                             acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
@@ -1362,30 +1435,19 @@ namespace fastllm {
                         values[(block + 2) * k + i] = I32sum(acc2);
                         values[(block + 3) * k + i] = I32sum(acc3);
                     }
-                }
 
-                for (; block + 2 < n; block += 3) {
-                    uint8_t *weightWalk = b;
-                    uint8_t *inputStart = a + block * m;
-
-                    for (int i = 0; i < k; i++) {
-                        uint8_t *a = weightWalk + (i * m) / 2;
-                        uint8_t *b = inputStart;
+                    for (; block + 2 < n; block += 3) {
+                        uint8_t *inputStart = a + block * m;
 
                         __m256i acc0 = _mm256_setzero_si256();
                         __m256i acc1 = _mm256_setzero_si256();
                         __m256i acc2 = _mm256_setzero_si256();
 
-                        const __m256i lowMask = _mm256_set1_epi8(0xf);
-                        const __m256i ones = _mm256_set1_epi16(1);
-                        int j = 0, ans = 0;
-                        for (; j + 31 < m; j += 32) {
-                            __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
-                            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-                            __m256i bx = _mm256_and_si256(lowMask, bytex);
-                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
-                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
-                            __m256i by2 = _mm256_loadu_si256((const __m256i *) (b + m * 2 + j));                        
+                        for (int j2 = 0; j2 + 31 < m; j2 += 32) {
+                            __m256i bx = _mm256_loadu_si256((const __m256i *) (dst + j2));
+                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (inputStart + j2));
+                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (inputStart + m * 1 + j2));
+                            __m256i by2 = _mm256_loadu_si256((const __m256i *) (inputStart + m * 2 + j2));
 
                             acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
                             acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
@@ -1395,28 +1457,17 @@ namespace fastllm {
                         values[(block + 1) * k + i] = I32sum(acc1);
                         values[(block + 2) * k + i] = I32sum(acc2);
                     }
-                }
 
-                for (; block + 1 < n; block += 2) {
-                    uint8_t *weightWalk = b;
-                    uint8_t *inputStart = a + block * m;
-
-                    for (int i = 0; i < k; i++) {
-                        uint8_t *a = weightWalk + (i * m) / 2;
-                        uint8_t *b = inputStart;
+                    for (; block + 1 < n; block += 2) {
+                        uint8_t *inputStart = a + block * m;
 
                         __m256i acc0 = _mm256_setzero_si256();
                         __m256i acc1 = _mm256_setzero_si256();
 
-                        const __m256i lowMask = _mm256_set1_epi8(0xf);
-                        const __m256i ones = _mm256_set1_epi16(1);
-                        int j = 0, ans = 0;
-                        for (; j + 31 < m; j += 32) {
-                            __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
-                            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-                            __m256i bx = _mm256_and_si256(lowMask, bytex);
-                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
-                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
+                        for (int j2 = 0; j2 + 31 < m; j2 += 32) {
+                            __m256i bx = _mm256_loadu_si256((const __m256i *) (dst + j2));
+                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (inputStart + j2));
+                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (inputStart + m * 1 + j2));
 
                             acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
                             acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
@@ -1424,25 +1475,14 @@ namespace fastllm {
                         values[block * k + i] = I32sum(acc0);
                         values[(block + 1) * k + i] = I32sum(acc1);
                     }
-                }
 
-                for (; block < n; block++) {
-                    uint8_t *weightWalk = b;
-                    uint8_t *inputStart = a + block * m;
-
-                    for (int i = 0; i < k; i++) {
-                        uint8_t *a = weightWalk + (i * m) / 2;
-                        uint8_t *b = inputStart;
+                    for (; block < n; block++) {
+                        uint8_t *inputStart = a + block * m;
 
                         __m256i acc = _mm256_setzero_si256();
-                        const __m256i lowMask = _mm256_set1_epi8(0xf);
-                        const __m256i ones = _mm256_set1_epi16(1);
-                        int j = 0, ans = 0;
-                        for (; j + 31 < m; j += 32) {
-                            __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
-                            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-                            __m256i bx = _mm256_and_si256(lowMask, bytex);
-                            __m256i by = _mm256_loadu_si256((const __m256i *) (b + j));
+                        for (int j2 = 0; j2 + 31 < m; j2 += 32) {
+                            __m256i bx = _mm256_loadu_si256((const __m256i *) (dst + j2));
+                            __m256i by = _mm256_loadu_si256((const __m256i *) (inputStart + j2));
                             acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(by, bx), ones));
                         }
                         values[block * k + i] = I32sum(acc);
@@ -3151,15 +3191,88 @@ namespace fastllm {
                 }
             }
 #elif defined(__AVX2__)
+            const __m256i ones = _mm256_set1_epi16(1);
+            const __m256i ones8 = _mm256_set1_epi8(1);
+            const __m256i xors = _mm256_set1_epi8(-128);
             int block = 0;
+            for (; block + 7 < n; block += 8) {
+                uint8_t *inputStart = a + block * m;
+                uint8_t *weightWalk = b;
+                for (int i = 0; i < k; i++) {
+                    __m256i acc0 = _mm256_setzero_si256();
+                    __m256i acc1 = _mm256_setzero_si256();
+                    __m256i acc2 = _mm256_setzero_si256();
+                    __m256i acc3 = _mm256_setzero_si256();
+                    __m256i acc4 = _mm256_setzero_si256();
+                    __m256i acc5 = _mm256_setzero_si256();
+                    __m256i acc6 = _mm256_setzero_si256();
+                    __m256i acc7 = _mm256_setzero_si256();
+                    int j = 0;
+                    for (; j + 31 < m; j += 32) {
+                        __m256i byRaw = _mm256_loadu_si256((const __m256i*)(weightWalk + j));
+                        __m256i by = _mm256_xor_si256(byRaw, xors);
+                        by = _mm256_add_epi8(by, _mm256_and_si256(_mm256_cmpeq_epi8(by, xors), ones8));
+                        __m256i bx = _mm256_loadu_si256((const __m256i*)(inputStart + j));
+                        __m256i bys = _mm256_sign_epi8(by, bx);
+                        bx = _mm256_sign_epi8(bx, bx);
+                        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, bys), ones));
+                        bx = _mm256_loadu_si256((const __m256i*)(inputStart + m + j));
+                        bys = _mm256_sign_epi8(by, bx);
+                        bx = _mm256_sign_epi8(bx, bx);
+                        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, bys), ones));
+                        bx = _mm256_loadu_si256((const __m256i*)(inputStart + m * 2 + j));
+                        bys = _mm256_sign_epi8(by, bx);
+                        bx = _mm256_sign_epi8(bx, bx);
+                        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, bys), ones));
+                        bx = _mm256_loadu_si256((const __m256i*)(inputStart + m * 3 + j));
+                        bys = _mm256_sign_epi8(by, bx);
+                        bx = _mm256_sign_epi8(bx, bx);
+                        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, bys), ones));
+                        bx = _mm256_loadu_si256((const __m256i*)(inputStart + m * 4 + j));
+                        bys = _mm256_sign_epi8(by, bx);
+                        bx = _mm256_sign_epi8(bx, bx);
+                        acc4 = _mm256_add_epi32(acc4, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, bys), ones));
+                        bx = _mm256_loadu_si256((const __m256i*)(inputStart + m * 5 + j));
+                        bys = _mm256_sign_epi8(by, bx);
+                        bx = _mm256_sign_epi8(bx, bx);
+                        acc5 = _mm256_add_epi32(acc5, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, bys), ones));
+                        bx = _mm256_loadu_si256((const __m256i*)(inputStart + m * 6 + j));
+                        bys = _mm256_sign_epi8(by, bx);
+                        bx = _mm256_sign_epi8(bx, bx);
+                        acc6 = _mm256_add_epi32(acc6, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, bys), ones));
+                        bx = _mm256_loadu_si256((const __m256i*)(inputStart + m * 7 + j));
+                        bys = _mm256_sign_epi8(by, bx);
+                        bx = _mm256_sign_epi8(bx, bx);
+                        acc7 = _mm256_add_epi32(acc7, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, bys), ones));
+                    }
+                    int ans0 = 0, ans1 = 0, ans2 = 0, ans3 = 0, ans4 = 0, ans5 = 0, ans6 = 0, ans7 = 0;
+                    for (; j < m; j++) {
+                        int w = (int)weightWalk[j] - 128;
+                        ans0 += ((int8_t*)inputStart)[j] * w;
+                        ans1 += ((int8_t*)(inputStart + m))[j] * w;
+                        ans2 += ((int8_t*)(inputStart + m * 2))[j] * w;
+                        ans3 += ((int8_t*)(inputStart + m * 3))[j] * w;
+                        ans4 += ((int8_t*)(inputStart + m * 4))[j] * w;
+                        ans5 += ((int8_t*)(inputStart + m * 5))[j] * w;
+                        ans6 += ((int8_t*)(inputStart + m * 6))[j] * w;
+                        ans7 += ((int8_t*)(inputStart + m * 7))[j] * w;
+                    }
+                    c[block * kstride + i] = ans0 + I32sum(acc0);
+                    c[(block + 1) * kstride + i] = ans1 + I32sum(acc1);
+                    c[(block + 2) * kstride + i] = ans2 + I32sum(acc2);
+                    c[(block + 3) * kstride + i] = ans3 + I32sum(acc3);
+                    c[(block + 4) * kstride + i] = ans4 + I32sum(acc4);
+                    c[(block + 5) * kstride + i] = ans5 + I32sum(acc5);
+                    c[(block + 6) * kstride + i] = ans6 + I32sum(acc6);
+                    c[(block + 7) * kstride + i] = ans7 + I32sum(acc7);
+                    weightWalk += m;
+                }
+            }
             for (; block < n; block++) {
                 uint8_t *weightWalk = b;
                 uint8_t *inputStart = a + block * m;
-
                 for (int i = 0; i < k; i++) {
-                    uint8_t *inputWalk = inputStart;
-
-                    c[block * kstride + i] = DotU8U8(inputWalk, weightWalk, m);
+                    c[block * kstride + i] = DotU8U8(inputStart, weightWalk, m);
                     weightWalk += m;
                 }
             }

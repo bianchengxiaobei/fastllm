@@ -125,6 +125,29 @@ namespace fastllm {
         numa_free(raw_ptr, size);
     }
 
+    void* allocate_interleaved(size_t size) {
+        if (!numaDetector.canUseNuma) {
+            return allocate_aligned(size);
+        }
+        void* ptr = numa_alloc_interleaved(size);
+        if (!ptr) {
+            std::cerr << "numa_alloc_interleaved failed (" << size << " bytes)" << std::endl;
+            return nullptr;
+        }
+        return ptr;
+    }
+
+    void free_interleaved(void* ptr, size_t size) {
+        if (!ptr) {
+            return;
+        }
+        if (!numaDetector.canUseNuma) {
+            free_aligned(ptr, size);
+            return;
+        }
+        numa_free(ptr, size);
+    }
+
     void* allocate_pinned_numa(size_t size, int node) {
 #ifdef USE_CUDA
         void *ptr = allocate_aligned_numa(size, node);

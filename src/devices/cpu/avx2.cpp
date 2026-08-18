@@ -317,28 +317,232 @@ namespace fastllm {
 #endif
     }
 
+    template <int BROW>
+    void mul_mat_bf16_bf16_direct_avx2_pair(
+        int n,
+        const uint16_t* A,
+        size_t stride_a,
+        const uint16_t* B,
+        size_t stride_b,
+        float* C,
+        size_t stride_c
+    ) {
+#ifdef __AVX2__
+        constexpr int SIMD_WIDTH = 8;
+        int nb = n / SIMD_WIDTH;
+        int remainder = n % SIMD_WIDTH;
+
+        __m256 acc[2][BROW];
+        for (int c = 0; c < 2; c++) {
+            for (int r = 0; r < BROW; r++) {
+                acc[c][r] = _mm256_setzero_ps();
+            }
+        }
+
+        const uint16_t* a0 = A;
+        const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
+
+        for (int i = 0; i < nb; ++i) {
+            __m256 w0 = bf16_to_fp32_avx2(
+                _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
+            __m256 w1 = bf16_to_fp32_avx2(
+                _mm_loadu_si128((const __m128i*)(a1 + i * SIMD_WIDTH)));
+            for (int r = 0; r < BROW; ++r) {
+                const uint16_t* b_row =
+                    (const uint16_t*)((const char*)B + r * stride_b);
+                __m256 iv = bf16_to_fp32_avx2(
+                    _mm_loadu_si128((const __m128i*)(b_row + i * SIMD_WIDTH)));
+                acc[0][r] = _mm256_fmadd_ps(iv, w0, acc[0][r]);
+                acc[1][r] = _mm256_fmadd_ps(iv, w1, acc[1][r]);
+            }
+        }
+
+        float tailSum[2][BROW];
+        memset(tailSum, 0, sizeof(tailSum));
+        for (int j = 0; j < remainder; ++j) {
+            int idx = nb * SIMD_WIDTH + j;
+            uint32_t ta0 = (uint32_t)a0[idx] << 16;
+            uint32_t ta1 = (uint32_t)a1[idx] << 16;
+            float a0v, a1v;
+            memcpy(&a0v, &ta0, sizeof(a0v));
+            memcpy(&a1v, &ta1, sizeof(a1v));
+            for (int r = 0; r < BROW; ++r) {
+                const uint16_t* b_row =
+                    (const uint16_t*)((const char*)B + r * stride_b);
+                uint32_t tb = (uint32_t)b_row[idx] << 16;
+                float bv;
+                memcpy(&bv, &tb, sizeof(bv));
+                tailSum[0][r] += a0v * bv;
+                tailSum[1][r] += a1v * bv;
+            }
+        }
+
+        for (int c = 0; c < 2; c++) {
+            for (int r = 0; r < BROW; r++) {
+                float* c_row = (float*)((char*)C + r * stride_c);
+                c_row[c] = Floatsum(acc[c][r]) + tailSum[c][r];
+            }
+        }
+#endif
+    }
+
+    // bf16 weight (A, 1 column) x fp32 input (B, BROW rows) -> fp32 output (1 column)
+    template <int BROW>
+    void mul_mat_bf16_f32_direct_avx2(
+        int n,
+        const uint16_t* A,
+        size_t stride_a,
+        const float* B,
+        size_t stride_b,
+        float* C,
+        size_t stride_c
+    ) {
+#ifdef __AVX2__
+        constexpr int SIMD_WIDTH = 8;
+        int nb = n / SIMD_WIDTH;
+        int remainder = n % SIMD_WIDTH;
+
+        __m256 acc[BROW];
+        for (int r = 0; r < BROW; r++) {
+            acc[r] = _mm256_setzero_ps();
+        }
+
+        const uint16_t* a0 = A;
+        for (int i = 0; i < nb; ++i) {
+            __m256 w0 = bf16_to_fp32_avx2(
+                _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
+            for (int r = 0; r < BROW; ++r) {
+                const float* b_row =
+                    (const float*)((const char*)B + r * stride_b);
+                __m256 iv = _mm256_loadu_ps(b_row + i * SIMD_WIDTH);
+                acc[r] = _mm256_fmadd_ps(iv, w0, acc[r]);
+            }
+        }
+
+        float tailSum[BROW];
+        memset(tailSum, 0, sizeof(tailSum));
+        for (int j = 0; j < remainder; ++j) {
+            int idx = nb * SIMD_WIDTH + j;
+            uint32_t wa0 = (uint32_t)a0[idx] << 16;
+            float w0v;
+            memcpy(&w0v, &wa0, sizeof(w0v));
+            for (int r = 0; r < BROW; ++r) {
+                const float* b_row =
+                    (const float*)((const char*)B + r * stride_b);
+                tailSum[r] += w0v * b_row[idx];
+            }
+        }
+
+        for (int r = 0; r < BROW; r++) {
+            float* c_row = (float*)((char*)C + r * stride_c);
+            c_row[0] = Floatsum(acc[r]) + tailSum[r];
+        }
+#endif
+    }
+
+    // bf16 weight (A, 2 columns) x fp32 input (B, BROW rows) -> fp32 output (2 columns)
+    template <int BROW>
+    void mul_mat_bf16_f32_direct_avx2_pair(
+        int n,
+        const uint16_t* A,
+        size_t stride_a,
+        const float* B,
+        size_t stride_b,
+        float* C,
+        size_t stride_c
+    ) {
+#ifdef __AVX2__
+        constexpr int SIMD_WIDTH = 8;
+        int nb = n / SIMD_WIDTH;
+        int remainder = n % SIMD_WIDTH;
+
+        __m256 acc[2][BROW];
+        for (int c = 0; c < 2; c++) {
+            for (int r = 0; r < BROW; r++) {
+                acc[c][r] = _mm256_setzero_ps();
+            }
+        }
+
+        const uint16_t* a0 = A;
+        const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
+
+        for (int i = 0; i < nb; ++i) {
+            __m256 w0 = bf16_to_fp32_avx2(
+                _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
+            __m256 w1 = bf16_to_fp32_avx2(
+                _mm_loadu_si128((const __m128i*)(a1 + i * SIMD_WIDTH)));
+            for (int r = 0; r < BROW; ++r) {
+                const float* b_row =
+                    (const float*)((const char*)B + r * stride_b);
+                __m256 iv = _mm256_loadu_ps(b_row + i * SIMD_WIDTH);
+                acc[0][r] = _mm256_fmadd_ps(iv, w0, acc[0][r]);
+                acc[1][r] = _mm256_fmadd_ps(iv, w1, acc[1][r]);
+            }
+        }
+
+        float tailSum[2][BROW];
+        memset(tailSum, 0, sizeof(tailSum));
+        for (int j = 0; j < remainder; ++j) {
+            int idx = nb * SIMD_WIDTH + j;
+            uint32_t wa0 = (uint32_t)a0[idx] << 16;
+            uint32_t wa1 = (uint32_t)a1[idx] << 16;
+            float w0v, w1v;
+            memcpy(&w0v, &wa0, sizeof(w0v));
+            memcpy(&w1v, &wa1, sizeof(w1v));
+            for (int r = 0; r < BROW; r++) {
+                const float* b_row =
+                    (const float*)((const char*)B + r * stride_b);
+                float bv = b_row[idx];
+                tailSum[0][r] += w0v * bv;
+                tailSum[1][r] += w1v * bv;
+            }
+        }
+
+        for (int c = 0; c < 2; c++) {
+            for (int r = 0; r < BROW; r++) {
+                float* c_row = (float*)((char*)C + r * stride_c);
+                c_row[c] = Floatsum(acc[c][r]) + tailSum[c][r];
+            }
+        }
+#endif
+    }
+
     template <int BRow>
     void LinearBFloat16BFloat16_AVX2_Row_Kernel(
         uint16_t *inputData, 
         uint16_t *weightData, 
         float *biasData, 
         float *outputData,
-        int i, int m, int k, int st, int end) 
+        int i, int m, int k, int st, int end,
+        float *fp32Input) 
     {
-        int j = st;
-        for (j = st; j + 4 < end; j += 5) {
-            mul_mat_bf16_bf16_direct_avx2_optimized<BRow, 5>(
-                m, weightData + j * m, m * sizeof(uint16_t), 
-                inputData + i * m, m * sizeof(uint16_t), 
-                outputData + i * k + j, k * sizeof(float));
+        // 每行组只转换一次输入 bf16 -> fp32，跨所有输出列复用
+        for (int r = 0; r < BRow; r++) {
+            const uint16_t *src = inputData + (size_t)(i + r) * m;
+            float *dst = fp32Input + (size_t)r * m;
+            int l = 0;
+            for (; l + 7 < m; l += 8) {
+                _mm256_storeu_ps(dst + l, bf16_to_fp32_avx2(
+                    _mm_loadu_si128((const __m128i*)(src + l))));
+            }
+            for (; l < m; l++) {
+                uint32_t x = (uint32_t)src[l] << 16;
+                memcpy(dst + l, &x, sizeof(float));
+            }
         }
-        
-        switch (end - j) {
-            case 0: break;
-            case 1: mul_mat_bf16_bf16_direct_avx2_optimized<BRow, 1>(m, weightData + j * m, m * sizeof(uint16_t), inputData + i * m, m * sizeof(uint16_t), outputData + i * k + j, k * sizeof(float)); break;
-            case 2: mul_mat_bf16_bf16_direct_avx2_optimized<BRow, 2>(m, weightData + j * m, m * sizeof(uint16_t), inputData + i * m, m * sizeof(uint16_t), outputData + i * k + j, k * sizeof(float)); break;
-            case 3: mul_mat_bf16_bf16_direct_avx2_optimized<BRow, 3>(m, weightData + j * m, m * sizeof(uint16_t), inputData + i * m, m * sizeof(uint16_t), outputData + i * k + j, k * sizeof(float)); break;
-            case 4: mul_mat_bf16_bf16_direct_avx2_optimized<BRow, 4>(m, weightData + j * m, m * sizeof(uint16_t), inputData + i * m, m * sizeof(uint16_t), outputData + i * k + j, k * sizeof(float)); break;
+
+        int j = st;
+        for (; j + 1 < end; j += 2) {
+            mul_mat_bf16_f32_direct_avx2_pair<BRow>(
+                m, weightData + (size_t)j * m, m * sizeof(uint16_t), 
+                fp32Input, m * sizeof(float), 
+                outputData + (size_t)i * k + j, k * sizeof(float));
+        }
+        if (j < end) {
+            mul_mat_bf16_f32_direct_avx2<BRow>(
+                m, weightData + (size_t)j * m, m * sizeof(uint16_t), 
+                fp32Input, m * sizeof(float), 
+                outputData + (size_t)i * k + j, k * sizeof(float));
         }
     }
 
@@ -349,17 +553,22 @@ namespace fastllm {
         float *outputData,
         int n, int m, int k, int st, int end) 
     {
+        thread_local std::vector<float> fp32Input;
+        if ((size_t)fp32Input.size() < (size_t)5 * m) {
+            fp32Input.resize((size_t)5 * m);
+        }
+
         int i = 0;
         for (; i + 4 < n; i += 5) {
-            LinearBFloat16BFloat16_AVX2_Row_Kernel<5>(inputData, weightData, biasData, outputData, i, m, k, st, end);
+            LinearBFloat16BFloat16_AVX2_Row_Kernel<5>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data());
         }
         
         switch (n - i) {
             case 0: break;
-            case 1: LinearBFloat16BFloat16_AVX2_Row_Kernel<1>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 2: LinearBFloat16BFloat16_AVX2_Row_Kernel<2>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 3: LinearBFloat16BFloat16_AVX2_Row_Kernel<3>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 4: LinearBFloat16BFloat16_AVX2_Row_Kernel<4>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
+            case 1: LinearBFloat16BFloat16_AVX2_Row_Kernel<1>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data()); break;
+            case 2: LinearBFloat16BFloat16_AVX2_Row_Kernel<2>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data()); break;
+            case 3: LinearBFloat16BFloat16_AVX2_Row_Kernel<3>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data()); break;
+            case 4: LinearBFloat16BFloat16_AVX2_Row_Kernel<4>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data()); break;
         }
         
         AddBiasAVX2(outputData, biasData, n, k, st, end);
@@ -1178,29 +1387,84 @@ namespace fastllm {
 #endif
     }
 
+    template <int BROW>
+    void mul_mat_f16_f32_direct_avx2_pair(
+        int n,
+        const uint16_t* A,
+        size_t stride_a,
+        const float* B,
+        size_t stride_b,
+        float* C,
+        size_t stride_c
+    ) {
+#if defined(__AVX2__)
+        constexpr int SIMD_WIDTH = 8;
+        int nb = n / SIMD_WIDTH;
+        int remainder = n % SIMD_WIDTH;
+
+        __m256 acc[2][BROW];
+        for (int c = 0; c < 2; c++) {
+            for (int r = 0; r < BROW; r++) {
+                acc[c][r] = _mm256_setzero_ps();
+            }
+        }
+
+        const uint16_t* a0 = A;
+        const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
+
+        for (int i = 0; i < nb; ++i) {
+            __m256 w0 = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
+            __m256 w1 = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i*)(a1 + i * SIMD_WIDTH)));
+            for (int r = 0; r < BROW; ++r) {
+                const float* b_row =
+                    (const float*)((const char*)B + r * stride_b);
+                __m256 iv = _mm256_loadu_ps(b_row + i * SIMD_WIDTH);
+                acc[0][r] = _mm256_fmadd_ps(iv, w0, acc[0][r]);
+                acc[1][r] = _mm256_fmadd_ps(iv, w1, acc[1][r]);
+            }
+        }
+
+        float tailSum[2][BROW];
+        memset(tailSum, 0, sizeof(tailSum));
+        for (int j = 0; j < remainder; ++j) {
+            int idx = nb * SIMD_WIDTH + j;
+            float w0v = _mm_cvtss_f32(
+                _mm_cvtph_ps(_mm_cvtsi32_si128(a0[idx])));
+            float w1v = _mm_cvtss_f32(
+                _mm_cvtph_ps(_mm_cvtsi32_si128(a1[idx])));
+            for (int r = 0; r < BROW; ++r) {
+                const float* b_row =
+                    (const float*)((const char*)B + r * stride_b);
+                float bv = b_row[idx];
+                tailSum[0][r] += w0v * bv;
+                tailSum[1][r] += w1v * bv;
+            }
+        }
+
+        for (int c = 0; c < 2; c++) {
+            for (int r = 0; r < BROW; r++) {
+                float* c_row = (float*)((char*)C + r * stride_c);
+                c_row[c] = Floatsum(acc[c][r]) + tailSum[c][r];
+            }
+        }
+#endif
+    }
+
     template <int BRow>
     void LinearFloat32Float16_AVX2_Row_Kernel(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int i, int m, int k, int st, int end) {
         int j = st;
-        for (j = st; j + 4 < end; j += 5) {
-            mul_mat_f16_f32_direct_avx2<BRow, 5>(m, weightData + j * m, m * sizeof(uint16_t), 
-                                                inputData + i * m, m * sizeof(float), 
-                                                outputData + i * k + j, k * sizeof(float));
+        for (; j + 1 < end; j += 2) {
+            mul_mat_f16_f32_direct_avx2_pair<BRow>(m, weightData + (size_t)j * m, m * sizeof(uint16_t), 
+                                                inputData + (size_t)i * m, m * sizeof(float), 
+                                                outputData + (size_t)i * k + j, k * sizeof(float));
         }
-        switch (end - j) {
-            case 0: break;
-            case 1: mul_mat_f16_f32_direct_avx2<BRow, 1>(m, weightData + j * m, m * sizeof(uint16_t), 
-                                                        inputData + i * m, m * sizeof(float), 
-                                                        outputData + i * k + j, k * sizeof(float)); break;
-            case 2: mul_mat_f16_f32_direct_avx2<BRow, 2>(m, weightData + j * m, m * sizeof(uint16_t), 
-                                                        inputData + i * m, m * sizeof(float), 
-                                                        outputData + i * k + j, k * sizeof(float)); break;
-            case 3: mul_mat_f16_f32_direct_avx2<BRow, 3>(m, weightData + j * m, m * sizeof(uint16_t), 
-                                                        inputData + i * m, m * sizeof(float), 
-                                                        outputData + i * k + j, k * sizeof(float)); break;
-            case 4: mul_mat_f16_f32_direct_avx2<BRow, 4>(m, weightData + j * m, m * sizeof(uint16_t), 
-                                                        inputData + i * m, m * sizeof(float), 
-                                                        outputData + i * k + j, k * sizeof(float)); break;
+        if (j < end) {
+            mul_mat_f16_f32_direct_avx2<BRow, 1>(m, weightData + (size_t)j * m, m * sizeof(uint16_t), 
+                                                inputData + (size_t)i * m, m * sizeof(float), 
+                                                outputData + (size_t)i * k + j, k * sizeof(float));
         }
     }
 
@@ -1287,35 +1551,90 @@ namespace fastllm {
 #endif
     }
 
+    template <int BROW>
+    void mul_mat_bf16_f16_direct_avx2_pair(
+        int n,
+        const uint16_t* A,
+        size_t stride_a,
+        const uint16_t* B,
+        size_t stride_b,
+        float* C,
+        size_t stride_c
+    ) {
+#if defined(__AVX2__)
+        constexpr int SIMD_WIDTH = 8;
+        int nb = n / SIMD_WIDTH;
+        int remainder = n % SIMD_WIDTH;
+
+        __m256 acc[2][BROW];
+        for (int c = 0; c < 2; c++) {
+            for (int r = 0; r < BROW; r++) {
+                acc[c][r] = _mm256_setzero_ps();
+            }
+        }
+
+        const uint16_t* a0 = A;
+        const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
+
+        for (int i = 0; i < nb; ++i) {
+            __m256 w0 = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
+            __m256 w1 = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i*)(a1 + i * SIMD_WIDTH)));
+            for (int r = 0; r < BROW; ++r) {
+                const uint16_t* b_row =
+                    (const uint16_t*)((const char*)B + r * stride_b);
+                __m256 iv = bf16_to_fp32_avx2(
+                    _mm_loadu_si128((const __m128i*)(b_row + i * SIMD_WIDTH)));
+                acc[0][r] = _mm256_fmadd_ps(iv, w0, acc[0][r]);
+                acc[1][r] = _mm256_fmadd_ps(iv, w1, acc[1][r]);
+            }
+        }
+
+        float tailSum[2][BROW];
+        memset(tailSum, 0, sizeof(tailSum));
+        for (int j = 0; j < remainder; ++j) {
+            int idx = nb * SIMD_WIDTH + j;
+            float w0v = _mm_cvtss_f32(
+                _mm_cvtph_ps(_mm_cvtsi32_si128(a0[idx])));
+            float w1v = _mm_cvtss_f32(
+                _mm_cvtph_ps(_mm_cvtsi32_si128(a1[idx])));
+            for (int r = 0; r < BROW; ++r) {
+                const uint16_t* b_row =
+                    (const uint16_t*)((const char*)B + r * stride_b);
+                uint32_t tb = (uint32_t)b_row[idx] << 16;
+                float bv;
+                memcpy(&bv, &tb, sizeof(bv));
+                tailSum[0][r] += w0v * bv;
+                tailSum[1][r] += w1v * bv;
+            }
+        }
+
+        for (int c = 0; c < 2; c++) {
+            for (int r = 0; r < BROW; r++) {
+                float* c_row = (float*)((char*)C + r * stride_c);
+                c_row[c] = Floatsum(acc[c][r]) + tailSum[c][r];
+            }
+        }
+#endif
+    }
+
     template <int BRow>
     void LinearBFloat16Float16_AVX2_Row_Kernel(
         uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
         int i, int m, int k, int st, int end) {
         int j = st;
-        for (; j + 4 < end; j += 5) {
-            mul_mat_bf16_f16_direct_avx2<BRow, 5>(
+        for (; j + 1 < end; j += 2) {
+            mul_mat_bf16_f16_direct_avx2_pair<BRow>(
                 m, weightData + (size_t)j * m, m * sizeof(uint16_t),
                 inputData + (size_t)i * m, m * sizeof(uint16_t),
                 outputData + (size_t)i * k + j, k * sizeof(float));
         }
-        switch (end - j) {
-            case 0: break;
-            case 1: mul_mat_bf16_f16_direct_avx2<BRow, 1>(
+        if (j < end) {
+            mul_mat_bf16_f16_direct_avx2<BRow, 1>(
                 m, weightData + (size_t)j * m, m * sizeof(uint16_t),
                 inputData + (size_t)i * m, m * sizeof(uint16_t),
-                outputData + (size_t)i * k + j, k * sizeof(float)); break;
-            case 2: mul_mat_bf16_f16_direct_avx2<BRow, 2>(
-                m, weightData + (size_t)j * m, m * sizeof(uint16_t),
-                inputData + (size_t)i * m, m * sizeof(uint16_t),
-                outputData + (size_t)i * k + j, k * sizeof(float)); break;
-            case 3: mul_mat_bf16_f16_direct_avx2<BRow, 3>(
-                m, weightData + (size_t)j * m, m * sizeof(uint16_t),
-                inputData + (size_t)i * m, m * sizeof(uint16_t),
-                outputData + (size_t)i * k + j, k * sizeof(float)); break;
-            case 4: mul_mat_bf16_f16_direct_avx2<BRow, 4>(
-                m, weightData + (size_t)j * m, m * sizeof(uint16_t),
-                inputData + (size_t)i * m, m * sizeof(uint16_t),
-                outputData + (size_t)i * k + j, k * sizeof(float)); break;
+                outputData + (size_t)i * k + j, k * sizeof(float));
         }
     }
 

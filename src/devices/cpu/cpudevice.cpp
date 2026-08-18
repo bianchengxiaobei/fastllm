@@ -32,6 +32,14 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
+#ifdef USE_NUMAS
+#include "numas.h"
+#elif defined(USE_CPU_NUMA)
+#include <numa.h>
+#include <numaif.h>
+#include <sched.h>
+#endif
+
 #include "utils.h"
 #include "gguf.h"
 
@@ -193,6 +201,146 @@ namespace fastllm {
             }
         }
     }
+
+#ifdef USE_CPU_NUMA
+    // 纯 CPU 构建的 NUMA 支持：检测拓扑、把线程池线程绑到各 node 的 cpu，
+    // 并记录 threadId -> node 映射，供 decode 转置 GEMV 做 per-node 调度。
+    struct CpuNumaState {
+        int numaCnt = 1;
+        bool enabled = false;
+        std::vector<int> nodeThreadStart;            // {nodeId -> 起始 pool threadId}
+        std::vector<int> nodeThreadCount;            // {nodeId -> 线程数}
+    };
+
+    static CpuNumaState &GetCpuNumaState() {
+        static CpuNumaState state;
+        return state;
+    }
+
+    struct CpuBindCPUOp : MultiThreadBaseOp {
+        int cpuId;
+        CpuBindCPUOp(int cpuId) : cpuId(cpuId) {}
+        void Run() override {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpuId, &set);
+            sched_setaffinity(0, sizeof(cpu_set_t), &set);
+        }
+    };
+
+    static void InitCpuNumaBinding() {
+        static std::once_flag once;
+        std::call_once(once, []() {
+            CpuNumaState &s = GetCpuNumaState();
+            if (numa_available() < 0) {
+                return;
+            }
+            int nodes = numa_num_configured_nodes();
+            if (nodes < 2) {
+                return;
+            }
+            AliveThreadPool *pool = GetAlivePool();
+            int threads = pool->curActivateThreadInterval.second;
+            if (threads <= 0) {
+                threads = (int)pool->threads.size();
+            }
+            if (threads < 2 * nodes) {
+                return;
+            }
+
+            // 收集每个 node 的 cpu 列表
+            std::vector<std::vector<int>> cpusPerNode(nodes);
+            for (int n = 0; n < nodes; n++) {
+                struct bitmask *mask = numa_allocate_cpumask();
+                if (numa_node_to_cpus(n, mask) == 0) {
+                    int cpuCnt = numa_num_configured_cpus();
+                    for (int c = 0; c < cpuCnt; c++) {
+                        if (numa_bitmask_isbitset(mask, c)) {
+                            cpusPerNode[n].push_back(c);
+                        }
+                    }
+                }
+                numa_free_cpumask(mask);
+            }
+
+            int perNode = threads / nodes;
+            int boundThreads = perNode * nodes;   // 余数线程不参与 node 分片
+
+            s.numaCnt = nodes;
+            s.nodeThreadStart.resize(nodes);
+            s.nodeThreadCount.resize(nodes);
+
+            for (int n = 0; n < nodes; n++) {
+                int start = n * perNode;
+                s.nodeThreadStart[n] = start;
+                s.nodeThreadCount[n] = perNode;
+                for (int j = 0; j < perNode; j++) {
+                    int tid = start + j;
+                    if (!cpusPerNode[n].empty()) {
+                        int cpu = cpusPerNode[n][j % cpusPerNode[n].size()];
+                        pool->PushOp(tid, new CpuBindCPUOp(cpu));
+                    }
+                }
+            }
+            for (int tid = 0; tid < boundThreads; tid++) {
+                pool->Wait(tid);
+            }
+            s.enabled = true;
+        });
+    }
+
+    // 在 [firstThread, firstThread + threadCount) 线程范围内做 work-stealing，
+    // 复用 DynamicScheduleTasks 的 TaskState/WorkStealingOp 逻辑。
+    static void DynamicScheduleTasksRange(std::vector<MultiThreadBaseOp*> &ops,
+                                          int firstThread, int threadCount,
+                                          AliveThreadPool *pool) {
+        using TaskState = typename WorkStealingOp::TaskState;
+        std::vector<TaskState*> taskStates(threadCount, nullptr);
+        for (int i = 0; i < threadCount; i++) {
+            taskStates[i] = new TaskState();
+            taskStates[i]->curr.store(0, std::memory_order_relaxed);
+            taskStates[i]->end = 0;
+            taskStates[i]->completed.store(false, std::memory_order_relaxed);
+        }
+
+        int totalOps = (int)ops.size();
+        if (totalOps > 0) {
+            int tasksPerThread = totalOps / threadCount;
+            int remainingTasks = totalOps % threadCount;
+            int taskIndex = 0;
+            for (int i = 0; i < threadCount; i++) {
+                int numTasks = tasksPerThread + (i < remainingTasks ? 1 : 0);
+                if (numTasks > 0) {
+                    taskStates[i]->tasks.clear();
+                    taskStates[i]->tasks.reserve(numTasks);
+                    for (int j = 0; j < numTasks && taskIndex < totalOps; j++) {
+                        taskStates[i]->tasks.push_back(ops[taskIndex++]);
+                    }
+                    taskStates[i]->curr.store(0, std::memory_order_relaxed);
+                    taskStates[i]->end = (int)taskStates[i]->tasks.size();
+                } else {
+                    taskStates[i]->end = 0;
+                }
+            }
+        }
+
+        std::vector<WorkStealingOp*> wsOps(threadCount);
+        for (int i = 0; i < threadCount; i++) {
+            wsOps[i] = new WorkStealingOp(i, &taskStates, taskStates[i], threadCount);
+            pool->PushOp(firstThread + i, wsOps[i]);
+        }
+        for (int i = 0; i < threadCount; i++) {
+            pool->Wait(firstThread + i);
+        }
+        for (int i = 0; i < threadCount; i++) {
+            delete wsOps[i];
+            delete taskStates[i];
+        }
+        for (auto *op : ops) {
+            delete op;
+        }
+    }
+#endif
 
     struct DeepSeekV4MoeLinearTaskStorage {
         std::vector<MultiThreadLinearBFloat16FP8E4M3Op> fp8;
@@ -697,6 +845,12 @@ namespace fastllm {
             vst1q_f32(float32 + i + 4, output_vec2);
         }
 #endif
+#ifdef __AVX2__
+        for (; i + 7 < len; i += 8) {
+            __m128i f16 = _mm_loadu_si128((const __m128i*)(float16 + i));
+            _mm256_storeu_ps(float32 + i, _mm256_cvtph_ps(f16));
+        }
+#endif
         for (; i < len; i++) {
             float32[i] = fp16tofp32.dict[float16[i]];
         }
@@ -772,7 +926,19 @@ namespace fastllm {
     }
 
     void Float16ToBFloat16(uint16_t *float16, uint16_t *bfloat16, int len) {
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+#ifdef __AVX2__
+        // f16 -> f32 (exact) -> bf16: truncate low 16 bits, matching fp16tobf16.dict
+        for (; i + 7 < len; i += 8) {
+            __m128i f16 = _mm_loadu_si128((const __m128i*)(float16 + i));
+            __m256 f32 = _mm256_cvtph_ps(f16);
+            __m256i bf = _mm256_srli_epi32(_mm256_castps_si256(f32), 16);
+            __m128i lo = _mm256_castsi256_si128(bf);
+            __m128i hi = _mm256_extracti128_si256(bf, 1);
+            _mm_storeu_si128((__m128i*)(bfloat16 + i), _mm_packus_epi32(lo, hi));
+        }
+#endif
+        for (; i < len; i++) {
             bfloat16[i] = fp16tobf16.dict[float16[i]];
         }
     }
@@ -784,7 +950,15 @@ namespace fastllm {
     }
 
     void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len) {
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+#ifdef __AVX2__
+        for (; i + 7 < len; i += 8) {
+            __m128i b16 = _mm_loadu_si128((const __m128i*)(bfloat16 + i));
+            __m256i x = _mm256_slli_epi32(_mm256_cvtepu16_epi32(b16), 16);
+            _mm256_storeu_si256((__m256i*)(float32 + i), x);
+        }
+#endif
+        for (; i < len; i++) {
             uint32_t x = (uint32_t)bfloat16[i] << 16;
             memcpy(&float32[i], &x, sizeof(float));
         }
@@ -1615,21 +1789,147 @@ namespace fastllm {
         std::vector <uint16_t> bf16Input;
     } moeFloatSingleVarManager;
 
+    // 转置权重缓冲。USE_CPU_NUMA 下优先按 node 分片（每片 numa_alloc_onnode 到
+    // 对应 node，decode GEMV 读权重零远程）；不可分片时退回单块交织分配；再退回
+    // 对齐分配。USE_NUMAS 走 numas 模块的交织分配。
+    struct TransposedWeightBuf {
+        uint16_t *data = nullptr;      // 单块模式
+        size_t bytes = 0;
+        bool numaAllocated = false;    // data 是否来自 numa_alloc_interleaved
+
+        std::vector<uint16_t*> shards; // per-node 分片（仅 USE_CPU_NUMA）
+        std::vector<size_t> shardBytes;
+        int numCb = 0;
+        int cbPerNode = 0;             // 分片模式下每 node 覆盖的 cb 数
+
+        bool AllocateSingle(size_t b) {
+            bytes = b;
+#ifdef USE_NUMAS
+            data = (uint16_t*)allocate_interleaved(b);
+            return data != nullptr;
+#elif defined(USE_CPU_NUMA)
+            if (numa_available() == 0) {
+                data = (uint16_t*)numa_alloc_interleaved(b);
+                numaAllocated = data != nullptr;
+            }
+            if (data == nullptr) {
+                data = (uint16_t*)alignedAllocator<uint8_t, 64>().allocate(b);
+            }
+            return data != nullptr;
+#else
+            data = (uint16_t*)alignedAllocator<uint8_t, 64>().allocate(b);
+            return data != nullptr;
+#endif
+        }
+
+        bool AllocateSharded(int cbTotal, int m, int nodes) {
+#ifdef USE_CPU_NUMA
+            if (nodes < 2 || cbTotal % nodes != 0) {
+                return false;
+            }
+            int per = cbTotal / nodes;
+            size_t sBytes = (size_t)per * (m / 8) * 512 * 2;
+            shards.resize(nodes, nullptr);
+            shardBytes.resize(nodes, 0);
+            for (int n = 0; n < nodes; n++) {
+                void *p = numa_alloc_onnode(sBytes, n);
+                if (!p) {
+                    for (int i = 0; i < n; i++) {
+                        numa_free(shards[i], shardBytes[i]);
+                    }
+                    shards.clear();
+                    shardBytes.clear();
+                    return false;
+                }
+                shards[n] = (uint16_t*)p;
+                shardBytes[n] = sBytes;
+            }
+            numCb = cbTotal;
+            cbPerNode = per;
+            return true;
+#else
+            return false;
+#endif
+        }
+
+        void Free() {
+            if (data) {
+#ifdef USE_NUMAS
+                free_interleaved(data, bytes);
+#elif defined(USE_CPU_NUMA)
+                if (numaAllocated) {
+                    numa_free(data, bytes);
+                } else {
+                    alignedAllocator<uint8_t, 64>().deallocate((uint8_t*)data, bytes);
+                }
+#else
+                alignedAllocator<uint8_t, 64>().deallocate((uint8_t*)data, bytes);
+#endif
+                data = nullptr;
+                bytes = 0;
+                numaAllocated = false;
+            }
+#ifdef USE_CPU_NUMA
+            for (size_t i = 0; i < shards.size(); i++) {
+                if (shards[i]) {
+                    numa_free(shards[i], shardBytes[i]);
+                }
+            }
+            shards.clear();
+            shardBytes.clear();
+            numCb = 0;
+            cbPerNode = 0;
+#endif
+        }
+
+        TransposedWeightBuf() = default;
+        ~TransposedWeightBuf() { Free(); }
+        TransposedWeightBuf(TransposedWeightBuf &&o) noexcept
+            : data(o.data), bytes(o.bytes), numaAllocated(o.numaAllocated),
+              shards(std::move(o.shards)), shardBytes(std::move(o.shardBytes)),
+              numCb(o.numCb), cbPerNode(o.cbPerNode) {
+            o.data = nullptr;
+            o.bytes = 0;
+            o.numaAllocated = false;
+            o.numCb = 0;
+            o.cbPerNode = 0;
+        }
+        TransposedWeightBuf& operator=(TransposedWeightBuf &&o) noexcept {
+            if (this != &o) {
+                Free();
+                data = o.data;
+                bytes = o.bytes;
+                numaAllocated = o.numaAllocated;
+                shards = std::move(o.shards);
+                shardBytes = std::move(o.shardBytes);
+                numCb = o.numCb;
+                cbPerNode = o.cbPerNode;
+                o.data = nullptr;
+                o.bytes = 0;
+                o.numaAllocated = false;
+                o.numCb = 0;
+                o.cbPerNode = 0;
+            }
+            return *this;
+        }
+        TransposedWeightBuf(const TransposedWeightBuf&) = delete;
+        TransposedWeightBuf& operator=(const TransposedWeightBuf&) = delete;
+    };
+
     struct FastllmMoeDataManager {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
             // 块转置权重的缓存，key 为原始权重的 cpuData 指针（加载后固定）
             std::mutex weightTLock;
-            std::unordered_map <const uint16_t *, std::vector <uint8_t, alignedAllocator<uint8_t, 64> > > transposedWeights;
+            std::unordered_map <const uint16_t *, TransposedWeightBuf> transposedWeights;
     } fastllmMoeDataManager;
 
-    // 将 BF16 权重 [k][m]（行主序）转置为 [k/64][m/8][64][8] 的块布局：
-    // 一个 (m/8) 块内 64 列 × 8 元素 = 1024B 连续，decode 单 token GEMV 可单流连续读
-    static void TransposeBF16MoEWeightsBlock64(const uint16_t *src, uint16_t *dst,
-                                               int k, int m) {
-        const int numCb = k / 64;
-        for (int cb = 0; cb < numCb; cb++) {
-            uint16_t *dstBase = dst + (size_t)cb * (m / 8) * 512;
+    // 将 BF16 权重 [k][m]（行主序）的 cb 区间 [cbStart, cbEnd) 转置为块布局
+    // [cb][m/8][64][8]，写入 dst 从局部下标 0 开始
+    static void TransposeBF16MoEWeightsBlock64Range(const uint16_t *src, uint16_t *dst,
+                                                    int k, int m, int cbStart, int cbEnd) {
+        for (int cb = cbStart; cb < cbEnd; cb++) {
+            uint16_t *dstBase = dst + (size_t)(cb - cbStart) * (m / 8) * 512;
             for (int mb = 0; mb < m; mb += 8) {
                 uint16_t *d = dstBase + (mb / 8) * 512;
                 for (int c = 0; c < 64; c++) {
@@ -1639,23 +1939,91 @@ namespace fastllm {
         }
     }
 
-    // 获取（或生成）块转置权重，返回转置后的指针；不支持时返回 nullptr
-    static const uint16_t *GetTransposedBF16Weight(const uint16_t *src, int k, int m) {
-        if (src == nullptr || k <= 0 || m <= 0 || k % 64 != 0 || m % 8 != 0) {
-            return nullptr;
+    // 转置权重的访问视图：单块（numaCnt==1）或 per-node 分片（numaCnt>=2）
+    struct TransposedWeightView {
+        const uint16_t *single = nullptr;
+        const uint16_t *shards[8] = {};
+        int cbStart[8] = {}, cbEnd[8] = {};
+        int numCb = 0;
+        int numaCnt = 1;
+
+        bool Valid() const { return numCb > 0; }
+
+        int NodeOf(int cb) const {
+            for (int n = 0; n < numaCnt; n++) {
+                if (cb >= cbStart[n] && cb < cbEnd[n]) {
+                    return n;
+                }
+            }
+            return 0;
         }
+
+        int LocalCb(int cb) const { return cb - cbStart[NodeOf(cb)]; }
+
+        const uint16_t *ShardBase(int cb) const {
+            if (numaCnt <= 1) {
+                return single;
+            }
+            return shards[NodeOf(cb)];
+        }
+    };
+
+    static TransposedWeightView BuildTransposedWeightView(const TransposedWeightBuf &buf, int numCb) {
+        TransposedWeightView view;
+        view.numCb = numCb;
+        if (!buf.shards.empty()) {
+            view.numaCnt = (int)buf.shards.size();
+            for (int n = 0; n < view.numaCnt; n++) {
+                view.shards[n] = buf.shards[n];
+                view.cbStart[n] = n * buf.cbPerNode;
+                view.cbEnd[n] = (n + 1) * buf.cbPerNode;
+            }
+        } else {
+            view.numaCnt = 1;
+            view.single = buf.data;
+            view.cbStart[0] = 0;
+            view.cbEnd[0] = numCb;
+        }
+        return view;
+    }
+
+    // 获取（或生成）块转置权重；不支持时返回 numCb==0 的视图
+    static TransposedWeightView GetTransposedBF16Weight(const uint16_t *src, int k, int m) {
+        TransposedWeightView view;
+        if (src == nullptr || k <= 0 || m <= 0 || k % 64 != 0 || m % 8 != 0) {
+            return view;
+        }
+        int numCb = k / 64;
         {
             std::lock_guard <std::mutex> lock(fastllmMoeDataManager.weightTLock);
             auto it = fastllmMoeDataManager.transposedWeights.find(src);
             if (it != fastllmMoeDataManager.transposedWeights.end()) {
-                return (const uint16_t*)it->second.data();
+                return BuildTransposedWeightView(it->second, numCb);
             }
         }
-        std::vector <uint8_t, alignedAllocator<uint8_t, 64> > buf((size_t)k * m * 2);
-        TransposeBF16MoEWeightsBlock64(src, (uint16_t*)buf.data(), k, m);
+
+        TransposedWeightBuf buf;
+        int nodes = 1;
+#ifdef USE_CPU_NUMA
+        InitCpuNumaBinding();
+        CpuNumaState &state = GetCpuNumaState();
+        nodes = state.enabled ? std::min(state.numaCnt, 8) : 1;
+#endif
+        if (!buf.AllocateSharded(numCb, m, nodes)) {
+            if (!buf.AllocateSingle((size_t)k * m * 2)) {
+                return view;
+            }
+            TransposeBF16MoEWeightsBlock64Range(src, buf.data, k, m, 0, numCb);
+        } else {
+            int per = numCb / nodes;
+            for (int n = 0; n < nodes; n++) {
+                TransposeBF16MoEWeightsBlock64Range(src, buf.shards[n], k, m, n * per, (n + 1) * per);
+            }
+        }
+
         std::lock_guard <std::mutex> lock(fastllmMoeDataManager.weightTLock);
         auto ret = fastllmMoeDataManager.transposedWeights.emplace(src, std::move(buf));
-        return (const uint16_t*)ret.first->second.data();
+        return BuildTransposedWeightView(ret.first->second, numCb);
     }
 
     // decode 专用 GEMV：1 个 token × 64 输出列，权重为块转置布局，外层按 m 连续读 1024B
@@ -1701,16 +2069,42 @@ namespace fastllm {
     struct MultiThreadGemvBF16Block64Op : MultiThreadBaseOp {
         const uint16_t *input, *weightT;
         float *output;
-        int m, cb;
+        int m, cb, outCb, node;
 
         MultiThreadGemvBF16Block64Op(const uint16_t *input, const uint16_t *weightT,
-                                     float *output, int m, int cb)
-                : input(input), weightT(weightT), output(output), m(m), cb(cb) {}
+                                     float *output, int m, int cb, int outCb, int node)
+                : input(input), weightT(weightT), output(output), m(m), cb(cb), outCb(outCb), node(node) {}
 
         void Run() override {
-            GemvBF16Block64AVX2(input, weightT, output + cb * 64, m, cb);
+            GemvBF16Block64AVX2(input, weightT, output + outCb * 64, m, cb);
         }
     };
+
+    // decode 转置 GEMV 任务的调度：NUMA 启用且全部为转置任务时，按 node 静态分片，
+    // 每个 node 的任务只丢给该 node 的线程做 work-stealing（权重零远程）；否则退回
+    // 全局 DynamicScheduleTasks。
+    static void ScheduleCpuMoEGemm(std::vector<MultiThreadBaseOp*> &ops, int transposedCount) {
+#ifdef USE_CPU_NUMA
+        InitCpuNumaBinding();
+        CpuNumaState &state = GetCpuNumaState();
+        if (state.enabled && transposedCount == (int)ops.size() && transposedCount > 0) {
+            std::vector<std::vector<MultiThreadBaseOp*>> perNode(state.numaCnt);
+            for (auto *op : ops) {
+                auto *g = (MultiThreadGemvBF16Block64Op*)op;
+                int n = (g->node >= 0 && g->node < state.numaCnt) ? g->node : 0;
+                perNode[n].push_back(g);
+            }
+            for (int n = 0; n < state.numaCnt; n++) {
+                if (!perNode[n].empty()) {
+                    DynamicScheduleTasksRange(perNode[n], state.nodeThreadStart[n],
+                                              state.nodeThreadCount[n], GetAlivePool());
+                }
+            }
+            return;
+        }
+#endif
+        DynamicScheduleTasks(ops);
+    }
 
     void FastllmGemm (int n, int m, int k, 
         const void *A, long lda, // A [n * m], lda = bytes for 1 row in A
@@ -1752,16 +2146,23 @@ namespace fastllm {
         } else if (AType == DataType::FLOAT32) {
             if (CType == DataType::FLOAT32) {
                 if (BType == DataType::FLOAT32) {
-                    for (int i = 0; i < n; i++) {
-                        float *floatA = (float*)((uint8_t*)A + i * lda);
-                        float *floatC = (float*)((uint8_t*)C + i * ldc);
-                        for (int j = st; j < end; j++) {
-                            float *floatB = (float*)((uint8_t*)B + j * ldb);
-                            float sum = 0.0f;
-                            for (int l = 0; l < m; l++) {
-                                sum += floatA[l] * floatB[l];
+                    if (lda == (long)m * sizeof(float) &&
+                        ldb == (long)m * sizeof(float)) {
+                        MultiThreadLinearFloat32Float32Op(
+                            (float*)A, (float*)B, nullptr, (float*)C,
+                            n, m, (int)(ldc / sizeof(float)), st, end).Run();
+                    } else {
+                        for (int i = 0; i < n; i++) {
+                            float *floatA = (float*)((uint8_t*)A + i * lda);
+                            float *floatC = (float*)((uint8_t*)C + i * ldc);
+                            for (int j = st; j < end; j++) {
+                                float *floatB = (float*)((uint8_t*)B + j * ldb);
+                                float sum = 0.0f;
+                                for (int l = 0; l < m; l++) {
+                                    sum += floatA[l] * floatB[l];
+                                }
+                                floatC[j] = sum;
                             }
-                            floatC[j] = sum;
                         }
                     }
                     finish = true;
@@ -2207,8 +2608,12 @@ namespace fastllm {
 
             const __m256 expNegX = exp256_ps(
                 _mm256_sub_ps(_mm256_setzero_ps(), x));
-            const __m256 silu = _mm256_div_ps(
-                x, _mm256_add_ps(_mm256_set1_ps(1.0f), expNegX));
+            const __m256 den = _mm256_add_ps(
+                _mm256_set1_ps(1.0f), expNegX);
+            __m256 r = _mm256_rcp_ps(den);
+            r = _mm256_mul_ps(
+                r, _mm256_fnmadd_ps(den, r, _mm256_set1_ps(2.0f)));
+            const __m256 silu = _mm256_mul_ps(x, r);
             _mm256_storeu_ps(output + i, _mm256_mul_ps(silu, y));
         }
 #endif
@@ -2317,29 +2722,65 @@ namespace fastllm {
             
     void MultiThreadReduceBatchOp::Run() {
             for (int i = batch_st; i < batch_end; i++) {
-                bool initialized = false;
+                bool initialized = preZeroed;
+                float *dst = lastOutput + (size_t)i * hidden_size;
                 for (int expert_idx = 0; expert_idx < k; expert_idx++) {
                     int curPos = pos[i * k + expert_idx];
                     if (curPos == -1) continue; // 跳过无效位置
                     float weight = weights[curPos];
+                    const float *src =
+                        ((float*)downOutData) + (size_t)curPos * hidden_size;
                     if (!initialized) {
-                        // 第一个有效专家：初始化输出
-                        for (int h = hidden_st; h < hidden_end; h++) {
-                            lastOutput[i * hidden_size + h] = weight * ((float*)downOutData)[curPos * hidden_size + h];
+#ifdef __AVX2__
+                        const __m256 vw = _mm256_set1_ps(weight);
+                        int h = hidden_st;
+                        for (; h + 7 < hidden_end; h += 8) {
+                            _mm256_storeu_ps(dst + h,
+                                _mm256_mul_ps(vw, _mm256_loadu_ps(src + h)));
                         }
+                        for (; h < hidden_end; h++) {
+                            dst[h] = weight * src[h];
+                        }
+#else
+                        for (int h = hidden_st; h < hidden_end; h++) {
+                            dst[h] = weight * src[h];
+                        }
+#endif
                         initialized = true;
                     } else {
-                        // 累加其余专家的贡献
-                        for (int h = hidden_st; h < hidden_end; h++) {
-                            lastOutput[i * hidden_size + h] += weight * ((float*)downOutData)[curPos * hidden_size + h];
+#ifdef __AVX2__
+                        const __m256 vw = _mm256_set1_ps(weight);
+                        int h = hidden_st;
+                        for (; h + 7 < hidden_end; h += 8) {
+                            _mm256_storeu_ps(dst + h,
+                                _mm256_fmadd_ps(vw, _mm256_loadu_ps(src + h),
+                                    _mm256_loadu_ps(dst + h)));
                         }
+                        for (; h < hidden_end; h++) {
+                            dst[h] += weight * src[h];
+                        }
+#else
+                        for (int h = hidden_st; h < hidden_end; h++) {
+                            dst[h] += weight * src[h];
+                        }
+#endif
                     }
                 }
                 if (!initialized) {
-                    // 如果没有有效专家，初始化为0
-                    for (int h = hidden_st; h < hidden_end; h++) {
-                        lastOutput[i * hidden_size + h] = 0.0f;
+#ifdef __AVX2__
+                    const __m256 vzero = _mm256_setzero_ps();
+                    int h = hidden_st;
+                    for (; h + 7 < hidden_end; h += 8) {
+                        _mm256_storeu_ps(dst + h, vzero);
                     }
+                    for (; h < hidden_end; h++) {
+                        dst[h] = 0.0f;
+                    }
+#else
+                    for (int h = hidden_st; h < hidden_end; h++) {
+                        dst[h] = 0.0f;
+                    }
+#endif
                 }
             }
     }
@@ -2347,7 +2788,7 @@ namespace fastllm {
     void MultiThreadReduceBatch(uint8_t *downOutData, DataType downOutDataType,
                     float *weights, float *lastOutput,
                     int *pos, int bsz, int k,
-                    int hidden_size) {
+                    int hidden_size, bool preZeroed) {
         auto *pool = GetAlivePool();
         int threadNum = pool->threads.size();
         
@@ -2389,7 +2830,8 @@ namespace fastllm {
                     pos, bsz, k,
                     hidden_size,
                     batch_st, batch_end,
-                    hidden_st, hidden_end));
+                    hidden_st, hidden_end,
+                    preZeroed));
                 
                 pool->PushOp(op_idx++, ops.back());
             }
@@ -4260,6 +4702,7 @@ long long ops = 0;
                     int offset = 0;
                     int stride = 64;
                     std::vector<MultiThreadBaseOp*> gemmOps;
+                    int transposedCount = 0;
                     for (int e = 0; e < expertTasks.size(); e++) {
                         if (weights[e * 2] != nullptr && expertTasks[e].size() > 0) {
                             int lines = expertTasks[e].size();
@@ -4273,16 +4716,18 @@ long long ops = 0;
                             // Get weight data (assuming weights are stored as BFloat16)
                             uint16_t* weightPtr = (uint16_t*)(weights[e * 2]->cpuData);
 
-                            const uint16_t *weightT = nullptr;
+                            TransposedWeightView tw;
                             if (lines == 1 && weights[e * 2]->dataType == DataType::BFLOAT16) {
-                                weightT = GetTransposedBF16Weight(weightPtr, interDim * 2, inputDim);
+                                tw = GetTransposedBF16Weight(weightPtr, interDim * 2, inputDim);
                             }
-                            if (weightT != nullptr) {
-                                for (int cb = 0; cb < interDim * 2 / 64; cb++) {
+                            if (tw.Valid()) {
+                                int numCb = interDim * 2 / 64;
+                                for (int cb = 0; cb < numCb; cb++) {
                                     gemmOps.push_back(new MultiThreadGemvBF16Block64Op(
-                                        expertInputPtr, weightT, expertGateUpOutputPtr,
-                                        inputDim, cb
+                                        expertInputPtr, tw.ShardBase(cb), expertGateUpOutputPtr,
+                                        inputDim, tw.LocalCb(cb), cb, tw.NodeOf(cb)
                                     ));
+                                    transposedCount++;
                                 }
                             } else {
                                 for (int st = 0; st < interDim * 2; st += stride) {
@@ -4299,7 +4744,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                             offset += lines;
                         }
                     }
-                    DynamicScheduleTasks(gemmOps);
+                    ScheduleCpuMoEGemm(gemmOps, transposedCount);
 //printf("ops = %f g\n", (float)ops / 1e9);
                 }
 //printf("gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
@@ -4323,6 +4768,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     int offset = 0;
                     int stride = 64;
                     std::vector <MultiThreadBaseOp*> gemmOps;
+                    int transposedCount = 0;
                     for (int e = 0; e < expertTasks.size(); e++) {
                         if (weights[e * 2 + 1] != nullptr && expertTasks[e].size() > 0) {
                             int lines = expertTasks[e].size();
@@ -4336,16 +4782,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                             // Get weight data (assuming weights are stored as BFloat16)
                             uint16_t* weightPtr = (uint16_t*)(weights[e * 2 + 1]->cpuData);
 
-                            const uint16_t *weightT = nullptr;
+                            TransposedWeightView tw;
                             if (lines == 1 && weights[e * 2 + 1]->dataType == DataType::BFLOAT16) {
-                                weightT = GetTransposedBF16Weight(weightPtr, dim, interDim);
+                                tw = GetTransposedBF16Weight(weightPtr, dim, interDim);
                             }
-                            if (weightT != nullptr) {
-                                for (int cb = 0; cb < dim / 64; cb++) {
+                            if (tw.Valid()) {
+                                int numCb = dim / 64;
+                                for (int cb = 0; cb < numCb; cb++) {
                                     gemmOps.push_back(new MultiThreadGemvBF16Block64Op(
-                                        (const uint16_t*)expertDownInputPtr, weightT,
-                                        (float*)expertDownOutputPtr, interDim, cb
+                                        (const uint16_t*)expertDownInputPtr, tw.ShardBase(cb),
+                                        (float*)expertDownOutputPtr, interDim,
+                                        tw.LocalCb(cb), cb, tw.NodeOf(cb)
                                     ));
+                                    transposedCount++;
                                 }
                             } else {
                                 for (int st = 0; st < dim; st += stride) {
@@ -4361,7 +4810,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                             offset += lines;
                         }
                     }
-                    DynamicScheduleTasks(gemmOps);
+                    ScheduleCpuMoEGemm(gemmOps, transposedCount);
                 }
 
 //printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
@@ -5423,12 +5872,12 @@ ops += (long long)lines * inputDim * interDim * 2;
     };
 
     static void RunMultiThreadRMSNormFloat16(uint16_t *output, uint16_t *input, float *weight, int outer, int channels, float eps, AliveThreadPool *pool) {
-        if (outer == 1) {
+        if (outer <= 1 || (long long)outer * channels < 65536) {
             (MultiThreadRMSNormFloat16Op(output, input, weight, outer, channels, eps)).Run();
             return;
         }
-        int threadNum = pool->threads.size();
-        int per = outer / pool->threads.size();
+        int threadNum = std::min((int)pool->threads.size(), outer);
+        int per = outer / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadRMSNormFloat16Op*> ops;
         for (int i = 0; i < threadNum; i++) {
@@ -5478,12 +5927,12 @@ ops += (long long)lines * inputDim * interDim * 2;
     };
 
     static void RunMultiThreadRMSNormBFloat16(uint16_t *output, uint16_t *input, float *weight, int outer, int channels, float eps, AliveThreadPool *pool) {
-        if (outer == 1) {
+        if (outer <= 1 || (long long)outer * channels < 65536) {
             (MultiThreadRMSNormBFloat16Op(output, input, weight, outer, channels, eps)).Run();
             return;
         }
-        int threadNum = pool->threads.size();
-        int per = outer / pool->threads.size();
+        int threadNum = std::min((int)pool->threads.size(), outer);
+        int per = outer / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadRMSNormBFloat16Op*> ops;
         for (int i = 0; i < threadNum; i++) {
