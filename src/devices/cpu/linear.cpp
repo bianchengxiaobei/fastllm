@@ -363,6 +363,54 @@ namespace fastllm {
 #ifdef __AVX2__
         const __m128i nibbleMask128 = _mm_set1_epi8(0x0f);
         const __m256i ones = _mm256_set1_epi16(1);
+
+        if (n == 1) {
+            // GEMV fast path.  MoE decode runs n==1 per expert, so hoist the
+            // per-group input scale/sum out of the column loop.  Column-outer
+            // order is kept: weight bytes stream contiguously, which dominates
+            // the single-row case.  (sum - aSum8[g]) stays exact integer
+            // arithmetic, identical to the generic loop's rounding.
+            static thread_local std::vector<float> aScaleBuf;
+            static thread_local std::vector<int> aSum8Buf;
+            if ((int)aScaleBuf.size() < groups) {
+                aScaleBuf.resize(groups);
+                aSum8Buf.resize(groups);
+            }
+            const uint8_t *inputRow = inputData;
+            for (int g = 0; g < groups; g++) {
+                const uint8_t *inputGroup = inputRow + (size_t)g * astride;
+                aScaleBuf[g] = *(const float*)(inputGroup + groupCnt);
+                aSum8Buf[g] = 8 * *(const int*)(inputGroup + groupCnt + sizeof(float));
+            }
+            float *floatC = (float*)outputData;
+            for (int j = st; j < end; j++) {
+                const uint8_t *weightRow = weightData + (size_t)j * ldb;
+                float total = 0.0f;
+                for (int g = 0; g < groups; g++) {
+                    const int8_t *quantizedInput =
+                        (const int8_t*)(inputRow + (size_t)g * astride);
+                    const uint8_t *weightGroup = weightRow +
+                        GetInt4Group32DataOffset(g, groups);
+                    const uint16_t scaleBits = *(const uint16_t*)(weightRow +
+                        GetInt4Group32ScaleOffset(g, groups));
+                    const float scaleB = BFloat16BitsToFloat32(scaleBits);
+
+                    __m128i packed = _mm_loadu_si128((const __m128i*)weightGroup);
+                    __m128i low = _mm_and_si128(packed, nibbleMask128);
+                    __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), nibbleMask128);
+                    __m256i quantizedWeight = _mm256_set_m128i(
+                        _mm_unpackhi_epi8(high, low), _mm_unpacklo_epi8(high, low));
+                    __m256i input = _mm256_loadu_si256((const __m256i*)quantizedInput);
+                    __m256i products = _mm256_maddubs_epi16(quantizedWeight, input);
+                    int sum = I32sum(_mm256_madd_epi16(products, ones));
+
+                    total += (float)(sum - aSum8Buf[g]) * aScaleBuf[g] * scaleB;
+                }
+                floatC[j] = total;
+            }
+            AddBias(outputData, biasData, n, k, st, end);
+            return true;
+        }
 #endif
         for (int i = 0; i < n; i++) {
             float *floatC = (float*)((uint8_t*)outputData + (size_t)i * ldc);

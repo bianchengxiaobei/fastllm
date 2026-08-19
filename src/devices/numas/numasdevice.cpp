@@ -1196,7 +1196,11 @@ namespace fastllm {
             std::vector<MultiThreadDeepSeekV4NumasRoundOutputOp> roundOps;
             std::vector<MultiThreadDeepSeekV4NumasStoreOutputOp> storeOps;
             std::vector<MultiThreadDeepSeekV4NumasReduceOp> reduceOps;
-    #ifdef USE_CUDA
+            std::vector<MultiThreadMemcpyMultiLinesTask> memcpyTaskStorage;
+            std::vector<int> reducePos, sampleExpertIdx, samplesExpertCount;
+            std::vector<int> expertOffsets, reduceExpertOrder;
+            std::vector<float> taskWeights;
+#ifdef USE_CUDA
             std::unique_ptr<void, FastllmCudaHostFreeDeleter> pinnedOutput {nullptr};
             size_t pinnedOutputBytes = 0;
             std::unique_ptr<void, FastllmCudaFreeDeleter> gpuOutputStaging {nullptr};
@@ -4967,7 +4971,10 @@ namespace fastllm {
         auto& downOutput = fastllmMoeDataManagerNumas.downOutput;
         auto& reduceOutput = fastllmMoeDataManagerNumas.reduceOutput;
 
-        int alignTotalLines = ((totalLines - 1) / 64 + 1) * 64;
+        // 64-byte alignment comes from the alignedAllocator base pointer, so
+        // rows only need padding to the AVX2 8-float granularity.  Padding to
+        // 64 wastes ~7x scratch memory during decode (totalLines ~ topk + 1).
+        int alignTotalLines = ((totalLines - 1) / 8 + 1) * 8;
         // 计算所需大小
         size_t realInputSize = GetDataBytes(startDataType, bs, inputDim);
         size_t inputFloat32Size = (size_t)bs * inputDim;
@@ -5028,7 +5035,7 @@ namespace fastllm {
         }
 
         // 1. realInput -> expandInput
-        std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
+        auto &memcpyTasks = fastllmMoeDataManagerNumas.memcpyTaskStorage;
         memcpyTasks.resize(totalLines);
         {
             uint8_t* realInputPtr = realInput.data();
@@ -5109,6 +5116,11 @@ namespace fastllm {
             // tasks for an eight-row verifier layer and erase the cache reuse
             // gained by grouping repeated experts.
             stride = 208;
+        } else if (gateColsPerNuma % 128 == 0) {
+            // Fewer, larger column chunks amortize work-stealing/scheduling
+            // overhead on AVX2-only machines.  128 stays group32-aligned
+            // (128 % 64 == 0), so the fused INF_INT8_GROUP32 path is safe.
+            stride = 128;
         }
         const bool skipRedundantCrossSwiglu =
             useDeepSeekV4LargeFast;
@@ -5292,7 +5304,10 @@ namespace fastllm {
 
         // 5. down
         offset = 0;
-        stride = useDeepSeekV4GroupedDecodeFast ? 128 : 64;
+        // Down projection writes plain FLOAT32 with no swiglu/quantization
+        // alignment constraints, so always use the wider 128-column chunks to
+        // cut per-task scheduling overhead (grouped-decode already uses 128).
+        stride = 128;
         auto &downTaskStorage =
             fastllmMoeDataManagerNumas.gemmTaskStorage;
         std::vector<std::vector<MultiThreadBaseOp*>> &downOps =
@@ -5429,25 +5444,36 @@ namespace fastllm {
 
         // 6. reduce
         {
+            auto &samplesExpertCount =
+                fastllmMoeDataManagerNumas.samplesExpertCount;
+            auto &reducePos = fastllmMoeDataManagerNumas.reducePos;
+            auto &taskWeights = fastllmMoeDataManagerNumas.taskWeights;
+            auto &sampleExpertIdx =
+                fastllmMoeDataManagerNumas.sampleExpertIdx;
+            auto &expertOffsets =
+                fastllmMoeDataManagerNumas.expertOffsets;
+            auto &reduceExpertOrder =
+                fastllmMoeDataManagerNumas.reduceExpertOrder;
+
             // 计算每个样本选择的专家数 k
             int k = 0;
-            std::vector<int> samples_expert_count(bs, 0);
+            samplesExpertCount.assign(bs, 0);
             for (int e = 0; e < (int)expertTasks.size(); e++) {
                 if (weights[e * 2] != nullptr && isCpuExpert[e]) {
                     for (auto& task : expertTasks[e]) {
                         int rowIdx = task.first;
-                        samples_expert_count[rowIdx]++;
-                        k = std::max(k, samples_expert_count[rowIdx]);
+                        samplesExpertCount[rowIdx]++;
+                        k = std::max(k, samplesExpertCount[rowIdx]);
                     }
                 }
             }
 
-            // 分配内存: task_weights 按 totalLines 大小，以 downOutput 行号索引
-            std::vector<int> pos(bs * k, -1);
-            std::vector<float> task_weights(totalLines, 0.0f);
-            std::vector<int> sample_expert_idx(bs, 0);
+            // task_weights 按 totalLines 大小，以 downOutput 行号索引
+            reducePos.assign(bs * k, -1);
+            taskWeights.assign(totalLines, 0.0f);
+            sampleExpertIdx.assign(bs, 0);
 
-            std::vector<int> expertOffsets(expertTasks.size(), -1);
+            expertOffsets.assign(expertTasks.size(), -1);
             int reduceOffset = 0;
             for (int e = 0; e < (int)expertTasks.size(); e++) {
                 if (weights[e * 2] != nullptr && isCpuExpert[e]) {
@@ -5455,7 +5481,7 @@ namespace fastllm {
                     reduceOffset += expertTasks[e].size();
                 }
             }
-            std::vector<int> reduceExpertOrder;
+            reduceExpertOrder.clear();
             if (deepSeekV4Mode) {
                 for (int e = 1; e < (int)expertTasks.size(); e++) {
                     reduceExpertOrder.push_back(e);
@@ -5472,10 +5498,10 @@ namespace fastllm {
                     for (auto& task : expertTasks[e]) {
                         int rowIdx = task.first;
                         float weight = deepSeekV4Mode ? 1.0f : task.second;
-                        int idx = sample_expert_idx[rowIdx]++;
+                        int idx = sampleExpertIdx[rowIdx]++;
                         int outputRow = expertOffsets[e] + line++;
-                        pos[rowIdx * k + idx] = outputRow;
-                        task_weights[outputRow] = weight;
+                        reducePos[rowIdx * k + idx] = outputRow;
+                        taskWeights[outputRow] = weight;
                     }
                 }
             }
@@ -5488,13 +5514,13 @@ namespace fastllm {
             MultiThreadReduceBatch(
                 (uint8_t*)downOutput.data(),  // downOutData
                 DataType::FLOAT32,             // downOutDataType
-                task_weights.data(),           // weights
+                taskWeights.data(),            // weights
                 lastOutput,                    // lastOutput
-                pos.data(),                    // pos
+                reducePos.data(),              // pos
                 bs,                           // bsz
                 k,                            // k (每个样本的专家数)
                 dim,                          // hidden_size
-                true                          // lastOutput 已 memset 清零
+                false                         // 首专家走 mul+store，省略读 dst=0
             );
         }
 
