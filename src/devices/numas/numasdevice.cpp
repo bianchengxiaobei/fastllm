@@ -4542,49 +4542,64 @@ namespace fastllm {
                     activeExpertCount++;
                 }
             }
+            int originalMaxTaskSize = maxTaskSize;
             maxTaskSize = std::min(maxTaskSize, defaultExpertLimit);
+            // GPU 候选按 GPU 耗时降序预排一次（LPT 序）。阈值 t 递增时专家
+            // 只会从 GPU 集合移入 CPU 集合，过滤保序，无需每轮重新 sort。
+            std::vector<int> gpuOrder;
+            gpuOrder.reserve(numExperts);
+            for (int e = 0; e < numExperts; e++) {
+                if (expertValid[e] && expertSz[e] > 0) {
+                    gpuOrder.push_back(e);
+                }
+            }
+            std::sort(gpuOrder.begin(), gpuOrder.end(),
+                      [&](int a, int b) {
+                          if (expertGpu[a] != expertGpu[b]) {
+                              return expertGpu[a] > expertGpu[b];
+                          }
+                          return a < b;
+                      });
+            // 按路由数分组，CPU 耗时增量累加，避免每轮全量重扫。
+            std::vector<std::vector<int> > bySz(originalMaxTaskSize + 2);
+            for (int e = 0; e < numExperts; e++) {
+                if (expertValid[e] && expertSz[e] > 0) {
+                    bySz[expertSz[e]].push_back(e);
+                }
+            }
+            std::vector<double> gpuTimes;
+            gpuTimes.reserve(gpuOrder.size());
+            std::vector<double> gpuLoads(gpuCount, 0.0);
+            double cpuTime = 0.0;
             for (int t = 1; t <= maxTaskSize + 1; t++) {
-                double cpuTime = 0.0;
-                std::vector<std::pair<double, int> > gpuJobs;
-                for (int e = 0; e < numExperts; e++) {
-                    if (!expertValid[e]) {
-                        continue;
-                    }
-                    if (expertSz[e] < t) {
-                        cpuTime += expertCpu[e];
-                    } else {
-                        gpuJobs.push_back({expertGpu[e], e});
+                gpuTimes.clear();
+                for (int e : gpuOrder) {
+                    if (expertSz[e] >= t) {
+                        gpuTimes.push_back(expertGpu[e]);
                     }
                 }
-                if (gpuCount > 1 && activeExpertCount >= gpuCount &&
-                    (int)gpuJobs.size() < gpuCount) {
-                    continue;
+                if (!(gpuCount > 1 && activeExpertCount >= gpuCount &&
+                      (int)gpuTimes.size() < gpuCount)) {
+                    std::fill(gpuLoads.begin(), gpuLoads.end(), 0.0);
+                    for (double g : gpuTimes) {
+                        auto loadIt = std::min_element(
+                            gpuLoads.begin(), gpuLoads.end());
+                        *loadIt += g;
+                    }
+                    double gpuTime = gpuTimes.empty() ? 0.0 :
+                        *std::max_element(gpuLoads.begin(), gpuLoads.end());
+                    double metric = gpuCount == 1 ?
+                        std::fabs(cpuTime - gpuTime) :
+                        std::max(cpuTime, gpuTime);
+                    if (metric < bestMetric) {
+                        bestMetric = metric;
+                        bestLimit = t;
+                        bestCpuTime = cpuTime;
+                        bestGpuTime = gpuTime;
+                    }
                 }
-                std::sort(
-                    gpuJobs.begin(), gpuJobs.end(),
-                    [](const std::pair<double, int> &a,
-                       const std::pair<double, int> &b) {
-                        if (a.first != b.first) {
-                            return a.first > b.first;
-                        }
-                        return a.second < b.second;
-                    });
-                std::vector<double> gpuLoads(gpuCount, 0.0);
-                for (const auto &job : gpuJobs) {
-                    auto loadIt = std::min_element(
-                        gpuLoads.begin(), gpuLoads.end());
-                    *loadIt += job.first;
-                }
-                double gpuTime = gpuLoads.empty() ? 0.0 :
-                    *std::max_element(gpuLoads.begin(), gpuLoads.end());
-                double metric = gpuCount == 1 ?
-                    std::fabs(cpuTime - gpuTime) :
-                    std::max(cpuTime, gpuTime);
-                if (metric < bestMetric) {
-                    bestMetric = metric;
-                    bestLimit = t;
-                    bestCpuTime = cpuTime;
-                    bestGpuTime = gpuTime;
+                for (int e : bySz[t]) {
+                    cpuTime += expertCpu[e];
                 }
             }
             if (profile.lastPrintedLimit != bestLimit) {

@@ -7123,6 +7123,12 @@ namespace fastllm {
         Data tempMiddle;
         Data tempSwiglu;
         Data tempOutput;
+        void *cudaIndex = nullptr;
+        size_t cudaIndexBytes = 0;
+        void *cudaScales = nullptr;
+        size_t cudaScalesBytes = 0;
+        void *cudaUnitScales = nullptr;
+        size_t cudaUnitScalesBytes = 0;
     };
 
     static CudaMergeMoeFromCpuWorkspace &GetCudaMergeMoeFromCpuWorkspace(
@@ -7228,8 +7234,22 @@ namespace fastllm {
         }
 
 // ForceDeviceSync(); timeCnt["get experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-        int *cudaIndex = (int*)FastllmCudaMalloc(indexVec.size() * sizeof(int));
-        float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
+        auto ensureBuf = [](void *&buf, size_t &cap, size_t need) -> void* {
+            if (cap < need) {
+                if (buf != nullptr) {
+                    FastllmCudaFree(buf);
+                }
+                buf = FastllmCudaMalloc(need);
+                cap = need;
+            }
+            return buf;
+        };
+        int *cudaIndex = (int*)ensureBuf(
+            workspace.cudaIndex, workspace.cudaIndexBytes,
+            indexVec.size() * sizeof(int));
+        float *cudaScales = (float*)ensureBuf(
+            workspace.cudaScales, workspace.cudaScalesBytes,
+            scales.size() * sizeof(float));
         float *cudaUnitScales = nullptr;
 // ForceDeviceSync(); timeCnt["malloc index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
@@ -7239,7 +7259,8 @@ namespace fastllm {
                 isCrossSwiglu && gateType == MoeGateSwiglu,
                 "DeepSeek-V4 CUDA NUMA MoE requires cross-SwiGLU weights.");
             std::vector<float> unitScales(scales.size(), 1.0f);
-            cudaUnitScales = (float*)FastllmCudaMalloc(
+            cudaUnitScales = (float*)ensureBuf(
+                workspace.cudaUnitScales, workspace.cudaUnitScalesBytes,
                 unitScales.size() * sizeof(float));
             FastllmCudaCopyFromHostToDevice(
                 cudaUnitScales, unitScales.data(),
@@ -7449,11 +7470,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);
 
-        FastllmCudaFree(cudaIndex);
-        FastllmCudaFree(cudaScales);
-        if (cudaUnitScales != nullptr) {
-            FastllmCudaFree(cudaUnitScales);
-        }
 // printf("copy weight %f G.\n", total / 1e9);
 
         input.FreeCudaTemporary({}, false);
