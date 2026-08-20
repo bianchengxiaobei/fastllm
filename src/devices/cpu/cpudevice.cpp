@@ -3334,10 +3334,7 @@ namespace fastllm {
         // 清理资源
         for (int i = 0; i < numThreads; i++) {
             delete wsOps[i];
-            if (taskStates[i] != nullptr) {
-                taskStates[i]->~TaskState();
-                delete taskStates[i];
-            }
+            delete taskStates[i];
         }
         
         // 删除原始ops
