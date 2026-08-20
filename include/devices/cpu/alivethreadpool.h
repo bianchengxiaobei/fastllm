@@ -29,6 +29,7 @@ namespace fastllm {
     }
     struct MultiThreadBaseOp {
         virtual void Run() = 0;
+        virtual ~MultiThreadBaseOp() = default;
     };
 
     struct AliveThreadTask {
@@ -152,7 +153,7 @@ namespace fastllm {
 
         ~MultiThreadMultiOps() {
             for (int i = 0; i < ops.size(); i++) {
-                delete[] ops[i];
+                delete ops[i];
             }
         }
     };

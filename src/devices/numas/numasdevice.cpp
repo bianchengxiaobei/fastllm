@@ -812,6 +812,106 @@ namespace fastllm {
         }
     }
 
+    struct NumasMoeFirstTouchOp : MultiThreadBaseOp {
+        uint8_t *data;
+        size_t totalBytes, rows, rowBytes, offset, len;
+
+        NumasMoeFirstTouchOp(
+            uint8_t *data, size_t totalBytes, size_t rows,
+            size_t rowBytes, size_t offset, size_t len
+        ) : data(data), totalBytes(totalBytes), rows(rows),
+            rowBytes(rowBytes), offset(offset), len(len) {}
+
+        void Run() override {
+            // Zeroing faults the pages in on this worker's NUMA node.  The
+            // content itself is overwritten before use.
+            for (size_t r = 0; r < rows; r++) {
+                size_t rowStart = r * rowBytes;
+                if (rowStart + offset >= totalBytes) {
+                    break;
+                }
+                size_t avail = std::min(
+                    len, totalBytes - rowStart - offset);
+                memset(data + rowStart + offset, 0, avail);
+            }
+        }
+    };
+
+    // Fault fresh scratch pages in from one worker of every NUMA node.  The
+    // caller thread would otherwise place every page on its own node and
+    // force the other socket's workers through the QPI link for the whole
+    // bandwidth-bound MoE pipeline.  When rowBytes divides evenly across the
+    // nodes, each node owns the same per-row column shard the gate/down
+    // kernels write there; rowBytes == 0 falls back to a flat split.
+    static void NumasMoeFirstTouch(
+        uint8_t *data, size_t bytes, size_t rowBytes
+    ) {
+        static const bool disabled =
+            std::getenv(
+                "FASTLLM_NUMAS_MOE_DISABLE_FIRST_TOUCH") != nullptr;
+        if (disabled || bytes == 0) {
+            return;
+        }
+        auto *pool = GetAlivePool();
+        auto *numaConfig = GetNumaConfig();
+        if (pool == nullptr || numaConfig == nullptr ||
+            numaConfig->numaCnt <= 1) {
+            return;
+        }
+        const int nodes = numaConfig->numaCnt;
+        if (rowBytes == 0 || rowBytes > bytes ||
+            rowBytes % nodes != 0) {
+            rowBytes = bytes;
+        }
+        const size_t chunk = rowBytes / nodes;
+        const size_t rows = (bytes + rowBytes - 1) / rowBytes;
+        std::vector<NumasMoeFirstTouchOp> ops;
+        std::vector<int> tids;
+        ops.reserve(nodes);
+        tids.reserve(nodes);
+        for (int nid = 0; nid < nodes; nid++) {
+            if (numaConfig->numaToCpuDict[nid].empty()) {
+                continue;
+            }
+            const size_t offset = (size_t)nid * chunk;
+            const size_t len = (nid == nodes - 1) ?
+                (rowBytes - offset) : chunk;
+            ops.emplace_back(
+                data, bytes, rows, rowBytes, offset, len);
+            tids.push_back(numaConfig->numaToCpuDict[nid][0].first);
+        }
+        for (int i = 0; i < (int)ops.size(); i++) {
+            pool->PushOp(tids[i], &ops[i]);
+        }
+        for (int i = 0; i < (int)ops.size(); i++) {
+            pool->Wait(tids[i]);
+        }
+    }
+
+    // Grow a cached MoE scratch buffer.  Newly committed pages are faulted
+    // in by one worker per NUMA node (see NumasMoeFirstTouch) instead of by
+    // the calling thread.  Only capacity growth pays the touch cost; small
+    // buffers (< 1 MiB) stay on the plain resize path because they fit in
+    // the shared L3 anyway.
+    template <typename Vector>
+    static void NumasMoeEnsureScratchSize(
+        Vector &buf, size_t need, size_t rowBytes
+    ) {
+        if (buf.size() >= need) {
+            return;
+        }
+        if (buf.capacity() < need) {
+            const size_t newCap = std::max(need, buf.capacity() * 2);
+            buf.reserve(newCap);
+            const size_t newBytes =
+                newCap * sizeof(typename Vector::value_type);
+            if (newBytes >= (1u << 20)) {
+                NumasMoeFirstTouch((uint8_t*)buf.data(), newBytes, rowBytes);
+            }
+        }
+        buf.resize(need);
+    }
+
     void Fp8ToFastllmFP8_E4M3_BLOCK128(int experts, int k, int m, uint8_t *fp8, float *scales, int blockK, int blockM, std::vector <uint8_t> &fp8Packed) {
         int ks = (k - 1) / blockK + 1;
         int ms = (m - 1) / blockM + 1;
@@ -4988,28 +5088,29 @@ namespace fastllm {
         size_t downOutputSize = alignTotalLines * outputDim;
         size_t reduceOutputSize = bs * outputDim;
 
-        // 只在当前容量不足时才进行 resize
+        // 只在当前容量不足时才进行 resize；大缓冲区新增的页由
+        // 各 NUMA 节点的 worker 分别 touch，避免全部落在单节点
         if (realInput.size() < realInputSize) {
             realInput.resize(realInputSize);
         }
         if (input.dataType != DataType::FLOAT32 && inputFloat32.size() < inputFloat32Size) {
             inputFloat32.resize(inputFloat32Size);
         }
-        if (expandInput.size() < expandInputSize) {
-            expandInput.resize(expandInputSize);
-        }
-        if (gateUpOutput.size() < gateUpOutputSize) {
-            gateUpOutput.resize(gateUpOutputSize);
-        }
-        if (swigluOutput.size() < swigluOutputSize) {
-            swigluOutput.resize(swigluOutputSize);
-        }
-        if (downInput.size() < downInputSize) {
-            downInput.resize(downInputSize);
-        }
-        if (downOutput.size() < downOutputSize) {
-            downOutput.resize(downOutputSize);
-        }
+        NumasMoeEnsureScratchSize(
+            expandInput, expandInputSize,
+            GetDataBytes(startDataType, 1, inputDim));
+        NumasMoeEnsureScratchSize(
+            gateUpOutput, gateUpOutputSize,
+            (size_t)interDim * 2 * sizeof(float));
+        NumasMoeEnsureScratchSize(
+            swigluOutput, swigluOutputSize,
+            (size_t)interDim * sizeof(float));
+        NumasMoeEnsureScratchSize(
+            downInput, downInputSize,
+            GetDataBytes(downInputDataType, 1, interDim));
+        NumasMoeEnsureScratchSize(
+            downOutput, downOutputSize,
+            (size_t)dim * sizeof(float));
         // downOutput 不需要 fill 0：所有有效行都会被 down 阶段完整写入；
         if (reduceOutput.size() < reduceOutputSize) {
             reduceOutput.resize(reduceOutputSize);
@@ -5969,11 +6070,13 @@ namespace fastllm {
         // Verification rows are strongly correlated and commonly route to
         // the same experts.  The ordinary small-batch path below completes
         // every row independently, re-reading those expert weights once per
-        // row.  Group DSpark-sized batches by expert and execute one M-row
-        // GEMM so the decoded weight tiles are shared by all matching rows.
-        // Keep larger small batches on their established path until they have
+        // row.  Group small batches by expert and execute one M-row GEMM so
+        // the decoded weight tiles are shared by all matching rows.  Decode
+        // is weight-bandwidth-bound (especially on AVX2-only hosts), so the
+        // grouped path applies to every mode, not just DeepSeek-V4.  Keep
+        // larger small batches on their established path until they have
         // dedicated scheduling and correctness coverage.
-        const bool useGroupedDecode = deepSeekV4Mode && n > 1 && n <= 8 &&
+        const bool useGroupedDecode = n > 1 && n <= 8 &&
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE") == nullptr;
         if (useGroupedDecode) {
@@ -6097,25 +6200,26 @@ namespace fastllm {
                     size_t downOutputSize = v.size() * outputDim;
                     size_t reduceOutputSize = 1 * outputDim;
 
-                    // 只在当前容量不足时才进行 resize
+                    // 只在当前容量不足时才进行 resize；大缓冲区新增的页由
+                    // 各 NUMA 节点的 worker 分别 touch，避免全部落在单节点
                     if (realInput.size() < realInputSize) {
                         realInput.resize(realInputSize);
                     }
                     if (input.dataType != DataType::FLOAT32 && inputFloat32.size() < inputFloat32Size) {
                         inputFloat32.resize(inputFloat32Size);
                     }
-                    if (gateUpOutput.size() < gateUpOutputSize) {
-                        gateUpOutput.resize(gateUpOutputSize);
-                    }
-                    if (swigluOutput.size() < swigluOutputSize) {
-                        swigluOutput.resize(swigluOutputSize);
-                    }
-                    if (downInput.size() < downInputSize) {
-                        downInput.resize(downInputSize);
-                    }
-                    if (downOutput.size() < downOutputSize) {
-                        downOutput.resize(downOutputSize);
-                    }
+                    NumasMoeEnsureScratchSize(
+                        gateUpOutput, gateUpOutputSize,
+                        (size_t)interDim * 2 * sizeof(float));
+                    NumasMoeEnsureScratchSize(
+                        swigluOutput, swigluOutputSize,
+                        (size_t)interDim * sizeof(float));
+                    NumasMoeEnsureScratchSize(
+                        downInput, downInputSize,
+                        GetDataBytes(downInputDataType, 1, interDim));
+                    NumasMoeEnsureScratchSize(
+                        downOutput, downOutputSize,
+                        (size_t)outputDim * sizeof(float));
                     if (reduceOutput.size() < reduceOutputSize) {
                         reduceOutput.resize(reduceOutputSize);
                     }
@@ -6485,6 +6589,23 @@ namespace fastllm {
                             prepareTaskStorage[nid].reserve(tasksPerNode);
                             prepareTasks[nid].reserve(tasksPerNode);
                         }
+                        // Each gate GEMM shard wrote columns
+                        // [nid * kPer, (nid + 1) * kPer), i.e. swiglu pairs
+                        // [nid * prepareDimPerNuma, ...).  Hand each node
+                        // exactly those rows so prepare reads gateUpOutput
+                        // and writes downInput locally instead of crossing
+                        // the QPI link.  FP8 activation blocks need 128-row
+                        // aligned task boundaries; fall back to the
+                        // round-robin spread when that cannot be guaranteed.
+                        const int prepareDimPerNuma =
+                            interDim / std::max(1, numaConfig->numaCnt);
+                        const bool useLocalPrepareRanges =
+                            numaConfig->numaCnt > 1 &&
+                            interDim % numaConfig->numaCnt == 0 &&
+                            prepareDimPerNuma % 128 == 0 &&
+                            swigluRowsPerTask % 128 == 0 &&
+                            swigluRowsPerTask <= prepareDimPerNuma &&
+                            prepareDimPerNuma % swigluRowsPerTask == 0;
                         size_t taskIndex = 0;
                         for (int expertIdx = 0;
                              expertIdx < totalExperts; expertIdx++) {
@@ -6501,8 +6622,10 @@ namespace fastllm {
                                     std::min(
                                         row + swigluRowsPerTask,
                                         interDim);
-                                int nid =
-                                    taskIndex++ % numaConfig->numaCnt;
+                                int nid = useLocalPrepareRanges ?
+                                    row / prepareDimPerNuma :
+                                    (int)(taskIndex++ %
+                                          numaConfig->numaCnt);
                                 prepareTaskStorage[nid].emplace_back(
                                     gateUpOutput.data() +
                                         (size_t)expertIdx *

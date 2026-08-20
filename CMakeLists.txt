@@ -22,6 +22,8 @@ option(PY_API "python api" OFF)
 
 option(USE_MMAP "use mmap" OFF)
 
+option(USE_ASAN "build with AddressSanitizer" OFF)
+
 option(USE_SENTENCEPIECE "use sentencepiece" OFF)
 
 option(USE_IVCOREX "use iluvatar corex gpu" OFF)
@@ -210,6 +212,13 @@ endif()
 
 
 message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
+
+if(USE_ASAN)
+    message(STATUS "AddressSanitizer: ON")
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
+endif()
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
