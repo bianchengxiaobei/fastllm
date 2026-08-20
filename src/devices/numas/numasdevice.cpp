@@ -1960,7 +1960,10 @@ namespace fastllm {
 
         workspace.gemm.clear();
         workspace.gemm.resize(numaConfig->numaCnt);
-        constexpr int rowsPerTask = 64;
+        // prefill 用更小的行块：每个 task 会把整块输入重读 rowsPerTask/2
+        // 次，32 行能把这部分流量减半；decode（tokens==1）时唯一一行输入
+        // 驻留 L1，64 行可减少任务数、拉长每个任务的权重流，利于预取。
+        const int rowsPerTask = tokens == 1 ? 64 : 32;
         const size_t elementsPerGroup = (size_t)oRank * groupDim;
         for (int node = 0; node < numaConfig->numaCnt; node++) {
             auto &tasks = workspace.gemm[node];

@@ -9,10 +9,20 @@ namespace fastllm {
 
         NumaDetector () {
             if (numa_available() != -1) {
+                cpu_set_t originalAffinity;
+                CPU_ZERO(&originalAffinity);
+                if (sched_getaffinity(0, sizeof(originalAffinity), &originalAffinity) != 0) {
+                    canUseNuma = false;
+                    return;
+                }
                 if (numa_run_on_node(0) == -1) {
                     std::cerr << "Warning: NUMA node binding failed (non-privileged mode?)" << std::endl;
                     canUseNuma = false;
                 }
+                // 探测结束，恢复主线程原有 affinity。
+                // 否则主线程被永久钉在 node 0，后续继承其 affinity 的加载线程
+                // 全部挤在 node 0 上，导致模型加载/注册阶段单 node 过载。
+                sched_setaffinity(0, sizeof(originalAffinity), &originalAffinity);
             } else {
                 canUseNuma = false;
             }

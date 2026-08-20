@@ -507,70 +507,89 @@ namespace fastllm {
 #endif
     }
 
-    template <int BRow>
-    void LinearBFloat16BFloat16_AVX2_Row_Kernel(
-        uint16_t *inputData, 
-        uint16_t *weightData, 
-        float *biasData, 
-        float *outputData,
-        int i, int m, int k, int st, int end,
-        float *fp32Input) 
-    {
-        // 每行组只转换一次输入 bf16 -> fp32，跨所有输出列复用
-        for (int r = 0; r < BRow; r++) {
-            const uint16_t *src = inputData + (size_t)(i + r) * m;
-            float *dst = fp32Input + (size_t)r * m;
-            int l = 0;
-            for (; l + 7 < m; l += 8) {
-                _mm256_storeu_ps(dst + l, bf16_to_fp32_avx2(
-                    _mm_loadu_si128((const __m128i*)(src + l))));
-            }
-            for (; l < m; l++) {
-                uint32_t x = (uint32_t)src[l] << 16;
-                memcpy(dst + l, &x, sizeof(float));
-            }
-        }
-
-        int j = st;
-        for (; j + 1 < end; j += 2) {
-            mul_mat_bf16_f32_direct_avx2_pair<BRow>(
-                m, weightData + (size_t)j * m, m * sizeof(uint16_t), 
-                fp32Input, m * sizeof(float), 
-                outputData + (size_t)i * k + j, k * sizeof(float));
-        }
-        if (j < end) {
-            mul_mat_bf16_f32_direct_avx2<BRow>(
-                m, weightData + (size_t)j * m, m * sizeof(uint16_t), 
-                fp32Input, m * sizeof(float), 
-                outputData + (size_t)i * k + j, k * sizeof(float));
-        }
-    }
-
     bool LinearBFloat16BFloat16_AVX2_Kernel(
-        uint16_t *inputData, 
-        uint16_t *weightData, 
-        float *biasData, 
+        uint16_t *inputData,
+        uint16_t *weightData,
+        float *biasData,
         float *outputData,
-        int n, int m, int k, int st, int end) 
+        int n, int m, int k, int st, int end)
     {
+        // 输入按超块先转成 fp32，权重行再作外层循环：每对权重行只流式读取
+        // 一次，遍历块内所有 token 时都驻留在 L1/L2。原来 token 块在外层的
+        // 顺序每 5 个 token 就要把 [st, end) 的整块权重重新读一遍。
+        // 超块限制 scratch 大小，n 更大时权重最多重读 ceil(n / 128) 次。
+        constexpr int superBlock = 128;
         thread_local std::vector<float> fp32Input;
-        if ((size_t)fp32Input.size() < (size_t)5 * m) {
-            fp32Input.resize((size_t)5 * m);
+        if ((size_t)fp32Input.size() < (size_t)superBlock * m) {
+            fp32Input.resize((size_t)superBlock * m);
         }
 
-        int i = 0;
-        for (; i + 4 < n; i += 5) {
-            LinearBFloat16BFloat16_AVX2_Row_Kernel<5>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data());
+        for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
+            const int superRows = std::min(superBlock, n - iSuper);
+            for (int r = 0; r < superRows; r++) {
+                const uint16_t *src = inputData + (size_t)(iSuper + r) * m;
+                float *dst = fp32Input.data() + (size_t)r * m;
+                int l = 0;
+                for (; l + 7 < m; l += 8) {
+                    _mm256_storeu_ps(dst + l, bf16_to_fp32_avx2(
+                        _mm_loadu_si128((const __m128i*)(src + l))));
+                }
+                for (; l < m; l++) {
+                    uint32_t x = (uint32_t)src[l] << 16;
+                    memcpy(dst + l, &x, sizeof(float));
+                }
+            }
+
+            const int tailBegin = superRows - superRows % 5;
+            int j = st;
+            for (; j + 1 < end; j += 2) {
+                uint16_t *weightPair = weightData + (size_t)j * m;
+                for (int i = 0; i < tailBegin; i += 5) {
+                    mul_mat_bf16_f32_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)i * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + i) * k + j, k * sizeof(float));
+                }
+                switch (superRows - tailBegin) {
+                    case 0: break;
+                    case 1: mul_mat_bf16_f32_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    case 2: mul_mat_bf16_f32_direct_avx2_pair<2>(m, weightPair, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    case 3: mul_mat_bf16_f32_direct_avx2_pair<3>(m, weightPair, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    case 4: mul_mat_bf16_f32_direct_avx2_pair<4>(m, weightPair, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                }
+            }
+            if (j < end) {
+                uint16_t *weightRow = weightData + (size_t)j * m;
+                for (int i = 0; i < tailBegin; i += 5) {
+                    mul_mat_bf16_f32_direct_avx2<5>(m, weightRow, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)i * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + i) * k + j, k * sizeof(float));
+                }
+                switch (superRows - tailBegin) {
+                    case 0: break;
+                    case 1: mul_mat_bf16_f32_direct_avx2<1>(m, weightRow, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    case 2: mul_mat_bf16_f32_direct_avx2<2>(m, weightRow, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    case 3: mul_mat_bf16_f32_direct_avx2<3>(m, weightRow, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    case 4: mul_mat_bf16_f32_direct_avx2<4>(m, weightRow, m * sizeof(uint16_t),
+                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                }
+            }
         }
-        
-        switch (n - i) {
-            case 0: break;
-            case 1: LinearBFloat16BFloat16_AVX2_Row_Kernel<1>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data()); break;
-            case 2: LinearBFloat16BFloat16_AVX2_Row_Kernel<2>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data()); break;
-            case 3: LinearBFloat16BFloat16_AVX2_Row_Kernel<3>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data()); break;
-            case 4: LinearBFloat16BFloat16_AVX2_Row_Kernel<4>(inputData, weightData, biasData, outputData, i, m, k, st, end, fp32Input.data()); break;
-        }
-        
+
         AddBiasAVX2(outputData, biasData, n, k, st, end);
         return true;
     }
@@ -1452,34 +1471,58 @@ namespace fastllm {
 #endif
     }
 
-    template <int BRow>
-    void LinearFloat32Float16_AVX2_Row_Kernel(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
-                        int i, int m, int k, int st, int end) {
-        int j = st;
-        for (; j + 1 < end; j += 2) {
-            mul_mat_f16_f32_direct_avx2_pair<BRow>(m, weightData + (size_t)j * m, m * sizeof(uint16_t), 
-                                                inputData + (size_t)i * m, m * sizeof(float), 
-                                                outputData + (size_t)i * k + j, k * sizeof(float));
-        }
-        if (j < end) {
-            mul_mat_f16_f32_direct_avx2<BRow, 1>(m, weightData + (size_t)j * m, m * sizeof(uint16_t), 
-                                                inputData + (size_t)i * m, m * sizeof(float), 
-                                                outputData + (size_t)i * k + j, k * sizeof(float));
-        }
-    }
-
     bool LinearFloat32Float16_AVX2_Kernel(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
-        int i = 0;
-        for (; i + 4 < n; i += 5) {
-            LinearFloat32Float16_AVX2_Row_Kernel<5>(inputData, weightData, biasData, outputData, i, m, k, st, end);
+        // 权重行在外层循环：每对权重行只流式读取一次，遍历所有 token 块时
+        // 都驻留在 L1/L2。原来 token 块在外层的顺序每 5 个 token 就要把
+        // [st, end) 的整块权重重新读一遍，prefill 时权重流量被放大。
+        const int tailBegin = n - n % 5;
+        int j = st;
+        for (; j + 1 < end; j += 2) {
+            uint16_t *weightPair = weightData + (size_t)j * m;
+            for (int i = 0; i < tailBegin; i += 5) {
+                mul_mat_f16_f32_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)i * m, m * sizeof(float),
+                    outputData + (size_t)i * k + j, k * sizeof(float));
+            }
+            switch (n - tailBegin) {
+                case 0: break;
+                case 1: mul_mat_f16_f32_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(float),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 2: mul_mat_f16_f32_direct_avx2_pair<2>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(float),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 3: mul_mat_f16_f32_direct_avx2_pair<3>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(float),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 4: mul_mat_f16_f32_direct_avx2_pair<4>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(float),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+            }
         }
-        switch (n - i) {
-            case 0: break;
-            case 1: LinearFloat32Float16_AVX2_Row_Kernel<1>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 2: LinearFloat32Float16_AVX2_Row_Kernel<2>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 3: LinearFloat32Float16_AVX2_Row_Kernel<3>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 4: LinearFloat32Float16_AVX2_Row_Kernel<4>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
+        if (j < end) {
+            uint16_t *weightRow = weightData + (size_t)j * m;
+            for (int i = 0; i < tailBegin; i += 5) {
+                mul_mat_f16_f32_direct_avx2<5, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)i * m, m * sizeof(float),
+                    outputData + (size_t)i * k + j, k * sizeof(float));
+            }
+            switch (n - tailBegin) {
+                case 0: break;
+                case 1: mul_mat_f16_f32_direct_avx2<1, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(float),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 2: mul_mat_f16_f32_direct_avx2<2, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(float),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 3: mul_mat_f16_f32_direct_avx2<3, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(float),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 4: mul_mat_f16_f32_direct_avx2<4, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(float),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+            }
         }
         AddBiasAVX2(outputData, biasData, n, k, st, end);
         return true;
@@ -1619,38 +1662,59 @@ namespace fastllm {
 #endif
     }
 
-    template <int BRow>
-    void LinearBFloat16Float16_AVX2_Row_Kernel(
-        uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
-        int i, int m, int k, int st, int end) {
-        int j = st;
-        for (; j + 1 < end; j += 2) {
-            mul_mat_bf16_f16_direct_avx2_pair<BRow>(
-                m, weightData + (size_t)j * m, m * sizeof(uint16_t),
-                inputData + (size_t)i * m, m * sizeof(uint16_t),
-                outputData + (size_t)i * k + j, k * sizeof(float));
-        }
-        if (j < end) {
-            mul_mat_bf16_f16_direct_avx2<BRow, 1>(
-                m, weightData + (size_t)j * m, m * sizeof(uint16_t),
-                inputData + (size_t)i * m, m * sizeof(uint16_t),
-                outputData + (size_t)i * k + j, k * sizeof(float));
-        }
-    }
-
     bool LinearBFloat16Float16_AVX2_Kernel(
         uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end) {
-        int i = 0;
-        for (; i + 4 < n; i += 5) {
-            LinearBFloat16Float16_AVX2_Row_Kernel<5>(inputData, weightData, biasData, outputData, i, m, k, st, end);
+        // 权重行在外层循环：每对权重行只流式读取一次，遍历所有 token 块时
+        // 都驻留在 L1/L2。原来 token 块在外层的顺序每 5 个 token 就要把
+        // [st, end) 的整块权重重新读一遍，prefill 时权重流量被放大。
+        const int tailBegin = n - n % 5;
+        int j = st;
+        for (; j + 1 < end; j += 2) {
+            uint16_t *weightPair = weightData + (size_t)j * m;
+            for (int i = 0; i < tailBegin; i += 5) {
+                mul_mat_bf16_f16_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)i * m, m * sizeof(uint16_t),
+                    outputData + (size_t)i * k + j, k * sizeof(float));
+            }
+            switch (n - tailBegin) {
+                case 0: break;
+                case 1: mul_mat_bf16_f16_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 2: mul_mat_bf16_f16_direct_avx2_pair<2>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 3: mul_mat_bf16_f16_direct_avx2_pair<3>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 4: mul_mat_bf16_f16_direct_avx2_pair<4>(m, weightPair, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+            }
         }
-        switch (n - i) {
-            case 0: break;
-            case 1: LinearBFloat16Float16_AVX2_Row_Kernel<1>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 2: LinearBFloat16Float16_AVX2_Row_Kernel<2>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 3: LinearBFloat16Float16_AVX2_Row_Kernel<3>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
-            case 4: LinearBFloat16Float16_AVX2_Row_Kernel<4>(inputData, weightData, biasData, outputData, i, m, k, st, end); break;
+        if (j < end) {
+            uint16_t *weightRow = weightData + (size_t)j * m;
+            for (int i = 0; i < tailBegin; i += 5) {
+                mul_mat_bf16_f16_direct_avx2<5, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)i * m, m * sizeof(uint16_t),
+                    outputData + (size_t)i * k + j, k * sizeof(float));
+            }
+            switch (n - tailBegin) {
+                case 0: break;
+                case 1: mul_mat_bf16_f16_direct_avx2<1, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 2: mul_mat_bf16_f16_direct_avx2<2, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 3: mul_mat_bf16_f16_direct_avx2<3, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+                case 4: mul_mat_bf16_f16_direct_avx2<4, 1>(m, weightRow, m * sizeof(uint16_t),
+                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
+                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+            }
         }
         AddBiasAVX2(outputData, biasData, n, k, st, end);
         return true;
