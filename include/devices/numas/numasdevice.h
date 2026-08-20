@@ -58,6 +58,11 @@ namespace fastllm {
     // Release them explicitly while the CUDA allocator is still alive.
     void ClearNumasMoeRuntimeCache();
 
+    // Print aggregate NUMA weight registration stats collected during model
+    // load (weight count / bytes / total time).  Enabled by
+    // FASTLLM_PROFILE_NUMAS_MOE=1.
+    void PrintNumasRegistrationProfile();
+
     class NumasKimiK3RoutedExpertsOp : BaseOperator {
         bool CanRun(const std::string &opType, const DataDict &datas,
                     const FloatDict &floatParams, const IntDict &intParams);

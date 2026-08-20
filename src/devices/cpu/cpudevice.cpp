@@ -11232,6 +11232,28 @@ ops += (long long)lines * inputDim * interDim * 2;
         uint8_t *pagedData = cache.pagedKVCacheData->cpuData;
         uint8_t *inputData = input.cpuData;
         int unitSize = cache.unitSize;
+
+        if (cache.pagedKVCacheData == nullptr || pagedData == nullptr) {
+            ErrorInFastLLM("CpuAppendPagedCacheOp: pagedKVCacheData cpuData is null.\n");
+        }
+        if (cache.pagedKVCacheData->dataType != cache.dataType) {
+            ErrorInFastLLM("CpuAppendPagedCacheOp: dataType mismatch. pagedKVCacheData = " +
+                           GetDataTypeName(cache.pagedKVCacheData->dataType) +
+                           ", cache = " + GetDataTypeName(cache.dataType) + ".\n");
+        }
+        if ((int)cache.pagedKVCacheData->dims.size() != 4 ||
+            cache.pagedKVCacheData->dims[1] != cache.pageLen ||
+            cache.pagedKVCacheData->dims[2] != numHeads ||
+            cache.pagedKVCacheData->dims[3] != headDim) {
+            ErrorInFastLLM("CpuAppendPagedCacheOp: dims mismatch. pagedKVCacheData dims = [" +
+                           std::to_string(cache.pagedKVCacheData->dims.size() > 0 ? cache.pagedKVCacheData->dims[0] : -1) + ", " +
+                           std::to_string(cache.pagedKVCacheData->dims.size() > 1 ? cache.pagedKVCacheData->dims[1] : -1) + ", " +
+                           std::to_string(cache.pagedKVCacheData->dims.size() > 2 ? cache.pagedKVCacheData->dims[2] : -1) + ", " +
+                           std::to_string(cache.pagedKVCacheData->dims.size() > 3 ? cache.pagedKVCacheData->dims[3] : -1) +
+                           "], cache.pageLen = " + std::to_string(cache.pageLen) +
+                           ", input dims = [" + std::to_string(numHeads) + ", " +
+                           std::to_string(seqLen) + ", " + std::to_string(headDim) + "].\n");
+        }
         
         // 先填充当前 page 的剩余空间
         if (cache.pageIndex.size() > 0 && remainingInCurrentPage > 0) {
@@ -11262,6 +11284,12 @@ ops += (long long)lines * inputDim * interDim * 2;
         while (tokensToAppend > 0) {
             // 分配新的 page
             int newPageIdx = cache.pagedKVCacheData->GetUnusedPageIndex(true);
+
+            if (newPageIdx < 0 || newPageIdx >= cache.pagedKVCacheData->dims[0]) {
+                ErrorInFastLLM("CpuAppendPagedCacheOp: newPageIdx out of range. newPageIdx = " +
+                               std::to_string(newPageIdx) + ", maxPages = " +
+                               std::to_string(cache.pagedKVCacheData->dims[0]) + ".\n");
+            }
 
             cache.pageIndex.push_back(newPageIdx);
             

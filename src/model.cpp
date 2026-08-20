@@ -74,6 +74,7 @@
 namespace fastllm {
 #if defined(USE_NUMAS)
     void RegisterNumas(fastllm::Data *data, std::string weightType);
+    void PrintNumasRegistrationProfile();
 #endif
 
     std::string ReadAllFile(const std::string &fileName) {
@@ -3286,6 +3287,9 @@ namespace fastllm {
             threads[i]->join();
             delete threads[i];
         }
+#if defined(USE_NUMAS)
+        PrintNumasRegistrationProfile();
+#endif
         model->OnModelWeightsLoaded();
 
         printf("\n");

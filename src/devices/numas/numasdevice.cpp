@@ -1421,6 +1421,25 @@ namespace fastllm {
         }
     }
 
+    static std::atomic<uint64_t> gNumasRegisterCount{0};
+    static std::atomic<uint64_t> gNumasRegisterBytes{0};
+    static std::atomic<uint64_t> gNumasRegisterTimeNs{0};
+
+    void PrintNumasRegistrationProfile() {
+        if (std::getenv("FASTLLM_PROFILE_NUMAS_MOE") == nullptr) {
+            return;
+        }
+        uint64_t count = gNumasRegisterCount.load(std::memory_order_relaxed);
+        uint64_t bytes = gNumasRegisterBytes.load(std::memory_order_relaxed);
+        double seconds = (double)gNumasRegisterTimeNs.load(
+            std::memory_order_relaxed) / 1e9;
+        double gib = bytes / 1024.0 / 1024.0 / 1024.0;
+        printf("[fastllm-profile-numas-register] weights=%llu bytes=%.2f GiB "
+               "time=%.3f s throughput=%.2f GiB/s\n",
+               (unsigned long long)count, gib, seconds,
+               seconds > 0.0 ? gib / seconds : 0.0);
+    }
+
     static bool ShouldConvertFP8LinearToBFloat16(
             const std::string &weightType) {
         // FP8 packed formats only have fast kernels on AVX512/VNNI/BF16.
@@ -1440,6 +1459,7 @@ namespace fastllm {
         if (data == nullptr) {
             return;
         }
+        auto profileStart = std::chrono::steady_clock::now();
         if (data->numasData.size() == 0) {
             data->numasData.resize(numaConfig->numaCnt);
 
@@ -1686,6 +1706,14 @@ namespace fastllm {
             }
             data->expansionBytes = data->GetBytes();
             data->isPinned = usePinned;
+
+            gNumasRegisterCount.fetch_add(1, std::memory_order_relaxed);
+            gNumasRegisterBytes.fetch_add(
+                data->expansionBytes, std::memory_order_relaxed);
+            gNumasRegisterTimeNs.fetch_add(
+                (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - profileStart).count(),
+                std::memory_order_relaxed);
         }
 
         if (data->dataType == DataType::INT4_GROUP32) {
