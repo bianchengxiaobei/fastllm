@@ -11244,6 +11244,18 @@ ops += (long long)lines * inputDim * interDim * 2;
         uint8_t *inputData = input.cpuData;
         int unitSize = cache.unitSize;
 
+        {
+            static std::once_flag debugOnce;
+            std::call_once(debugOnce, []() {
+                printf("[fastllm-debug-append] CpuAppendPagedCacheOp::Run (new checks active)\n");
+                fflush(stdout);
+            });
+        }
+        printf("[fastllm-debug-append] numHeads=%d seqLen=%d headDim=%d unitSize=%d pageLen=%d lastPageLen=%d maxPages=%d pagedData=%p\n",
+               numHeads, seqLen, headDim, unitSize, cache.pageLen, cache.lastPageLen,
+               (int)cache.pagedKVCacheData->dims[0], (void*)pagedData);
+        fflush(stdout);
+
         if (cache.pagedKVCacheData == nullptr || pagedData == nullptr) {
             ErrorInFastLLM("CpuAppendPagedCacheOp: pagedKVCacheData cpuData is null.\n");
         }
@@ -11301,6 +11313,12 @@ ops += (long long)lines * inputDim * interDim * 2;
                                std::to_string(newPageIdx) + ", maxPages = " +
                                std::to_string(cache.pagedKVCacheData->dims[0]) + ".\n");
             }
+
+            printf("[fastllm-debug-append] newPageIdx=%d tokensToAppend=%d offsetBytes=%lld totalBytes=%lld\n",
+                   newPageIdx, tokensToAppend,
+                   (long long)(newPageIdx * cache.pageLen * numHeads * headDim) * unitSize,
+                   (long long)(cache.pagedKVCacheData->dims[0]) * cache.pageLen * numHeads * headDim * unitSize);
+            fflush(stdout);
 
             cache.pageIndex.push_back(newPageIdx);
             
