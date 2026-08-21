@@ -21668,7 +21668,14 @@ namespace fastllm {
                             dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
                         };
 
-                        for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
+                        // 预分配输出最终 shape，各 chunk 结果直接写进对应切片，
+                        // 避免旧的逐 chunk `Mul + Cat` 把已累积结果反复整块拷
+                        // 一遍的 O(chunks^2) 流量。
+                        const int chunks = tot_heads / chunk_size;
+                        bool outPreallocated = false;
+                        int outRows = 0, outInner = 0, outHeadDim = 0;
+
+                        for (int ci = 0; ci < chunks; ci++) {
                             Data q_i, k_i, v_i, attn_i, k_cumdecay_i;
                             makeChunk4D(qq, ci, q_i);
                             makeChunk4D(*pkk, ci, k_i);
@@ -21693,12 +21700,25 @@ namespace fastllm {
                             MatMul(attn_i, v_new, atv);
                             AddTo(atv, attn_inter);
                             atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
-                            if (ci == 0) {
-                                Mul(atv, 1.0f, out);
-                            } else {
-                                Mul(out, 1.0f, core_attn_out_temp);
-                                Cat(core_attn_out_temp, atv, 3, out);
+                            if (!outPreallocated) {
+                                outRows = atv.dims[0];
+                                outInner = atv.dims[1];
+                                outHeadDim = atv.dims[4];
+                                out.Resize({outRows, outInner, 1,
+                                            chunks * chunk_size, outHeadDim});
+                                out.Allocate();
+                                outPreallocated = true;
                             }
+                            Data outSlice;
+                            outSlice.dataType = out.dataType;
+                            outSlice.UpdateUnitSize();
+                            outSlice.isFake = true;
+                            outSlice.dataDevice = out.dataDevice;
+                            outSlice.cpuData = out.cpuData +
+                                (size_t)ci * chunk_size * outHeadDim * out.unitSize;
+                            outSlice.dims = {outRows, outInner, 1,
+                                             chunk_size, outHeadDim};
+                            Mul(atv, 1.0f, outSlice);
 
                             Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
                             Split(g_i, 2, g_i.dims[2] - 1, g_i.dims[2], g_i_last);
