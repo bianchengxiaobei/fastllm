@@ -44,6 +44,7 @@ namespace py = pybind11;
 #endif
 
 #include <mutex>
+#include <atomic>
 
 #include "gguf.h"
 
@@ -1974,6 +1975,43 @@ namespace fastllm {
         if (!isFake && Count(0) > expansionSize) {
             FreeSpace();
             MallocSpace(Count(0));
+            // 大块 CPU 输出缓冲首次分配时预触页：`new` 只保留虚拟地址，
+            // 首次写每页触发 ~3us page fault（400MB -> ~300ms）。这里直接
+            // 预热让页错误提前摊掉，避免首轮 gemm 中被 page fault 打断。
+            if (this->dataDevice == DataDevice::CPU &&
+                this->expansionBytes >= (64ULL << 20) && this->cpuData) {
+                const size_t bytes = this->expansionBytes;
+                AliveThreadPool *pool = fastllmAliveThreadPool;
+                const size_t workers = pool ? pool->threads.size() : 0;
+                if (workers > 1) {
+                    const size_t block = (bytes + workers - 1) / workers;
+                    std::atomic<size_t> cursor{0};
+                    std::vector<std::thread> warmers;
+                    warmers.reserve(workers - 1);
+                    for (size_t w = 1; w < workers; w++) {
+                        warmers.emplace_back([this, block, &cursor]() {
+                            size_t off = cursor.fetch_add(block);
+                            while (off < this->expansionBytes) {
+                                size_t len = std::min(block,
+                                    this->expansionBytes - off);
+                                memset(this->cpuData + off, 0, len);
+                                off = cursor.fetch_add(block);
+                            }
+                        });
+                    }
+                    size_t off = cursor.fetch_add(block);
+                    while (off < bytes) {
+                        size_t len = std::min(block, bytes - off);
+                        memset(this->cpuData + off, 0, len);
+                        off = cursor.fetch_add(block);
+                    }
+                    for (auto &t : warmers) {
+                        t.join();
+                    }
+                } else {
+                    memset(this->cpuData, 0, bytes);
+                }
+            }
         }
     }
 
