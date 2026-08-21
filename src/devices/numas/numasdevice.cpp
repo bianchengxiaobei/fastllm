@@ -1452,6 +1452,231 @@ namespace fastllm {
                !GetCPUInstructInfo()->hasAVX512VNNI;
     }
 
+    // True while the current thread executes tasks inside
+    // DynamicScheduleTasks.  RegisterNumasImpl must not re-enter the alive
+    // pool from a worker thread (PushOp on a busy worker spins forever),
+    // so it falls back to inline conversion there.
+    static thread_local bool gInsideNumasPoolWorker = false;
+
+    void DynamicScheduleTasks(std::vector<std::vector<MultiThreadBaseOp*>>& ops, bool deleteOps);
+
+#ifdef __AVX2__
+    // Decode 32 FP8 E4M3 codes into BF16 with truncation (bits >> 16),
+    // bit-identical to the scalar dictionary path.  Broadwell has no
+    // AVX512 gather alternatives; 4x8 i32gather overlaps well enough in
+    // OoO to beat the scalar dependent-load loop several times over.
+    static inline void Fp8CodesToBFloat16x32_AVX2(
+            const uint8_t *codes, uint16_t *dst,
+            __m256 scale, const float *dict) {
+        __m256i bytes = _mm256_loadu_si256((const __m256i*)codes);
+        __m128i lo = _mm256_castsi256_si128(bytes);
+        __m128i hi = _mm256_extracti128_si256(bytes, 1);
+        __m256i idx[4];
+        idx[0] = _mm256_cvtepu8_epi32(lo);
+        idx[1] = _mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8));
+        idx[2] = _mm256_cvtepu8_epi32(hi);
+        idx[3] = _mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8));
+        for (int half = 0; half < 2; half++) {
+            __m256 f0 = _mm256_mul_ps(
+                _mm256_i32gather_ps(dict, idx[2 * half], 4), scale);
+            __m256 f1 = _mm256_mul_ps(
+                _mm256_i32gather_ps(dict, idx[2 * half + 1], 4), scale);
+            __m256i packed = _mm256_packus_epi32(
+                _mm256_srli_epi32(_mm256_castps_si256(f0), 16),
+                _mm256_srli_epi32(_mm256_castps_si256(f1), 16));
+            _mm256_storeu_si256((__m256i*)(dst + 16 * half),
+                                _mm256_permute4x64_epi64(packed, 0xD8));
+        }
+    }
+#endif
+
+    namespace {
+        // Copies a global row range into one NUMA shard.  When swigluK is
+        // non-zero the CrossSwiglu row permutation is fused into the copy,
+        // so callers no longer materialize a reordered temporary buffer.
+        struct NumasRegisterRowCopyOp : MultiThreadBaseOp {
+            const uint8_t *src;
+            uint8_t *dstShard;
+            size_t bytesPerRow;
+            int globalRowBegin, globalRowEnd;
+            int shardRowBegin;
+            int swigluK;
+
+            NumasRegisterRowCopyOp(const uint8_t *src, uint8_t *dstShard,
+                                   size_t bytesPerRow,
+                                   int globalRowBegin, int globalRowEnd,
+                                   int shardRowBegin, int swigluK)
+                : src(src), dstShard(dstShard), bytesPerRow(bytesPerRow),
+                  globalRowBegin(globalRowBegin), globalRowEnd(globalRowEnd),
+                  shardRowBegin(shardRowBegin), swigluK(swigluK) {}
+
+            void Run() override {
+                uint8_t *dst = dstShard +
+                    (size_t)(globalRowBegin - shardRowBegin) * bytesPerRow;
+                if (swigluK == 0) {
+                    memcpy(dst, src + (size_t)globalRowBegin * bytesPerRow,
+                           (size_t)(globalRowEnd - globalRowBegin) *
+                           bytesPerRow);
+                    return;
+                }
+                for (int g = globalRowBegin; g < globalRowEnd; g++) {
+                    int srcRow = GetCrossSwigluSourceRow(g, swigluK);
+                    memcpy(dst + (size_t)(g - globalRowBegin) * bytesPerRow,
+                           src + (size_t)srcRow * bytesPerRow, bytesPerRow);
+                }
+            }
+        };
+
+        struct NumasRegisterFP8ToBf16Op : MultiThreadBaseOp {
+            const uint8_t *packedData;
+            uint16_t *dstShard;
+            int globalRowBegin, globalRowEnd;
+            int shardRowBegin;
+            int swigluK;
+            int m, blockSize, numBlocks;
+            size_t srcBytesPerRow;
+            const float *dict;
+            bool useAvx2;
+
+            NumasRegisterFP8ToBf16Op(const uint8_t *packedData,
+                                     uint16_t *dstShard,
+                                     int globalRowBegin, int globalRowEnd,
+                                     int shardRowBegin, int swigluK,
+                                     int m, int blockSize, int numBlocks,
+                                     size_t srcBytesPerRow,
+                                     const float *dict, bool useAvx2)
+                : packedData(packedData), dstShard(dstShard),
+                  globalRowBegin(globalRowBegin), globalRowEnd(globalRowEnd),
+                  shardRowBegin(shardRowBegin), swigluK(swigluK),
+                  m(m), blockSize(blockSize), numBlocks(numBlocks),
+                  srcBytesPerRow(srcBytesPerRow), dict(dict),
+                  useAvx2(useAvx2) {}
+
+            void Run() override {
+                for (int g = globalRowBegin; g < globalRowEnd; g++) {
+                    const int srcRow = swigluK == 0 ?
+                        g : GetCrossSwigluSourceRow(g, swigluK);
+                    const uint8_t *rowStart = packedData +
+                        (size_t)srcRow * srcBytesPerRow;
+                    uint16_t *dstRow = dstShard +
+                        (size_t)(g - shardRowBegin) * m;
+                    for (int block = 0; block < numBlocks; block++) {
+                        const uint8_t *fp8Ptr = rowStart +
+                            (size_t)block * (blockSize + sizeof(float));
+                        float scale = *(const float*)(fp8Ptr + blockSize);
+                        int base = block * blockSize;
+                        int cnt = std::min(blockSize, m - base);
+                        int l = 0;
+#ifdef __AVX2__
+                        if (useAvx2) {
+                            __m256 scaleVec = _mm256_set1_ps(scale);
+                            for (; l + 32 <= cnt; l += 32) {
+                                Fp8CodesToBFloat16x32_AVX2(
+                                    fp8Ptr + l, dstRow + base + l,
+                                    scaleVec, dict);
+                            }
+                        }
+#endif
+                        for (; l < cnt; l++) {
+                            float v = dict[fp8Ptr[l]] * scale;
+                            uint32_t bits;
+                            memcpy(&bits, &v, sizeof(bits));
+                            dstRow[base + l] = (uint16_t)(bits >> 16);
+                        }
+                    }
+                }
+            }
+        };
+
+        struct NumasRegisterNvfp4RowsOp : MultiThreadBaseOp {
+            int k, m, blockK, blockM;
+            uint8_t *nvfp4, *scaleBytes, *dst;
+            int dstRowStart, dstRows;
+            bool isCrossSwiglu, useBlock32;
+
+            NumasRegisterNvfp4RowsOp(int k, int m, uint8_t *nvfp4,
+                                     uint8_t *scaleBytes, int blockK,
+                                     int blockM, uint8_t *dst,
+                                     int dstRowStart, int dstRows,
+                                     bool isCrossSwiglu, bool useBlock32)
+                : k(k), m(m), blockK(blockK), blockM(blockM),
+                  nvfp4(nvfp4), scaleBytes(scaleBytes), dst(dst),
+                  dstRowStart(dstRowStart), dstRows(dstRows),
+                  isCrossSwiglu(isCrossSwiglu), useBlock32(useBlock32) {}
+
+            void Run() override {
+                if (useBlock32) {
+                    Nvfp4ToFastllmNVFP4_BLOCK32_E8M0_Rows(
+                        k, m, nvfp4, scaleBytes, blockK, blockM,
+                        dst, dstRowStart, dstRows, isCrossSwiglu);
+                } else {
+                    Nvfp4ToFastllmNVFP4_BLOCK16_E8M0_Rows(
+                        k, m, nvfp4, scaleBytes, blockK, blockM,
+                        dst, dstRowStart, dstRows, isCrossSwiglu);
+                }
+            }
+        };
+    }
+
+    // Smallest per-node shard worth dispatching to the pool.
+    static const size_t kNumasRegisterParallelBytes = 1 << 20;
+
+    // Runs row-range ops for every NUMA shard on the pool threads bound to
+    // that shard's node, so destination pages are written locally instead
+    // of across the QPI link.  Falls back to inline execution when nested
+    // inside a pool worker or when the shard is too small to amortize the
+    // dispatch overhead.  OpFactory: MultiThreadBaseOp*(node, rowBegin, rowEnd).
+    template <typename OpFactory>
+    static void RunNumasRegisterOpsPerNode(int kPerNuma, size_t bytesPerNode,
+                                           OpFactory makeOp) {
+        auto *numaConfig = GetNumaConfig();
+        const bool parallel = !gInsideNumasPoolWorker &&
+            numaConfig->threads > 0 &&
+            bytesPerNode >= kNumasRegisterParallelBytes;
+        if (!parallel) {
+            for (int node = 0; node < numaConfig->numaCnt; node++) {
+                std::unique_ptr<MultiThreadBaseOp> op(makeOp(
+                    node, node * kPerNuma, (node + 1) * kPerNuma));
+                op->Run();
+            }
+            return;
+        }
+        std::vector<std::vector<MultiThreadBaseOp*>> ops(numaConfig->numaCnt);
+        for (int node = 0; node < numaConfig->numaCnt; node++) {
+            int threadNum = std::max(
+                1, (int)numaConfig->numaToCpuDict[node].size());
+            int chunkRows = std::max(1, kPerNuma / (threadNum * 4));
+            int shardBegin = node * kPerNuma;
+            for (int row = 0; row < kPerNuma; row += chunkRows) {
+                int rowEnd = std::min(row + chunkRows, kPerNuma);
+                ops[node].push_back(makeOp(
+                    node, shardBegin + row, shardBegin + rowEnd));
+            }
+        }
+        DynamicScheduleTasks(ops, true);
+    }
+
+    // Allocates every NUMA shard and copies the source rows into them,
+    // fusing the optional CrossSwiglu permutation.  AllocFunc:
+    // void*(size_t bytes, int node).
+    template <typename AllocFunc>
+    static void CopyRowsToNumaShards(fastllm::Data *data, const uint8_t *src,
+                                     size_t bytesPerRow, int k, int kPerNuma,
+                                     bool isCrossSwiglu, AllocFunc allocFunc) {
+        auto *numaConfig = GetNumaConfig();
+        const size_t shardBytes = (size_t)kPerNuma * bytesPerRow;
+        for (int node = 0; node < numaConfig->numaCnt; node++) {
+            data->numasData[node] = (uint8_t*)allocFunc(shardBytes, node);
+        }
+        const int swigluK = isCrossSwiglu ? k : 0;
+        RunNumasRegisterOpsPerNode(kPerNuma, shardBytes,
+            [&](int node, int rowBegin, int rowEnd) -> MultiThreadBaseOp* {
+                return new NumasRegisterRowCopyOp(
+                    src, data->numasData[node], bytesPerRow,
+                    rowBegin, rowEnd, node * kPerNuma, swigluK);
+            });
+    }
+
     static void RegisterNumasImpl(fastllm::Data *data,
                                   const std::string &weightType,
                                   bool allowPinned) {
@@ -1484,63 +1709,60 @@ namespace fastllm {
                 // GGUF格式需要先交错存储，然后再repack
                 // 因为repack会将多行打包在一起，打包后行之间的数据互相依赖，无法再做行交错
                 size_t bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
+                uint8_t *origCpuData = data->cpuData;
+                std::vector<uint8_t> reordered;
+                uint8_t *srcData = origCpuData;
                 if (isCrossSwiglu) {
-                    std::vector<uint8_t> reordered;
-                    CrossSwigluReorder(data->cpuData, k, bytesPerRow, reordered);
-                    memcpy(data->cpuData, reordered.data(), (size_t)k * bytesPerRow);
+                    CrossSwigluReorder(origCpuData, k, bytesPerRow, reordered);
+                    // Repack 在 cpuData 上原地读写；临时指向交错缓冲，
+                    // 省掉一次全量拷贝回 cpuData 的开销
+                    srcData = reordered.data();
+                    data->cpuData = reordered.data();
                 }
                 // 交错存储完成后再repack
                 data->Repack();
+                data->cpuData = origCpuData;
                 // repack后bytesPerRow可能变化，重新获取
                 bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
-                uint8_t *srcData = data->cpuData;
-                for (int i = 0; i < numaConfig->numaCnt; i++) {
-                    data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                    memcpy(data->numasData[i], srcData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                }
+                CopyRowsToNumaShards(data, srcData, bytesPerRow, k, kPerNuma, false, allocFunc);
             } else {
                 data->Repack();
 
                 auto registerFP8AsBFloat16 = [&](const uint8_t *packedData,
-                                                 DataType packedType) {
+                                                 DataType packedType,
+                                                 bool applyCrossSwiglu) {
                     const int blockSize =
                         packedType == DataType::FP8_E4M3_BLOCK_128 ? 128 : m;
                     const size_t srcBytesPerRow =
                         GetDataBytes(packedType, 1, m);
                     const int numBlocks = (m + blockSize - 1) / blockSize;
                     static const FP8E4M3ToFP32Manager fp8;
+                    bool useAvx2 = false;
+#ifdef __AVX2__
+                    useAvx2 = GetCPUInstructInfo()->hasAVX2;
+#endif
+                    const size_t shardBytes =
+                        (size_t)kPerNuma * m * sizeof(uint16_t);
                     for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        uint16_t *dst = (uint16_t*)allocFunc(
-                            (size_t)kPerNuma * m * sizeof(uint16_t), i);
-                        data->numasData[i] = (uint8_t*)dst;
-                        const uint8_t *src = packedData +
-                            (size_t)i * kPerNuma * srcBytesPerRow;
-                        for (int row = 0; row < kPerNuma; row++) {
-                            const uint8_t *rowStart = src +
-                                (size_t)row * srcBytesPerRow;
-                            uint16_t *dstRow = dst + (size_t)row * m;
-                            for (int block = 0; block < numBlocks; block++) {
-                                const uint8_t *fp8Ptr = rowStart +
-                                    (size_t)block * (blockSize + sizeof(float));
-                                float scale = *(const float*)(fp8Ptr + blockSize);
-                                int base = block * blockSize;
-                                int cnt = std::min(blockSize, m - base);
-                                for (int l = 0; l < cnt; l++) {
-                                    float v = fp8.dict[fp8Ptr[l]] * scale;
-                                    uint32_t bits;
-                                    memcpy(&bits, &v, sizeof(bits));
-                                    dstRow[base + l] = (uint16_t)(bits >> 16);
-                                }
-                            }
-                        }
+                        data->numasData[i] = (uint8_t*)allocFunc(shardBytes, i);
                     }
+                    const int swigluK = applyCrossSwiglu ? k : 0;
+                    RunNumasRegisterOpsPerNode(kPerNuma, shardBytes,
+                        [&](int node, int rowBegin,
+                            int rowEnd) -> MultiThreadBaseOp* {
+                            return new NumasRegisterFP8ToBf16Op(
+                                packedData, (uint16_t*)data->numasData[node],
+                                rowBegin, rowEnd, node * kPerNuma, swigluK,
+                                m, blockSize, numBlocks, srcBytesPerRow,
+                                fp8.dict, useAvx2);
+                        });
                     data->dataType = DataType::BFLOAT16;
                 };
 
                 if (ShouldConvertFP8LinearToBFloat16(weightType) &&
                     (data->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                      data->dataType == DataType::FP8_E4M3_PERCHANNEL)) {
-                    registerFP8AsBFloat16(data->cpuData, data->dataType);
+                    registerFP8AsBFloat16(data->cpuData, data->dataType, isCrossSwiglu);
                 } else if (data->dataType == DataType::FLOAT32 ||
                     data->dataType == DataType::BFLOAT16 ||
                     data->dataType == DataType::FLOAT16 ||
@@ -1554,16 +1776,7 @@ namespace fastllm {
                     data->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
                     data->dataType == DataType::INT4_GROUP32) {
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                    uint8_t *srcData = data->cpuData;
-                    std::vector<uint8_t> reordered;
-                    if (isCrossSwiglu) {
-                        CrossSwigluReorder(data->cpuData, k, bytesPerRow, reordered);
-                        srcData = reordered.data();
-                    }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], srcData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    CopyRowsToNumaShards(data, data->cpuData, bytesPerRow, k, kPerNuma, isCrossSwiglu, allocFunc);
                 } else if (data->dataType == DataType::FP8_E4M3) {
                     std::vector <uint8_t> fp8Packed;
                     if (data->blockM == 128) {
@@ -1577,18 +1790,10 @@ namespace fastllm {
                     }
 
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                    if (isCrossSwiglu) {
-                        std::vector<uint8_t> reordered;
-                        CrossSwigluReorder(fp8Packed.data(), k, bytesPerRow, reordered);
-                        fp8Packed.swap(reordered);
-                    }
                     if (ShouldConvertFP8LinearToBFloat16(weightType)) {
-                        registerFP8AsBFloat16(fp8Packed.data(), data->dataType);
+                        registerFP8AsBFloat16(fp8Packed.data(), data->dataType, isCrossSwiglu);
                     } else {
-                        for (int i = 0; i < numaConfig->numaCnt; i++) {
-                            data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                            memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                        }
+                        CopyRowsToNumaShards(data, fp8Packed.data(), bytesPerRow, k, kPerNuma, isCrossSwiglu, allocFunc);
                     }
                 } else if (data->dataType == DataType::NVFP4) {
                     if (data->blockM < 16 || (data->blockM % 16 != 0 && data->blockM != m)) {
@@ -1606,37 +1811,28 @@ namespace fastllm {
                             DataType::NVFP4_BLOCK_16_E8M0;
                         const size_t packedBytesPerRow =
                             GetDataBytes(data->dataType, 1, m);
+                        const size_t shardBytes =
+                            (size_t)kPerNuma * packedBytesPerRow;
                         for (int i = 0; i < numaConfig->numaCnt; i++) {
                             data->numasData[i] = (uint8_t*)allocFunc(
-                                kPerNuma * packedBytesPerRow, i);
-                            if (useBlock32) {
-                                Nvfp4ToFastllmNVFP4_BLOCK32_E8M0_Rows(
-                                    k, m, (uint8_t*)data->cpuData,
-                                    scaleBytes, data->blockK, data->blockM,
-                                    data->numasData[i], i * kPerNuma,
-                                    kPerNuma, isCrossSwiglu);
-                            } else {
-                                Nvfp4ToFastllmNVFP4_BLOCK16_E8M0_Rows(
-                                    k, m, (uint8_t*)data->cpuData,
-                                    scaleBytes, data->blockK, data->blockM,
-                                    data->numasData[i], i * kPerNuma,
-                                    kPerNuma, isCrossSwiglu);
-                            }
+                                shardBytes, i);
                         }
+                        RunNumasRegisterOpsPerNode(kPerNuma, shardBytes,
+                            [&](int node, int rowBegin,
+                                int rowEnd) -> MultiThreadBaseOp* {
+                                return new NumasRegisterNvfp4RowsOp(
+                                    k, m, (uint8_t*)data->cpuData,
+                                    scaleBytes, data->blockK, data->blockM,
+                                    data->numasData[node], rowBegin,
+                                    rowEnd - rowBegin, isCrossSwiglu,
+                                    useBlock32);
+                            });
                     } else {
                         std::vector<uint8_t> nvfp4Packed;
                         Nvfp4ToFastllmNVFP4_BLOCK16(1, k, m, (uint8_t*)data->cpuData, scaleFloats, scaleBytes, data->blockK, data->blockM, nvfp4Packed);
                         data->dataType = DataType::NVFP4_BLOCK_16;
                         size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
-                        if (isCrossSwiglu) {
-                            std::vector<uint8_t> reordered;
-                            CrossSwigluReorder(nvfp4Packed.data(), k, packedBytesPerRow, reordered);
-                            nvfp4Packed.swap(reordered);
-                        }
-                        for (int i = 0; i < numaConfig->numaCnt; i++) {
-                            data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * packedBytesPerRow, i);
-                            memcpy(data->numasData[i], nvfp4Packed.data() + (size_t)i * kPerNuma * packedBytesPerRow, kPerNuma * packedBytesPerRow);
-                        }
+                        CopyRowsToNumaShards(data, nvfp4Packed.data(), packedBytesPerRow, k, kPerNuma, isCrossSwiglu, allocFunc);
                     }
                 } else if (data->dataType == DataType::INT8) {
                     std::vector <uint8_t> int8Packed;
@@ -1644,30 +1840,14 @@ namespace fastllm {
                     data->dataType = DataType::INT8_PERCHANNEL;
 
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                    if (isCrossSwiglu) {
-                        std::vector<uint8_t> reordered;
-                        CrossSwigluReorder(int8Packed.data(), k, bytesPerRow, reordered);
-                        int8Packed.swap(reordered);
-                    }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], int8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    CopyRowsToNumaShards(data, int8Packed.data(), bytesPerRow, k, kPerNuma, isCrossSwiglu, allocFunc);
                 } else if (data->dataType == DataType::INT4_NOZERO) {
                     std::vector <uint8_t> int4Packed;
                     Int4ToFastllmInt4PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
                     data->dataType = DataType::INT4_PERCHANNEL;
 
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                    if (isCrossSwiglu) {
-                        std::vector<uint8_t> reordered;
-                        CrossSwigluReorder(int4Packed.data(), k, bytesPerRow, reordered);
-                        int4Packed.swap(reordered);
-                    }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    CopyRowsToNumaShards(data, int4Packed.data(), bytesPerRow, k, kPerNuma, isCrossSwiglu, allocFunc);
                 } else if (data->dataType == DataType::INT4_GROUP) {
                     if (m % data->groupCnt > 0) {
                         ErrorInFastLLM("RegisterNumas can't support data type int4g when m % groupCnt > 0.");
@@ -1691,15 +1871,7 @@ namespace fastllm {
                     }
 
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                    if (isCrossSwiglu) {
-                        std::vector<uint8_t> reordered;
-                        CrossSwigluReorder(int4Packed.data(), k, bytesPerRow, reordered);
-                        int4Packed.swap(reordered);
-                    }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    CopyRowsToNumaShards(data, int4Packed.data(), bytesPerRow, k, kPerNuma, isCrossSwiglu, allocFunc);
                 } else {
                     ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
                 }
@@ -2743,6 +2915,10 @@ namespace fastllm {
               myState(state), numaConfig(config) {}
         
         void Run() override {
+            // RegisterNumasImpl may run inside these tasks (batch path);
+            // the flag stops it from re-entering the pool and deadlocking.
+            gInsideNumasPoolWorker = true;
+
             // 首先执行自己的任务
             processOwnTasks();
             
@@ -2751,6 +2927,8 @@ namespace fastllm {
             
             // 标记完成
             myState->completed.store(true, std::memory_order_release);
+
+            gInsideNumasPoolWorker = false;
         }
         
     private:

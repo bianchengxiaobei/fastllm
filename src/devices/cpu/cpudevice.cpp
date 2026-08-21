@@ -2167,6 +2167,11 @@ namespace fastllm {
                     }
                     finish = true;
                 } else if (BType == DataType::BFLOAT16) {
+                    static const bool profileScalarF32Bf16 =
+                        std::getenv("FASTLLM_PROFILE_F32BF16_SCALAR") != nullptr;
+                    auto scalarStart = profileScalarF32Bf16 ?
+                        std::chrono::steady_clock::now() :
+                        std::chrono::steady_clock::time_point();
                     for (int i = 0; i < n; i++) {
                         float *floatA = (float*)((uint8_t*)A + i * lda);
                         float *floatC = (float*)((uint8_t*)C + i * ldc);
@@ -2178,6 +2183,15 @@ namespace fastllm {
                             }
                             floatC[j] = sum;
                         }
+                    }
+                    if (profileScalarF32Bf16) {
+                        auto scalarEnd = std::chrono::steady_clock::now();
+                        printf(
+                            "[fastllm-profile-f32bf16-scalar] n=%d m=%d "
+                            "cols=%d seconds=%.6f\n",
+                            n, m, end - st,
+                            std::chrono::duration<double>(
+                                scalarEnd - scalarStart).count());
                     }
                     finish = true;
                 } else if (BType == DataType::FLOAT16) {
@@ -11289,7 +11303,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int t = 0; t < copyLen; t++) {
                 for (int h = 0; h < numHeads; h++) {
                     uint8_t *dst = pagedData + 
-                        (currentPageIdx * cache.pageLen * numHeads * headDim +
+                        ((size_t)currentPageIdx * cache.pageLen * numHeads * headDim +
                          (cache.lastPageLen + t) * numHeads * headDim +
                          h * headDim) * unitSize;
                     uint8_t *src = inputData + 
@@ -11331,7 +11345,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int t = 0; t < copyLen; t++) {
                 for (int h = 0; h < numHeads; h++) {
                     uint8_t *dst = pagedData + 
-                        (newPageIdx * cache.pageLen * numHeads * headDim +
+                        ((size_t)newPageIdx * cache.pageLen * numHeads * headDim +
                          t * numHeads * headDim +
                          h * headDim) * unitSize;
                     uint8_t *src = inputData + 
@@ -11400,7 +11414,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         float dotProduct = 0.0f;
                         int kHeadIdx = o / group;
                         uint8_t *kDataPtr = kPagedData +
-                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                            ((size_t)currentPageIdx * pageLen * kNumHeads * kHeadDim +
                              t * kNumHeads * kHeadDim +
                              kHeadIdx * kHeadDim) * kUnitSize;
                         float *kToken = (float*)kDataPtr;
@@ -11460,7 +11474,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         int j = kvTokenIdx;
                         int vHeadIdx = o / group;
                         uint8_t *vDataPtr = vPagedData +
-                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                            ((size_t)currentPageIdx * vPageLen * vNumHeads * vHeadDim +
                              t * vNumHeads * vHeadDim +
                              vHeadIdx * vHeadDim) * vUnitSize;
                         float *vToken = (float*)vDataPtr;
@@ -11541,7 +11555,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         float dotProduct = 0.0f;
                         int kHeadIdx = o / group;
                         uint8_t *kDataPtr = kPagedData +
-                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                            ((size_t)currentPageIdx * pageLen * kNumHeads * kHeadDim +
                              t * kNumHeads * kHeadDim +
                              kHeadIdx * kHeadDim) * kUnitSize;
 
@@ -11608,7 +11622,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         int j = kvTokenIdx;
                         int vHeadIdx = o / group;
                         uint8_t *vDataPtr = vPagedData +
-                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                            ((size_t)currentPageIdx * vPageLen * vNumHeads * vHeadDim +
                              t * vNumHeads * vHeadDim +
                              vHeadIdx * vHeadDim) * vUnitSize;
 
@@ -11698,7 +11712,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         float dotProduct = 0.0f;
                         int kHeadIdx = o / group;
                         uint8_t *kDataPtr = kPagedData +
-                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                            ((size_t)currentPageIdx * pageLen * kNumHeads * kHeadDim +
                              t * kNumHeads * kHeadDim +
                              kHeadIdx * kHeadDim) * kUnitSize;
 
@@ -11765,7 +11779,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         int j = kvTokenIdx;
                         int vHeadIdx = o / group;
                         uint8_t *vDataPtr = vPagedData +
-                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                            ((size_t)currentPageIdx * vPageLen * vNumHeads * vHeadDim +
                              t * vNumHeads * vHeadDim +
                              vHeadIdx * vHeadDim) * vUnitSize;
 
@@ -12025,7 +12039,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             int pageOffset = posData[b];
             for (int h = 0; h < numHeads; h++) {
                 uint8_t *dst = pagedData +
-                    (pageIdx * pageLen * numHeads * headDim + pageOffset * numHeads * headDim + h * headDim) * unitSize;
+                    ((size_t)pageIdx * pageLen * numHeads * headDim + pageOffset * numHeads * headDim + h * headDim) * unitSize;
                 uint8_t *src = inputData + (b * numHeads * headDim + h * headDim) * unitSize;
                 memcpy(dst, src, headDim * unitSize);
             }

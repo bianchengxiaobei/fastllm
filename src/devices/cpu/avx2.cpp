@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <algorithm>
 #include <cstring>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #ifdef __AVX2__
 #include "immintrin.h"
@@ -524,6 +527,11 @@ namespace fastllm {
             fp32Input.resize((size_t)superBlock * m);
         }
 
+        static const bool profileKernel =
+            std::getenv("FASTLLM_PROFILE_BF16_KERNEL") != nullptr;
+        double convertSeconds = 0, fmaSeconds = 0;
+        auto phaseStart = std::chrono::steady_clock::now();
+
         for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
             const int superRows = std::min(superBlock, n - iSuper);
             for (int r = 0; r < superRows; r++) {
@@ -539,6 +547,9 @@ namespace fastllm {
                     memcpy(dst + l, &x, sizeof(float));
                 }
             }
+            auto fmaStart = std::chrono::steady_clock::now();
+            convertSeconds +=
+                std::chrono::duration<double>(fmaStart - phaseStart).count();
 
             const int tailBegin = superRows - superRows % 5;
             int j = st;
@@ -588,9 +599,24 @@ namespace fastllm {
                         outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
                 }
             }
+            auto blockEnd = std::chrono::steady_clock::now();
+            fmaSeconds +=
+                std::chrono::duration<double>(blockEnd - fmaStart).count();
+            phaseStart = blockEnd;
         }
 
+        const auto biasStart = std::chrono::steady_clock::now();
         AddBiasAVX2(outputData, biasData, n, k, st, end);
+        const auto biasEnd = std::chrono::steady_clock::now();
+        const double biasSeconds =
+            std::chrono::duration<double>(biasEnd - biasStart).count();
+
+        if (profileKernel) {
+            printf(
+                "[fastllm-profile-avx2-bf16] n=%d m=%d k=%d threads=1 "
+                "convert=%.6f fma=%.6f bias=%.6f\n",
+                n, m, k, convertSeconds, fmaSeconds, biasSeconds);
+        }
         return true;
     }
 
