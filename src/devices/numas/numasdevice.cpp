@@ -2731,7 +2731,11 @@ namespace fastllm {
         const auto registrationEnd = profile ?
             std::chrono::steady_clock::now() :
             std::chrono::steady_clock::time_point();
+        const auto allocStart = profile ? std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point();
         output.Allocate();
+        const auto allocEnd = profile ? std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point();
 
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
@@ -2743,14 +2747,25 @@ namespace fastllm {
         const uint8_t *gemmInput = input.cpuData;
         DataType gemmInputType = input.dataType;
         const DataType weightType = weight.GetDataType();
+        double convertF32Seconds = 0;
         if (input.dataType == DataType::FLOAT32 &&
             weightType != DataType::FLOAT32 &&
             weightType != DataType::FLOAT16) {
             uint16_t *converted = workspace.EnsureConvertedBFloatInput(
                 (size_t)n * m);
+            const auto convertStart = profile ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             RunMultiThreadConvertFromFloat32(
                 converted, DataType::BFLOAT16,
                 (const float*)input.cpuData, n, m, GetAlivePool());
+            const auto convertEnd = profile ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
+            if (profile) {
+                convertF32Seconds = std::chrono::duration<double>(
+                    convertEnd - convertStart).count();
+            }
             gemmInput = (const uint8_t*)converted;
             gemmInputType = DataType::BFLOAT16;
         } else if (input.dataType == DataType::BFLOAT16 &&
@@ -2832,6 +2847,8 @@ namespace fastllm {
             const auto end = std::chrono::steady_clock::now();
             double registrationSeconds =
                 std::chrono::duration<double>(registrationEnd - begin).count();
+            double allocSeconds =
+                std::chrono::duration<double>(allocEnd - allocStart).count();
             double prepareSeconds =
                 std::chrono::duration<double>(
                     prepareEnd - registrationEnd).count();
@@ -2842,12 +2859,14 @@ namespace fastllm {
             double flops = 2.0 * (double)n * m * k;
             printf(
                 "[fastllm-profile-numas-linear] n=%d m=%d k=%d "
-                "input=%s weight=%s register=%.6f prepare=%.6f "
+                "input=%s weight=%s register=%.6f alloc=%.6f "
+                "convert=%.6f prepare=%.6f "
                 "gemm=%.6f finalize=%.6f compute=%.6f total=%.6f "
                 "gflops=%.3f\n",
                 n, m, k, GetDataTypeName(input.dataType).c_str(),
                 GetDataTypeName(weight.GetDataType()).c_str(),
-                registrationSeconds, prepareSeconds, gemmSeconds,
+                registrationSeconds, allocSeconds, convertF32Seconds,
+                prepareSeconds, gemmSeconds,
                 finalizeSeconds,
                 prepareSeconds + gemmSeconds + finalizeSeconds,
                 registrationSeconds + prepareSeconds + gemmSeconds +
