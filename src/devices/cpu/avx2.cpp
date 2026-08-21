@@ -517,10 +517,10 @@ namespace fastllm {
         float *outputData,
         int n, int m, int k, int st, int end)
     {
-        // 输入按超块先转成 fp32，权重行再作外层循环：每对权重行只流式读取
-        // 一次，遍历块内所有 token 时都驻留在 L1/L2。原来 token 块在外层的
-        // 顺序每 5 个 token 就要把 [st, end) 的整块权重重新读一遍。
-        // 超块限制 scratch 大小，n 更大时权重最多重读 ceil(n / 128) 次。
+        // 输入按超块先转成 fp32，token 块作外层、权重列作内层：5 行输入
+        // 块驻留 L2 并在遍历所有权重列时反复复用，权重列流式读取。
+        // 旧的权重列外层顺序会让 1MB fp32 输入块被重读 (end-st)/2 次
+        // （L3 反复读，约 170 次），是主要瓶颈。
         constexpr int superBlock = 128;
         thread_local std::vector<float> fp32Input;
         if ((size_t)fp32Input.size() < (size_t)superBlock * m) {
@@ -552,51 +552,32 @@ namespace fastllm {
                 std::chrono::duration<double>(fmaStart - phaseStart).count();
 
             const int tailBegin = superRows - superRows % 5;
-            int j = st;
-            for (; j + 1 < end; j += 2) {
-                uint16_t *weightPair = weightData + (size_t)j * m;
-                for (int i = 0; i < tailBegin; i += 5) {
+            for (int i = 0; i < tailBegin; i += 5) {
+                const float *inputBlock = fp32Input.data() + (size_t)i * m;
+                float *outRow = outputData + (size_t)(iSuper + i) * k;
+                int j = st;
+                for (; j + 1 < end; j += 2) {
+                    uint16_t *weightPair = weightData + (size_t)j * m;
                     mul_mat_bf16_f32_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)i * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + i) * k + j, k * sizeof(float));
+                        inputBlock, m * sizeof(float), outRow + j, k * sizeof(float));
                 }
-                switch (superRows - tailBegin) {
-                    case 0: break;
-                    case 1: mul_mat_bf16_f32_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
-                    case 2: mul_mat_bf16_f32_direct_avx2_pair<2>(m, weightPair, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
-                    case 3: mul_mat_bf16_f32_direct_avx2_pair<3>(m, weightPair, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
-                    case 4: mul_mat_bf16_f32_direct_avx2_pair<4>(m, weightPair, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                if (j < end) {
+                    mul_mat_bf16_f32_direct_avx2<5>(m, weightData + (size_t)j * m, m * sizeof(uint16_t),
+                        inputBlock, m * sizeof(float), outRow + j, k * sizeof(float));
                 }
             }
-            if (j < end) {
-                uint16_t *weightRow = weightData + (size_t)j * m;
-                for (int i = 0; i < tailBegin; i += 5) {
-                    mul_mat_bf16_f32_direct_avx2<5>(m, weightRow, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)i * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + i) * k + j, k * sizeof(float));
+            for (int i = tailBegin; i < superRows; i++) {
+                const float *inputRow = fp32Input.data() + (size_t)i * m;
+                float *outRow = outputData + (size_t)(iSuper + i) * k;
+                int j = st;
+                for (; j + 1 < end; j += 2) {
+                    uint16_t *weightPair = weightData + (size_t)j * m;
+                    mul_mat_bf16_f32_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
+                        inputRow, m * sizeof(float), outRow + j, k * sizeof(float));
                 }
-                switch (superRows - tailBegin) {
-                    case 0: break;
-                    case 1: mul_mat_bf16_f32_direct_avx2<1>(m, weightRow, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
-                    case 2: mul_mat_bf16_f32_direct_avx2<2>(m, weightRow, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
-                    case 3: mul_mat_bf16_f32_direct_avx2<3>(m, weightRow, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
-                    case 4: mul_mat_bf16_f32_direct_avx2<4>(m, weightRow, m * sizeof(uint16_t),
-                        fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
-                        outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                if (j < end) {
+                    mul_mat_bf16_f32_direct_avx2<1>(m, weightData + (size_t)j * m, m * sizeof(uint16_t),
+                        inputRow, m * sizeof(float), outRow + j, k * sizeof(float));
                 }
             }
             auto blockEnd = std::chrono::steady_clock::now();
