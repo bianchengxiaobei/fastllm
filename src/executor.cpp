@@ -9,6 +9,9 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/disk/diskdevice.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -333,6 +336,11 @@ namespace fastllm {
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
         profiler[opType] += spend;
+        static const bool profileSlowOps = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+        if (profileSlowOps && spend > 0.05f) {
+            printf("[fastllm-slow-op] %s spend=%.6f s\n", opType.c_str(), spend);
+            fflush(stdout);
+        }
     }
 
     void Executor::RunOnDevice(const std::string &deviceType,
@@ -408,6 +416,12 @@ namespace fastllm {
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
         profiler[opType] += spend;
+        static const bool profileSlowOps = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+        if (profileSlowOps && spend > 0.05f) {
+            printf("[fastllm-slow-op] %s (device=%s) spend=%.6f s\n",
+                   opType.c_str(), deviceType.c_str(), spend);
+            fflush(stdout);
+        }
     }
 
     void Executor::ClearProfiler() {
