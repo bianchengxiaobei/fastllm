@@ -2583,13 +2583,19 @@ namespace fastllm {
             gemmInputType = DataType::BFLOAT16;
         } else if (input.dataType == DataType::BFLOAT16 &&
                    weightType == DataType::FLOAT16 &&
-                   !GetCPUInstructInfo()->hasAVX2 &&
                    (n != 1 ||
-                    !GetCPUInstructInfo()->hasAVX512F)) {
+                    !GetCPUInstructInfo()->hasAVX512F) &&
+                   (!GetCPUInstructInfo()->hasAVX2 || n > 1)) {
+            // AVX2 prefill: convert the input to float32 once up front.
+            // The direct bf16 x fp16 kernel would redo the bf16->fp32
+            // conversion inside the GEMM inner loop for every weight pair,
+            // and those integer ops compete with FMA for p0/p1 on
+            // Broadwell.  Decode (n == 1) stays on the direct kernel.
             float *converted = workspace.EnsureConvertedFloatInput(
                 (size_t)n * m);
-            BFloat16ToFloat32(
-                (uint16_t*)input.cpuData, converted, n * m);
+            RunMultiThreadConvertFromBFloat16(
+                converted, DataType::FLOAT32,
+                (const uint16_t*)input.cpuData, n, m, GetAlivePool());
             gemmInput = (const uint8_t*)converted;
             gemmInputType = DataType::FLOAT32;
         }
@@ -2616,8 +2622,9 @@ namespace fastllm {
             // Only collapse extreme one-column/two-column shards.  Wider
             // projections still benefit from all available memory channels.
             if (columnsPerNode < workers * 2) {
-                // AVX2 processes 5 output columns per kernel block; larger
-                // tasks amortize input-row reuse and scheduling overhead.
+                // AVX2 kernel blocks cover 2 output columns x 5 input rows;
+                // larger tasks amortize input-row reuse and scheduling
+                // overhead.
                 constexpr int minColumnsPerTask = 32;
                 int usefulTasks =
                     (columnsPerNode + minColumnsPerTask - 1) /
@@ -2626,6 +2633,10 @@ namespace fastllm {
             }
             int columnsPerTask =
                 (columnsPerNode + taskCount - 1) / taskCount;
+            // Align task boundaries to 16 columns (one 64-byte cache line of
+            // the float32 output scratch) so neighboring tasks never write
+            // the same line.
+            columnsPerTask = (columnsPerTask + 15) & ~15;
             storage.reserve(taskCount);
             int globalStart = node * columnsPerNode;
             for (int start = 0; start < columnsPerNode;

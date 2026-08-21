@@ -594,135 +594,145 @@ namespace fastllm {
         return true;
     }
 
+    // FP8 E4M3 x BF16 GEMV kernels.  Decode streams the weight bytes from
+    // DRAM, so the inner loop is built to keep every load retiring:
+    //  - one FP32 copy of A is converted once per input row and reused by
+    //    every weight row (the old kernel re-converted A per output column);
+    //  - two weight rows are interleaved into four independent FMA chains so
+    //    the 5-cycle vfmaddps latency cannot stall the weight stream;
+    //  - the FP8 -> BF16 bit trick stays unchanged: decoded values are
+    //    pre-scaled by 2^-120 and magicScale compensates once per row/block.
+#ifdef __AVX2__
+    static inline void DecodeFP8E4M3x16_AVX2(const uint8_t *src, __m256 &lo, __m256 &hi) {
+        const __m128i signMask = _mm_set1_epi8((char)0x80);
+        const __m128i mantMask = _mm_set1_epi8(0x7F);
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i bytes = _mm_loadu_si128((const __m128i*)src);
+        const __m128i signBytes = _mm_and_si128(bytes, signMask);
+        const __m128i mantBytes = _mm_and_si128(bytes, mantMask);
+        const __m128i signLo = _mm_unpacklo_epi8(signBytes, zero);
+        const __m128i mantLo = _mm_unpacklo_epi8(mantBytes, zero);
+        const __m128i bf16Lo = _mm_or_si128(_mm_slli_epi16(signLo, 8), _mm_slli_epi16(mantLo, 4));
+        const __m128i signHi = _mm_unpackhi_epi8(signBytes, zero);
+        const __m128i mantHi = _mm_unpackhi_epi8(mantBytes, zero);
+        const __m128i bf16Hi = _mm_or_si128(_mm_slli_epi16(signHi, 8), _mm_slli_epi16(mantHi, 4));
+        lo = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16Lo), 16));
+        hi = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16Hi), 16));
+    }
+
+    static inline float HorizontalSum8_AVX2(__m256 v) {
+        const __m128 lo = _mm256_castps256_ps128(v);
+        const __m128 hi = _mm256_extractf128_ps(v, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        return _mm_cvtss_f32(s);
+    }
+
+    static inline float FP8E4M3ScalarToFloat_AVX2(uint8_t fp8Val) {
+        const uint16_t bf16Val = (uint16_t)(((uint16_t)(fp8Val & 0x80) << 8) |
+                                            ((uint16_t)(fp8Val & 0x7F) << 4));
+        const uint32_t bits = (uint32_t)bf16Val << 16;
+        float value;
+        memcpy(&value, &bits, sizeof(float));
+        return value;
+    }
+
+    static float *GetFP8GemmAFloatScratch_AVX2(int m) {
+        static thread_local std::vector<float> scratch;
+        if ((int)scratch.size() < m) {
+            scratch.resize(m);
+        }
+        return scratch.data();
+    }
+
+    static inline void ConvertBFloat16ToFloat32_AVX2(const uint16_t *src, float *dst, int len) {
+        int i = 0;
+        for (; i + 15 < len; i += 16) {
+            const __m256i packed = _mm256_loadu_si256((const __m256i*)(src + i));
+            const __m128i lo = _mm256_castsi256_si128(packed);
+            const __m128i hi = _mm256_extracti128_si256(packed, 1);
+            _mm256_storeu_ps(dst + i,
+                _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(lo), 16)));
+            _mm256_storeu_ps(dst + i + 8,
+                _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(hi), 16)));
+        }
+        for (; i < len; i++) {
+            const uint32_t bits = (uint32_t)src[i] << 16;
+            memcpy(dst + i, &bits, sizeof(float));
+        }
+    }
+#endif
+
     bool LinearBFloat16_FP8E4M3BLOCK128_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX2__
-        static int block_size = 128;
-        size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
-        float magicScale = pow(2, 120);
-        
+        const size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
+        const float magicScale = (float)pow(2, 120);
+        const int blockM = 128;
+        const int numBlocks = (m + blockM - 1) / blockM;
+        const size_t blockStride = blockM + sizeof(float);
+
         for (int i = 0; i < n; i++) {
-            uint16_t *bf16A = inputData + i * m;
-            float *floatC = outputData + i * k;
-            int j = st;
-            __m128i v_a_mask_byte = _mm_set1_epi8(0x80); 
-            __m128i v_b_mask_byte = _mm_set1_epi8(0x7F); 
-            
-            for (; j < end; j++) {
-                float now = 0.0f;
-                __m256 last_sum = _mm256_setzero_ps(); // Accumulator for 8 parallel sums
-                // 获取当前行的起始位置
-                uint8_t *rowData = (uint8_t*)weightData + j * perRow;
-                
-                // 计算需要多少个block（每个block有128个FP8 + 1个float scale）
-                const int blockM = 128;
-                int numBlocks = (m + blockM - 1) / blockM;
-                
+            float *a = GetFP8GemmAFloatScratch_AVX2(m);
+            ConvertBFloat16ToFloat32_AVX2(inputData + (size_t)i * m, a, m);
+            float *floatC = outputData + (size_t)i * k;
+
+            for (int j = st; j < end; j += 2) {
+                const bool hasSecond = (j + 1 < end);
+                const uint8_t *row0 = weightData + (size_t)j * perRow;
+                const uint8_t *row1 = hasSecond ? (row0 + perRow) : row0;
+                __m256 total0 = _mm256_setzero_ps();
+                __m256 total1 = _mm256_setzero_ps();
+                float tail0 = 0.0f;
+                float tail1 = 0.0f;
+
                 for (int blockIdx = 0; blockIdx < numBlocks; blockIdx++) {
-                    // 计算当前block在rowData中的偏移
-                    // 每个block占用 128 bytes (FP8) + 4 bytes (float scale)
-                    size_t blockOffset = blockIdx * (blockM + sizeof(float));
-                    
-                    // 获取当前block的FP8数据和scale
-                    uint8_t *fp8B = rowData + blockOffset;
-                    
-                    // 计算当前block处理的元素范围
-                    int blockStart = blockIdx * blockM;
-                    int blockEnd = std::min(blockStart + blockM, m);
-                    
-                    __m256 v_sum = _mm256_setzero_ps(); // Accumulator for 8 parallel sums
-                    
-                    // 处理当前block内的数据
-                    int l = blockStart;
-                    for (; l + 15 < blockEnd; l += 16) {
-                        // 1. Load 16 BF16 inputs and convert to float
-                        __m256i v_input_bf16 = _mm256_loadu_si256((__m256i const*)(bf16A + l));
-                        
-                        // Convert BF16 to float32 (shift left by 16 bits)
-                        __m128i v_input_low = _mm256_extracti128_si256(v_input_bf16, 0);
-                        __m128i v_input_high = _mm256_extracti128_si256(v_input_bf16, 1);
-                        
-                        // Process low 8 BF16 values
-                        __m256i v_input_low_32 = _mm256_cvtepu16_epi32(v_input_low);
-                        __m256i v_input_low_shifted = _mm256_slli_epi32(v_input_low_32, 16);
-                        __m256 v_input_float_low = _mm256_castsi256_ps(v_input_low_shifted);
-                        
-                        // Process high 8 BF16 values
-                        __m256i v_input_high_32 = _mm256_cvtepu16_epi32(v_input_high);
-                        __m256i v_input_high_shifted = _mm256_slli_epi32(v_input_high_32, 16);
-                        __m256 v_input_float_high = _mm256_castsi256_ps(v_input_high_shifted);
-                        
-                        // 2. Load 16 FP8 weights from current block
-                        __m128i va_bytes = _mm_loadu_si128((__m128i*)(fp8B + (l - blockStart)));
-                        
-                        // Extract sign and mantissa for FP8 conversion
-                        __m128i va_masked_bytes = _mm_and_si128(va_bytes, v_a_mask_byte);
-                        __m128i vb_masked_bytes = _mm_and_si128(va_bytes, v_b_mask_byte);
-                        
-                        // Convert to 16-bit for BF16 format
-                        // Low 8 bytes
-                        __m128i va_low_bytes = _mm_unpacklo_epi8(va_masked_bytes, _mm_setzero_si128());
-                        __m128i vb_low_bytes = _mm_unpacklo_epi8(vb_masked_bytes, _mm_setzero_si128());
-                        __m128i v_a_term_low = _mm_slli_epi16(va_low_bytes, 8);
-                        __m128i v_b_term_low = _mm_slli_epi16(vb_low_bytes, 4);
-                        __m128i v_result_low = _mm_or_si128(v_a_term_low, v_b_term_low);
-                        
-                        // High 8 bytes
-                        __m128i va_high_bytes = _mm_unpackhi_epi8(va_masked_bytes, _mm_setzero_si128());
-                        __m128i vb_high_bytes = _mm_unpackhi_epi8(vb_masked_bytes, _mm_setzero_si128());
-                        __m128i v_a_term_high = _mm_slli_epi16(va_high_bytes, 8);
-                        __m128i v_b_term_high = _mm_slli_epi16(vb_high_bytes, 4);
-                        __m128i v_result_high = _mm_or_si128(v_a_term_high, v_b_term_high);
-                        
-                        // Convert BF16 weights to float32
-                        __m256i v_weight_low_32 = _mm256_cvtepu16_epi32(v_result_low);
-                        __m256i v_weight_low_shifted = _mm256_slli_epi32(v_weight_low_32, 16);
-                        __m256 v_weight_float_low = _mm256_castsi256_ps(v_weight_low_shifted);
-                        
-                        __m256i v_weight_high_32 = _mm256_cvtepu16_epi32(v_result_high);
-                        __m256i v_weight_high_shifted = _mm256_slli_epi32(v_weight_high_32, 16);
-                        __m256 v_weight_float_high = _mm256_castsi256_ps(v_weight_high_shifted);
-                        
-                        // 3. Compute dot product: multiply and accumulate
-                        __m256 v_mul_low = _mm256_mul_ps(v_input_float_low, v_weight_float_low);
-                        __m256 v_mul_high = _mm256_mul_ps(v_input_float_high, v_weight_float_high);
-                        
-                        v_sum = _mm256_add_ps(v_sum, v_mul_low);
-                        v_sum = _mm256_add_ps(v_sum, v_mul_high);
+                    const int base = blockIdx * blockM;
+                    const int blockEnd = std::min(blockM, m - base);
+                    const uint8_t *fp80 = row0 + blockIdx * blockStride;
+                    const uint8_t *fp81 = row1 + blockIdx * blockStride;
+                    __m256 s0 = _mm256_setzero_ps();
+                    __m256 s1 = _mm256_setzero_ps();
+                    __m256 r0 = _mm256_setzero_ps();
+                    __m256 r1 = _mm256_setzero_ps();
+
+                    int p = 0;
+                    for (; p + 15 < blockEnd; p += 16) {
+                        const __m256 a0 = _mm256_loadu_ps(a + base + p);
+                        const __m256 a1 = _mm256_loadu_ps(a + base + p + 8);
+                        __m256 w0lo, w0hi, w1lo, w1hi;
+                        DecodeFP8E4M3x16_AVX2(fp80 + p, w0lo, w0hi);
+                        s0 = _mm256_fmadd_ps(a0, w0lo, s0);
+                        s1 = _mm256_fmadd_ps(a1, w0hi, s1);
+                        DecodeFP8E4M3x16_AVX2(fp81 + p, w1lo, w1hi);
+                        r0 = _mm256_fmadd_ps(a0, w1lo, r0);
+                        r1 = _mm256_fmadd_ps(a1, w1hi, r1);
                     }
-                    
-                    // 处理剩余的元素（标量处理）
-                    for (; l < blockEnd; l++) {
-                        // Convert BF16 input to float
-                        uint32_t input_val = ((uint32_t)bf16A[l]) << 16;
-                        float input_float = *((float*)&input_val);
-                        
-                        // Convert FP8 weight to BF16 then to float
-                        uint8_t fp8_val = fp8B[l - blockStart];
-                        uint16_t sign_and_exp = (fp8_val & 0x80) << 8;
-                        uint16_t mantissa = (fp8_val & 0x7F) << 4;
-                        uint16_t bf16_val = sign_and_exp | mantissa;
-                        uint32_t weight_val = ((uint32_t)bf16_val) << 16;
-                        float weight_float = *((float*)&weight_val);
-                        
-                        // Accumulate
-                        now += input_float * weight_float;
+
+                    // Scalar tail also carries the block scale: the old
+                    // kernel dropped these products below 2^-120.
+                    float blockTail0 = 0.0f;
+                    float blockTail1 = 0.0f;
+                    for (; p < blockEnd; p++) {
+                        const float av = a[base + p];
+                        blockTail0 += av * FP8E4M3ScalarToFloat_AVX2(fp80[p]);
+                        blockTail1 += av * FP8E4M3ScalarToFloat_AVX2(fp81[p]);
                     }
-                    
-                    float curScale = *(float*)(fp8B + blockM);  // scale在128个FP8之后
-                    __m256 vScale = _mm256_set1_ps(curScale);
-                    last_sum = _mm256_fmadd_ps(v_sum, vScale, last_sum);
+
+                    float scale0, scale1;
+                    memcpy(&scale0, fp80 + blockM, sizeof(float));
+                    memcpy(&scale1, fp81 + blockM, sizeof(float));
+                    total0 = _mm256_fmadd_ps(_mm256_add_ps(s0, s1), _mm256_set1_ps(scale0), total0);
+                    total1 = _mm256_fmadd_ps(_mm256_add_ps(r0, r1), _mm256_set1_ps(scale1), total1);
+                    tail0 += blockTail0 * scale0;
+                    tail1 += blockTail1 * scale1;
                 }
-                
-                // Horizontal sum of last_sum
-                __m128 sum_low = _mm256_extractf128_ps(last_sum, 0);
-                __m128 sum_high = _mm256_extractf128_ps(last_sum, 1);
-                __m128 sum_128 = _mm_add_ps(sum_low, sum_high);
-                sum_128 = _mm_hadd_ps(sum_128, sum_128);
-                sum_128 = _mm_hadd_ps(sum_128, sum_128);
-                
-                now += _mm_cvtss_f32(sum_128) * magicScale;
-                floatC[j] = now;
+
+                floatC[j] = (HorizontalSum8_AVX2(total0) + tail0) * magicScale;
+                if (hasSecond) {
+                    floatC[j + 1] = (HorizontalSum8_AVX2(total1) + tail1) * magicScale;
+                }
             }
         }
         return true;
@@ -734,127 +744,55 @@ namespace fastllm {
     bool LinearBFloat16_FP8E4M3PERCHANNEL_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX2__
-        static int block_size = m;
-        size_t perRow = GetDataBytes(DataType::FP8_E4M3_PERCHANNEL, 1, m);
-        float magicScale = pow(2, 120);
-        
+        const size_t perRow = GetDataBytes(DataType::FP8_E4M3_PERCHANNEL, 1, m);
+        const float magicScale = (float)pow(2, 120);
+
         for (int i = 0; i < n; i++) {
-            uint16_t *bf16A = inputData + i * m;
-            float *floatC = outputData + i * k;
-            int j = st;
-            __m128i v_a_mask_byte = _mm_set1_epi8(0x80); 
-            __m128i v_b_mask_byte = _mm_set1_epi8(0x7F); 
-            
-            for (; j < end; j++) {
-                float now = 0.0f;
-                __m256 last_sum = _mm256_setzero_ps(); // Accumulator for 8 parallel sums
-                // 获取当前行的起始位置
-                uint8_t *rowData = (uint8_t*)weightData + j * perRow;
-                    
-                // 获取当前block的FP8数据和scale
-                uint8_t *fp8B = rowData;
-                    
-                // 计算当前block处理的元素范围
-                int blockStart = 0;
-                int blockEnd = m;
-                    
-                __m256 v_sum = _mm256_setzero_ps(); // Accumulator for 8 parallel sums
-                    
-                // 处理当前block内的数据
-                int l = blockStart;
-                for (; l + 15 < blockEnd; l += 16) {
-                    // 1. Load 16 BF16 inputs and convert to float
-                    __m256i v_input_bf16 = _mm256_loadu_si256((__m256i const*)(bf16A + l));
-                        
-                    // Convert BF16 to float32 (shift left by 16 bits)
-                    __m128i v_input_low = _mm256_extracti128_si256(v_input_bf16, 0);
-                    __m128i v_input_high = _mm256_extracti128_si256(v_input_bf16, 1);
-                        
-                    // Process low 8 BF16 values
-                    __m256i v_input_low_32 = _mm256_cvtepu16_epi32(v_input_low);
-                    __m256i v_input_low_shifted = _mm256_slli_epi32(v_input_low_32, 16);
-                    __m256 v_input_float_low = _mm256_castsi256_ps(v_input_low_shifted);
-                    
-                    // Process high 8 BF16 values
-                    __m256i v_input_high_32 = _mm256_cvtepu16_epi32(v_input_high);
-                    __m256i v_input_high_shifted = _mm256_slli_epi32(v_input_high_32, 16);
-                    __m256 v_input_float_high = _mm256_castsi256_ps(v_input_high_shifted);
-                        
-                    // 2. Load 16 FP8 weights from current block
-                    __m128i va_bytes = _mm_loadu_si128((__m128i*)(fp8B + (l - blockStart)));
-                        
-                    // Extract sign and mantissa for FP8 conversion
-                    __m128i va_masked_bytes = _mm_and_si128(va_bytes, v_a_mask_byte);
-                    __m128i vb_masked_bytes = _mm_and_si128(va_bytes, v_b_mask_byte);
-                        
-                    // Convert to 16-bit for BF16 format
-                    // Low 8 bytes
-                    __m128i va_low_bytes = _mm_unpacklo_epi8(va_masked_bytes, _mm_setzero_si128());
-                    __m128i vb_low_bytes = _mm_unpacklo_epi8(vb_masked_bytes, _mm_setzero_si128());
-                    __m128i v_a_term_low = _mm_slli_epi16(va_low_bytes, 8);
-                    __m128i v_b_term_low = _mm_slli_epi16(vb_low_bytes, 4);
-                    __m128i v_result_low = _mm_or_si128(v_a_term_low, v_b_term_low);
-                        
-                    // High 8 bytes
-                    __m128i va_high_bytes = _mm_unpackhi_epi8(va_masked_bytes, _mm_setzero_si128());
-                    __m128i vb_high_bytes = _mm_unpackhi_epi8(vb_masked_bytes, _mm_setzero_si128());
-                    __m128i v_a_term_high = _mm_slli_epi16(va_high_bytes, 8);
-                    __m128i v_b_term_high = _mm_slli_epi16(vb_high_bytes, 4);
-                    __m128i v_result_high = _mm_or_si128(v_a_term_high, v_b_term_high);
-                        
-                    // Convert BF16 weights to float32
-                    __m256i v_weight_low_32 = _mm256_cvtepu16_epi32(v_result_low);
-                    __m256i v_weight_low_shifted = _mm256_slli_epi32(v_weight_low_32, 16);
-                    __m256 v_weight_float_low = _mm256_castsi256_ps(v_weight_low_shifted);
-                    
-                    __m256i v_weight_high_32 = _mm256_cvtepu16_epi32(v_result_high);
-                    __m256i v_weight_high_shifted = _mm256_slli_epi32(v_weight_high_32, 16);
-                    __m256 v_weight_float_high = _mm256_castsi256_ps(v_weight_high_shifted);
-                    
-                    // 3. Compute dot product: multiply and accumulate
-                    __m256 v_mul_low = _mm256_mul_ps(v_input_float_low, v_weight_float_low);
-                    __m256 v_mul_high = _mm256_mul_ps(v_input_float_high, v_weight_float_high);
-                        
-                    v_sum = _mm256_add_ps(v_sum, v_mul_low);
-                    v_sum = _mm256_add_ps(v_sum, v_mul_high);
+            float *a = GetFP8GemmAFloatScratch_AVX2(m);
+            ConvertBFloat16ToFloat32_AVX2(inputData + (size_t)i * m, a, m);
+            float *floatC = outputData + (size_t)i * k;
+
+            for (int j = st; j < end; j += 2) {
+                const bool hasSecond = (j + 1 < end);
+                const uint8_t *row0 = weightData + (size_t)j * perRow;
+                const uint8_t *row1 = hasSecond ? (row0 + perRow) : row0;
+                __m256 s0 = _mm256_setzero_ps();
+                __m256 s1 = _mm256_setzero_ps();
+                __m256 r0 = _mm256_setzero_ps();
+                __m256 r1 = _mm256_setzero_ps();
+                float tail0 = 0.0f;
+                float tail1 = 0.0f;
+
+                int p = 0;
+                for (; p + 15 < m; p += 16) {
+                    const __m256 a0 = _mm256_loadu_ps(a + p);
+                    const __m256 a1 = _mm256_loadu_ps(a + p + 8);
+                    __m256 w0lo, w0hi, w1lo, w1hi;
+                    DecodeFP8E4M3x16_AVX2(row0 + p, w0lo, w0hi);
+                    s0 = _mm256_fmadd_ps(a0, w0lo, s0);
+                    s1 = _mm256_fmadd_ps(a1, w0hi, s1);
+                    DecodeFP8E4M3x16_AVX2(row1 + p, w1lo, w1hi);
+                    r0 = _mm256_fmadd_ps(a0, w1lo, r0);
+                    r1 = _mm256_fmadd_ps(a1, w1hi, r1);
+                }
+                for (; p < m; p++) {
+                    const float av = a[p];
+                    tail0 += av * FP8E4M3ScalarToFloat_AVX2(row0[p]);
+                    tail1 += av * FP8E4M3ScalarToFloat_AVX2(row1[p]);
+                }
+
+                float scale0, scale1;
+                memcpy(&scale0, row0 + m, sizeof(float));
+                memcpy(&scale1, row1 + m, sizeof(float));
+                floatC[j] = (HorizontalSum8_AVX2(_mm256_add_ps(s0, s1)) + tail0) * scale0 * magicScale;
+                if (hasSecond) {
+                    floatC[j + 1] = (HorizontalSum8_AVX2(_mm256_add_ps(r0, r1)) + tail1) * scale1 * magicScale;
+                }
             }
-                    
-            // 处理剩余的元素（标量处理）
-            for (; l < blockEnd; l++) {
-                    // Convert BF16 input to float
-                    uint32_t input_val = ((uint32_t)bf16A[l]) << 16;
-                    float input_float = *((float*)&input_val);
-                    
-                    // Convert FP8 weight to BF16 then to float
-                    uint8_t fp8_val = fp8B[l - blockStart];
-                    uint16_t sign_and_exp = (fp8_val & 0x80) << 8;
-                    uint16_t mantissa = (fp8_val & 0x7F) << 4;
-                    uint16_t bf16_val = sign_and_exp | mantissa;
-                    uint32_t weight_val = ((uint32_t)bf16_val) << 16;
-                    float weight_float = *((float*)&weight_val);
-                        
-                    // Accumulate
-                    now += input_float * weight_float;
-            }
-                    
-            float curScale = *(float*)(fp8B + m);  // scale在128个FP8之后
-            __m256 vScale = _mm256_set1_ps(curScale);
-            last_sum = _mm256_fmadd_ps(v_sum, vScale, last_sum);
-                
-            // Horizontal sum of last_sum
-            __m128 sum_low = _mm256_extractf128_ps(last_sum, 0);
-            __m128 sum_high = _mm256_extractf128_ps(last_sum, 1);
-            __m128 sum_128 = _mm_add_ps(sum_low, sum_high);
-            sum_128 = _mm_hadd_ps(sum_128, sum_128);
-            sum_128 = _mm_hadd_ps(sum_128, sum_128);
-                
-            now += _mm_cvtss_f32(sum_128) * magicScale;
-            floatC[j] = now;
         }
-    }
-    return true;
+        return true;
 #else
-    return false;
+        return false;
 #endif
     }
 
@@ -1340,32 +1278,7 @@ namespace fastllm {
             }
         }
         
-        // 处理剩余元素
-        if (remainder > 0) {
-            for (int ix = 0; ix < AROW; ++ix) {
-                const uint16_t* a_row = (const uint16_t*)((const char*)A + ix * stride_a);
-                
-                for (int iy = 0; iy < BROW; ++iy) {
-                    const float* b_row = (const float*)((const char*)B + iy * stride_b);
-                    
-                    int acc_idx = ix * BROW + iy;
-                    
-                    for (int j = 0; j < remainder; ++j) {
-                        // 单个元素处理
-                        __m128i a_f16 = _mm_cvtsi32_si128(a_row[nb * SIMD_WIDTH + j]);
-                        __m128 a_scalar = _mm_cvtph_ps(a_f16);
-                        float a_val = _mm_cvtss_f32(a_scalar);
-                        float b_val = b_row[nb * SIMD_WIDTH + j];
-                        
-                        // 累加到对应的累加器
-                        __m256 temp = _mm256_set1_ps(a_val * b_val);
-                        acc[acc_idx] = _mm256_add_ps(acc[acc_idx], _mm256_blend_ps(_mm256_setzero_ps(), temp, 1));
-                    }
-                }
-            }
-        }
-        
-        // 水平求和并存储
+        // 水平求和并存储（剩余元素在归约后统一累加，避免重复计入）
         for (int ix = 0; ix < AROW; ++ix) {
             for (int iy = 0; iy < BROW; ++iy) {
                 int acc_idx = ix * BROW + iy;
@@ -1471,57 +1384,80 @@ namespace fastllm {
 #endif
     }
 
+    // 5x2 微内核沿整个 m 做点积，tile 装不进缓存时必有一个操作数被反复
+    // 重读。把权重列面板控制在 ~128KB：它能和一个 5 行 fp32 输入块一起
+    // 放进 Broadwell 的 256KB L2，面板每个 token 超块只从 L3 载入一次，
+    // 之后每个 token 块都从 L2 重读。返回偶数（权重按对处理）。
+    static int LinearWeightPanelColumns(int m) {
+        constexpr size_t panelBytesTarget = 128 * 1024;
+        size_t perRow = sizeof(uint16_t) * (size_t)std::max(1, m);
+        size_t columns = panelBytesTarget / perRow;
+        columns = std::min<size_t>(columns, 32);
+        columns &= ~size_t(1);
+        return (int)std::max<size_t>(columns, 2);
+    }
+
     bool LinearFloat32Float16_AVX2_Kernel(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
-        // 权重行在外层循环：每对权重行只流式读取一次，遍历所有 token 块时
-        // 都驻留在 L1/L2。原来 token 块在外层的顺序每 5 个 token 就要把
-        // [st, end) 的整块权重重新读一遍，prefill 时权重流量被放大。
-        const int tailBegin = n - n % 5;
-        int j = st;
-        for (; j + 1 < end; j += 2) {
-            uint16_t *weightPair = weightData + (size_t)j * m;
-            for (int i = 0; i < tailBegin; i += 5) {
-                mul_mat_f16_f32_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)i * m, m * sizeof(float),
-                    outputData + (size_t)i * k + j, k * sizeof(float));
-            }
-            switch (n - tailBegin) {
-                case 0: break;
-                case 1: mul_mat_f16_f32_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(float),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 2: mul_mat_f16_f32_direct_avx2_pair<2>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(float),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 3: mul_mat_f16_f32_direct_avx2_pair<3>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(float),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 4: mul_mat_f16_f32_direct_avx2_pair<4>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(float),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-            }
-        }
-        if (j < end) {
-            uint16_t *weightRow = weightData + (size_t)j * m;
-            for (int i = 0; i < tailBegin; i += 5) {
-                mul_mat_f16_f32_direct_avx2<5, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)i * m, m * sizeof(float),
-                    outputData + (size_t)i * k + j, k * sizeof(float));
-            }
-            switch (n - tailBegin) {
-                case 0: break;
-                case 1: mul_mat_f16_f32_direct_avx2<1, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(float),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 2: mul_mat_f16_f32_direct_avx2<2, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(float),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 3: mul_mat_f16_f32_direct_avx2<3, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(float),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 4: mul_mat_f16_f32_direct_avx2<4, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(float),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+        // 2D 分块：token 按超块、输出列按 L2 面板切。面板内 token 块在
+        // 外层循环：权重面板驻留 L2 被所有 token 块复用，每个 5 行输入块
+        // 每个面板只读一次。DRAM 流量约为权重一遍 + 输入一遍，不再随 n
+        // 放大；输入重读只发生在面板数（列分块）上且落在 L3。
+        constexpr int superBlock = 128;
+        const int panelCols = LinearWeightPanelColumns(m);
+        for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
+            const int superRows = std::min(superBlock, n - iSuper);
+            const float *superInput = inputData + (size_t)iSuper * m;
+            const int tailBegin = superRows - superRows % 5;
+            for (int jPanel = st; jPanel < end; jPanel += panelCols) {
+                const int panelEnd = std::min(jPanel + panelCols, end);
+                int j = jPanel;
+                for (; j + 1 < panelEnd; j += 2) {
+                    uint16_t *weightPair = weightData + (size_t)j * m;
+                    for (int i = 0; i < tailBegin; i += 5) {
+                        mul_mat_f16_f32_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
+                            superInput + (size_t)i * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + i) * k + j, k * sizeof(float));
+                    }
+                    switch (superRows - tailBegin) {
+                        case 0: break;
+                        case 1: mul_mat_f16_f32_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
+                            superInput + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 2: mul_mat_f16_f32_direct_avx2_pair<2>(m, weightPair, m * sizeof(uint16_t),
+                            superInput + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 3: mul_mat_f16_f32_direct_avx2_pair<3>(m, weightPair, m * sizeof(uint16_t),
+                            superInput + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 4: mul_mat_f16_f32_direct_avx2_pair<4>(m, weightPair, m * sizeof(uint16_t),
+                            superInput + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    }
+                }
+                if (j < panelEnd) {
+                    uint16_t *weightRow = weightData + (size_t)j * m;
+                    for (int i = 0; i < tailBegin; i += 5) {
+                        mul_mat_f16_f32_direct_avx2<5, 1>(m, weightRow, m * sizeof(uint16_t),
+                            superInput + (size_t)i * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + i) * k + j, k * sizeof(float));
+                    }
+                    switch (superRows - tailBegin) {
+                        case 0: break;
+                        case 1: mul_mat_f16_f32_direct_avx2<1, 1>(m, weightRow, m * sizeof(uint16_t),
+                            superInput + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 2: mul_mat_f16_f32_direct_avx2<2, 1>(m, weightRow, m * sizeof(uint16_t),
+                            superInput + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 3: mul_mat_f16_f32_direct_avx2<3, 1>(m, weightRow, m * sizeof(uint16_t),
+                            superInput + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 4: mul_mat_f16_f32_direct_avx2<4, 1>(m, weightRow, m * sizeof(uint16_t),
+                            superInput + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    }
+                }
             }
         }
         AddBiasAVX2(outputData, biasData, n, k, st, end);
@@ -1665,55 +1601,85 @@ namespace fastllm {
     bool LinearBFloat16Float16_AVX2_Kernel(
         uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end) {
-        // 权重行在外层循环：每对权重行只流式读取一次，遍历所有 token 块时
-        // 都驻留在 L1/L2。原来 token 块在外层的顺序每 5 个 token 就要把
-        // [st, end) 的整块权重重新读一遍，prefill 时权重流量被放大。
-        const int tailBegin = n - n % 5;
-        int j = st;
-        for (; j + 1 < end; j += 2) {
-            uint16_t *weightPair = weightData + (size_t)j * m;
-            for (int i = 0; i < tailBegin; i += 5) {
-                mul_mat_bf16_f16_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)i * m, m * sizeof(uint16_t),
-                    outputData + (size_t)i * k + j, k * sizeof(float));
-            }
-            switch (n - tailBegin) {
-                case 0: break;
-                case 1: mul_mat_bf16_f16_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 2: mul_mat_bf16_f16_direct_avx2_pair<2>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 3: mul_mat_bf16_f16_direct_avx2_pair<3>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 4: mul_mat_bf16_f16_direct_avx2_pair<4>(m, weightPair, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-            }
+        // 输入按超块先转成 fp32（转换只做一次，内循环只剩 fp16 权重转换
+        // 和 FMA，Broadwell 上 p0/p1 端口压力显著低于在 GEMM 内循环里逐块
+        // 转 bf16）。GEMM 用 2D 分块：输出列按 L2 面板切，面板内 token 块
+        // 在外层循环，权重面板驻留 L2 被所有 token 块复用，每个 5 行输入块
+        // 每个面板只读一次。DRAM 流量约为权重一遍 + 输入一遍，不再随 n
+        // 放大；超块把 fp32 scratch 限制在固定大小。
+        constexpr int superBlock = 128;
+        thread_local std::vector<float> fp32Input;
+        if (fp32Input.size() < (size_t)superBlock * m) {
+            fp32Input.resize((size_t)superBlock * m);
         }
-        if (j < end) {
-            uint16_t *weightRow = weightData + (size_t)j * m;
-            for (int i = 0; i < tailBegin; i += 5) {
-                mul_mat_bf16_f16_direct_avx2<5, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)i * m, m * sizeof(uint16_t),
-                    outputData + (size_t)i * k + j, k * sizeof(float));
+
+        const int panelCols = LinearWeightPanelColumns(m);
+        for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
+            const int superRows = std::min(superBlock, n - iSuper);
+            for (int r = 0; r < superRows; r++) {
+                const uint16_t *src = inputData + (size_t)(iSuper + r) * m;
+                float *dst = fp32Input.data() + (size_t)r * m;
+                int l = 0;
+                for (; l + 7 < m; l += 8) {
+                    _mm256_storeu_ps(dst + l, bf16_to_fp32_avx2(
+                        _mm_loadu_si128((const __m128i*)(src + l))));
+                }
+                for (; l < m; l++) {
+                    uint32_t x = (uint32_t)src[l] << 16;
+                    memcpy(dst + l, &x, sizeof(float));
+                }
             }
-            switch (n - tailBegin) {
-                case 0: break;
-                case 1: mul_mat_bf16_f16_direct_avx2<1, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 2: mul_mat_bf16_f16_direct_avx2<2, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 3: mul_mat_bf16_f16_direct_avx2<3, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
-                case 4: mul_mat_bf16_f16_direct_avx2<4, 1>(m, weightRow, m * sizeof(uint16_t),
-                    inputData + (size_t)tailBegin * m, m * sizeof(uint16_t),
-                    outputData + (size_t)tailBegin * k + j, k * sizeof(float)); break;
+
+            const int tailBegin = superRows - superRows % 5;
+            for (int jPanel = st; jPanel < end; jPanel += panelCols) {
+                const int panelEnd = std::min(jPanel + panelCols, end);
+                int j = jPanel;
+                for (; j + 1 < panelEnd; j += 2) {
+                    uint16_t *weightPair = weightData + (size_t)j * m;
+                    for (int i = 0; i < tailBegin; i += 5) {
+                        mul_mat_f16_f32_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)i * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + i) * k + j, k * sizeof(float));
+                    }
+                    switch (superRows - tailBegin) {
+                        case 0: break;
+                        case 1: mul_mat_f16_f32_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 2: mul_mat_f16_f32_direct_avx2_pair<2>(m, weightPair, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 3: mul_mat_f16_f32_direct_avx2_pair<3>(m, weightPair, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 4: mul_mat_f16_f32_direct_avx2_pair<4>(m, weightPair, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    }
+                }
+                if (j < panelEnd) {
+                    uint16_t *weightRow = weightData + (size_t)j * m;
+                    for (int i = 0; i < tailBegin; i += 5) {
+                        mul_mat_f16_f32_direct_avx2<5, 1>(m, weightRow, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)i * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + i) * k + j, k * sizeof(float));
+                    }
+                    switch (superRows - tailBegin) {
+                        case 0: break;
+                        case 1: mul_mat_f16_f32_direct_avx2<1, 1>(m, weightRow, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 2: mul_mat_f16_f32_direct_avx2<2, 1>(m, weightRow, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 3: mul_mat_f16_f32_direct_avx2<3, 1>(m, weightRow, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                        case 4: mul_mat_f16_f32_direct_avx2<4, 1>(m, weightRow, m * sizeof(uint16_t),
+                            fp32Input.data() + (size_t)tailBegin * m, m * sizeof(float),
+                            outputData + (size_t)(iSuper + tailBegin) * k + j, k * sizeof(float)); break;
+                    }
+                }
             }
         }
         AddBiasAVX2(outputData, biasData, n, k, st, end);

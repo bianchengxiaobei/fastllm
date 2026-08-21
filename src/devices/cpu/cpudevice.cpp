@@ -3096,7 +3096,18 @@ namespace fastllm {
         }
         if (dstDataType == DataType::FLOAT32) {
             float *destination = (float*)dstData;
-            for (size_t index = 0; index < rows * columns; index++) {
+            size_t count = rows * columns;
+            size_t index = 0;
+#ifdef __AVX2__
+            for (; index + 7 < count; index += 8) {
+                __m128i packed = _mm_loadu_si128(
+                    (const __m128i*)(bfloat16Data + index));
+                _mm256_storeu_ps(destination + index,
+                    _mm256_castsi256_ps(_mm256_slli_epi32(
+                        _mm256_cvtepu16_epi32(packed), 16)));
+            }
+#endif
+            for (; index < count; index++) {
                 destination[index] =
                     BFloat16BitsToFloat32(bfloat16Data[index]);
             }
