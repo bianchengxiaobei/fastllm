@@ -21697,11 +21697,11 @@ namespace fastllm {
                             AddTo(atv, attn_inter);
                             atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
                             if (ci == 0) {
-                                // 预分配全部 chunk 的最终 shape，之后每轮 CatDirect 原地追加，
-                                // 避免逐 chunk `Mul + Cat` 反复 realloc 并把已累积结果整块重拷。
+                                // 预分配全部 chunk 的最终 shape；各 chunk 结果按块内偏移
+                                // 原地写入，避免旧的逐 chunk `Mul + Cat` 反复 realloc 并把
+                                // 已累积结果整块重拷。
                                 int totalChunks = tot_heads / chunk_size;
-                                std::vector <int> oneDims = atv.dims;
-                                std::vector <int> fullDims = oneDims;
+                                std::vector <int> fullDims = atv.dims;
                                 fullDims[3] = atv.dims[3] * totalChunks;
                                 out.dataType = atv.dataType;
 #ifdef USE_CUDA
@@ -21710,14 +21710,22 @@ namespace fastllm {
 #endif
                                 out.Resize(fullDims);
                                 out.Allocate();
-                                // CatDirect 把 strides[axis-1] 当外层块的物理间距使用，
-                                // strides 必须保持“满容量布局”。因此先冻结 expansionDims
-                                // 再 Resize 回单 chunk 逻辑 dims，避免 strides 被重算成
-                                // 单 chunk 布局导致 CatDirect 写错位置。
-                                out.expansionDims = fullDims;
-                                out.Resize(oneDims);
                             }
-                            CatDirect(out, atv, 3);
+                            // 原地把 atv 写入 out 的第 ci 个 chunk 槽位。显式按满容量布局
+                            // 计算目标偏移，不依赖 strides（CatDirect 要求 strides[axis-1]
+                            // 恰好等于外层块的物理间距，与逻辑 dims 不一致时会写错/越界）。
+                            {
+                                int blocks = atv.dims[0] * atv.dims[1];
+                                int chunkLen = atv.dims[3];
+                                int v = atv.dims[4];
+                                int totalLen = out.dims[3];
+                                int unitSize = atv.unitSize;
+                                for (int o = 0; o < blocks; o++) {
+                                    memcpy(out.cpuData + ((long long)o * totalLen + (long long)ci * chunkLen) * v * unitSize,
+                                           atv.cpuData + (long long)o * chunkLen * v * unitSize,
+                                           (size_t)chunkLen * v * unitSize);
+                                }
+                            }
 
                             Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
                             Split(g_i, 2, g_i.dims[2] - 1, g_i.dims[2], g_i_last);
@@ -21768,8 +21776,6 @@ namespace fastllm {
                         PermuteSelf(g_exp, {2, 0, 1, 3});
                         PermuteSelf(*pgg, {2, 0, 1, 3});
                         runChunkPrefillReference(last_recurrent_state, core_attn_out);
-                        // 清掉 expansionDims，让后续 Reshape 重新计算 strides
-                        core_attn_out.expansionDims.clear();
                     }
 
                     core_attn_out.Reshape({core_attn_out.dims[0], core_attn_out.dims[1], -1, core_attn_out.dims.back()});
@@ -23033,11 +23039,11 @@ namespace fastllm {
                             AddTo(atv, attn_inter);
                             atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
                             if (ci == 0) {
-                                // 预分配全部 chunk 的最终 shape，之后每轮 CatDirect 原地追加，
-                                // 避免逐 chunk `Mul + Cat` 反复 realloc 并把已累积结果整块重拷。
+                                // 预分配全部 chunk 的最终 shape；各 chunk 结果按块内偏移
+                                // 原地写入，避免旧的逐 chunk `Mul + Cat` 反复 realloc 并把
+                                // 已累积结果整块重拷。
                                 int totalChunks = tot_heads / chunk_size;
-                                std::vector <int> oneDims = atv.dims;
-                                std::vector <int> fullDims = oneDims;
+                                std::vector <int> fullDims = atv.dims;
                                 fullDims[3] = atv.dims[3] * totalChunks;
                                 out.dataType = atv.dataType;
 #ifdef USE_CUDA
@@ -23046,14 +23052,22 @@ namespace fastllm {
 #endif
                                 out.Resize(fullDims);
                                 out.Allocate();
-                                // CatDirect 把 strides[axis-1] 当外层块的物理间距使用，
-                                // strides 必须保持“满容量布局”。因此先冻结 expansionDims
-                                // 再 Resize 回单 chunk 逻辑 dims，避免 strides 被重算成
-                                // 单 chunk 布局导致 CatDirect 写错位置。
-                                out.expansionDims = fullDims;
-                                out.Resize(oneDims);
                             }
-                            CatDirect(out, atv, 3);
+                            // 原地把 atv 写入 out 的第 ci 个 chunk 槽位。显式按满容量布局
+                            // 计算目标偏移，不依赖 strides（CatDirect 要求 strides[axis-1]
+                            // 恰好等于外层块的物理间距，与逻辑 dims 不一致时会写错/越界）。
+                            {
+                                int blocks = atv.dims[0] * atv.dims[1];
+                                int chunkLen = atv.dims[3];
+                                int v = atv.dims[4];
+                                int totalLen = out.dims[3];
+                                int unitSize = atv.unitSize;
+                                for (int o = 0; o < blocks; o++) {
+                                    memcpy(out.cpuData + ((long long)o * totalLen + (long long)ci * chunkLen) * v * unitSize,
+                                           atv.cpuData + (long long)o * chunkLen * v * unitSize,
+                                           (size_t)chunkLen * v * unitSize);
+                                }
+                            }
 
                             Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
                             Split(g_i, 2, g_i.dims[2] - 1, g_i.dims[2], g_i_last);
@@ -23104,8 +23118,6 @@ namespace fastllm {
                         PermuteSelf(g_exp, {2, 0, 1, 3});
                         PermuteSelf(*pgg, {2, 0, 1, 3});
                         runChunkPrefillReference(last_recurrent_state, core_attn_out);
-                        // 清掉 expansionDims，让后续 Reshape 重新计算 strides
-                        core_attn_out.expansionDims.clear();
                     }
 
                     core_attn_out.Reshape({core_attn_out.dims[0], core_attn_out.dims[1], -1, core_attn_out.dims.back()});
