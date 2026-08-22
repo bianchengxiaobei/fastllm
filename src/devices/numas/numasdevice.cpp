@@ -1903,10 +1903,12 @@ namespace fastllm {
         // 权重加载阶段 model.cpp 用多个 std::thread 并行加载，
         // 每个线程都会触发 RegisterNumas -> allocate_pinned_numa(cudaHostRegister)
         // 和 DynamicScheduleTasks(向绑核池线程 PushOp + Wait)。
-        // 16 个加载线程同时打 CUDA 驱动锁和池线程会造成互锁/饿死：
-        // 表现为 "Loading 90" 卡住、CPU 占用骤降。串行化注册即可消除争用。
-        static std::mutex registerMutex;
-        std::lock_guard<std::mutex> guard(registerMutex);
+        // 曾经的 "Loading 90 卡住、CPU 占用骤降" 根因是多个加载线程并发对同一
+        // worker PushOp：交错写 task->op 且 publishId 被跳过，另一线程的 Wait()
+        // 永久自旋。此前用全局 mutex 串行化整个注册流程规避，但把单线程内联
+        // 转换（INT4/FP8 packing 等）也一并串行化，加载明显变慢。
+        // 现已修复根因：AliveThreadLoop::PushOp 带 per-loop 锁（alivethreadpool.h），
+        // 并发 DynamicScheduleTasks 安全，此处恢复并行注册。
         RegisterNumasImpl(data, weightType, true);
     }
 
@@ -2731,7 +2733,8 @@ namespace fastllm {
             bias.dataType == DataType::FLOAT32,
             "Linear's bias' type should be float32.\n");
 
-        const bool profile = GetFastllmEnv().printProfile;
+        // numas-linear 逐次耗时日志太吵，已关闭；需要时改回 GetFastllmEnv().printProfile
+        const bool profile = false;
         const auto begin = profile ? std::chrono::steady_clock::now() :
             std::chrono::steady_clock::time_point();
         EnsureNumasLinearWeightRegistered(weight);
