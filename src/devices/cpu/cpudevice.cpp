@@ -11805,11 +11805,25 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
                     dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
 #elif defined(__AVX__)
-                    __m256 vsum = _mm256_setzero_ps();
+                    __m256 vsum0 = _mm256_setzero_ps();
+                    __m256 vsum1 = _mm256_setzero_ps();
+                    __m256 vsum2 = _mm256_setzero_ps();
+                    __m256 vsum3 = _mm256_setzero_ps();
+                    for (; l + 31 < q2; l += 32) {
+                        vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
+                        vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
+                        vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
+                        vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
+                    }
+                    __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
+                                                _mm256_add_ps(vsum2, vsum3));
                     for (; l + 7 < q2; l += 8) {
-                        __m256 vx = _mm256_loadu_ps((const float *) (qRow + l));
-                        __m256 vy = _mm256_loadu_ps((const float *) (kToken + l));
-                        vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                        vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                               _mm256_loadu_ps((const float *) (kToken + l)), vsum);
                     }
                     dotProduct += Floatsum(vsum);
 #endif
@@ -11858,10 +11872,24 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
 #elif defined(__AVX__)
                     __m256 wv = _mm256_set1_ps(w);
+                    for (; l + 31 < v2; l += 32) {
+                        _mm256_storeu_ps(oRow + l,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                         _mm256_loadu_ps(oRow + l)));
+                        _mm256_storeu_ps(oRow + l + 8,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
+                                                         _mm256_loadu_ps(oRow + l + 8)));
+                        _mm256_storeu_ps(oRow + l + 16,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
+                                                         _mm256_loadu_ps(oRow + l + 16)));
+                        _mm256_storeu_ps(oRow + l + 24,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
+                                                         _mm256_loadu_ps(oRow + l + 24)));
+                    }
                     for (; l + 7 < v2; l += 8) {
                         _mm256_storeu_ps(oRow + l,
-                                         _mm256_add_ps(_mm256_loadu_ps(oRow + l),
-                                                       _mm256_mul_ps(wv, _mm256_loadu_ps(vToken + l))));
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                         _mm256_loadu_ps(oRow + l)));
                     }
 #endif
                     for (; l < v2; l++) {
@@ -12034,11 +12062,25 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
                     dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
 #elif defined(__AVX__)
-                    __m256 vsum = _mm256_setzero_ps();
+                    __m256 vsum0 = _mm256_setzero_ps();
+                    __m256 vsum1 = _mm256_setzero_ps();
+                    __m256 vsum2 = _mm256_setzero_ps();
+                    __m256 vsum3 = _mm256_setzero_ps();
+                    for (; l + 31 < q2; l += 32) {
+                        vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
+                        vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
+                        vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
+                        vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
+                    }
+                    __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
+                                                _mm256_add_ps(vsum2, vsum3));
                     for (; l + 7 < q2; l += 8) {
-                        __m256 vx = _mm256_loadu_ps((const float *) (qRow + l));
-                        __m256 vy = _mm256_loadu_ps((const float *) (kToken + l));
-                        vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                        vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                               _mm256_loadu_ps((const float *) (kToken + l)), vsum);
                     }
                     dotProduct += Floatsum(vsum);
 #endif
@@ -12087,10 +12129,24 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
 #elif defined(__AVX__)
                     __m256 wv = _mm256_set1_ps(w);
+                    for (; l + 31 < v2; l += 32) {
+                        _mm256_storeu_ps(oRow + l,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                         _mm256_loadu_ps(oRow + l)));
+                        _mm256_storeu_ps(oRow + l + 8,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
+                                                         _mm256_loadu_ps(oRow + l + 8)));
+                        _mm256_storeu_ps(oRow + l + 16,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
+                                                         _mm256_loadu_ps(oRow + l + 16)));
+                        _mm256_storeu_ps(oRow + l + 24,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
+                                                         _mm256_loadu_ps(oRow + l + 24)));
+                    }
                     for (; l + 7 < v2; l += 8) {
                         _mm256_storeu_ps(oRow + l,
-                                         _mm256_add_ps(_mm256_loadu_ps(oRow + l),
-                                                       _mm256_mul_ps(wv, _mm256_loadu_ps(vToken + l))));
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                         _mm256_loadu_ps(oRow + l)));
                     }
 #endif
                     for (; l < v2; l++) {
@@ -12192,11 +12248,25 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
                     dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
 #elif defined(__AVX__)
-                    __m256 vsum = _mm256_setzero_ps();
+                    __m256 vsum0 = _mm256_setzero_ps();
+                    __m256 vsum1 = _mm256_setzero_ps();
+                    __m256 vsum2 = _mm256_setzero_ps();
+                    __m256 vsum3 = _mm256_setzero_ps();
+                    for (; l + 31 < q2; l += 32) {
+                        vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
+                        vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
+                        vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
+                        vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
+                                                _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
+                    }
+                    __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
+                                                _mm256_add_ps(vsum2, vsum3));
                     for (; l + 7 < q2; l += 8) {
-                        __m256 vx = _mm256_loadu_ps((const float *) (qRow + l));
-                        __m256 vy = _mm256_loadu_ps((const float *) (kToken + l));
-                        vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                        vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                               _mm256_loadu_ps((const float *) (kToken + l)), vsum);
                     }
                     dotProduct += Floatsum(vsum);
 #endif
@@ -12245,10 +12315,24 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
 #elif defined(__AVX__)
                     __m256 wv = _mm256_set1_ps(w);
+                    for (; l + 31 < v2; l += 32) {
+                        _mm256_storeu_ps(oRow + l,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                         _mm256_loadu_ps(oRow + l)));
+                        _mm256_storeu_ps(oRow + l + 8,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
+                                                         _mm256_loadu_ps(oRow + l + 8)));
+                        _mm256_storeu_ps(oRow + l + 16,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
+                                                         _mm256_loadu_ps(oRow + l + 16)));
+                        _mm256_storeu_ps(oRow + l + 24,
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
+                                                         _mm256_loadu_ps(oRow + l + 24)));
+                    }
                     for (; l + 7 < v2; l += 8) {
                         _mm256_storeu_ps(oRow + l,
-                                         _mm256_add_ps(_mm256_loadu_ps(oRow + l),
-                                                       _mm256_mul_ps(wv, _mm256_loadu_ps(vToken + l))));
+                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                         _mm256_loadu_ps(oRow + l)));
                     }
 #endif
                     for (; l < v2; l++) {
