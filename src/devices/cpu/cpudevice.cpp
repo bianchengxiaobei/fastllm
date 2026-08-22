@@ -11767,134 +11767,189 @@ ops += (long long)lines * inputDim * interDim * 2;
             const int rows = qHi - qLo;
             const int base = k1 - q1;
 
-            // scores 缓冲 [row][j]；每个元素都会被写入（有效分或 -10000）
-            std::vector<float> qk((size_t)rows * k1);
+            // online softmax（flash）：K/V 按 kvBlock 分块，scores 块缓冲
+            // 常驻 L2，不再物化 [rows × k1] 的中间分数矩阵。
+            const int kvBlock = 128;
+            std::vector<float> acc((size_t)rows * v2, 0.0f);
+            std::vector<float> mVal((size_t)rows, -1e30f);
+            std::vector<float> lVal((size_t)rows, 0.0f);
+            std::vector<float> s((size_t)rows * kvBlock);
 
-            // pass 1: QK 打分。j 外层：同一 kToken 在整个 query 块内复用，
-            // K slab 每个 op 只流过一遍。
-            for (int j = 0; j < k1; j++) {
-                if (!maskHead && j > base + qHi - 1) {
-                    // 因果遮罩：对本块所有行都不可见
-                    for (int t = 0; t < rows; t++) {
-                        qk[(size_t)t * k1 + j] = -10000.0f;
-                    }
+            for (int jb = 0; jb < k1; jb += kvBlock) {
+                const int jEnd = std::min(jb + kvBlock, k1);
+                const int blockLen = jEnd - jb;
+
+                // 整块对本 op 的所有行都不可见（因果）→ 直接跳过
+                if (!maskHead && jb > base + qHi - 1) {
                     continue;
                 }
-                const float *kToken = kF32 + (size_t)j * kHeadDim;
+                // 本块对所有行完全可见 → 免逐元素遮罩判断
+                const bool allVisible = !maskHead && (jEnd - 1) <= base + qLo;
+
+                // A: 本块 scores
+                for (int j = jb; j < jEnd; j++) {
+                    const float *kToken = kF32 + (size_t)j * kHeadDim;
+                    for (int t = 0; t < rows; t++) {
+                        const int i = qLo + t;
+                        float *dst = s.data() + (size_t)t * blockLen + (j - jb);
+                        if (!allVisible) {
+                            if (maskHead) {
+                                if (maskHead[i * k1 + j] > 0.99) {
+                                    *dst = -10000.0f;
+                                    continue;
+                                }
+                            } else if (j > base + i) {
+                                *dst = -10000.0f;
+                                continue;
+                            }
+                        }
+
+                        const float *qRow = qHead + (size_t)i * q2;
+                        float dotProduct = 0.0f;
+                        int l = 0;
+#ifdef __aarch64__
+                        float32x4_t sum = {0, 0, 0, 0};
+                        for (; l + 3 < q2; l += 4) {
+                            sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qRow + l),
+                                                            vld1q_f32(kToken + l)));
+                        }
+                        dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                        __m256 vsum0 = _mm256_setzero_ps();
+                        __m256 vsum1 = _mm256_setzero_ps();
+                        __m256 vsum2 = _mm256_setzero_ps();
+                        __m256 vsum3 = _mm256_setzero_ps();
+                        for (; l + 31 < q2; l += 32) {
+                            vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
+                            vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
+                            vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
+                            vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
+                        }
+                        __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
+                                                    _mm256_add_ps(vsum2, vsum3));
+                        for (; l + 7 < q2; l += 8) {
+                            vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                   _mm256_loadu_ps((const float *) (kToken + l)), vsum);
+                        }
+                        dotProduct += Floatsum(vsum);
+#endif
+                        for (; l < q2; l++) {
+                            dotProduct += qRow[l] * kToken[l];
+                        }
+                        *dst = dotProduct * scale;
+                    }
+                }
+
+                // B: online softmax 状态更新（行最大值 / 归一化因子 / acc 重标定）
                 for (int t = 0; t < rows; t++) {
-                    const int i = qLo + t;
-                    float *dst = qk.data() + (size_t)t * k1 + j;
-                    if (maskHead) {
-                        if (maskHead[i * k1 + j] > 0.99) {
-                            *dst = -10000.0f;
+                    float *sRow = s.data() + (size_t)t * blockLen;
+                    float blockMax = -1e30f;
+                    for (int jj = 0; jj < blockLen; jj++) {
+                        blockMax = std::max(blockMax, sRow[jj]);
+                    }
+                    float mNew = std::max(mVal[t], blockMax);
+                    if (mNew <= -1e29f) {
+                        continue; // 到目前为止整行仍无可见 token
+                    }
+                    float correction = (mVal[t] <= -1e29f) ? 0.0f : expf(mVal[t] - mNew);
+                    float lt = 0.0f;
+                    for (int jj = 0; jj < blockLen; jj++) {
+                        float e = expf(sRow[jj] - mNew);
+                        sRow[jj] = e;
+                        lt += e;
+                    }
+                    lVal[t] = lVal[t] * correction + lt;
+                    float *accRow = acc.data() + (size_t)t * v2;
+                    if (correction != 1.0f) {
+                        int d = 0;
+#ifdef __aarch64__
+                        float32x4_t cv = vdupq_n_f32(correction);
+                        for (; d + 3 < v2; d += 4) {
+                            vst1q_f32(accRow + d, vmulq_f32(cv, vld1q_f32(accRow + d)));
+                        }
+#elif defined(__AVX__)
+                        __m256 cv = _mm256_set1_ps(correction);
+                        for (; d + 7 < v2; d += 8) {
+                            _mm256_storeu_ps(accRow + d, _mm256_mul_ps(cv, _mm256_loadu_ps(accRow + d)));
+                        }
+#endif
+                        for (; d < v2; d++) {
+                            accRow[d] *= correction;
+                        }
+                    }
+                    mVal[t] = mNew;
+                }
+
+                // C: V 块累加（s 已是本块的未归一化概率）
+                for (int j = jb; j < jEnd; j++) {
+                    const float *vToken = vF32 + (size_t)j * vHeadDim;
+                    for (int t = 0; t < rows; t++) {
+                        float w = s[(size_t)t * blockLen + (j - jb)];
+                        if (w == 0.0f) {
                             continue;
                         }
-                    } else if (j > base + i) {
-                        *dst = -10000.0f;
-                        continue;
-                    }
-
-                    const float *qRow = qHead + (size_t)i * q2;
-                    float dotProduct = 0.0f;
-                    int l = 0;
+                        float *oRow = acc.data() + (size_t)t * v2;
+                        int l = 0;
 #ifdef __aarch64__
-                    float32x4_t sum = {0, 0, 0, 0};
-                    for (; l + 3 < q2; l += 4) {
-                        sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qRow + l),
-                                                        vld1q_f32(kToken + l)));
-                    }
-                    dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+                        float32x4_t wv = vdupq_n_f32(w);
+                        for (; l + 3 < v2; l += 4) {
+                            vst1q_f32(oRow + l,
+                                      vaddq_f32(vld1q_f32(oRow + l),
+                                                vmulq_f32(wv, vld1q_f32(vToken + l))));
+                        }
 #elif defined(__AVX__)
-                    __m256 vsum0 = _mm256_setzero_ps();
-                    __m256 vsum1 = _mm256_setzero_ps();
-                    __m256 vsum2 = _mm256_setzero_ps();
-                    __m256 vsum3 = _mm256_setzero_ps();
-                    for (; l + 31 < q2; l += 32) {
-                        vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
-                                                _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
-                        vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
-                        vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
-                        vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
-                    }
-                    __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
-                                                _mm256_add_ps(vsum2, vsum3));
-                    for (; l + 7 < q2; l += 8) {
-                        vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
-                                               _mm256_loadu_ps((const float *) (kToken + l)), vsum);
-                    }
-                    dotProduct += Floatsum(vsum);
+                        __m256 wv = _mm256_set1_ps(w);
+                        for (; l + 31 < v2; l += 32) {
+                            _mm256_storeu_ps(oRow + l,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                             _mm256_loadu_ps(oRow + l)));
+                            _mm256_storeu_ps(oRow + l + 8,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
+                                                             _mm256_loadu_ps(oRow + l + 8)));
+                            _mm256_storeu_ps(oRow + l + 16,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
+                                                             _mm256_loadu_ps(oRow + l + 16)));
+                            _mm256_storeu_ps(oRow + l + 24,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
+                                                             _mm256_loadu_ps(oRow + l + 24)));
+                        }
+                        for (; l + 7 < v2; l += 8) {
+                            _mm256_storeu_ps(oRow + l,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                             _mm256_loadu_ps(oRow + l)));
+                        }
 #endif
-                    for (; l < q2; l++) {
-                        dotProduct += qRow[l] * kToken[l];
+                        for (; l < v2; l++) {
+                            oRow[l] += w * vToken[l];
+                        }
                     }
-                    *dst = dotProduct * scale;
                 }
             }
 
-            // pass 2: softmax（原地；求和顺序与旧实现一致）
+            // 最终归一化并写出
             for (int t = 0; t < rows; t++) {
-                float *qkRow = qk.data() + (size_t)t * k1;
-                float maxValue = -10000.0f;
-                for (int j = 0; j < k1; j++) {
-                    maxValue = std::max(maxValue, qkRow[j]);
-                }
-                float sum = 0.0f;
-                for (int j = 0; j < k1; j++) {
-                    float e = expf(qkRow[j] - maxValue);
-                    qkRow[j] = e;
-                    sum += e;
-                }
-                sum = std::max(sum, 0.1f);
-                for (int j = 0; j < k1; j++) {
-                    qkRow[j] /= sum;
-                }
-            }
-
-            // pass 3: V 加权累加。j 外层：vToken 在块内复用。
-            for (int j = 0; j < k1; j++) {
-                const float *vToken = vF32 + (size_t)j * vHeadDim;
-                for (int t = 0; t < rows; t++) {
-                    float w = qk[(size_t)t * k1 + j];
-                    if (w == 0.0f) {
-                        continue;
-                    }
-                    float *oRow = oHead + (size_t)(qLo + t) * v2;
-                    int l = 0;
+                float denom = std::max(lVal[t], 0.1f);
+                float inv = 1.0f / denom;
+                const float *accRow = acc.data() + (size_t)t * v2;
+                float *oRow = oHead + (size_t)(qLo + t) * v2;
+                int d = 0;
 #ifdef __aarch64__
-                    float32x4_t wv = vdupq_n_f32(w);
-                    for (; l + 3 < v2; l += 4) {
-                        vst1q_f32(oRow + l,
-                                  vaddq_f32(vld1q_f32(oRow + l),
-                                            vmulq_f32(wv, vld1q_f32(vToken + l))));
-                    }
+                float32x4_t iv = vdupq_n_f32(inv);
+                for (; d + 3 < v2; d += 4) {
+                    vst1q_f32(oRow + d, vmulq_f32(iv, vld1q_f32(accRow + d)));
+                }
 #elif defined(__AVX__)
-                    __m256 wv = _mm256_set1_ps(w);
-                    for (; l + 31 < v2; l += 32) {
-                        _mm256_storeu_ps(oRow + l,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
-                                                         _mm256_loadu_ps(oRow + l)));
-                        _mm256_storeu_ps(oRow + l + 8,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
-                                                         _mm256_loadu_ps(oRow + l + 8)));
-                        _mm256_storeu_ps(oRow + l + 16,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
-                                                         _mm256_loadu_ps(oRow + l + 16)));
-                        _mm256_storeu_ps(oRow + l + 24,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
-                                                         _mm256_loadu_ps(oRow + l + 24)));
-                    }
-                    for (; l + 7 < v2; l += 8) {
-                        _mm256_storeu_ps(oRow + l,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
-                                                         _mm256_loadu_ps(oRow + l)));
-                    }
+                __m256 iv = _mm256_set1_ps(inv);
+                for (; d + 7 < v2; d += 8) {
+                    _mm256_storeu_ps(oRow + d, _mm256_mul_ps(iv, _mm256_loadu_ps(accRow + d)));
+                }
 #endif
-                    for (; l < v2; l++) {
-                        oRow[l] += w * vToken[l];
-                    }
+                for (; d < v2; d++) {
+                    oRow[d] = accRow[d] * inv;
                 }
             }
         }
@@ -12023,140 +12078,191 @@ ops += (long long)lines * inputDim * interDim * 2;
             std::vector<float> fq((size_t)rows * q2);
             Float16ToFloat32(qHead + (size_t)qLo * q2, fq.data(), rows * q2);
 
-            // scores 缓冲 [row][j]；每个元素都会被写入（有效分或 -10000）
-            std::vector<float> qk((size_t)rows * k1);
-            std::vector<float> fo((size_t)rows * v2, 0.0f);
+            // online softmax（flash）：K/V 按 kvBlock 分块，scores 块缓冲
+            // 常驻 L2，不再物化 [rows × k1] 的中间分数矩阵。
+            const int kvBlock = 128;
+            std::vector<float> acc((size_t)rows * v2, 0.0f);
+            std::vector<float> mVal((size_t)rows, -1e30f);
+            std::vector<float> lVal((size_t)rows, 0.0f);
+            std::vector<float> s((size_t)rows * kvBlock);
 
-            // pass 1: QK 打分。j 外层：同一 kToken 在整个 query 块内复用，
-            // K slab 每个 op 只流过一遍。
-            for (int j = 0; j < k1; j++) {
-                if (!maskHead && j > base + qHi - 1) {
-                    for (int t = 0; t < rows; t++) {
-                        qk[(size_t)t * k1 + j] = -10000.0f;
-                    }
+            for (int jb = 0; jb < k1; jb += kvBlock) {
+                const int jEnd = std::min(jb + kvBlock, k1);
+                const int blockLen = jEnd - jb;
+
+                // 整块对本 op 的所有行都不可见（因果）→ 直接跳过
+                if (!maskHead && jb > base + qHi - 1) {
                     continue;
                 }
-                const float *kToken = kF32 + (size_t)j * kHeadDim;
+                // 本块对所有行完全可见 → 免逐元素遮罩判断
+                const bool allVisible = !maskHead && (jEnd - 1) <= base + qLo;
+
+                // A: 本块 scores
+                for (int j = jb; j < jEnd; j++) {
+                    const float *kToken = kF32 + (size_t)j * kHeadDim;
+                    for (int t = 0; t < rows; t++) {
+                        const int i = qLo + t;
+                        float *dst = s.data() + (size_t)t * blockLen + (j - jb);
+                        if (!allVisible) {
+                            if (maskHead) {
+                                float maskVal = half_to_float(maskHead[i * k1 + j]);
+                                if (maskVal > 0.99) {
+                                    *dst = -10000.0f;
+                                    continue;
+                                }
+                            } else if (j > base + i) {
+                                *dst = -10000.0f;
+                                continue;
+                            }
+                        }
+
+                        const float *qRow = fq.data() + (size_t)t * q2;
+                        float dotProduct = 0.0f;
+                        int l = 0;
+#ifdef __aarch64__
+                        float32x4_t sum = {0, 0, 0, 0};
+                        for (; l + 3 < q2; l += 4) {
+                            sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qRow + l),
+                                                            vld1q_f32(kToken + l)));
+                        }
+                        dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                        __m256 vsum0 = _mm256_setzero_ps();
+                        __m256 vsum1 = _mm256_setzero_ps();
+                        __m256 vsum2 = _mm256_setzero_ps();
+                        __m256 vsum3 = _mm256_setzero_ps();
+                        for (; l + 31 < q2; l += 32) {
+                            vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
+                            vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
+                            vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
+                            vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
+                        }
+                        __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
+                                                    _mm256_add_ps(vsum2, vsum3));
+                        for (; l + 7 < q2; l += 8) {
+                            vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                   _mm256_loadu_ps((const float *) (kToken + l)), vsum);
+                        }
+                        dotProduct += Floatsum(vsum);
+#endif
+                        for (; l < q2; l++) {
+                            dotProduct += qRow[l] * kToken[l];
+                        }
+                        *dst = dotProduct * scale;
+                    }
+                }
+
+                // B: online softmax 状态更新（行最大值 / 归一化因子 / acc 重标定）
                 for (int t = 0; t < rows; t++) {
-                    const int i = qLo + t;
-                    float *dst = qk.data() + (size_t)t * k1 + j;
-                    if (maskHead) {
-                        float maskVal = half_to_float(maskHead[i * k1 + j]);
-                        if (maskVal > 0.99) {
-                            *dst = -10000.0f;
+                    float *sRow = s.data() + (size_t)t * blockLen;
+                    float blockMax = -1e30f;
+                    for (int jj = 0; jj < blockLen; jj++) {
+                        blockMax = std::max(blockMax, sRow[jj]);
+                    }
+                    float mNew = std::max(mVal[t], blockMax);
+                    if (mNew <= -1e29f) {
+                        continue; // 到目前为止整行仍无可见 token
+                    }
+                    float correction = (mVal[t] <= -1e29f) ? 0.0f : expf(mVal[t] - mNew);
+                    float lt = 0.0f;
+                    for (int jj = 0; jj < blockLen; jj++) {
+                        float e = expf(sRow[jj] - mNew);
+                        sRow[jj] = e;
+                        lt += e;
+                    }
+                    lVal[t] = lVal[t] * correction + lt;
+                    float *accRow = acc.data() + (size_t)t * v2;
+                    if (correction != 1.0f) {
+                        int d = 0;
+#ifdef __aarch64__
+                        float32x4_t cv = vdupq_n_f32(correction);
+                        for (; d + 3 < v2; d += 4) {
+                            vst1q_f32(accRow + d, vmulq_f32(cv, vld1q_f32(accRow + d)));
+                        }
+#elif defined(__AVX__)
+                        __m256 cv = _mm256_set1_ps(correction);
+                        for (; d + 7 < v2; d += 8) {
+                            _mm256_storeu_ps(accRow + d, _mm256_mul_ps(cv, _mm256_loadu_ps(accRow + d)));
+                        }
+#endif
+                        for (; d < v2; d++) {
+                            accRow[d] *= correction;
+                        }
+                    }
+                    mVal[t] = mNew;
+                }
+
+                // C: V 块累加（s 已是本块的未归一化概率）
+                for (int j = jb; j < jEnd; j++) {
+                    const float *vToken = vF32 + (size_t)j * vHeadDim;
+                    for (int t = 0; t < rows; t++) {
+                        float w = s[(size_t)t * blockLen + (j - jb)];
+                        if (w == 0.0f) {
                             continue;
                         }
-                    } else if (j > base + i) {
-                        *dst = -10000.0f;
-                        continue;
-                    }
-
-                    const float *qRow = fq.data() + (size_t)t * q2;
-                    float dotProduct = 0.0f;
-                    int l = 0;
+                        float *oRow = acc.data() + (size_t)t * v2;
+                        int l = 0;
 #ifdef __aarch64__
-                    float32x4_t sum = {0, 0, 0, 0};
-                    for (; l + 3 < q2; l += 4) {
-                        sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qRow + l),
-                                                        vld1q_f32(kToken + l)));
-                    }
-                    dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+                        float32x4_t wv = vdupq_n_f32(w);
+                        for (; l + 3 < v2; l += 4) {
+                            vst1q_f32(oRow + l,
+                                      vaddq_f32(vld1q_f32(oRow + l),
+                                                vmulq_f32(wv, vld1q_f32(vToken + l))));
+                        }
 #elif defined(__AVX__)
-                    __m256 vsum0 = _mm256_setzero_ps();
-                    __m256 vsum1 = _mm256_setzero_ps();
-                    __m256 vsum2 = _mm256_setzero_ps();
-                    __m256 vsum3 = _mm256_setzero_ps();
-                    for (; l + 31 < q2; l += 32) {
-                        vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
-                                                _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
-                        vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
-                        vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
-                        vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
-                    }
-                    __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
-                                                _mm256_add_ps(vsum2, vsum3));
-                    for (; l + 7 < q2; l += 8) {
-                        vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
-                                               _mm256_loadu_ps((const float *) (kToken + l)), vsum);
-                    }
-                    dotProduct += Floatsum(vsum);
+                        __m256 wv = _mm256_set1_ps(w);
+                        for (; l + 31 < v2; l += 32) {
+                            _mm256_storeu_ps(oRow + l,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                             _mm256_loadu_ps(oRow + l)));
+                            _mm256_storeu_ps(oRow + l + 8,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
+                                                             _mm256_loadu_ps(oRow + l + 8)));
+                            _mm256_storeu_ps(oRow + l + 16,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
+                                                             _mm256_loadu_ps(oRow + l + 16)));
+                            _mm256_storeu_ps(oRow + l + 24,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
+                                                             _mm256_loadu_ps(oRow + l + 24)));
+                        }
+                        for (; l + 7 < v2; l += 8) {
+                            _mm256_storeu_ps(oRow + l,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                             _mm256_loadu_ps(oRow + l)));
+                        }
 #endif
-                    for (; l < q2; l++) {
-                        dotProduct += qRow[l] * kToken[l];
+                        for (; l < v2; l++) {
+                            oRow[l] += w * vToken[l];
+                        }
                     }
-                    *dst = dotProduct * scale;
                 }
             }
 
-            // pass 2: softmax（原地；求和顺序与旧实现一致）
+            // 最终归一化并写出
             for (int t = 0; t < rows; t++) {
-                float *qkRow = qk.data() + (size_t)t * k1;
-                float maxValue = -10000.0f;
-                for (int j = 0; j < k1; j++) {
-                    maxValue = std::max(maxValue, qkRow[j]);
-                }
-                float sum = 0.0f;
-                for (int j = 0; j < k1; j++) {
-                    float e = expf(qkRow[j] - maxValue);
-                    qkRow[j] = e;
-                    sum += e;
-                }
-                sum = std::max(sum, 0.1f);
-                for (int j = 0; j < k1; j++) {
-                    qkRow[j] /= sum;
-                }
-            }
-
-            // pass 3: V 加权累加。j 外层：vToken 在块内复用。
-            for (int j = 0; j < k1; j++) {
-                const float *vToken = vF32 + (size_t)j * vHeadDim;
-                for (int t = 0; t < rows; t++) {
-                    float w = qk[(size_t)t * k1 + j];
-                    if (w == 0.0f) {
-                        continue;
-                    }
-                    float *oRow = fo.data() + (size_t)t * v2;
-                    int l = 0;
+                float denom = std::max(lVal[t], 0.1f);
+                float inv = 1.0f / denom;
+                float *accRow = acc.data() + (size_t)t * v2;
+                int d = 0;
 #ifdef __aarch64__
-                    float32x4_t wv = vdupq_n_f32(w);
-                    for (; l + 3 < v2; l += 4) {
-                        vst1q_f32(oRow + l,
-                                  vaddq_f32(vld1q_f32(oRow + l),
-                                            vmulq_f32(wv, vld1q_f32(vToken + l))));
-                    }
-#elif defined(__AVX__)
-                    __m256 wv = _mm256_set1_ps(w);
-                    for (; l + 31 < v2; l += 32) {
-                        _mm256_storeu_ps(oRow + l,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
-                                                         _mm256_loadu_ps(oRow + l)));
-                        _mm256_storeu_ps(oRow + l + 8,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
-                                                         _mm256_loadu_ps(oRow + l + 8)));
-                        _mm256_storeu_ps(oRow + l + 16,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
-                                                         _mm256_loadu_ps(oRow + l + 16)));
-                        _mm256_storeu_ps(oRow + l + 24,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
-                                                         _mm256_loadu_ps(oRow + l + 24)));
-                    }
-                    for (; l + 7 < v2; l += 8) {
-                        _mm256_storeu_ps(oRow + l,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
-                                                         _mm256_loadu_ps(oRow + l)));
-                    }
-#endif
-                    for (; l < v2; l++) {
-                        oRow[l] += w * vToken[l];
-                    }
+                float32x4_t iv = vdupq_n_f32(inv);
+                for (; d + 3 < v2; d += 4) {
+                    vst1q_f32(accRow + d, vmulq_f32(iv, vld1q_f32(accRow + d)));
                 }
-            }
-
-            for (int t = 0; t < rows; t++) {
-                Float32ToFloat16(fo.data() + (size_t)t * v2, oHead + (size_t)(qLo + t) * v2, v2);
+#elif defined(__AVX__)
+                __m256 iv = _mm256_set1_ps(inv);
+                for (; d + 7 < v2; d += 8) {
+                    _mm256_storeu_ps(accRow + d, _mm256_mul_ps(iv, _mm256_loadu_ps(accRow + d)));
+                }
+#endif
+                for (; d < v2; d++) {
+                    accRow[d] *= inv;
+                }
+                Float32ToFloat16(accRow, oHead + (size_t)(qLo + t) * v2, v2);
             }
         }
     };
@@ -12207,142 +12313,193 @@ ops += (long long)lines * inputDim * interDim * 2;
             std::vector<float> fq((size_t)rows * q2);
             BFloat16ToFloat32(qHead + (size_t)qLo * q2, fq.data(), rows * q2);
 
-            // scores 缓冲 [row][j]；每个元素都会被写入（有效分或 -10000）
-            std::vector<float> qk((size_t)rows * k1);
-            std::vector<float> fo((size_t)rows * v2, 0.0f);
+            // online softmax（flash）：K/V 按 kvBlock 分块，scores 块缓冲
+            // 常驻 L2，不再物化 [rows × k1] 的中间分数矩阵。
+            const int kvBlock = 128;
+            std::vector<float> acc((size_t)rows * v2, 0.0f);
+            std::vector<float> mVal((size_t)rows, -1e30f);
+            std::vector<float> lVal((size_t)rows, 0.0f);
+            std::vector<float> s((size_t)rows * kvBlock);
 
-            // pass 1: QK 打分。j 外层：同一 kToken 在整个 query 块内复用，
-            // K slab 每个 op 只流过一遍。
-            for (int j = 0; j < k1; j++) {
-                if (!maskHead && j > base + qHi - 1) {
-                    for (int t = 0; t < rows; t++) {
-                        qk[(size_t)t * k1 + j] = -10000.0f;
-                    }
+            for (int jb = 0; jb < k1; jb += kvBlock) {
+                const int jEnd = std::min(jb + kvBlock, k1);
+                const int blockLen = jEnd - jb;
+
+                // 整块对本 op 的所有行都不可见（因果）→ 直接跳过
+                if (!maskHead && jb > base + qHi - 1) {
                     continue;
                 }
-                const float *kToken = kF32 + (size_t)j * kHeadDim;
+                // 本块对所有行完全可见 → 免逐元素遮罩判断
+                const bool allVisible = !maskHead && (jEnd - 1) <= base + qLo;
+
+                // A: 本块 scores
+                for (int j = jb; j < jEnd; j++) {
+                    const float *kToken = kF32 + (size_t)j * kHeadDim;
+                    for (int t = 0; t < rows; t++) {
+                        const int i = qLo + t;
+                        float *dst = s.data() + (size_t)t * blockLen + (j - jb);
+                        if (!allVisible) {
+                            if (maskHead) {
+                                float maskVal;
+                                uint32_t mx = (uint32_t)maskHead[i * k1 + j] << 16;
+                                memcpy(&maskVal, &mx, sizeof(float));
+                                if (maskVal > 0.99) {
+                                    *dst = -10000.0f;
+                                    continue;
+                                }
+                            } else if (j > base + i) {
+                                *dst = -10000.0f;
+                                continue;
+                            }
+                        }
+
+                        const float *qRow = fq.data() + (size_t)t * q2;
+                        float dotProduct = 0.0f;
+                        int l = 0;
+#ifdef __aarch64__
+                        float32x4_t sum = {0, 0, 0, 0};
+                        for (; l + 3 < q2; l += 4) {
+                            sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qRow + l),
+                                                            vld1q_f32(kToken + l)));
+                        }
+                        dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                        __m256 vsum0 = _mm256_setzero_ps();
+                        __m256 vsum1 = _mm256_setzero_ps();
+                        __m256 vsum2 = _mm256_setzero_ps();
+                        __m256 vsum3 = _mm256_setzero_ps();
+                        for (; l + 31 < q2; l += 32) {
+                            vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
+                            vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
+                            vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
+                            vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
+                                                    _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
+                        }
+                        __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
+                                                    _mm256_add_ps(vsum2, vsum3));
+                        for (; l + 7 < q2; l += 8) {
+                            vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                   _mm256_loadu_ps((const float *) (kToken + l)), vsum);
+                        }
+                        dotProduct += Floatsum(vsum);
+#endif
+                        for (; l < q2; l++) {
+                            dotProduct += qRow[l] * kToken[l];
+                        }
+                        *dst = dotProduct * scale;
+                    }
+                }
+
+                // B: online softmax 状态更新（行最大值 / 归一化因子 / acc 重标定）
                 for (int t = 0; t < rows; t++) {
-                    const int i = qLo + t;
-                    float *dst = qk.data() + (size_t)t * k1 + j;
-                    if (maskHead) {
-                        float maskVal;
-                        uint32_t mx = (uint32_t)maskHead[i * k1 + j] << 16;
-                        memcpy(&maskVal, &mx, sizeof(float));
-                        if (maskVal > 0.99) {
-                            *dst = -10000.0f;
+                    float *sRow = s.data() + (size_t)t * blockLen;
+                    float blockMax = -1e30f;
+                    for (int jj = 0; jj < blockLen; jj++) {
+                        blockMax = std::max(blockMax, sRow[jj]);
+                    }
+                    float mNew = std::max(mVal[t], blockMax);
+                    if (mNew <= -1e29f) {
+                        continue; // 到目前为止整行仍无可见 token
+                    }
+                    float correction = (mVal[t] <= -1e29f) ? 0.0f : expf(mVal[t] - mNew);
+                    float lt = 0.0f;
+                    for (int jj = 0; jj < blockLen; jj++) {
+                        float e = expf(sRow[jj] - mNew);
+                        sRow[jj] = e;
+                        lt += e;
+                    }
+                    lVal[t] = lVal[t] * correction + lt;
+                    float *accRow = acc.data() + (size_t)t * v2;
+                    if (correction != 1.0f) {
+                        int d = 0;
+#ifdef __aarch64__
+                        float32x4_t cv = vdupq_n_f32(correction);
+                        for (; d + 3 < v2; d += 4) {
+                            vst1q_f32(accRow + d, vmulq_f32(cv, vld1q_f32(accRow + d)));
+                        }
+#elif defined(__AVX__)
+                        __m256 cv = _mm256_set1_ps(correction);
+                        for (; d + 7 < v2; d += 8) {
+                            _mm256_storeu_ps(accRow + d, _mm256_mul_ps(cv, _mm256_loadu_ps(accRow + d)));
+                        }
+#endif
+                        for (; d < v2; d++) {
+                            accRow[d] *= correction;
+                        }
+                    }
+                    mVal[t] = mNew;
+                }
+
+                // C: V 块累加（s 已是本块的未归一化概率）
+                for (int j = jb; j < jEnd; j++) {
+                    const float *vToken = vF32 + (size_t)j * vHeadDim;
+                    for (int t = 0; t < rows; t++) {
+                        float w = s[(size_t)t * blockLen + (j - jb)];
+                        if (w == 0.0f) {
                             continue;
                         }
-                    } else if (j > base + i) {
-                        *dst = -10000.0f;
-                        continue;
-                    }
-
-                    const float *qRow = fq.data() + (size_t)t * q2;
-                    float dotProduct = 0.0f;
-                    int l = 0;
+                        float *oRow = acc.data() + (size_t)t * v2;
+                        int l = 0;
 #ifdef __aarch64__
-                    float32x4_t sum = {0, 0, 0, 0};
-                    for (; l + 3 < q2; l += 4) {
-                        sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qRow + l),
-                                                        vld1q_f32(kToken + l)));
-                    }
-                    dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+                        float32x4_t wv = vdupq_n_f32(w);
+                        for (; l + 3 < v2; l += 4) {
+                            vst1q_f32(oRow + l,
+                                      vaddq_f32(vld1q_f32(oRow + l),
+                                                vmulq_f32(wv, vld1q_f32(vToken + l))));
+                        }
 #elif defined(__AVX__)
-                    __m256 vsum0 = _mm256_setzero_ps();
-                    __m256 vsum1 = _mm256_setzero_ps();
-                    __m256 vsum2 = _mm256_setzero_ps();
-                    __m256 vsum3 = _mm256_setzero_ps();
-                    for (; l + 31 < q2; l += 32) {
-                        vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
-                                                _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
-                        vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
-                        vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
-                        vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
-                                                _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
-                    }
-                    __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
-                                                _mm256_add_ps(vsum2, vsum3));
-                    for (; l + 7 < q2; l += 8) {
-                        vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
-                                               _mm256_loadu_ps((const float *) (kToken + l)), vsum);
-                    }
-                    dotProduct += Floatsum(vsum);
+                        __m256 wv = _mm256_set1_ps(w);
+                        for (; l + 31 < v2; l += 32) {
+                            _mm256_storeu_ps(oRow + l,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                             _mm256_loadu_ps(oRow + l)));
+                            _mm256_storeu_ps(oRow + l + 8,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
+                                                             _mm256_loadu_ps(oRow + l + 8)));
+                            _mm256_storeu_ps(oRow + l + 16,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
+                                                             _mm256_loadu_ps(oRow + l + 16)));
+                            _mm256_storeu_ps(oRow + l + 24,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
+                                                             _mm256_loadu_ps(oRow + l + 24)));
+                        }
+                        for (; l + 7 < v2; l += 8) {
+                            _mm256_storeu_ps(oRow + l,
+                                             _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                             _mm256_loadu_ps(oRow + l)));
+                        }
 #endif
-                    for (; l < q2; l++) {
-                        dotProduct += qRow[l] * kToken[l];
+                        for (; l < v2; l++) {
+                            oRow[l] += w * vToken[l];
+                        }
                     }
-                    *dst = dotProduct * scale;
                 }
             }
 
-            // pass 2: softmax（原地；求和顺序与旧实现一致）
+            // 最终归一化并写出
             for (int t = 0; t < rows; t++) {
-                float *qkRow = qk.data() + (size_t)t * k1;
-                float maxValue = -10000.0f;
-                for (int j = 0; j < k1; j++) {
-                    maxValue = std::max(maxValue, qkRow[j]);
-                }
-                float sum = 0.0f;
-                for (int j = 0; j < k1; j++) {
-                    float e = expf(qkRow[j] - maxValue);
-                    qkRow[j] = e;
-                    sum += e;
-                }
-                sum = std::max(sum, 0.1f);
-                for (int j = 0; j < k1; j++) {
-                    qkRow[j] /= sum;
-                }
-            }
-
-            // pass 3: V 加权累加。j 外层：vToken 在块内复用。
-            for (int j = 0; j < k1; j++) {
-                const float *vToken = vF32 + (size_t)j * vHeadDim;
-                for (int t = 0; t < rows; t++) {
-                    float w = qk[(size_t)t * k1 + j];
-                    if (w == 0.0f) {
-                        continue;
-                    }
-                    float *oRow = fo.data() + (size_t)t * v2;
-                    int l = 0;
+                float denom = std::max(lVal[t], 0.1f);
+                float inv = 1.0f / denom;
+                float *accRow = acc.data() + (size_t)t * v2;
+                int d = 0;
 #ifdef __aarch64__
-                    float32x4_t wv = vdupq_n_f32(w);
-                    for (; l + 3 < v2; l += 4) {
-                        vst1q_f32(oRow + l,
-                                  vaddq_f32(vld1q_f32(oRow + l),
-                                            vmulq_f32(wv, vld1q_f32(vToken + l))));
-                    }
-#elif defined(__AVX__)
-                    __m256 wv = _mm256_set1_ps(w);
-                    for (; l + 31 < v2; l += 32) {
-                        _mm256_storeu_ps(oRow + l,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
-                                                         _mm256_loadu_ps(oRow + l)));
-                        _mm256_storeu_ps(oRow + l + 8,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
-                                                         _mm256_loadu_ps(oRow + l + 8)));
-                        _mm256_storeu_ps(oRow + l + 16,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
-                                                         _mm256_loadu_ps(oRow + l + 16)));
-                        _mm256_storeu_ps(oRow + l + 24,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
-                                                         _mm256_loadu_ps(oRow + l + 24)));
-                    }
-                    for (; l + 7 < v2; l += 8) {
-                        _mm256_storeu_ps(oRow + l,
-                                         _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
-                                                         _mm256_loadu_ps(oRow + l)));
-                    }
-#endif
-                    for (; l < v2; l++) {
-                        oRow[l] += w * vToken[l];
-                    }
+                float32x4_t iv = vdupq_n_f32(inv);
+                for (; d + 3 < v2; d += 4) {
+                    vst1q_f32(accRow + d, vmulq_f32(iv, vld1q_f32(accRow + d)));
                 }
-            }
-
-            for (int t = 0; t < rows; t++) {
-                Float32ToBFloat16(fo.data() + (size_t)t * v2, oHead + (size_t)(qLo + t) * v2, v2);
+#elif defined(__AVX__)
+                __m256 iv = _mm256_set1_ps(inv);
+                for (; d + 7 < v2; d += 8) {
+                    _mm256_storeu_ps(accRow + d, _mm256_mul_ps(iv, _mm256_loadu_ps(accRow + d)));
+                }
+#endif
+                for (; d < v2; d++) {
+                    accRow[d] *= inv;
+                }
+                Float32ToBFloat16(accRow, oHead + (size_t)(qLo + t) * v2, v2);
             }
         }
     };
