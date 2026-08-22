@@ -7504,13 +7504,29 @@ ops += (long long)lines * inputDim * interDim * 2;
         int inner = input0.strides[axis];
         int unitSize = input0.unitSize;
 
-        for (int o = 0; o < outer; o++) {
-            memcpy(output.cpuData + o * outputStride * unitSize,
-                   input0.cpuData + (o * input0Stride) * unitSize,
-                   input0.dims[axis] * inner * unitSize);
-            memcpy(output.cpuData + o * outputStride * unitSize + input0.dims[axis] * inner * unitSize,
-                   input1.cpuData + (o * input1Stride) * unitSize,
-                   input1.dims[axis] * inner * unitSize);
+        if (outer > 1 && (long long)outer * outputStride * unitSize >= 262144) {
+            std::vector <MultiThreadMemcpyMultiLinesTask> tasks;
+            tasks.reserve((size_t)outer * 2);
+            int len0 = input0.dims[axis] * inner * unitSize;
+            int len1 = input1.dims[axis] * inner * unitSize;
+            for (int o = 0; o < outer; o++) {
+                tasks.push_back(MultiThreadMemcpyMultiLinesTask(
+                    output.cpuData + (long long)o * outputStride * unitSize,
+                    input0.cpuData + (long long)o * input0Stride * unitSize, len0));
+                tasks.push_back(MultiThreadMemcpyMultiLinesTask(
+                    output.cpuData + (long long)o * outputStride * unitSize + len0,
+                    input1.cpuData + (long long)o * input1Stride * unitSize, len1));
+            }
+            RunMultiThreadMemcpyMultiLines(tasks, GetAlivePool());
+        } else {
+            for (int o = 0; o < outer; o++) {
+                memcpy(output.cpuData + o * outputStride * unitSize,
+                       input0.cpuData + (o * input0Stride) * unitSize,
+                       input0.dims[axis] * inner * unitSize);
+                memcpy(output.cpuData + o * outputStride * unitSize + input0.dims[axis] * inner * unitSize,
+                       input1.cpuData + (o * input1Stride) * unitSize,
+                       input1.dims[axis] * inner * unitSize);
+            }
         }
     }
 
@@ -8322,7 +8338,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int i = 0; i < len; i++) {
                 outputData[i] = fp16SiluManager.dict[inputData[i]];
             }
-        } else {
+        } else if (len < 65536) {
             float *inputData = (float*)input.cpuData;
             float *outputData = (float*)output.cpuData;
             int i = 0;
@@ -8338,6 +8354,25 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (; i < len; i++) {
                 float x = inputData[i];
                 outputData[i] = x / (1.0 + expf(-x));
+            }
+        } else {
+            auto *pool = GetAlivePool();
+            int threadNum = pool->threads.size();
+            int per = len / threadNum;
+            std::vector<fastllm::MultiThreadSiluOp*> ops;
+            int cur = 0;
+            for (int i = 0; i < threadNum; i++) {
+                int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+                ops.push_back(new MultiThreadSiluOp((float*)input.cpuData + cur, end - cur,
+                                                    (float*)output.cpuData + cur, 1, 0, 0));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->Wait(i);
+                delete ops[i];
             }
         }
     }
@@ -8835,6 +8870,56 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    struct MultiThreadMulScalarOp : MultiThreadBaseOp {
+        void *input, *output;
+        float v;
+        long long st, end;
+        bool isFloat16;
+
+        MultiThreadMulScalarOp (void *input, void *output, float v, long long st, long long end, bool isFloat16) :
+            input(input), output(output), v(v), st(st), end(end), isFloat16(isFloat16) {}
+
+        void Run() {
+            if (!isFloat16) {
+                float *inputData = (float*)input + st;
+                float *outputData = (float*)output + st;
+                for (long long i = 0; i < end - st; i++) {
+                    outputData[i] = inputData[i] * v;
+                }
+            } else {
+                uint16_t *inputData = (uint16_t*)input + st;
+                uint16_t *outputData = (uint16_t*)output + st;
+                for (long long i = 0; i < end - st; i++) {
+                    outputData[i] = float_to_half(fp16tofp32.dict[inputData[i]] * v);
+                }
+            }
+        }
+    };
+
+    static void RunMultiThreadMulScalar(void *input, void *output, float v, long long len,
+                                        bool isFloat16, AliveThreadPool *pool) {
+        if (len < 65536) {
+            MultiThreadMulScalarOp(input, output, v, 0, len, isFloat16).Run();
+            return;
+        }
+        int threadNum = pool->threads.size();
+        long long per = len / threadNum;
+        std::vector<fastllm::MultiThreadMulScalarOp*> ops;
+        long long cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            long long end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new MultiThreadMulScalarOp(input, output, v, cur, end, isFloat16));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void CpuMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -8848,17 +8933,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         int len = input.Count(0);
 
         if (input.dataType == DataType::FLOAT32) {
-            float *inputData = (float *) input.cpuData;
-            float *outputData = (float *) output.cpuData;
-            for (int i = 0; i < len; i++) {
-                outputData[i] = inputData[i] * v;
-            }
+            RunMultiThreadMulScalar(input.cpuData, output.cpuData, v, len, false, GetAlivePool());
         } else if (input.dataType == DataType::FLOAT16) {
-            uint16_t *inputData = (uint16_t *) input.cpuData;
-            uint16_t *outputData = (uint16_t *) output.cpuData;
-            for (int i = 0; i < len; i++) {
-                outputData[i] = float_to_half(fp16tofp32.dict[inputData[i]] * v);
-            }
+            RunMultiThreadMulScalar(input.cpuData, output.cpuData, v, len, true, GetAlivePool());
         }
     }
 
@@ -9730,6 +9807,56 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     };
 
+    static void RunMultiThreadTransposeMatrix(float *pDst, float *pSrc, int dstStride, int srcStride,
+                                              int n, int m, AliveThreadPool *pool) {
+        if ((long long)n * m < 65536 || n <= 1) {
+            Transpose(pDst, pSrc, dstStride, srcStride, n, m);
+            return;
+        }
+        int threadNum = std::min((int)pool->threads.size(), n);
+        int per = n / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadTransposeOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
+            ops.push_back(new MultiThreadTransposeOp(pDst + cur, pSrc + (long long)cur * srcStride,
+                                                     dstStride, srcStride, end - cur, m));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    struct MultiThreadPermuteCopyOp : MultiThreadBaseOp {
+        uint8_t *tmpData, *curData;
+        int *oldPos;
+        int unitSize, st, end;
+
+        MultiThreadPermuteCopyOp (uint8_t *tmpData, uint8_t *curData, int *oldPos, int unitSize, int st, int end) :
+            tmpData(tmpData), curData(curData), oldPos(oldPos), unitSize(unitSize), st(st), end(end) {}
+
+        void Run() {
+            if (unitSize == 4) {
+                for (int i = st; i < end; i++) {
+                    ((float*)tmpData)[i] = ((float*)curData)[oldPos[i]];
+                }
+            } else if (unitSize == 2) {
+                for (int i = st; i < end; i++) {
+                    ((uint16_t*)tmpData)[i] = ((uint16_t*)curData)[oldPos[i]];
+                }
+            } else if (unitSize == 1) {
+                for (int i = st; i < end; i++) {
+                    ((uint8_t*)tmpData)[i] = ((uint8_t*)curData)[oldPos[i]];
+                }
+            }
+        }
+    };
+
     void CpuPermuteOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -9747,31 +9874,19 @@ ops += (long long)lines * inputDim * interDim * 2;
         if (axis == std::vector <int> {1, 2, 0} && input.dataType == DataType::FLOAT32) {
             int n = input.dims[0];
             int m = input.Count(1);
-
-            int threadNum = 1;
-            int per = m / threadNum;
-            int cur = 0;
-            Transpose(((float*)tmpData) + cur * n, ((float*)curData) + cur, n, m, n, m - cur);
+            RunMultiThreadTransposeMatrix((float*)tmpData, (float*)curData, n, m, n, m, GetAlivePool());
         } else if (axis == std::vector <int> {1, 0, 2}) {
             int n = input.dims[0];
             int m = input.dims[1];
             int k = input.dims[2];
             int unitSize = input.unitSize;
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < m; j++) {
-                    memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
-                }
-            }
+            RunMultiThreadTransposeByLine(tmpData, curData, n, m, k * unitSize, GetAlivePool());
         } else if (axis == std::vector <int> {2, 0, 1, 3}) {
             int n = input.dims[0] * input.dims[1];
             int m = input.dims[2];
             int k = input.dims[3];
             int unitSize = input.unitSize;
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < m; j++) {
-                    memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
-                }
-            }
+            RunMultiThreadTransposeByLine(tmpData, curData, n, m, k * unitSize, GetAlivePool());
         } else if (axis == std::vector<int> {0, 2, 1, 3}) {
             int b = input.dims[0];
             int n = input.dims[1];
@@ -9779,11 +9894,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             int k = input.dims[3];
             int unitSize = input.unitSize;
             for (int o = 0; o < b; o++) {
-                for (int i = 0; i < n; i++) {
-                    for (int j = 0; j < m; j++) {
-                        memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
-                    }
-                }
+                RunMultiThreadTransposeByLine(tmpData, curData, n, m, k * unitSize, GetAlivePool());
                 tmpData += output.Count(1) * unitSize;
                 curData += input.Count(1) * unitSize;
             }
@@ -9808,17 +9919,37 @@ ops += (long long)lines * inputDim * interDim * 2;
                 oldPos[i] = old;
             }
 
-            if (input.unitSize == 4) {
-                for (int i = 0; i < count; ++i) {
-                    ((float*)tmpData)[i] = ((float*)curData)[oldPos[i]];
+            if (count < 65536) {
+                if (input.unitSize == 4) {
+                    for (int i = 0; i < count; ++i) {
+                        ((float*)tmpData)[i] = ((float*)curData)[oldPos[i]];
+                    }
+                } else if (input.unitSize == 2) {
+                    for (int i = 0; i < count; ++i) {
+                        ((uint16_t*)tmpData)[i] = ((uint16_t*)curData)[oldPos[i]];
+                    }
+                } else if (input.unitSize == 1) {
+                    for (int i = 0; i < count; ++i) {
+                        ((uint8_t*)tmpData)[i] = ((uint8_t*)curData)[oldPos[i]];
+                    }
                 }
-            } else if (input.unitSize == 2) {
-                for (int i = 0; i < count; ++i) {
-                    ((uint16_t*)tmpData)[i] = ((uint16_t*)curData)[oldPos[i]];
+            } else {
+                auto *pool = GetAlivePool();
+                int threadNum = pool->threads.size();
+                int per = count / threadNum;
+                std::vector<fastllm::MultiThreadPermuteCopyOp*> ops;
+                int cur = 0;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = (i == threadNum - 1 ? count : cur + per + (cur + per * (threadNum - i) < count));
+                    ops.push_back(new MultiThreadPermuteCopyOp(tmpData, curData, oldPos, input.unitSize, cur, end));
+                    cur = end;
                 }
-            } else if (input.unitSize == 1) {
-                for (int i = 0; i < count; ++i) {
-                    ((uint8_t*)tmpData)[i] = ((uint8_t*)curData)[oldPos[i]];
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(i);
+                    delete ops[i];
                 }
             }
 
@@ -9827,6 +9958,26 @@ ops += (long long)lines * inputDim * interDim * 2;
     }
 
     static std::vector <uint8_t> vold;
+
+    struct MultiThreadPermuteSelfSwapOp : MultiThreadBaseOp {
+        float *input;
+        int n, m, st, end;
+        std::vector <float> temp;
+
+        MultiThreadPermuteSelfSwapOp (float *input, int n, int m, int st, int end) :
+            input(input), n(n), m(m), st(st), end(end) {}
+
+        void Run() {
+            if ((int)temp.size() < n * m) {
+                temp.resize(n * m);
+            }
+            for (int o = st; o < end; o++) {
+                float *cur = input + (long long)o * n * m;
+                memcpy(temp.data(), cur, (long long)n * m * sizeof(float));
+                Transpose(cur, temp.data(), n, m, n, m);
+            }
+        }
+    };
 
     void DoCpuPermuteSelf(Data &input, const std::vector <int> &axis) {
         bool same = false;
@@ -9862,13 +10013,43 @@ ops += (long long)lines * inputDim * interDim * 2;
             int dl = input.dims.size();
             int outer = input.Count(0) / input.Count(dl - 2);
             int n = input.dims[dl - 2], m = input.dims[dl - 1];
-            float *temp = new float[n * m];
             float *finput = (float*)input.cpuData;
-            for (int i = 0; i < outer; i++) {
-                memcpy(temp, finput + i * n * m, n * m * sizeof(float));
-                Transpose(finput + i * n * m, temp, n, m, n, m);
+            if ((long long)outer * n * m < 65536) {
+                float *temp = new float[n * m];
+                for (int i = 0; i < outer; i++) {
+                    memcpy(temp, finput + (long long)i * n * m, (long long)n * m * sizeof(float));
+                    Transpose(finput + (long long)i * n * m, temp, n, m, n, m);
+                }
+                delete[] temp;
+            } else if (outer == 1) {
+                float *temp = new float[n * m];
+                uint64_t copyBytes = (uint64_t)n * m * sizeof(float);
+                if (copyBytes < 2147483648ULL) {
+                    RunMultiThreadMemcpy((uint8_t*)temp, input.cpuData, (int)copyBytes, GetAlivePool());
+                } else {
+                    memcpy(temp, input.cpuData, copyBytes);
+                }
+                RunMultiThreadTransposeMatrix(finput, temp, n, m, n, m, GetAlivePool());
+                delete[] temp;
+            } else {
+                auto *pool = GetAlivePool();
+                int threadNum = std::min((int)pool->threads.size(), outer);
+                int per = outer / threadNum;
+                std::vector<fastllm::MultiThreadPermuteSelfSwapOp*> ops;
+                int cur = 0;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = (i == threadNum - 1 ? outer : cur + per + (cur + per * (threadNum - i) < outer));
+                    ops.push_back(new MultiThreadPermuteSelfSwapOp(finput, n, m, cur, end));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(i);
+                    delete ops[i];
+                }
             }
-            delete[] temp;
             input.Resize(new_dims);
         } else if (axis == std::vector<int> {0, 2, 1, 3}) {
             if (vold.size() < input.GetBytes()) {
@@ -9905,7 +10086,12 @@ ops += (long long)lines * inputDim * interDim * 2;
             auto tmp = new Data();
             fastllm::Permute(input, axis, *tmp);
 
-            memcpy(input.cpuData, tmp->cpuData, input.unitSize * input.Count(0));
+            uint64_t copyBytes = (uint64_t)input.unitSize * input.Count(0);
+            if (copyBytes < 2147483648ULL) {
+                RunMultiThreadMemcpy(input.cpuData, tmp->cpuData, (int)copyBytes, GetAlivePool());
+            } else {
+                memcpy(input.cpuData, tmp->cpuData, copyBytes);
+            }
             input.Resize(tmp->dims);
             delete tmp;
         }
