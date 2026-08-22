@@ -6133,28 +6133,85 @@ ops += (long long)lines * inputDim * interDim * 2;
         output.Resize(dims);
     }
 
+    struct MultiThreadConv1DPerChannelOp : MultiThreadBaseOp {
+        float *floatInput, *floatOutput, *floatWeight, *floatBias;
+        int batchSize, inputLength, outputLength;
+        int inputChannels, outputChannels, kernelSize, padding, stride, groups;
+        int channelsPerGroup, outputChannelsPerGroup;
+        int st, end;
+
+        MultiThreadConv1DPerChannelOp (float *floatInput, float *floatOutput, float *floatWeight,
+                                       float *floatBias, int batchSize, int inputLength, int outputLength,
+                                       int inputChannels, int outputChannels, int kernelSize, int padding,
+                                       int stride, int groups, int channelsPerGroup,
+                                       int outputChannelsPerGroup, int st, int end) :
+            floatInput(floatInput), floatOutput(floatOutput), floatWeight(floatWeight), floatBias(floatBias),
+            batchSize(batchSize), inputLength(inputLength), outputLength(outputLength),
+            inputChannels(inputChannels), outputChannels(outputChannels), kernelSize(kernelSize),
+            padding(padding), stride(stride), groups(groups), channelsPerGroup(channelsPerGroup),
+            outputChannelsPerGroup(outputChannelsPerGroup), st(st), end(end) {}
+
+        void Run() {
+            for (int b = 0; b < batchSize; b++) {
+                float *batchInput = floatInput + (long long)b * (inputChannels * inputLength);
+                float *batchOutput = floatOutput + (long long)b * (outputChannels * outputLength);
+
+                for (int g = st; g < end; g++) {
+                    for (int oc = 0; oc < outputChannelsPerGroup; oc++) {
+                        int globalOc = g * outputChannelsPerGroup + oc;
+                        float *curWeight = floatWeight + globalOc * (channelsPerGroup * kernelSize);
+                        float *curOutput = batchOutput + (long long)globalOc * outputLength;
+
+                        for (int ol = 0; ol < outputLength; ol++) {
+                            int il = ol * stride - padding;
+                            float value = floatBias ? floatBias[globalOc] : 0.0f;
+
+                            for (int ic = 0; ic < channelsPerGroup; ic++) {
+                                int globalIc = g * channelsPerGroup + ic;
+                                float *curInput = batchInput + (long long)globalIc * inputLength;
+
+                                for (int k = 0; k < kernelSize; k++) {
+                                    float inputValue = 0;
+                                    int inputPos = il + k;
+
+                                    if (inputPos >= 0 && inputPos < inputLength) {
+                                        inputValue = curInput[inputPos];
+                                    }
+
+                                    value += inputValue * curWeight[ic * kernelSize + k];
+                                }
+                            }
+
+                            curOutput[ol] = value;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     void CpuConv1DPerChannel::Run(const std::string &opType, const fastllm::DataDict &datas,
                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
-        output.Allocate(0.0f);
-        int inputChannels = intParams.find("inputChannels")->second;    
-        int outputChannels = intParams.find("outputChannels")->second; 
+        output.Allocate();
+        int inputChannels = intParams.find("inputChannels")->second;
+        int outputChannels = intParams.find("outputChannels")->second;
         int kernelSize = intParams.find("kernel")->second;
-        int padding = intParams.find("pad")->second; 
+        int padding = intParams.find("pad")->second;
         int stride = intParams.find("stride")->second;
         int groups = inputChannels;  // 组数等于通道数，实现逐通道卷积
-        
+
         // 如果有groups参数，使用它
         if (intParams.find("groups") != intParams.end()) {
             groups = intParams.find("groups")->second;
         }
-        
+
         std::vector<int> dims = input.dims;
-        int batchSize = dims[0];        
-        int inputLength = dims[2];      
+        int batchSize = dims[0];
+        int inputLength = dims[2];
         int outputLength = (inputLength + 2 * padding - kernelSize) / stride + 1;
         float *floatInput = (float*)input.cpuData;
         float *floatOutput = (float*)output.cpuData;
@@ -6170,50 +6227,37 @@ ops += (long long)lines * inputDim * interDim * 2;
             floatOutput = (float*)floatOutputVector.data();
             Float16ToFloat32((uint16_t*)input.cpuData, floatInput, (int)floatInputVector.size());
         }
-        
+
         int channelsPerGroup = inputChannels / groups;   // 对于逐通道卷积，这是1
         int outputChannelsPerGroup = outputChannels / groups;  // 对于逐通道卷积，这也是1
-        
-        // 遍历批次
-        for (int b = 0; b < batchSize; b++) {
-            float *batchInput = floatInput + b * (inputChannels * inputLength);
-            float *batchOutput = floatOutput + b * (outputChannels * outputLength);
-            
-            // 对于逐通道卷积，每个通道独立处理
-            for (int g = 0; g < groups; g++) {
-                // 对于每个组内的输出通道
-                for (int oc = 0; oc < outputChannelsPerGroup; oc++) {
-                    int globalOc = g * outputChannelsPerGroup + oc;
-                    float *curWeight = floatWeight + globalOc * (channelsPerGroup * kernelSize);
-                    float *curOutput = batchOutput + globalOc * outputLength;
-                    
-                    // 遍历输出序列位置
-                    for (int ol = 0; ol < outputLength; ol++) {
-                        int il = ol * stride - padding;
-                        float value = floatBias ? floatBias[globalOc] : 0.0f;
-                        
-                        // 对于逐通道卷积，只处理对应的一个输入通道
-                        for (int ic = 0; ic < channelsPerGroup; ic++) {
-                            int globalIc = g * channelsPerGroup + ic;
-                            float *curInput = batchInput + globalIc * inputLength;
-                            
-                            // 遍历kernel
-                            for (int k = 0; k < kernelSize; k++) {
-                                float inputValue = 0;
-                                int inputPos = il + k;
-                                
-                                // 检查边界
-                                if (inputPos >= 0 && inputPos < inputLength) {
-                                    inputValue = curInput[inputPos];
-                                }
-                                
-                                value += inputValue * curWeight[ic * kernelSize + k];
-                            }
-                        }
-                        
-                        curOutput[ol] = value;
-                    }
-                }
+
+        if ((long long)batchSize * groups * outputLength * kernelSize * channelsPerGroup < 65536 ||
+            groups <= 1) {
+            MultiThreadConv1DPerChannelOp(floatInput, floatOutput, floatWeight, floatBias,
+                                          batchSize, inputLength, outputLength, inputChannels,
+                                          outputChannels, kernelSize, padding, stride, groups,
+                                          channelsPerGroup, outputChannelsPerGroup, 0, groups).Run();
+        } else {
+            auto *pool = GetAlivePool();
+            int threadNum = std::min((int)pool->threads.size(), groups);
+            int per = groups / threadNum;
+            std::vector<fastllm::MultiThreadConv1DPerChannelOp*> ops;
+            int cur = 0;
+            for (int i = 0; i < threadNum; i++) {
+                int end = (i == threadNum - 1 ? groups : cur + per + (cur + per * (threadNum - i) < groups));
+                ops.push_back(new MultiThreadConv1DPerChannelOp(
+                    floatInput, floatOutput, floatWeight, floatBias,
+                    batchSize, inputLength, outputLength, inputChannels,
+                    outputChannels, kernelSize, padding, stride, groups,
+                    channelsPerGroup, outputChannelsPerGroup, cur, end));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->Wait(i);
+                delete ops[i];
             }
         }
 
@@ -7333,9 +7377,16 @@ ops += (long long)lines * inputDim * interDim * 2;
         int channels = input.dims[axis];
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
-        
-        RunMultiThreadSlice(output.cpuData, input.cpuData + start * inner * unitSize, outer, 
-            inputStride * unitSize, outputStride * unitSize, (end - start) * inner * unitSize, GetAlivePool());
+
+        int copyLen = (end - start) * inner * unitSize;
+        if (outer == 1) {
+            // 整块连续拷贝，按字节分段并行，避免单线程拷几百 MB
+            RunMultiThreadMemcpy(output.cpuData, input.cpuData + start * inner * unitSize,
+                                 copyLen, GetAlivePool());
+        } else {
+            RunMultiThreadSlice(output.cpuData, input.cpuData + start * inner * unitSize, outer,
+                inputStride * unitSize, outputStride * unitSize, copyLen, GetAlivePool());
+        }
     }
 
     void CpuRepeatOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -7373,11 +7424,25 @@ ops += (long long)lines * inputDim * interDim * 2;
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
 
-        for (int o = 0; o < outer; o++) {
-            for (int t = 0; t < repeatTimes; t++) {
-                memcpy(output.cpuData + o * outputStride * unitSize + t * channels * inner * unitSize,
-                    input.cpuData + (o * inputStride) * unitSize,
-                    channels * inner * unitSize);
+        if ((long long)outer * outputStride * unitSize >= 262144) {
+            std::vector <MultiThreadMemcpyMultiLinesTask> tasks;
+            tasks.reserve((size_t)outer * repeatTimes);
+            for (int o = 0; o < outer; o++) {
+                for (int t = 0; t < repeatTimes; t++) {
+                    tasks.push_back(MultiThreadMemcpyMultiLinesTask(
+                        output.cpuData + (long long)o * outputStride * unitSize + (long long)t * channels * inner * unitSize,
+                        input.cpuData + (long long)o * inputStride * unitSize,
+                        channels * inner * unitSize));
+                }
+            }
+            RunMultiThreadMemcpyMultiLines(tasks, GetAlivePool());
+        } else {
+            for (int o = 0; o < outer; o++) {
+                for (int t = 0; t < repeatTimes; t++) {
+                    memcpy(output.cpuData + o * outputStride * unitSize + t * channels * inner * unitSize,
+                        input.cpuData + (o * inputStride) * unitSize,
+                        channels * inner * unitSize);
+                }
             }
         }
     }
@@ -7482,7 +7547,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input1 = *(datas.find("input1")->second);
         Data &output = *(datas.find("output")->second);
 
+        auto catSt = std::chrono::system_clock::now();
         output.Allocate();
+        auto catAlloc = std::chrono::system_clock::now();
 
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         if (input0.dims.size() == 0 && input1.dims.size() > 0) {
@@ -7526,6 +7593,17 @@ ops += (long long)lines * inputDim * interDim * 2;
                 memcpy(output.cpuData + o * outputStride * unitSize + input0.dims[axis] * inner * unitSize,
                        input1.cpuData + (o * input1Stride) * unitSize,
                        input1.dims[axis] * inner * unitSize);
+            }
+        }
+
+        static const bool catProfSlow = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+        if (catProfSlow) {
+            float allocSpend = GetSpan(catSt, catAlloc);
+            float copySpend = GetSpan(catAlloc, std::chrono::system_clock::now());
+            if (allocSpend + copySpend > 0.02f) {
+                printf("[fastllm-cat-detail] alloc=%.6f copy=%.6f total=%.6f s (outer=%d)\n",
+                       allocSpend, copySpend, allocSpend + copySpend, outer);
+                fflush(stdout);
             }
         }
     }
@@ -8924,7 +9002,9 @@ ops += (long long)lines * inputDim * interDim * 2;
                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
+        auto mulSt = std::chrono::system_clock::now();
         output.Allocate();
+        auto mulAlloc = std::chrono::system_clock::now();
 
         float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
         AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
@@ -8936,6 +9016,17 @@ ops += (long long)lines * inputDim * interDim * 2;
             RunMultiThreadMulScalar(input.cpuData, output.cpuData, v, len, false, GetAlivePool());
         } else if (input.dataType == DataType::FLOAT16) {
             RunMultiThreadMulScalar(input.cpuData, output.cpuData, v, len, true, GetAlivePool());
+        }
+
+        static const bool mulProfSlow = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+        if (mulProfSlow) {
+            float allocSpend = GetSpan(mulSt, mulAlloc);
+            float copySpend = GetSpan(mulAlloc, std::chrono::system_clock::now());
+            if (allocSpend + copySpend > 0.02f) {
+                printf("[fastllm-mul-detail] alloc=%.6f copy=%.6f total=%.6f s (len=%d)\n",
+                       allocSpend, copySpend, allocSpend + copySpend, len);
+                fflush(stdout);
+            }
         }
     }
 
@@ -8966,6 +9057,104 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    struct MultiThreadMulToOp : MultiThreadBaseOp {
+        uint8_t *input0Data, *input1Data;
+        long long st, end;
+        int dataType;          // 0: float32, 1: float16, 2: bfloat16
+        long long channelLen;  // > 0: input1 按 i / channelLen 广播
+        bool scalar;           // input1 只有 1 个元素
+
+        MultiThreadMulToOp (uint8_t *input0Data, uint8_t *input1Data, long long st, long long end,
+                            int dataType, long long channelLen, bool scalar) :
+            input0Data(input0Data), input1Data(input1Data), st(st), end(end),
+            dataType(dataType), channelLen(channelLen), scalar(scalar) {}
+
+        void Run() {
+            if (dataType == 0) {
+                float *a = (float*)input0Data + st;
+                float *b = (float*)input1Data;
+                if (scalar) {
+                    float v = b[0];
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] *= v;
+                    }
+                } else if (channelLen > 0) {
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] *= b[(st + i) / channelLen];
+                    }
+                } else {
+                    float *bb = b + st;
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] *= bb[i];
+                    }
+                }
+            } else if (dataType == 1) {
+                uint16_t *a = (uint16_t*)input0Data + st;
+                uint16_t *b = (uint16_t*)input1Data;
+                if (scalar) {
+                    float v = fp16tofp32.dict[b[0]];
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] = float_to_half(fp16tofp32.dict[a[i]] * v);
+                    }
+                } else if (channelLen > 0) {
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] = float_to_half(fp16tofp32.dict[a[i]] * fp16tofp32.dict[b[(st + i) / channelLen]]);
+                    }
+                } else {
+                    uint16_t *bb = b + st;
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] = float_to_half(fp16tofp32.dict[a[i]] * fp16tofp32.dict[bb[i]]);
+                    }
+                }
+            } else {
+                uint16_t *a = (uint16_t*)input0Data + st;
+                uint16_t *b = (uint16_t*)input1Data;
+                if (scalar) {
+                    float v = BFloat16BitsToFloat32(b[0]);
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] = Float32ToBFloat16RNEBits(BFloat16BitsToFloat32(a[i]) * v);
+                    }
+                } else if (channelLen > 0) {
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] = Float32ToBFloat16RNEBits(
+                            BFloat16BitsToFloat32(a[i]) * BFloat16BitsToFloat32(b[(st + i) / channelLen]));
+                    }
+                } else {
+                    uint16_t *bb = b + st;
+                    for (long long i = 0; i < end - st; i++) {
+                        a[i] = Float32ToBFloat16RNEBits(
+                            BFloat16BitsToFloat32(a[i]) * BFloat16BitsToFloat32(bb[i]));
+                    }
+                }
+            }
+        }
+    };
+
+    static void RunMultiThreadMulTo(uint8_t *input0Data, uint8_t *input1Data, long long len,
+                                    int dataType, long long channelLen, bool scalar,
+                                    AliveThreadPool *pool) {
+        if (len < 65536) {
+            MultiThreadMulToOp(input0Data, input1Data, 0, len, dataType, channelLen, scalar).Run();
+            return;
+        }
+        int threadNum = pool->threads.size();
+        long long per = len / threadNum;
+        std::vector<fastllm::MultiThreadMulToOp*> ops;
+        long long cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            long long end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new MultiThreadMulToOp(input0Data, input1Data, cur, end, dataType, channelLen, scalar));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void CpuMulToOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input0 = *(datas.find("input0")->second);
@@ -8984,73 +9173,15 @@ ops += (long long)lines * inputDim * interDim * 2;
         AssertInFastLLM(len % inner == 0, "MulTo error: Data`s shape can`t perform MulTo operation.\n");
         int round = (len / inner);
 
+        int dataType = (input0.dataType == DataType::FLOAT16 ? 1 :
+                        (input0.dataType == DataType::BFLOAT16 ? 2 : 0));
         if (input1Len == 1) {
-            if (input0.dataType == DataType::FLOAT16) {
-                uint16_t *input0Data = (uint16_t*)input0.cpuData;
-                uint16_t *input1Data = (uint16_t*)input1.cpuData;
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[0]]);
-                }
-            } else if (input0.dataType == DataType::BFLOAT16) {
-                uint16_t *input0Data = (uint16_t*)input0.cpuData;
-                uint16_t *input1Data = (uint16_t*)input1.cpuData;
-                float scalar = BFloat16BitsToFloat32(input1Data[0]);
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] = Float32ToBFloat16RNEBits(
-                        BFloat16BitsToFloat32(input0Data[i]) * scalar);
-                }
-            } else {
-                float *input0Data = (float*)input0.cpuData;
-                float *input1Data = (float*)input1.cpuData;
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] *= input1Data[0];
-                }
-            }
+            RunMultiThreadMulTo(input0.cpuData, input1.cpuData, len, dataType, 0, true, GetAlivePool());
         } else if (input0Len == input1Len) {
-            if (input0.dataType == DataType::FLOAT16) {
-                uint16_t *input0Data = (uint16_t*)input0.cpuData;
-                uint16_t *input1Data = (uint16_t*)input1.cpuData;
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[i]]);
-                }
-            } else if (input0.dataType == DataType::BFLOAT16) {
-                uint16_t *input0Data = (uint16_t*)input0.cpuData;
-                uint16_t *input1Data = (uint16_t*)input1.cpuData;
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] = Float32ToBFloat16RNEBits(
-                        BFloat16BitsToFloat32(input0Data[i]) *
-                        BFloat16BitsToFloat32(input1Data[i]));
-                }
-            } else {
-                float *input0Data = (float*)input0.cpuData;
-                float *input1Data = (float*)input1.cpuData;
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] *= input1Data[i];
-                }
-            }
+            RunMultiThreadMulTo(input0.cpuData, input1.cpuData, len, dataType, 0, false, GetAlivePool());
         } else {
             int channelLen = input0Len / input1Len;
-            if (input0.dataType == DataType::FLOAT16) {
-                uint16_t *input0Data = (uint16_t*)input0.cpuData;
-                uint16_t *input1Data = (uint16_t*)input1.cpuData;
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[i / channelLen]]);
-                }
-            } else if (input0.dataType == DataType::BFLOAT16) {
-                uint16_t *input0Data = (uint16_t*)input0.cpuData;
-                uint16_t *input1Data = (uint16_t*)input1.cpuData;
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] = Float32ToBFloat16RNEBits(
-                        BFloat16BitsToFloat32(input0Data[i]) *
-                        BFloat16BitsToFloat32(input1Data[i / channelLen]));
-                }
-            } else {
-                float *input0Data = (float*)input0.cpuData;
-                float *input1Data = (float*)input1.cpuData;
-                for (int i = 0; i < len; i++) {
-                    input0Data[i] *= input1Data[i / channelLen];
-                }
-            }
+            RunMultiThreadMulTo(input0.cpuData, input1.cpuData, len, dataType, channelLen, false, GetAlivePool());
         }
     }
 
@@ -9287,6 +9418,46 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    struct MultiThreadTransferAttnOp : MultiThreadBaseOp {
+        float *inputData;
+        int n, m, st, end;
+
+        MultiThreadTransferAttnOp (float *inputData, int n, int m, int st, int end) :
+            inputData(inputData), n(n), m(m), st(st), end(end) {}
+
+        void Run() {
+            std::vector <float> tempRow(m);
+            std::vector <float> tempSub((long long)m * m);
+            for (int o = st; o < end; o++) {
+                float *batchData = inputData + (long long)o * n * m;
+
+                for (int i = 1; i < n; i++) {
+                    // 复制第 i 行的前 i 个元素到临时数组
+                    std::memcpy(tempRow.data(), batchData + i * m, i * sizeof(float));
+
+                    // 复制子矩阵到临时数组
+                    for (int k = 0; k < i; k++) {
+                        std::memcpy(tempSub.data() + k * m, batchData + k * m, i * sizeof(float));
+                    }
+
+                    // 更新第 i 行的前 i 个元素
+                    for (int j = 0; j < i; j++) {
+                        float sum = tempRow[j];
+                        for (int k = 0; k < i; k++) {
+                            sum += tempRow[k] * tempSub[k * m + j];
+                        }
+                        batchData[i * m + j] = sum;
+                    }
+                }
+
+                // attn = attn + torch.eye(chunk_size, ...)
+                for (int i = 0; i < n; i++) {
+                    inputData[(long long)o * n * n + i * m + i] += 1.0f;
+                }
+            }
+        }
+    };
+
     void CpuTransferAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -9301,36 +9472,25 @@ ops += (long long)lines * inputDim * interDim * 2;
             Float16ToFloat32((uint16_t*)input.cpuData, inputData, (int)floatInputVector.size());
         }
 
-        // 预分配最大所需的临时空间
-        std::vector<float> tempRow(m);
-        std::vector<float> tempSub(m * m);
-        for (int o = 0; o < outer; o++) {
-            float *batchData = inputData + o * n * m;
-            
-            for (int i = 1; i < n; i++) {
-                // 复制第 i 行的前 i 个元素到临时数组
-                std::memcpy(tempRow.data(), batchData + i * m, i * sizeof(float));
-                
-                // 复制子矩阵到临时数组
-                for (int k = 0; k < i; k++) {
-                    std::memcpy(tempSub.data() + k * m, batchData + k * m, i * sizeof(float));
-                }
-                
-                // 更新第 i 行的前 i 个元素
-                for (int j = 0; j < i; j++) {
-                    float sum = tempRow[j];
-                    for (int k = 0; k < i; k++) {
-                        sum += tempRow[k] * tempSub[k * m + j];
-                    }
-                    batchData[i * m + j] = sum;
-                }
+        if ((long long)outer * n * m < 65536 || outer <= 1) {
+            MultiThreadTransferAttnOp(inputData, n, m, 0, outer).Run();
+        } else {
+            auto *pool = GetAlivePool();
+            int threadNum = std::min((int)pool->threads.size(), outer);
+            int per = outer / threadNum;
+            std::vector<fastllm::MultiThreadTransferAttnOp*> ops;
+            int cur = 0;
+            for (int i = 0; i < threadNum; i++) {
+                int end = (i == threadNum - 1 ? outer : cur + per + (cur + per * (threadNum - i) < outer));
+                ops.push_back(new MultiThreadTransferAttnOp(inputData, n, m, cur, end));
+                cur = end;
             }
-        }
-
-        // attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-        for (int o = 0; o < outer; o++) {
-            for (int i = 0; i < n; i++) {
-                inputData[o * n * n + i * m + i] += 1.0f;
+            for (int i = 0; i < threadNum; i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->Wait(i);
+                delete ops[i];
             }
         }
 
@@ -9834,24 +9994,36 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     struct MultiThreadPermuteCopyOp : MultiThreadBaseOp {
         uint8_t *tmpData, *curData;
-        int *oldPos;
+        std::vector <int> axis, oldSteps, newSteps;
         int unitSize, st, end;
 
-        MultiThreadPermuteCopyOp (uint8_t *tmpData, uint8_t *curData, int *oldPos, int unitSize, int st, int end) :
-            tmpData(tmpData), curData(curData), oldPos(oldPos), unitSize(unitSize), st(st), end(end) {}
+        MultiThreadPermuteCopyOp (uint8_t *tmpData, uint8_t *curData, std::vector <int> axis,
+                                  std::vector <int> oldSteps, std::vector <int> newSteps,
+                                  int unitSize, int st, int end) :
+            tmpData(tmpData), curData(curData), axis(axis), oldSteps(oldSteps),
+            newSteps(newSteps), unitSize(unitSize), st(st), end(end) {}
+
+        int MapPos(int i) {
+            int old = 0, idx = i;
+            for (int j = 0; j < (int)axis.size(); ++j) {
+                old += (idx / newSteps[j]) * oldSteps[axis[j]];
+                idx %= newSteps[j];
+            }
+            return old;
+        }
 
         void Run() {
             if (unitSize == 4) {
                 for (int i = st; i < end; i++) {
-                    ((float*)tmpData)[i] = ((float*)curData)[oldPos[i]];
+                    ((float*)tmpData)[i] = ((float*)curData)[MapPos(i)];
                 }
             } else if (unitSize == 2) {
                 for (int i = st; i < end; i++) {
-                    ((uint16_t*)tmpData)[i] = ((uint16_t*)curData)[oldPos[i]];
+                    ((uint16_t*)tmpData)[i] = ((uint16_t*)curData)[MapPos(i)];
                 }
             } else if (unitSize == 1) {
                 for (int i = st; i < end; i++) {
-                    ((uint8_t*)tmpData)[i] = ((uint8_t*)curData)[oldPos[i]];
+                    ((uint8_t*)tmpData)[i] = ((uint8_t*)curData)[MapPos(i)];
                 }
             }
         }
@@ -9902,37 +10074,14 @@ ops += (long long)lines * inputDim * interDim * 2;
             std::vector<int> oldSteps;
             std::vector<int> newSteps;
             int count = input.Count(0);
-            auto oldPos = new int[count];
             for (int i = 0; i < axis.size(); i++) {
                 oldSteps.push_back(input.Count(i + 1));
                 newSteps.push_back(output.Count(i + 1));
             }
 
-            for (int i = 0; i < count; ++i) {
-                int old = 0;
-                int idx = i;
-                for (int j = 0; j < axis.size(); ++j) {
-                    int order = axis[j];
-                    old += (idx / newSteps[j]) * oldSteps[order];
-                    idx %= newSteps[j];
-                }
-                oldPos[i] = old;
-            }
-
             if (count < 65536) {
-                if (input.unitSize == 4) {
-                    for (int i = 0; i < count; ++i) {
-                        ((float*)tmpData)[i] = ((float*)curData)[oldPos[i]];
-                    }
-                } else if (input.unitSize == 2) {
-                    for (int i = 0; i < count; ++i) {
-                        ((uint16_t*)tmpData)[i] = ((uint16_t*)curData)[oldPos[i]];
-                    }
-                } else if (input.unitSize == 1) {
-                    for (int i = 0; i < count; ++i) {
-                        ((uint8_t*)tmpData)[i] = ((uint8_t*)curData)[oldPos[i]];
-                    }
-                }
+                MultiThreadPermuteCopyOp(tmpData, curData, axis, oldSteps, newSteps,
+                                         input.unitSize, 0, count).Run();
             } else {
                 auto *pool = GetAlivePool();
                 int threadNum = pool->threads.size();
@@ -9941,7 +10090,8 @@ ops += (long long)lines * inputDim * interDim * 2;
                 int cur = 0;
                 for (int i = 0; i < threadNum; i++) {
                     int end = (i == threadNum - 1 ? count : cur + per + (cur + per * (threadNum - i) < count));
-                    ops.push_back(new MultiThreadPermuteCopyOp(tmpData, curData, oldPos, input.unitSize, cur, end));
+                    ops.push_back(new MultiThreadPermuteCopyOp(tmpData, curData, axis, oldSteps,
+                                                               newSteps, input.unitSize, cur, end));
                     cur = end;
                 }
                 for (int i = 0; i < threadNum; i++) {
@@ -9952,8 +10102,6 @@ ops += (long long)lines * inputDim * interDim * 2;
                     delete ops[i];
                 }
             }
-
-            delete[] oldPos;
         }
     }
 
@@ -10974,6 +11122,29 @@ ops += (long long)lines * inputDim * interDim * 2;
         output.Resize(dims);
     }
 
+    struct MultiThreadMakeDecayMaskOp : MultiThreadBaseOp {
+        float *inputData, *outputData;
+        int dim, st, end;
+
+        MultiThreadMakeDecayMaskOp (float *inputData, float *outputData, int dim, int st, int end) :
+            inputData(inputData), outputData(outputData), dim(dim), st(st), end(end) {}
+
+        void Run() {
+            // decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+            for (int o = st; o < end; o++) {
+                for (int i = 0; i < dim; i++) {
+                    for (int j = 0; j <= i && j < dim; j++) {
+                        outputData[(long long)o * dim * dim + i * dim + j] =
+                            std::exp(inputData[(long long)o * dim + i] - inputData[(long long)o * dim + j]);
+                    }
+                    for (int j = i + 1; j < dim; j++) {
+                        outputData[(long long)o * dim * dim + i * dim + j] = 0.0f;
+                    }
+                }
+            }
+        }
+    };
+
     void CpuMakeDecayMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -10995,15 +11166,25 @@ ops += (long long)lines * inputDim * interDim * 2;
             Float16ToFloat32((uint16_t*)input.cpuData, inputData, (int)floatInputVector.size());
         }
 
-        // decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-        for (int o = 0; o < outer; o++) {
-            for (int i = 0; i < dim; i++) {
-                for (int j = 0; j <= i && j < dim; j++) {
-                    outputData[o * dim * dim + i * dim + j] = std::exp(inputData[o * dim + i] - inputData[o * dim + j]);
-                }
-                for (int j = i + 1; j < dim; j++) {
-                    outputData[o * dim * dim + i * dim + j] = 0.0f;
-                }
+        if ((long long)outer * dim * dim < 65536 || outer <= 1) {
+            MultiThreadMakeDecayMaskOp(inputData, outputData, dim, 0, outer).Run();
+        } else {
+            auto *pool = GetAlivePool();
+            int threadNum = std::min((int)pool->threads.size(), outer);
+            int per = outer / threadNum;
+            std::vector<fastllm::MultiThreadMakeDecayMaskOp*> ops;
+            int cur = 0;
+            for (int i = 0; i < threadNum; i++) {
+                int end = (i == threadNum - 1 ? outer : cur + per + (cur + per * (threadNum - i) < outer));
+                ops.push_back(new MultiThreadMakeDecayMaskOp(inputData, outputData, dim, cur, end));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->Wait(i);
+                delete ops[i];
             }
         }
 

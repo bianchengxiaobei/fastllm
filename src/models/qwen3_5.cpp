@@ -21697,11 +21697,23 @@ namespace fastllm {
                             AddTo(atv, attn_inter);
                             atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
                             if (ci == 0) {
-                                Mul(atv, 1.0f, out);
-                            } else {
-                                Mul(out, 1.0f, core_attn_out_temp);
-                                Cat(core_attn_out_temp, atv, 3, out);
+                                // 预分配全部 chunk 的最终 shape，之后每轮 CatDirect 原地追加，
+                                // 避免逐 chunk `Mul + Cat` 反复 realloc 并把已累积结果整块重拷。
+                                int totalChunks = tot_heads / chunk_size;
+                                std::vector <int> oneDims = atv.dims;
+                                std::vector <int> fullDims = oneDims;
+                                fullDims[3] = atv.dims[3] * totalChunks;
+                                out.dataType = atv.dataType;
+#ifdef USE_CUDA
+                                out.dataDevice = atv.dataDevice;
+                                out.dataDeviceIds = atv.dataDeviceIds;
+#endif
+                                out.Resize(fullDims);
+                                out.Allocate();
+                                out.Resize(oneDims);
+                                out.expansionDims = fullDims;
                             }
+                            CatDirect(out, atv, 3);
 
                             Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
                             Split(g_i, 2, g_i.dims[2] - 1, g_i.dims[2], g_i_last);
@@ -21737,12 +21749,12 @@ namespace fastllm {
                     #endif
 
                     if (useFusedChunkPrefill) {
-                        #ifdef USE_CUDA
+#ifdef USE_CUDA
                         ChunkGatedDeltaRulePrefill(
                             qq, *pkk, vv_pad, *pgg, attn, k_cumdecay,
                             last_recurrent_state, core_attn_out
                         );
-                        #endif
+#endif
                     } else {
                         PermuteSelf(qq, {2, 0, 1, 3, 4});
                         PermuteSelf(*pkk, {2, 0, 1, 3, 4});
@@ -21752,6 +21764,8 @@ namespace fastllm {
                         PermuteSelf(g_exp, {2, 0, 1, 3});
                         PermuteSelf(*pgg, {2, 0, 1, 3});
                         runChunkPrefillReference(last_recurrent_state, core_attn_out);
+                        // 清掉 expansionDims，让后续 Reshape 重新计算 strides
+                        core_attn_out.expansionDims.clear();
                     }
 
                     core_attn_out.Reshape({core_attn_out.dims[0], core_attn_out.dims[1], -1, core_attn_out.dims.back()});
@@ -23015,11 +23029,23 @@ namespace fastllm {
                             AddTo(atv, attn_inter);
                             atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
                             if (ci == 0) {
-                                Mul(atv, 1.0f, out);
-                            } else {
-                                Mul(out, 1.0f, core_attn_out_temp);
-                                Cat(core_attn_out_temp, atv, 3, out);
+                                // 预分配全部 chunk 的最终 shape，之后每轮 CatDirect 原地追加，
+                                // 避免逐 chunk `Mul + Cat` 反复 realloc 并把已累积结果整块重拷。
+                                int totalChunks = tot_heads / chunk_size;
+                                std::vector <int> oneDims = atv.dims;
+                                std::vector <int> fullDims = oneDims;
+                                fullDims[3] = atv.dims[3] * totalChunks;
+                                out.dataType = atv.dataType;
+#ifdef USE_CUDA
+                                out.dataDevice = atv.dataDevice;
+                                out.dataDeviceIds = atv.dataDeviceIds;
+#endif
+                                out.Resize(fullDims);
+                                out.Allocate();
+                                out.Resize(oneDims);
+                                out.expansionDims = fullDims;
                             }
+                            CatDirect(out, atv, 3);
 
                             Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
                             Split(g_i, 2, g_i.dims[2] - 1, g_i.dims[2], g_i_last);
@@ -23070,6 +23096,8 @@ namespace fastllm {
                         PermuteSelf(g_exp, {2, 0, 1, 3});
                         PermuteSelf(*pgg, {2, 0, 1, 3});
                         runChunkPrefillReference(last_recurrent_state, core_attn_out);
+                        // 清掉 expansionDims，让后续 Reshape 重新计算 strides
+                        core_attn_out.expansionDims.clear();
                     }
 
                     core_attn_out.Reshape({core_attn_out.dims[0], core_attn_out.dims[1], -1, core_attn_out.dims.back()});
