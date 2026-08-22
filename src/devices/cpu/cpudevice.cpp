@@ -12509,14 +12509,12 @@ ops += (long long)lines * inputDim * interDim * 2;
             if (pagedAttnProf) {
                 static int pagedAttnLogCnt = 0;
                 int cnt = pagedAttnLogCnt++;
-                if (cnt < 8 || cnt % 200 == 0) {
-                    printf("[fastllm-paged-attn] #%d dtype=%s cache=%s q0=%d q1=%d q2=%d k1=%d v2=%d group=%d kvHeads=%d threads=%d conv=%.4f s\n",
-                           cnt, GetDataTypeName(q.dataType).c_str(),
-                           GetDataTypeName(k.pagedKVCacheData->dataType).c_str(),
-                           q0, q1, q2, k1, v2, group, kNumHeads,
-                           (int)GetAlivePool()->threads.size(), pagedAttnConvSpend);
-                    fflush(stdout);
-                }
+                printf("[fastllm-paged-attn] #%d dtype=%s cache=%s q0=%d q1=%d q2=%d k1=%d v2=%d group=%d kvHeads=%d threads=%d conv=%.4f s\n",
+                       cnt, GetDataTypeName(q.dataType).c_str(),
+                       GetDataTypeName(k.pagedKVCacheData->dataType).c_str(),
+                       q0, q1, q2, k1, v2, group, kNumHeads,
+                       (int)GetAlivePool()->threads.size(), pagedAttnConvSpend);
+                fflush(stdout);
             }
         }
     }
