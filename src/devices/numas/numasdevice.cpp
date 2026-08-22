@@ -1900,6 +1900,13 @@ namespace fastllm {
     }
 
     void RegisterNumas(fastllm::Data *data, std::string weightType) {
+        // 权重加载阶段 model.cpp 用多个 std::thread 并行加载，
+        // 每个线程都会触发 RegisterNumas -> allocate_pinned_numa(cudaHostRegister)
+        // 和 DynamicScheduleTasks(向绑核池线程 PushOp + Wait)。
+        // 16 个加载线程同时打 CUDA 驱动锁和池线程会造成互锁/饿死：
+        // 表现为 "Loading 90" 卡住、CPU 占用骤降。串行化注册即可消除争用。
+        static std::mutex registerMutex;
+        std::lock_guard<std::mutex> guard(registerMutex);
         RegisterNumasImpl(data, weightType, true);
     }
 

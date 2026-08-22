@@ -21671,6 +21671,9 @@ namespace fastllm {
                         // 预分配输出最终 shape，各 chunk 结果用 CatDirect 原地
                         // 追加，避免旧的逐 chunk `Mul + Cat` 把已累积结果反复
                         // 整块重拷一遍的 O(chunks^2) 流量。
+                        static const bool gdnChunkProf = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+                        auto gdnChunkSt = std::chrono::system_clock::now();
+                        float gdnCopySpend = 0.0f, gdnAllocSpend = 0.0f;
                         for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
                             Data q_i, k_i, v_i, attn_i, k_cumdecay_i;
                             makeChunk4D(qq, ci, q_i);
@@ -21708,12 +21711,17 @@ namespace fastllm {
                                 out.dataDevice = atv.dataDevice;
                                 out.dataDeviceIds = atv.dataDeviceIds;
 #endif
+                                auto gdnAllocSt = std::chrono::system_clock::now();
                                 out.Resize(fullDims);
                                 out.Allocate();
+                                if (gdnChunkProf) {
+                                    gdnAllocSpend += GetSpan(gdnAllocSt, std::chrono::system_clock::now());
+                                }
                             }
                             // 原地把 atv 写入 out 的第 ci 个 chunk 槽位。显式按满容量布局
                             // 计算目标偏移，不依赖 strides（CatDirect 要求 strides[axis-1]
                             // 恰好等于外层块的物理间距，与逻辑 dims 不一致时会写错/越界）。
+                            auto gdnCpSt = std::chrono::system_clock::now();
                             {
                                 int blocks = atv.dims[0] * atv.dims[1];
                                 int chunkLen = atv.dims[3];
@@ -21725,6 +21733,9 @@ namespace fastllm {
                                            atv.cpuData + (long long)o * chunkLen * v * unitSize,
                                            (size_t)chunkLen * v * unitSize);
                                 }
+                            }
+                            if (gdnChunkProf) {
+                                gdnCopySpend += GetSpan(gdnCpSt, std::chrono::system_clock::now());
                             }
 
                             Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
@@ -21744,6 +21755,15 @@ namespace fastllm {
                             Split(g_i_exp, 2, g_i_exp.dims[2] - 1, g_i_exp.dims[2], g_i_exp_last);
                             MulTo(state, g_i_exp_last);
                             AddTo(state, k_i_v_new);
+                        }
+                        if (gdnChunkProf) {
+                            float gdnTotalSpend = GetSpan(gdnChunkSt, std::chrono::system_clock::now());
+                            if (gdnTotalSpend > 0.02f) {
+                                printf("[fastllm-gdn-chunk-prefill] total=%.6f copy=%.6f alloc=%.6f s (seq=%d pad=%d chunks=%d tot_heads=%d)\n",
+                                       gdnTotalSpend, gdnCopySpend, gdnAllocSpend,
+                                       seq, pad_size, tot_heads / chunk_size, tot_heads);
+                                fflush(stdout);
+                            }
                         }
                     };
 
@@ -22203,6 +22223,27 @@ namespace fastllm {
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
+        }
+
+        static const bool fwdEntryProf = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+        if (fwdEntryProf && (!all1 || batch > 1)) {
+            int totalTokens = (int)inputIds.Count(0);
+            printf("[fastllm-q35-forward] prefill batch=%d seqLens=[", batch);
+            for (int i = 0; i < batch; i++) {
+                printf("%s%d", i == 0 ? "" : ",", seqLens[i]);
+            }
+            printf("] totalTokens=%d tokens=[", totalTokens);
+            if (inputIds.cpuData != nullptr) {
+                int showN = std::min(16, totalTokens);
+                for (int i = 0; i < showN; i++) {
+                    printf("%s%d", i == 0 ? "" : ",", (int)(((float *)inputIds.cpuData)[i]));
+                }
+                if (showN < totalTokens) {
+                    printf(",...");
+                }
+            }
+            printf("]\n");
+            fflush(stdout);
         }
 
         auto runSplitBatchForward = [&]() -> std::vector<int> {
@@ -23013,6 +23054,9 @@ namespace fastllm {
                         // 预分配输出最终 shape，各 chunk 结果用 CatDirect 原地
                         // 追加，避免旧的逐 chunk `Mul + Cat` 把已累积结果反复
                         // 整块重拷一遍的 O(chunks^2) 流量。
+                        static const bool gdnChunkProf = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+                        auto gdnChunkSt = std::chrono::system_clock::now();
+                        float gdnCopySpend = 0.0f, gdnAllocSpend = 0.0f;
                         for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
                             Data q_i, k_i, v_i, attn_i, k_cumdecay_i;
                             makeChunk4D(qq, ci, q_i);
@@ -23050,12 +23094,17 @@ namespace fastllm {
                                 out.dataDevice = atv.dataDevice;
                                 out.dataDeviceIds = atv.dataDeviceIds;
 #endif
+                                auto gdnAllocSt = std::chrono::system_clock::now();
                                 out.Resize(fullDims);
                                 out.Allocate();
+                                if (gdnChunkProf) {
+                                    gdnAllocSpend += GetSpan(gdnAllocSt, std::chrono::system_clock::now());
+                                }
                             }
                             // 原地把 atv 写入 out 的第 ci 个 chunk 槽位。显式按满容量布局
                             // 计算目标偏移，不依赖 strides（CatDirect 要求 strides[axis-1]
                             // 恰好等于外层块的物理间距，与逻辑 dims 不一致时会写错/越界）。
+                            auto gdnCpSt = std::chrono::system_clock::now();
                             {
                                 int blocks = atv.dims[0] * atv.dims[1];
                                 int chunkLen = atv.dims[3];
@@ -23067,6 +23116,9 @@ namespace fastllm {
                                            atv.cpuData + (long long)o * chunkLen * v * unitSize,
                                            (size_t)chunkLen * v * unitSize);
                                 }
+                            }
+                            if (gdnChunkProf) {
+                                gdnCopySpend += GetSpan(gdnCpSt, std::chrono::system_clock::now());
                             }
 
                             Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
@@ -23086,6 +23138,15 @@ namespace fastllm {
                             Split(g_i_exp, 2, g_i_exp.dims[2] - 1, g_i_exp.dims[2], g_i_exp_last);
                             MulTo(state, g_i_exp_last);
                             AddTo(state, k_i_v_new);
+                        }
+                        if (gdnChunkProf) {
+                            float gdnTotalSpend = GetSpan(gdnChunkSt, std::chrono::system_clock::now());
+                            if (gdnTotalSpend > 0.02f) {
+                                printf("[fastllm-gdn-chunk-prefill] total=%.6f copy=%.6f alloc=%.6f s (seq=%d pad=%d chunks=%d tot_heads=%d)\n",
+                                       gdnTotalSpend, gdnCopySpend, gdnAllocSpend,
+                                       seq, pad_size, tot_heads / chunk_size, tot_heads);
+                                fflush(stdout);
+                            }
                         }
                     };
 
