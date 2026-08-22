@@ -22226,6 +22226,18 @@ namespace fastllm {
         }
 
         static const bool fwdEntryProf = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+        auto cacheTokenLen = [](const Data &cache) -> int {
+            if (cache.isPagedKVCache) {
+                if (cache.pageIndex.empty()) {
+                    return 0;
+                }
+                return ((int)cache.pageIndex.size() - 1) * cache.pageLen + cache.lastPageLen;
+            }
+            if (cache.dims.size() > 1) {
+                return cache.dims[1];
+            }
+            return 0;
+        };
         int kvCachedTokens = -1;
         int kvLayersCached = 0;
         int linearStateLayers = 0;
@@ -22241,7 +22253,7 @@ namespace fastllm {
                 }
                 continue;
             }
-            int len = Qwen35CacheTokenLen(*pastKey);
+            int len = cacheTokenLen(*pastKey);
             if (len > 0) {
                 kvLayersCached++;
                 if (kvCachedTokens < 0) {
