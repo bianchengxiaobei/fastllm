@@ -510,6 +510,56 @@ namespace fastllm {
 #endif
     }
 
+    bool LinearFloat32BFloat16_AVX2_Kernel(
+        float *inputData,
+        uint16_t *weightData,
+        float *biasData,
+        float *outputData,
+        int n, int m, int k, int st, int end)
+    {
+        // fp32 input x bf16 weight -> fp32 output.  Decode is memory bound, so
+        // the inner loop streams weight rows and keeps 5 input rows resident
+        // in registers/L1.  Two weight rows are interleaved into independent
+        // FMA chains to hide the 5-cycle vfmaddps latency.
+        constexpr int superBlock = 64;
+        const int tailBegin = n - n % 5;
+        for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
+            const int superRows = std::min(superBlock, n - iSuper);
+            const int blockTail = iSuper + superRows - (superRows % 5);
+            const int start5 = iSuper;
+            for (int i = start5; i < blockTail; i += 5) {
+                const float *inputBlock = inputData + (size_t)i * m;
+                float *outRow = outputData + (size_t)i * k;
+                int j = st;
+                for (; j + 1 < end; j += 2) {
+                    uint16_t *weightPair = weightData + (size_t)j * m;
+                    mul_mat_bf16_f32_direct_avx2_pair<5>(m, weightPair, m * sizeof(uint16_t),
+                        inputBlock, m * sizeof(float), outRow + j, k * sizeof(float));
+                }
+                if (j < end) {
+                    mul_mat_bf16_f32_direct_avx2<5>(m, weightData + (size_t)j * m, m * sizeof(uint16_t),
+                        inputBlock, m * sizeof(float), outRow + j, k * sizeof(float));
+                }
+            }
+            for (int i = blockTail; i < iSuper + superRows; i++) {
+                const float *inputRow = inputData + (size_t)i * m;
+                float *outRow = outputData + (size_t)i * k;
+                int j = st;
+                for (; j + 1 < end; j += 2) {
+                    uint16_t *weightPair = weightData + (size_t)j * m;
+                    mul_mat_bf16_f32_direct_avx2_pair<1>(m, weightPair, m * sizeof(uint16_t),
+                        inputRow, m * sizeof(float), outRow + j, k * sizeof(float));
+                }
+                if (j < end) {
+                    mul_mat_bf16_f32_direct_avx2<1>(m, weightData + (size_t)j * m, m * sizeof(uint16_t),
+                        inputRow, m * sizeof(float), outRow + j, k * sizeof(float));
+                }
+            }
+        }
+        AddBiasAVX2(outputData, biasData, n, k, st, end);
+        return true;
+    }
+
     bool LinearBFloat16BFloat16_AVX2_Kernel(
         uint16_t *inputData,
         uint16_t *weightData,

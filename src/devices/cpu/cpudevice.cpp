@@ -2167,31 +2167,43 @@ namespace fastllm {
                     }
                     finish = true;
                 } else if (BType == DataType::BFLOAT16) {
-                    static const bool profileScalarF32Bf16 =
-                        std::getenv("FASTLLM_PROFILE_F32BF16_SCALAR") != nullptr;
-                    auto scalarStart = profileScalarF32Bf16 ?
+                    extern bool LinearFloat32BFloat16_AVX2_Kernel(
+                        float *inputData, uint16_t *weightData,
+                        float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+                    static const bool profileF32BF16 =
+                        std::getenv("FASTLLM_PROFILE_F32BF16") != nullptr;
+                    auto t0 = profileF32BF16 ?
                         std::chrono::steady_clock::now() :
                         std::chrono::steady_clock::time_point();
-                    for (int i = 0; i < n; i++) {
-                        float *floatA = (float*)((uint8_t*)A + i * lda);
-                        float *floatC = (float*)((uint8_t*)C + i * ldc);
-                        for (int j = st; j < end; j++) {
-                            uint16_t *floatB = (uint16_t*)((uint8_t*)B + j * ldb);
-                            float sum = 0.0f;
-                            for (int l = 0; l < m; l++) {
-                                sum += floatA[l] * bf16tofp32.dict[floatB[l]];
-                            }
-                            floatC[j] = sum;
-                        }
+                    bool usedAvx2 = false;
+                    if (cpuInstructInfo.hasAVX2 && n > 4) {
+                        usedAvx2 = LinearFloat32BFloat16_AVX2_Kernel(
+                            (float*)A, (uint16_t*)B, nullptr, (float*)C,
+                            n, m, (int)(ldc / sizeof(float)), st, end);
                     }
-                    if (profileScalarF32Bf16) {
-                        auto scalarEnd = std::chrono::steady_clock::now();
+                    if (profileF32BF16) {
+                        auto t1 = std::chrono::steady_clock::now();
                         printf(
-                            "[fastllm-profile-f32bf16-scalar] n=%d m=%d "
-                            "cols=%d seconds=%.6f\n",
-                            n, m, end - st,
-                            std::chrono::duration<double>(
-                                scalarEnd - scalarStart).count());
+                            "[fastllm-profile-f32bf16] n=%d m=%d cols=%d "
+                            "avx2=%d %.3f ms\n",
+                            n, m, end - st, usedAvx2 ? 1 : 0,
+                            std::chrono::duration<double, std::milli>(
+                                t1 - t0).count());
+                    }
+                    if (!usedAvx2) {
+                        for (int i = 0; i < n; i++) {
+                            float *floatA = (float*)((uint8_t*)A + i * lda);
+                            float *floatC = (float*)((uint8_t*)C + i * ldc);
+                            for (int j = st; j < end; j++) {
+                                uint16_t *floatB = (uint16_t*)((uint8_t*)B + j * ldb);
+                                float sum = 0.0f;
+                                for (int l = 0; l < m; l++) {
+                                    sum += floatA[l] * bf16tofp32.dict[floatB[l]];
+                                }
+                                floatC[j] = sum;
+                            }
+                        }
                     }
                     finish = true;
                 } else if (BType == DataType::FLOAT16) {
