@@ -21710,8 +21710,12 @@ namespace fastllm {
 #endif
                                 out.Resize(fullDims);
                                 out.Allocate();
-                                out.Resize(oneDims);
+                                // CatDirect 把 strides[axis-1] 当外层块的物理间距使用，
+                                // strides 必须保持“满容量布局”。因此先冻结 expansionDims
+                                // 再 Resize 回单 chunk 逻辑 dims，避免 strides 被重算成
+                                // 单 chunk 布局导致 CatDirect 写错位置。
                                 out.expansionDims = fullDims;
+                                out.Resize(oneDims);
                             }
                             CatDirect(out, atv, 3);
 
@@ -23042,8 +23046,12 @@ namespace fastllm {
 #endif
                                 out.Resize(fullDims);
                                 out.Allocate();
-                                out.Resize(oneDims);
+                                // CatDirect 把 strides[axis-1] 当外层块的物理间距使用，
+                                // strides 必须保持“满容量布局”。因此先冻结 expansionDims
+                                // 再 Resize 回单 chunk 逻辑 dims，避免 strides 被重算成
+                                // 单 chunk 布局导致 CatDirect 写错位置。
                                 out.expansionDims = fullDims;
+                                out.Resize(oneDims);
                             }
                             CatDirect(out, atv, 3);
 
