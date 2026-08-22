@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <thread>
 #include <vector>
 #if defined(_WIN32) || defined(_WIN64)
@@ -48,6 +49,10 @@ namespace fastllm {
         int id;
         AliveThreadTask realTask;
         AliveThreadTask *task;
+        // 并发 PushOp 会交错写 task->op 并跳过 publishId，
+        // 使另一调用方的 Wait() 永久自旋（加载阶段 16 线程并发注册权重时会触发）。
+        // 用每 loop 一把锁保证 "等空闲 -> 写 op -> 发布 id" 原子。
+        std::mutex pushMutex;
 
         AliveThreadLoop(int id)  {
             this->id = id;
@@ -79,6 +84,7 @@ namespace fastllm {
         }
 
         void PushOp(MultiThreadBaseOp *op) {
+            std::lock_guard<std::mutex> guard(pushMutex);
             while (this->task->doneId.load(std::memory_order_acquire) !=
                    this->task->publishId.load(std::memory_order_acquire)) {
             }
