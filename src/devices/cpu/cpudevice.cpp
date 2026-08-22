@@ -11731,6 +11731,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         float *qHead, *oHead, *maskHead;
         float scale;
         int q1, q2, k1, v2, group, o;
+        int qLo, qHi; // 本任务负责的 query 行区间（绝对行号）
         int pageLen, kNumHeads, kHeadDim, kUnitSize;
         int vPageLen, vNumHeads, vHeadDim, vUnitSize;
         uint8_t *kPagedData, *vPagedData;
@@ -11741,6 +11742,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         MultiThreadPagedAttentionFloat32Op(
             float *qHead, float *oHead, float *maskHead, float scale,
             int q1, int q2, int k1, int v2, int group, int o,
+            int qLo, int qHi,
             int pageLen, int kNumHeads, int kHeadDim, int kUnitSize,
             int vPageLen, int vNumHeads, int vHeadDim, int vUnitSize,
             uint8_t *kPagedData, uint8_t *vPagedData,
@@ -11749,6 +11751,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             const float *kF32Base, const float *vF32Base) :
             qHead(qHead), oHead(oHead), maskHead(maskHead), scale(scale),
             q1(q1), q2(q2), k1(k1), v2(v2), group(group), o(o),
+            qLo(qLo), qHi(qHi),
             pageLen(pageLen), kNumHeads(kNumHeads), kHeadDim(kHeadDim), kUnitSize(kUnitSize),
             vPageLen(vPageLen), vNumHeads(vNumHeads), vHeadDim(vHeadDim), vUnitSize(vUnitSize),
             kPagedData(kPagedData), vPagedData(vPagedData),
@@ -11761,25 +11764,37 @@ ops += (long long)lines * inputDim * interDim * 2;
             const float *kF32 = kF32Base + (size_t)kvHeadIdx * k1 * kHeadDim;
             const float *vF32 = vF32Base + (size_t)kvHeadIdx * k1 * vHeadDim;
 
-            float *qk = new float[std::max(k1, 1)];
-            float *temp = new float[std::max(k1, 1)];
-            for (int i = 0; i < q1; i++) {
-                float maxValue = -10000.0f;
-                int base = k1 - q1;
-                const float *qRow = qHead + (size_t)i * q2;
+            const int rows = qHi - qLo;
+            const int base = k1 - q1;
 
-                for (int j = 0; j < k1; j++) {
+            // scores 缓冲 [row][j]；每个元素都会被写入（有效分或 -10000）
+            std::vector<float> qk((size_t)rows * k1);
+
+            // pass 1: QK 打分。j 外层：同一 kToken 在整个 query 块内复用，
+            // K slab 每个 op 只流过一遍。
+            for (int j = 0; j < k1; j++) {
+                if (!maskHead && j > base + qHi - 1) {
+                    // 因果遮罩：对本块所有行都不可见
+                    for (int t = 0; t < rows; t++) {
+                        qk[(size_t)t * k1 + j] = -10000.0f;
+                    }
+                    continue;
+                }
+                const float *kToken = kF32 + (size_t)j * kHeadDim;
+                for (int t = 0; t < rows; t++) {
+                    const int i = qLo + t;
+                    float *dst = qk.data() + (size_t)t * k1 + j;
                     if (maskHead) {
                         if (maskHead[i * k1 + j] > 0.99) {
-                            qk[j] = -10000.0f;
+                            *dst = -10000.0f;
                             continue;
                         }
-                    } else if ((base + i) < j) {
-                        qk[j] = -10000.0f;
+                    } else if (j > base + i) {
+                        *dst = -10000.0f;
                         continue;
                     }
 
-                    const float *kToken = kF32 + (size_t)j * kHeadDim;
+                    const float *qRow = qHead + (size_t)i * q2;
                     float dotProduct = 0.0f;
                     int l = 0;
 #ifdef __aarch64__
@@ -11801,37 +11816,38 @@ ops += (long long)lines * inputDim * interDim * 2;
                     for (; l < q2; l++) {
                         dotProduct += qRow[l] * kToken[l];
                     }
-                    qk[j] = dotProduct * scale;
-                    maxValue = std::max(maxValue, qk[j]);
+                    *dst = dotProduct * scale;
                 }
+            }
 
-                int j = 0;
-#ifdef __aarch64__
-                float32x4_t vmax = vdupq_n_f32(maxValue);
-                for (; j + 3 < k1; j += 4) {
-                    vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+            // pass 2: softmax（原地；求和顺序与旧实现一致）
+            for (int t = 0; t < rows; t++) {
+                float *qkRow = qk.data() + (size_t)t * k1;
+                float maxValue = -10000.0f;
+                for (int j = 0; j < k1; j++) {
+                    maxValue = std::max(maxValue, qkRow[j]);
                 }
-#endif
-                for (; j < k1; j++) {
-                    temp[j] = expf(qk[j] - maxValue);
-                }
-
                 float sum = 0.0f;
                 for (int j = 0; j < k1; j++) {
-                    sum += temp[j];
+                    float e = expf(qkRow[j] - maxValue);
+                    qkRow[j] = e;
+                    sum += e;
                 }
                 sum = std::max(sum, 0.1f);
                 for (int j = 0; j < k1; j++) {
-                    qk[j] = temp[j] / sum;
+                    qkRow[j] /= sum;
                 }
+            }
 
-                float *oRow = oHead + (size_t)i * v2;
-                for (int j = 0; j < k1; j++) {
-                    float w = qk[j];
+            // pass 3: V 加权累加。j 外层：vToken 在块内复用。
+            for (int j = 0; j < k1; j++) {
+                const float *vToken = vF32 + (size_t)j * vHeadDim;
+                for (int t = 0; t < rows; t++) {
+                    float w = qk[(size_t)t * k1 + j];
                     if (w == 0.0f) {
                         continue;
                     }
-                    const float *vToken = vF32 + (size_t)j * vHeadDim;
+                    float *oRow = oHead + (size_t)(qLo + t) * v2;
                     int l = 0;
 #ifdef __aarch64__
                     float32x4_t wv = vdupq_n_f32(w);
@@ -11853,8 +11869,6 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
                 }
             }
-            delete[] qk;
-            delete[] temp;
         }
     };
 
@@ -11939,6 +11953,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         uint16_t *qHead, *oHead, *maskHead;
         float scale;
         int q1, q2, k1, v2, group, o;
+        int qLo, qHi; // 本任务负责的 query 行区间（绝对行号）
         int pageLen, kNumHeads, kHeadDim, kUnitSize;
         int vPageLen, vNumHeads, vHeadDim, vUnitSize;
         uint8_t *kPagedData, *vPagedData;
@@ -11950,6 +11965,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         MultiThreadPagedAttentionFloat16Op(
             uint16_t *qHead, uint16_t *oHead, uint16_t *maskHead, float scale,
             int q1, int q2, int k1, int v2, int group, int o,
+            int qLo, int qHi,
             int pageLen, int kNumHeads, int kHeadDim, int kUnitSize,
             int vPageLen, int vNumHeads, int vHeadDim, int vUnitSize,
             uint8_t *kPagedData, uint8_t *vPagedData,
@@ -11959,6 +11975,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             const float *kF32Base, const float *vF32Base) :
             qHead(qHead), oHead(oHead), maskHead(maskHead), scale(scale),
             q1(q1), q2(q2), k1(k1), v2(v2), group(group), o(o),
+            qLo(qLo), qHi(qHi),
             pageLen(pageLen), kNumHeads(kNumHeads), kHeadDim(kHeadDim), kUnitSize(kUnitSize),
             vPageLen(vPageLen), vNumHeads(vNumHeads), vHeadDim(vHeadDim), vUnitSize(vUnitSize),
             kPagedData(kPagedData), vPagedData(vPagedData),
@@ -11968,33 +11985,45 @@ ops += (long long)lines * inputDim * interDim * 2;
             kF32Base(kF32Base), vF32Base(vF32Base) {}
 
         void Run() {
-            std::vector<float> fqHead(q1 * q2);
-            Float16ToFloat32(qHead, fqHead.data(), q1 * q2);
-
             const int kvHeadIdx = o / group;
             const float *kF32 = kF32Base + (size_t)kvHeadIdx * k1 * kHeadDim;
             const float *vF32 = vF32Base + (size_t)kvHeadIdx * k1 * vHeadDim;
 
-            float *qk = new float[std::max(k1, 1)];
-            float *temp = new float[std::max(k1, 1)];
-            for (int i = 0; i < q1; i++) {
-                float maxValue = -10000.0f;
-                int base = k1 - q1;
-                const float *qRow = fqHead.data() + (size_t)i * q2;
+            const int rows = qHi - qLo;
+            const int base = k1 - q1;
 
-                for (int j = 0; j < k1; j++) {
+            std::vector<float> fq((size_t)rows * q2);
+            Float16ToFloat32(qHead + (size_t)qLo * q2, fq.data(), rows * q2);
+
+            // scores 缓冲 [row][j]；每个元素都会被写入（有效分或 -10000）
+            std::vector<float> qk((size_t)rows * k1);
+            std::vector<float> fo((size_t)rows * v2, 0.0f);
+
+            // pass 1: QK 打分。j 外层：同一 kToken 在整个 query 块内复用，
+            // K slab 每个 op 只流过一遍。
+            for (int j = 0; j < k1; j++) {
+                if (!maskHead && j > base + qHi - 1) {
+                    for (int t = 0; t < rows; t++) {
+                        qk[(size_t)t * k1 + j] = -10000.0f;
+                    }
+                    continue;
+                }
+                const float *kToken = kF32 + (size_t)j * kHeadDim;
+                for (int t = 0; t < rows; t++) {
+                    const int i = qLo + t;
+                    float *dst = qk.data() + (size_t)t * k1 + j;
                     if (maskHead) {
                         float maskVal = half_to_float(maskHead[i * k1 + j]);
                         if (maskVal > 0.99) {
-                            qk[j] = -10000.0f;
+                            *dst = -10000.0f;
                             continue;
                         }
-                    } else if ((base + i) < j) {
-                        qk[j] = -10000.0f;
+                    } else if (j > base + i) {
+                        *dst = -10000.0f;
                         continue;
                     }
 
-                    const float *kToken = kF32 + (size_t)j * kHeadDim;
+                    const float *qRow = fq.data() + (size_t)t * q2;
                     float dotProduct = 0.0f;
                     int l = 0;
 #ifdef __aarch64__
@@ -12016,62 +12045,63 @@ ops += (long long)lines * inputDim * interDim * 2;
                     for (; l < q2; l++) {
                         dotProduct += qRow[l] * kToken[l];
                     }
-                    qk[j] = dotProduct * scale;
-                    maxValue = std::max(maxValue, qk[j]);
+                    *dst = dotProduct * scale;
                 }
+            }
 
-                int j = 0;
-#ifdef __aarch64__
-                float32x4_t vmax = vdupq_n_f32(maxValue);
-                for (; j + 3 < k1; j += 4) {
-                    vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+            // pass 2: softmax（原地；求和顺序与旧实现一致）
+            for (int t = 0; t < rows; t++) {
+                float *qkRow = qk.data() + (size_t)t * k1;
+                float maxValue = -10000.0f;
+                for (int j = 0; j < k1; j++) {
+                    maxValue = std::max(maxValue, qkRow[j]);
                 }
-#endif
-                for (; j < k1; j++) {
-                    temp[j] = expf(qk[j] - maxValue);
-                }
-
                 float sum = 0.0f;
                 for (int j = 0; j < k1; j++) {
-                    sum += temp[j];
+                    float e = expf(qkRow[j] - maxValue);
+                    qkRow[j] = e;
+                    sum += e;
                 }
                 sum = std::max(sum, 0.1f);
                 for (int j = 0; j < k1; j++) {
-                    qk[j] = temp[j] / sum;
+                    qkRow[j] /= sum;
                 }
+            }
 
-                std::vector<float> foHead(v2, 0.0f);
-                for (int j = 0; j < k1; j++) {
-                    float w = qk[j];
+            // pass 3: V 加权累加。j 外层：vToken 在块内复用。
+            for (int j = 0; j < k1; j++) {
+                const float *vToken = vF32 + (size_t)j * vHeadDim;
+                for (int t = 0; t < rows; t++) {
+                    float w = qk[(size_t)t * k1 + j];
                     if (w == 0.0f) {
                         continue;
                     }
-                    const float *vToken = vF32 + (size_t)j * vHeadDim;
+                    float *oRow = fo.data() + (size_t)t * v2;
                     int l = 0;
 #ifdef __aarch64__
                     float32x4_t wv = vdupq_n_f32(w);
                     for (; l + 3 < v2; l += 4) {
-                        vst1q_f32(foHead.data() + l,
-                                  vaddq_f32(vld1q_f32(foHead.data() + l),
+                        vst1q_f32(oRow + l,
+                                  vaddq_f32(vld1q_f32(oRow + l),
                                             vmulq_f32(wv, vld1q_f32(vToken + l))));
                     }
 #elif defined(__AVX__)
                     __m256 wv = _mm256_set1_ps(w);
                     for (; l + 7 < v2; l += 8) {
-                        _mm256_storeu_ps(foHead.data() + l,
-                                         _mm256_add_ps(_mm256_loadu_ps(foHead.data() + l),
+                        _mm256_storeu_ps(oRow + l,
+                                         _mm256_add_ps(_mm256_loadu_ps(oRow + l),
                                                        _mm256_mul_ps(wv, _mm256_loadu_ps(vToken + l))));
                     }
 #endif
                     for (; l < v2; l++) {
-                        foHead[l] += w * vToken[l];
+                        oRow[l] += w * vToken[l];
                     }
                 }
-
-                Float32ToFloat16(foHead.data(), oHead + i * v2, v2);
             }
-            delete[] qk;
-            delete[] temp;
+
+            for (int t = 0; t < rows; t++) {
+                Float32ToFloat16(fo.data() + (size_t)t * v2, oHead + (size_t)(qLo + t) * v2, v2);
+            }
         }
     };
 
@@ -12079,6 +12109,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         uint16_t *qHead, *oHead, *maskHead;
         float scale;
         int q1, q2, k1, v2, group, o;
+        int qLo, qHi; // 本任务负责的 query 行区间（绝对行号）
         int pageLen, kNumHeads, kHeadDim, kUnitSize;
         int vPageLen, vNumHeads, vHeadDim, vUnitSize;
         uint8_t *kPagedData, *vPagedData;
@@ -12090,6 +12121,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         MultiThreadPagedAttentionBFloat16Op(
             uint16_t *qHead, uint16_t *oHead, uint16_t *maskHead, float scale,
             int q1, int q2, int k1, int v2, int group, int o,
+            int qLo, int qHi,
             int pageLen, int kNumHeads, int kHeadDim, int kUnitSize,
             int vPageLen, int vNumHeads, int vHeadDim, int vUnitSize,
             uint8_t *kPagedData, uint8_t *vPagedData,
@@ -12099,6 +12131,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             const float *kF32Base, const float *vF32Base) :
             qHead(qHead), oHead(oHead), maskHead(maskHead), scale(scale),
             q1(q1), q2(q2), k1(k1), v2(v2), group(group), o(o),
+            qLo(qLo), qHi(qHi),
             pageLen(pageLen), kNumHeads(kNumHeads), kHeadDim(kHeadDim), kUnitSize(kUnitSize),
             vPageLen(vPageLen), vNumHeads(vNumHeads), vHeadDim(vHeadDim), vUnitSize(vUnitSize),
             kPagedData(kPagedData), vPagedData(vPagedData),
@@ -12108,35 +12141,47 @@ ops += (long long)lines * inputDim * interDim * 2;
             kF32Base(kF32Base), vF32Base(vF32Base) {}
 
         void Run() {
-            std::vector<float> fqHead(q1 * q2);
-            BFloat16ToFloat32(qHead, fqHead.data(), q1 * q2);
-
             const int kvHeadIdx = o / group;
             const float *kF32 = kF32Base + (size_t)kvHeadIdx * k1 * kHeadDim;
             const float *vF32 = vF32Base + (size_t)kvHeadIdx * k1 * vHeadDim;
 
-            float *qk = new float[std::max(k1, 1)];
-            float *temp = new float[std::max(k1, 1)];
-            for (int i = 0; i < q1; i++) {
-                float maxValue = -10000.0f;
-                int base = k1 - q1;
-                const float *qRow = fqHead.data() + (size_t)i * q2;
+            const int rows = qHi - qLo;
+            const int base = k1 - q1;
 
-                for (int j = 0; j < k1; j++) {
+            std::vector<float> fq((size_t)rows * q2);
+            BFloat16ToFloat32(qHead + (size_t)qLo * q2, fq.data(), rows * q2);
+
+            // scores 缓冲 [row][j]；每个元素都会被写入（有效分或 -10000）
+            std::vector<float> qk((size_t)rows * k1);
+            std::vector<float> fo((size_t)rows * v2, 0.0f);
+
+            // pass 1: QK 打分。j 外层：同一 kToken 在整个 query 块内复用，
+            // K slab 每个 op 只流过一遍。
+            for (int j = 0; j < k1; j++) {
+                if (!maskHead && j > base + qHi - 1) {
+                    for (int t = 0; t < rows; t++) {
+                        qk[(size_t)t * k1 + j] = -10000.0f;
+                    }
+                    continue;
+                }
+                const float *kToken = kF32 + (size_t)j * kHeadDim;
+                for (int t = 0; t < rows; t++) {
+                    const int i = qLo + t;
+                    float *dst = qk.data() + (size_t)t * k1 + j;
                     if (maskHead) {
                         float maskVal;
                         uint32_t mx = (uint32_t)maskHead[i * k1 + j] << 16;
                         memcpy(&maskVal, &mx, sizeof(float));
                         if (maskVal > 0.99) {
-                            qk[j] = -10000.0f;
+                            *dst = -10000.0f;
                             continue;
                         }
-                    } else if ((base + i) < j) {
-                        qk[j] = -10000.0f;
+                    } else if (j > base + i) {
+                        *dst = -10000.0f;
                         continue;
                     }
 
-                    const float *kToken = kF32 + (size_t)j * kHeadDim;
+                    const float *qRow = fq.data() + (size_t)t * q2;
                     float dotProduct = 0.0f;
                     int l = 0;
 #ifdef __aarch64__
@@ -12158,62 +12203,63 @@ ops += (long long)lines * inputDim * interDim * 2;
                     for (; l < q2; l++) {
                         dotProduct += qRow[l] * kToken[l];
                     }
-                    qk[j] = dotProduct * scale;
-                    maxValue = std::max(maxValue, qk[j]);
+                    *dst = dotProduct * scale;
                 }
+            }
 
-                int j = 0;
-#ifdef __aarch64__
-                float32x4_t vmax = vdupq_n_f32(maxValue);
-                for (; j + 3 < k1; j += 4) {
-                    vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+            // pass 2: softmax（原地；求和顺序与旧实现一致）
+            for (int t = 0; t < rows; t++) {
+                float *qkRow = qk.data() + (size_t)t * k1;
+                float maxValue = -10000.0f;
+                for (int j = 0; j < k1; j++) {
+                    maxValue = std::max(maxValue, qkRow[j]);
                 }
-#endif
-                for (; j < k1; j++) {
-                    temp[j] = expf(qk[j] - maxValue);
-                }
-
                 float sum = 0.0f;
                 for (int j = 0; j < k1; j++) {
-                    sum += temp[j];
+                    float e = expf(qkRow[j] - maxValue);
+                    qkRow[j] = e;
+                    sum += e;
                 }
                 sum = std::max(sum, 0.1f);
                 for (int j = 0; j < k1; j++) {
-                    qk[j] = temp[j] / sum;
+                    qkRow[j] /= sum;
                 }
+            }
 
-                std::vector<float> foHead(v2, 0.0f);
-                for (int j = 0; j < k1; j++) {
-                    float w = qk[j];
+            // pass 3: V 加权累加。j 外层：vToken 在块内复用。
+            for (int j = 0; j < k1; j++) {
+                const float *vToken = vF32 + (size_t)j * vHeadDim;
+                for (int t = 0; t < rows; t++) {
+                    float w = qk[(size_t)t * k1 + j];
                     if (w == 0.0f) {
                         continue;
                     }
-                    const float *vToken = vF32 + (size_t)j * vHeadDim;
+                    float *oRow = fo.data() + (size_t)t * v2;
                     int l = 0;
 #ifdef __aarch64__
                     float32x4_t wv = vdupq_n_f32(w);
                     for (; l + 3 < v2; l += 4) {
-                        vst1q_f32(foHead.data() + l,
-                                  vaddq_f32(vld1q_f32(foHead.data() + l),
+                        vst1q_f32(oRow + l,
+                                  vaddq_f32(vld1q_f32(oRow + l),
                                             vmulq_f32(wv, vld1q_f32(vToken + l))));
                     }
 #elif defined(__AVX__)
                     __m256 wv = _mm256_set1_ps(w);
                     for (; l + 7 < v2; l += 8) {
-                        _mm256_storeu_ps(foHead.data() + l,
-                                         _mm256_add_ps(_mm256_loadu_ps(foHead.data() + l),
+                        _mm256_storeu_ps(oRow + l,
+                                         _mm256_add_ps(_mm256_loadu_ps(oRow + l),
                                                        _mm256_mul_ps(wv, _mm256_loadu_ps(vToken + l))));
                     }
 #endif
                     for (; l < v2; l++) {
-                        foHead[l] += w * vToken[l];
+                        oRow[l] += w * vToken[l];
                     }
                 }
-
-                Float32ToBFloat16(foHead.data(), oHead + i * v2, v2);
             }
-            delete[] qk;
-            delete[] temp;
+
+            for (int t = 0; t < rows; t++) {
+                Float32ToBFloat16(fo.data() + (size_t)t * v2, oHead + (size_t)(qLo + t) * v2, v2);
+            }
         }
     };
 
@@ -12323,19 +12369,28 @@ ops += (long long)lines * inputDim * interDim * 2;
                 pagedAttnConvSpend = GetSpan(convSt, std::chrono::system_clock::now());
 
                 std::vector<MultiThreadPagedAttentionFloat32Op*> ops;
+                // 任务粒度 = (q 头 × 64 行 query 块)：q0 小于线程数时也能
+                // 填满线程池；同时 K/V 在块内被整块复用（j 外层扫描）。
+                const int qTileRows = 64;
+                int qBlocks = (q1 + qTileRows - 1) / qTileRows;
                 for (int o = 0; o < q0; o++) {
                     float *qHead = qd + o * q.strides[0];
                     float *oHead = od + o * output.strides[0];
                     float *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
-                    ops.push_back(new MultiThreadPagedAttentionFloat32Op(
-                        qHead, oHead, maskHead, scale,
-                        q1, q2, k1, v2, group, o,
-                        pageLen, kNumHeads, kHeadDim, kUnitSize,
-                        vPageLen, vNumHeads, vHeadDim, vUnitSize,
-                        kPagedData, vPagedData,
-                        &k.pageIndex, &v.pageIndex,
-                        k.lastPageLen, v.lastPageLen,
-                        kF32.data(), vF32.data()));
+                    for (int b = 0; b < qBlocks; b++) {
+                        int qLo = b * qTileRows;
+                        int qHi = std::min(qLo + qTileRows, q1);
+                        ops.push_back(new MultiThreadPagedAttentionFloat32Op(
+                            qHead, oHead, maskHead, scale,
+                            q1, q2, k1, v2, group, o,
+                            qLo, qHi,
+                            pageLen, kNumHeads, kHeadDim, kUnitSize,
+                            vPageLen, vNumHeads, vHeadDim, vUnitSize,
+                            kPagedData, vPagedData,
+                            &k.pageIndex, &v.pageIndex,
+                            k.lastPageLen, v.lastPageLen,
+                            kF32.data(), vF32.data()));
+                    }
                 }
                 for (int st = 0; st < (int)ops.size(); st += threads) {
                     int end = std::min(st + threads, (int)ops.size());
@@ -12398,20 +12453,29 @@ ops += (long long)lines * inputDim * interDim * 2;
                 pagedAttnConvSpend = GetSpan(convSt, std::chrono::system_clock::now());
 
                 std::vector<MultiThreadPagedAttentionFloat16Op*> ops;
+                // 任务粒度 = (q 头 × 64 行 query 块)：q0 小于线程数时也能
+                // 填满线程池；同时 K/V 在块内被整块复用（j 外层扫描）。
+                const int qTileRows = 64;
+                int qBlocks = (q1 + qTileRows - 1) / qTileRows;
                 for (int o = 0; o < q0; o++) {
                     uint16_t *qHead = qd + o * q.strides[0];
                     uint16_t *oHead = od + o * output.strides[0];
                     uint16_t *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
-                    ops.push_back(new MultiThreadPagedAttentionFloat16Op(
-                        qHead, oHead, maskHead, scale,
-                        q1, q2, k1, v2, group, o,
-                        pageLen, kNumHeads, kHeadDim, kUnitSize,
-                        vPageLen, vNumHeads, vHeadDim, vUnitSize,
-                        kPagedData, vPagedData,
-                        &k.pageIndex, &v.pageIndex,
-                        k.lastPageLen, v.lastPageLen,
-                        k.pagedKVCacheData->dataType, v.pagedKVCacheData->dataType,
-                        kF32.data(), vF32.data()));
+                    for (int b = 0; b < qBlocks; b++) {
+                        int qLo = b * qTileRows;
+                        int qHi = std::min(qLo + qTileRows, q1);
+                        ops.push_back(new MultiThreadPagedAttentionFloat16Op(
+                            qHead, oHead, maskHead, scale,
+                            q1, q2, k1, v2, group, o,
+                            qLo, qHi,
+                            pageLen, kNumHeads, kHeadDim, kUnitSize,
+                            vPageLen, vNumHeads, vHeadDim, vUnitSize,
+                            kPagedData, vPagedData,
+                            &k.pageIndex, &v.pageIndex,
+                            k.lastPageLen, v.lastPageLen,
+                            k.pagedKVCacheData->dataType, v.pagedKVCacheData->dataType,
+                            kF32.data(), vF32.data()));
+                    }
                 }
                 for (int st = 0; st < (int)ops.size(); st += threads) {
                     int end = std::min(st + threads, (int)ops.size());
@@ -12477,20 +12541,29 @@ ops += (long long)lines * inputDim * interDim * 2;
                 pagedAttnConvSpend = GetSpan(convSt, std::chrono::system_clock::now());
 
                 std::vector<MultiThreadPagedAttentionBFloat16Op*> ops;
+                // 任务粒度 = (q 头 × 64 行 query 块)：q0 小于线程数时也能
+                // 填满线程池；同时 K/V 在块内被整块复用（j 外层扫描）。
+                const int qTileRows = 64;
+                int qBlocks = (q1 + qTileRows - 1) / qTileRows;
                 for (int o = 0; o < q0; o++) {
                     uint16_t *qHead = qd + o * q.strides[0];
                     uint16_t *oHead = od + o * output.strides[0];
                     uint16_t *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
-                    ops.push_back(new MultiThreadPagedAttentionBFloat16Op(
-                        qHead, oHead, maskHead, scale,
-                        q1, q2, k1, v2, group, o,
-                        pageLen, kNumHeads, kHeadDim, kUnitSize,
-                        vPageLen, vNumHeads, vHeadDim, vUnitSize,
-                        kPagedData, vPagedData,
-                        &k.pageIndex, &v.pageIndex,
-                        k.lastPageLen, v.lastPageLen,
-                        k.pagedKVCacheData->dataType, v.pagedKVCacheData->dataType,
-                        kF32.data(), vF32.data()));
+                    for (int b = 0; b < qBlocks; b++) {
+                        int qLo = b * qTileRows;
+                        int qHi = std::min(qLo + qTileRows, q1);
+                        ops.push_back(new MultiThreadPagedAttentionBFloat16Op(
+                            qHead, oHead, maskHead, scale,
+                            q1, q2, k1, v2, group, o,
+                            qLo, qHi,
+                            pageLen, kNumHeads, kHeadDim, kUnitSize,
+                            vPageLen, vNumHeads, vHeadDim, vUnitSize,
+                            kPagedData, vPagedData,
+                            &k.pageIndex, &v.pageIndex,
+                            k.lastPageLen, v.lastPageLen,
+                            k.pagedKVCacheData->dataType, v.pagedKVCacheData->dataType,
+                            kF32.data(), vF32.data()));
+                    }
                 }
                 for (int st = 0; st < (int)ops.size(); st += threads) {
                     int end = std::min(st + threads, (int)ops.size());
