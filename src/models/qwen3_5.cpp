@@ -5700,6 +5700,11 @@ namespace fastllm {
     namespace {
         struct Qwen35LinearPrefixSnapshotCache {
             bool valid = false;
+            Data single;
+            std::vector<int> dataDeviceIds;
+            std::vector<int> dims;
+            DataType dataType = DataType::FLOAT16;
+            bool transposed = false;
         };
 
         struct Qwen35LinearPrefixSnapshotLayer {
@@ -5742,20 +5747,36 @@ namespace fastllm {
             return *counter;
         }
 
+        static int Qwen35EnvInt(const char *name, int fallback) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == 0) {
+                return fallback;
+            }
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end == value) {
+                return fallback;
+            }
+            return (int)parsed;
+        }
+
         static bool Qwen35LinearPrefixCacheEnabled() {
-            return false;
+            const char *enabled = std::getenv("FASTLLM_PREFIX_CACHE");
+            return enabled == nullptr || enabled[0] == 0 || Qwen35MoeIsTrueString(enabled);
         }
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
-            return fastllm::GetPageLen();
+            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
+            pages = std::max(1, pages);
+            return pages * fastllm::GetPageLen();
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
-            return 1;
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 4));
         }
 
         static int Qwen35LinearPrefixSnapshotMaxRecords() {
-            return 1;
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 8));
         }
 
         static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {
@@ -5772,30 +5793,152 @@ namespace fastllm {
             return false;
         }
 
+        static int Qwen35CacheTokenLen(const Data &cache) {
+            if (cache.isPagedKVCache) {
+                if (cache.pageIndex.empty()) {
+                    return 0;
+                }
+                return ((int)cache.pageIndex.size() - 1) * cache.pageLen + cache.lastPageLen;
+            }
+            if (cache.dims.size() > 1) {
+                return cache.dims[1];
+            }
+            return 0;
+        }
+
         static int Qwen35CurrentTokenGrowingCacheLen(
                 const Qwen3_5Model *model,
                 int blockCnt,
                 const std::vector<std::pair<Data, Data> > &pastKeyValues) {
-            (void)model;
-            (void)blockCnt;
-            (void)pastKeyValues;
+            for (int i = 0; i < blockCnt && i < (int)pastKeyValues.size(); i++) {
+                if (Qwen35LayerIsLinearAttention(model, i)) {
+                    continue;
+                }
+                int len = Qwen35CacheTokenLen(pastKeyValues[i].first);
+                if (len > 0) {
+                    return len;
+                }
+                len = Qwen35CacheTokenLen(pastKeyValues[i].second);
+                if (len > 0) {
+                    return len;
+                }
+            }
             return 0;
+        }
+
+        static bool Qwen35SnapshotCopyTensor(const Data &src, Data &dst) {
+            if (src.dims.empty()) {
+                return false;
+            }
+            if (src.dataDevice != DataDevice::CPU || src.cpuData == nullptr) {
+                return false;
+            }
+            dst.CopyFrom(src);
+            dst.isKVCache = true;
+            dst.isLinearAttention = src.isLinearAttention;
+            dst.isLinearAttentionTransposed = src.isLinearAttentionTransposed;
+            dst.isPagedKVCache = false;
+            dst.pagedKVCacheData = nullptr;
+            dst.pageIndex.clear();
+            dst.lastPageLen = 0;
+            dst.multiDeviceData = false;
+            dst.multiDeviceDatas.clear();
+            dst.ClearTensorParallelLayout();
+            dst.ToDevice(DataDevice::CPU, true);
+            return dst.cpuData != nullptr;
         }
 
         static bool Qwen35SnapshotCopyCache(
                 const Data &src,
                 Qwen35LinearPrefixSnapshotCache &dst) {
-            (void)src;
-            (void)dst;
-            return false;
+            dst.valid = false;
+            dst.dataDeviceIds = src.dataDeviceIds;
+            dst.dims = src.dims;
+            dst.dataType = src.dataType;
+            dst.transposed = src.isLinearAttentionTransposed;
+            if (src.multiDeviceData && !src.multiDeviceDatas.empty()) {
+                return false;
+            }
+            dst.valid = Qwen35SnapshotCopyTensor(src, dst.single);
+            return dst.valid;
+        }
+
+        static void Qwen35ReleasePagedReferencesNoDuplicate(
+                Data &cache,
+                std::set<std::pair<PagedCacheManager*, int> > &released) {
+            if (cache.isPagedKVCache && cache.pagedKVCacheData != nullptr) {
+                std::vector<int> pages;
+                for (int page : cache.pageIndex) {
+                    std::pair<PagedCacheManager*, int> key = {cache.pagedKVCacheData, page};
+                    if (released.insert(key).second) {
+                        pages.push_back(page);
+                    }
+                }
+                if (!pages.empty()) {
+                    cache.pagedKVCacheData->ReleasePageIndices(pages);
+                }
+            }
+            cache.isPagedKVCache = false;
+            cache.pagedKVCacheData = nullptr;
+            cache.pageIndex.clear();
+            cache.lastPageLen = 0;
+        }
+
+        static void Qwen35ReleaseAllPagedReferences(Data &cache) {
+            std::set<std::pair<PagedCacheManager*, int> > released;
+            Qwen35ReleasePagedReferencesNoDuplicate(cache, released);
+            if (cache.multiDeviceData) {
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr) {
+                        Qwen35ReleasePagedReferencesNoDuplicate(*it.second, released);
+                    }
+                }
+            }
+        }
+
+        static void Qwen35ClearCacheForSnapshotRestore(Data &cache) {
+            Qwen35ReleaseAllPagedReferences(cache);
+            if (cache.multiDeviceData) {
+                for (auto &it : cache.multiDeviceDatas) {
+                    delete it.second;
+                }
+                cache.multiDeviceDatas.clear();
+                cache.multiDeviceData = false;
+            }
+            cache.ClearTensorParallelLayout();
+            cache.FreeSpace();
+            cache.isFake = false;
+            cache.isKVCache = true;
+            cache.isLinearAttention = true;
+            cache.isPagedKVCache = false;
+            cache.pagedKVCacheData = nullptr;
+            cache.pageIndex.clear();
+            cache.lastPageLen = 0;
+        }
+
+        static bool Qwen35RestoreSnapshotTensor(const Data &snapshot, Data &dst, int device) {
+            (void)device;
+            Qwen35ClearCacheForSnapshotRestore(dst);
+            dst.CopyFrom(snapshot);
+            dst.isKVCache = true;
+            dst.isLinearAttention = true;
+            dst.isLinearAttentionTransposed = snapshot.isLinearAttentionTransposed;
+            dst.isPagedKVCache = false;
+            dst.pagedKVCacheData = nullptr;
+            dst.pageIndex.clear();
+            dst.lastPageLen = 0;
+            dst.ToDevice(DataDevice::CPU, true);
+            return !dst.dims.empty() && dst.cpuData != nullptr;
         }
 
         static bool Qwen35RestoreSnapshotCache(
                 const Qwen35LinearPrefixSnapshotCache &snapshot,
                 Data &dst) {
-            (void)snapshot;
-            (void)dst;
-            return false;
+            if (!snapshot.valid) {
+                return false;
+            }
+            int device = snapshot.dataDeviceIds.empty() ? 0 : snapshot.dataDeviceIds[0];
+            return Qwen35RestoreSnapshotTensor(snapshot.single, dst, device);
         }
 
         static const Qwen35LinearPrefixSnapshot *Qwen35FindLinearPrefixSnapshotLocked(
@@ -5804,16 +5947,47 @@ namespace fastllm {
                 int maxCachedLen,
                 int exactLen = -1,
                 bool requireMtp = false) {
-            (void)model;
-            (void)tokens;
-            (void)maxCachedLen;
-            (void)exactLen;
-            (void)requireMtp;
-            return nullptr;
+            auto &all = Qwen35LinearPrefixSnapshots();
+            auto it = all.find(model);
+            if (it == all.end()) {
+                return nullptr;
+            }
+            const Qwen35LinearPrefixSnapshot *best = nullptr;
+            for (auto &snapshotPtr : it->second) {
+                Qwen35LinearPrefixSnapshot *snapshot = snapshotPtr.get();
+                if (snapshot == nullptr || snapshot->cachedLen <= 0 ||
+                    snapshot->cachedLen > maxCachedLen ||
+                    snapshot->cachedLen > (int)tokens.size()) {
+                    continue;
+                }
+                if (exactLen >= 0 && snapshot->cachedLen != exactLen) {
+                    continue;
+                }
+                if ((int)snapshot->tokens.size() != snapshot->cachedLen ||
+                    !std::equal(snapshot->tokens.begin(), snapshot->tokens.end(), tokens.begin())) {
+                    continue;
+                }
+                if (requireMtp &&
+                    (!snapshot->mtpValid || snapshot->mtpTokens != snapshot->cachedLen ||
+                     snapshot->mtpKey.dims.size() < 2 ||
+                     snapshot->mtpValue.dims.size() < 2 ||
+                     snapshot->mtpKey.dims[1] != snapshot->cachedLen ||
+                     snapshot->mtpValue.dims[1] != snapshot->cachedLen)) {
+                    continue;
+                }
+                if (best == nullptr ||
+                    snapshot->cachedLen > best->cachedLen ||
+                    (snapshot->cachedLen == best->cachedLen &&
+                     snapshot->timestamp > best->timestamp)) {
+                    best = snapshot;
+                }
+            }
+            return best;
         }
 
         static void Qwen35EraseLinearPrefixSnapshots(const Qwen3_5Model *model) {
-            (void)model;
+            std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
+            Qwen35LinearPrefixSnapshots().erase(model);
         }
     }
 #endif
