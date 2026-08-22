@@ -22226,6 +22226,29 @@ namespace fastllm {
         }
 
         static const bool fwdEntryProf = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
+        int kvCachedTokens = -1;
+        int kvLayersCached = 0;
+        int linearStateLayers = 0;
+        for (int i = 0; i < block_cnt && i < (int)pastKeyValues.size(); i++) {
+            Data *pastKey = pastKeyValues[i].first;
+            if (pastKey == nullptr) {
+                continue;
+            }
+            if (pastKey->isLinearAttention) {
+                if (!pastKey->dims.empty() ||
+                    (pastKeyValues[i].second != nullptr && !pastKeyValues[i].second->dims.empty())) {
+                    linearStateLayers++;
+                }
+                continue;
+            }
+            int len = Qwen35CacheTokenLen(*pastKey);
+            if (len > 0) {
+                kvLayersCached++;
+                if (kvCachedTokens < 0) {
+                    kvCachedTokens = len;
+                }
+            }
+        }
         if (fwdEntryProf && (!all1 || batch > 1)) {
             int totalTokens = (int)inputIds.Count(0);
             printf("[fastllm-q35-forward] prefill batch=%d seqLens=[", batch);
@@ -22243,7 +22266,16 @@ namespace fastllm {
                 }
             }
             printf("]\n");
+            printf("[fastllm-q35-forward] cache: kvCachedTokens=%d kvLayers=%d/%d linearStateLayers=%d\n",
+                   kvCachedTokens, kvLayersCached, block_cnt, linearStateLayers);
             fflush(stdout);
+        } else if (fwdEntryProf) {
+            static int decodeLogCounter = 0;
+            if ((decodeLogCounter++ % 100) == 0) {
+                printf("[fastllm-q35-forward] decode#%d batch=%d kvCachedTokens=%d kvLayers=%d/%d linearStateLayers=%d\n",
+                       decodeLogCounter, batch, kvCachedTokens, kvLayersCached, block_cnt, linearStateLayers);
+                fflush(stdout);
+            }
         }
 
         auto runSplitBatchForward = [&]() -> std::vector<int> {
