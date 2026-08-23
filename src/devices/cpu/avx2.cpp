@@ -581,6 +581,10 @@ namespace fastllm {
             std::getenv("FASTLLM_PROFILE_BF16_KERNEL") != nullptr;
         double convertSeconds = 0, fmaSeconds = 0;
         auto phaseStart = std::chrono::steady_clock::now();
+        if (profileKernel) {
+            printf("[fastllm-bf16-kernel] n=%d m=%d k=%d st=%d end=%d\n",
+                   n, m, k, st, end);
+        }
 
         for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
             const int superRows = std::min(superBlock, n - iSuper);

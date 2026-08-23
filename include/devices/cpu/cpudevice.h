@@ -205,6 +205,16 @@ namespace fastllm {
         void Run();
     };
 
+    struct MultiThreadSigmoidOp : MultiThreadBaseOp {
+        float *input, *output;
+        int len;
+
+        MultiThreadSigmoidOp(float *input, int len, float *output) :
+                input(input), len(len), output(output) {}
+
+        void Run();
+    };
+
     // q布局: [qlen, qdim]
     // k布局: [klen, qdim]
     // v布局: [klen, vdim]

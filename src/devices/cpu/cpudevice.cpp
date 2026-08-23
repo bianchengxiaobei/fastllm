@@ -8562,10 +8562,26 @@ ops += (long long)lines * inputDim * interDim * 2;
         } else {
             float *inputData = (float*)input.cpuData;
             float *outputData = (float*)output.cpuData;
-            int i = 0;
-            for (; i < len; i++) {
-                float x = inputData[i];
-                outputData[i] = 1.0 / (1.0 + exp(-x));
+            auto *pool = GetAlivePool();
+            int threadNum = pool->threads.size();
+            if (len < 65536) {
+                MultiThreadSigmoidOp(inputData, len, outputData).Run();
+            } else {
+                int per = len / threadNum;
+                std::vector<fastllm::MultiThreadSigmoidOp*> ops;
+                int cur = 0;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+                    ops.push_back(new MultiThreadSigmoidOp(inputData + cur, end - cur, outputData + cur));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(i);
+                    delete ops[i];
+                }
             }
         }
     }
@@ -11487,6 +11503,33 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int i = 0; i < len; i++) {
                 out[i] = gelu(cur[i]);
             }
+        }
+    }
+
+    void MultiThreadSigmoidOp::Run() {
+        int i = 0;
+#ifdef __AVX2__
+        const __m256 one = _mm256_set1_ps(1.0f);
+        const __m256 negOne = _mm256_set1_ps(-1.0f);
+        const __m256 lo = _mm256_set1_ps(-87.0f);
+        const __m256 hi = _mm256_set1_ps(87.0f);
+        const __m256 loOut = _mm256_set1_ps(0.0f);
+        const __m256 hiOut = _mm256_set1_ps(1.0f);
+        for (; i + 7 < len; i += 8) {
+            __m256 x = _mm256_loadu_ps(input + i);
+            __m256 clipped = _mm256_min_ps(_mm256_max_ps(x, lo), hi);
+            __m256 e = exp256_ps(_mm256_mul_ps(negOne, clipped));
+            __m256 r = _mm256_div_ps(one, _mm256_add_ps(one, e));
+            __m256 below = _mm256_cmp_ps(x, lo, _CMP_LT_OQ);
+            __m256 above = _mm256_cmp_ps(x, hi, _CMP_GT_OQ);
+            r = _mm256_blendv_ps(r, loOut, below);
+            r = _mm256_blendv_ps(r, hiOut, above);
+            _mm256_storeu_ps(output + i, r);
+        }
+#endif
+        for (; i < len; i++) {
+            float x = input[i];
+            output[i] = 1.0f / (1.0f + std::exp(-x));
         }
     }
     

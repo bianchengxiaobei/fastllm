@@ -7354,10 +7354,25 @@ namespace fastllm {
                     double total = profileRegisterMs + profileResizeMs + profileInputMs + profileGatePrepMs +
                                    profileGateMs + profileSwigluConvertMs + profileDownPrepMs + profileDownMs +
                                    profileReduceMs + profileOutputMs;
-                    printf("[fastllm-profile-numas-moe] small_batch bs=%d topk=%d experts=%d register=%.3f resize=%.3f input=%.3f gate_prep=%.3f gate_swiglu=%.3f swiglu_convert=%.3f down_prep=%.3f down=%.3f reduce=%.3f output=%.3f total=%.3f\n",
-                           bs, topk, profileExpertCalls, profileRegisterMs, profileResizeMs, profileInputMs,
-                           profileGatePrepMs, profileGateMs, profileSwigluConvertMs, profileDownPrepMs,
-                           profileDownMs, profileReduceMs, profileOutputMs, total);
+                    int workersPerNode = numaConfig->numaToCpuDict[0].size();
+                    // Bytes scanned per token: gate weight (inputDim x interDim*2 x 2B x experts)
+                    // + down weight (interDim x outputDim x 2B x experts), read once per token.
+                    double gateBytes = (double)inputDim * (interDim * 2.0) * 2.0 * totalExperts;
+                    double downBytes = (double)interDim * outputDim * 2.0 * totalExperts;
+                    double gateSec = profileGateMs / 1000.0;
+                    double downSec = profileDownMs / 1000.0;
+                    double gateGBs = gateSec > 0 ? gateBytes / gateSec / 1e9 : 0;
+                    double downGBs = downSec > 0 ? downBytes / downSec / 1e9 : 0;
+                    printf("[fastllm-profile-numas-moe] small_batch bs=%d topk=%d experts=%d inputDim=%d interDim=%d outputDim=%d gateType=%d downType=%d gateRowsPerTask=%d downRowsPerTask=%d numaCnt=%d threads=%d workersPerNode=%d register=%.3f resize=%.3f input=%.3f gate_prep=%.3f gate_swiglu=%.3f(%.1fGB/s %dMB) swiglu_convert=%.3f down_prep=%.3f down=%.3f(%.1fGB/s %dMB) reduce=%.3f output=%.3f total=%.3f\n",
+                           bs, topk, profileExpertCalls, inputDim, interDim, outputDim,
+                           (int)weights[2]->GetDataType(), (int)weights[3]->GetDataType(),
+                           gateRowsPerTask, downRowsPerTask,
+                           numaConfig->numaCnt, numaConfig->threads, workersPerNode,
+                           profileRegisterMs, profileResizeMs, profileInputMs,
+                           profileGatePrepMs, profileGateMs, gateGBs, (int)(gateBytes / 1e6),
+                           profileSwigluConvertMs, profileDownPrepMs,
+                           profileDownMs, downGBs, (int)(downBytes / 1e6),
+                           profileReduceMs, profileOutputMs, total);
                     fflush(stdout);
                 }
             }
