@@ -577,14 +577,13 @@ namespace fastllm {
             fp32Input.resize((size_t)superBlock * m);
         }
 
-        static const bool profileKernel =
-            std::getenv("FASTLLM_PROFILE_BF16_KERNEL") != nullptr;
+        static const bool profileKernel = false;
         double convertSeconds = 0, fmaSeconds = 0;
         auto phaseStart = std::chrono::steady_clock::now();
-        if (profileKernel) {
-            printf("[fastllm-bf16-kernel] n=%d m=%d k=%d st=%d end=%d\n",
-                   n, m, k, st, end);
-        }
+        // if (profileKernel) {
+        //     printf("[fastllm-bf16-kernel] n=%d m=%d k=%d st=%d end=%d\n",
+        //            n, m, k, st, end);
+        // }
 
         for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
             const int superRows = std::min(superBlock, n - iSuper);
@@ -646,12 +645,12 @@ namespace fastllm {
         const double biasSeconds =
             std::chrono::duration<double>(biasEnd - biasStart).count();
 
-        if (profileKernel) {
-            printf(
-                "[fastllm-profile-avx2-bf16] n=%d m=%d k=%d threads=1 "
-                "convert=%.6f fma=%.6f bias=%.6f\n",
-                n, m, k, convertSeconds, fmaSeconds, biasSeconds);
-        }
+        // if (profileKernel) {
+        //     printf(
+        //         "[fastllm-profile-avx2-bf16] n=%d m=%d k=%d threads=1 "
+        //         "convert=%.6f fma=%.6f bias=%.6f\n",
+        //         n, m, k, convertSeconds, fmaSeconds, biasSeconds);
+        // }
         return true;
     }
 
