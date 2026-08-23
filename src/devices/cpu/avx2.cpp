@@ -412,14 +412,11 @@ namespace fastllm {
 
         const uint16_t* a0 = A;
         for (int i = 0; i < nb; ++i) {
-            _mm_prefetch((const char*)(a0 + (i + 4) * SIMD_WIDTH), _MM_HINT_T0);
             __m256 w0 = bf16_to_fp32_avx2(
                 _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
             for (int r = 0; r < BROW; ++r) {
                 const float* b_row =
                     (const float*)((const char*)B + r * stride_b);
-                _mm_prefetch((const char*)(b_row + (i + 4) * SIMD_WIDTH),
-                             _MM_HINT_T0);
                 __m256 iv = _mm256_loadu_ps(b_row + i * SIMD_WIDTH);
                 acc[r] = _mm256_fmadd_ps(iv, w0, acc[r]);
             }
@@ -473,10 +470,6 @@ namespace fastllm {
         const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
 
         for (int i = 0; i < nb; ++i) {
-            // Prefetch the weight and input for the next iteration so DRAM
-            // latency is hidden behind the current FMA chain.
-            _mm_prefetch((const char*)(a0 + (i + 4) * SIMD_WIDTH), _MM_HINT_T0);
-            _mm_prefetch((const char*)(a1 + (i + 4) * SIMD_WIDTH), _MM_HINT_T0);
             __m256 w0 = bf16_to_fp32_avx2(
                 _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
             __m256 w1 = bf16_to_fp32_avx2(
@@ -484,8 +477,6 @@ namespace fastllm {
             for (int r = 0; r < BROW; ++r) {
                 const float* b_row =
                     (const float*)((const char*)B + r * stride_b);
-                _mm_prefetch((const char*)(b_row + (i + 4) * SIMD_WIDTH),
-                             _MM_HINT_T0);
                 __m256 iv = _mm256_loadu_ps(b_row + i * SIMD_WIDTH);
                 acc[0][r] = _mm256_fmadd_ps(iv, w0, acc[0][r]);
                 acc[1][r] = _mm256_fmadd_ps(iv, w1, acc[1][r]);
@@ -768,8 +759,6 @@ namespace fastllm {
 
                     int p = 0;
                     for (; p + 15 < blockEnd; p += 16) {
-                        _mm_prefetch((const char*)(fp80 + p + 64), _MM_HINT_T0);
-                        _mm_prefetch((const char*)(fp81 + p + 64), _MM_HINT_T0);
                         const __m256 a0 = _mm256_loadu_ps(a + base + p);
                         const __m256 a1 = _mm256_loadu_ps(a + base + p + 8);
                         __m256 w0lo, w0hi, w1lo, w1hi;
@@ -836,8 +825,6 @@ namespace fastllm {
 
                 int p = 0;
                 for (; p + 15 < m; p += 16) {
-                    _mm_prefetch((const char*)(row0 + p + 64), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(row1 + p + 64), _MM_HINT_T0);
                     const __m256 a0 = _mm256_loadu_ps(a + p);
                     const __m256 a1 = _mm256_loadu_ps(a + p + 8);
                     __m256 w0lo, w0hi, w1lo, w1hi;
