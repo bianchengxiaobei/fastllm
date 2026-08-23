@@ -11824,11 +11824,22 @@ ops += (long long)lines * inputDim * interDim * 2;
 
             // online softmax（flash）：K/V 按 kvBlock 分块，scores 块缓冲
             // 常驻 L2，不再物化 [rows × k1] 的中间分数矩阵。
+            // 临时 buffer 提为线程局部并复用 capacity：本类 task 数量可达
+            // 数百个（heads × query 块），每 task 重新 malloc 百 KB 会高频
+            // 触发 mmap/munmap + TLB shootdown，成为 prefill 长序列的瓶颈。
             const int kvBlock = 128;
-            std::vector<float> acc((size_t)rows * v2, 0.0f);
-            std::vector<float> mVal((size_t)rows, -1e30f);
-            std::vector<float> lVal((size_t)rows, 0.0f);
-            std::vector<float> s((size_t)rows * kvBlock);
+            static thread_local std::vector<float> scratchAcc;
+            static thread_local std::vector<float> scratchMVal;
+            static thread_local std::vector<float> scratchLVal;
+            static thread_local std::vector<float> scratchS;
+            scratchAcc.assign((size_t)rows * v2, 0.0f);
+            scratchMVal.assign((size_t)rows, -1e30f);
+            scratchLVal.assign((size_t)rows, 0.0f);
+            scratchS.assign((size_t)rows * kvBlock, 0.0f);
+            float *acc = scratchAcc.data();
+            float *mVal = scratchMVal.data();
+            float *lVal = scratchLVal.data();
+            float *s = scratchS.data();
 
             for (int jb = 0; jb < k1; jb += kvBlock) {
                 const int jEnd = std::min(jb + kvBlock, k1);
@@ -11846,7 +11857,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     const float *kToken = kF32 + (size_t)j * kHeadDim;
                     for (int t = 0; t < rows; t++) {
                         const int i = qLo + t;
-                        float *dst = s.data() + (size_t)t * blockLen + (j - jb);
+                        float *dst = s + (size_t)t * blockLen + (j - jb);
                         if (!allVisible) {
                             if (maskHead) {
                                 if (maskHead[i * k1 + j] > 0.99) {
@@ -11901,7 +11912,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
                 // B: online softmax 状态更新（行最大值 / 归一化因子 / acc 重标定）
                 for (int t = 0; t < rows; t++) {
-                    float *sRow = s.data() + (size_t)t * blockLen;
+                    float *sRow = s + (size_t)t * blockLen;
                     float blockMax = -1e30f;
                     for (int jj = 0; jj < blockLen; jj++) {
                         blockMax = std::max(blockMax, sRow[jj]);
@@ -11918,7 +11929,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         lt += e;
                     }
                     lVal[t] = lVal[t] * correction + lt;
-                    float *accRow = acc.data() + (size_t)t * v2;
+                    float *accRow = acc + (size_t)t * v2;
                     if (correction != 1.0f) {
                         int d = 0;
 #ifdef __aarch64__
@@ -11947,7 +11958,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         if (w == 0.0f) {
                             continue;
                         }
-                        float *oRow = acc.data() + (size_t)t * v2;
+                        float *oRow = acc + (size_t)t * v2;
                         int l = 0;
 #ifdef __aarch64__
                         float32x4_t wv = vdupq_n_f32(w);
@@ -11989,7 +12000,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int t = 0; t < rows; t++) {
                 float denom = std::max(lVal[t], 0.1f);
                 float inv = 1.0f / denom;
-                const float *accRow = acc.data() + (size_t)t * v2;
+                const float *accRow = acc + (size_t)t * v2;
                 float *oRow = oHead + (size_t)(qLo + t) * v2;
                 int d = 0;
 #ifdef __aarch64__
@@ -12130,16 +12141,29 @@ ops += (long long)lines * inputDim * interDim * 2;
             const int rows = qHi - qLo;
             const int base = k1 - q1;
 
-            std::vector<float> fq((size_t)rows * q2);
-            Float16ToFloat32(qHead + (size_t)qLo * q2, fq.data(), rows * q2);
+            static thread_local std::vector<float> scratchFq;
+            scratchFq.assign((size_t)rows * q2, 0.0f);
+            float *fq = scratchFq.data();
+            Float16ToFloat32(qHead + (size_t)qLo * q2, fq, rows * q2);
 
             // online softmax（flash）：K/V 按 kvBlock 分块，scores 块缓冲
             // 常驻 L2，不再物化 [rows × k1] 的中间分数矩阵。
+            // 临时 buffer 提为线程局部并复用 capacity：本类 task 数量可达
+            // 数百个，每 task 重新 malloc 百 KB 会高频触发 mmap/munmap 与
+            // TLB shootdown，成为 prefill 长序列的瓶颈。
             const int kvBlock = 128;
-            std::vector<float> acc((size_t)rows * v2, 0.0f);
-            std::vector<float> mVal((size_t)rows, -1e30f);
-            std::vector<float> lVal((size_t)rows, 0.0f);
-            std::vector<float> s((size_t)rows * kvBlock);
+            static thread_local std::vector<float> scratchAcc;
+            static thread_local std::vector<float> scratchMVal;
+            static thread_local std::vector<float> scratchLVal;
+            static thread_local std::vector<float> scratchS;
+            scratchAcc.assign((size_t)rows * v2, 0.0f);
+            scratchMVal.assign((size_t)rows, -1e30f);
+            scratchLVal.assign((size_t)rows, 0.0f);
+            scratchS.assign((size_t)rows * kvBlock, 0.0f);
+            float *acc = scratchAcc.data();
+            float *mVal = scratchMVal.data();
+            float *lVal = scratchLVal.data();
+            float *s = scratchS.data();
 
             for (int jb = 0; jb < k1; jb += kvBlock) {
                 const int jEnd = std::min(jb + kvBlock, k1);
@@ -12157,7 +12181,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     const float *kToken = kF32 + (size_t)j * kHeadDim;
                     for (int t = 0; t < rows; t++) {
                         const int i = qLo + t;
-                        float *dst = s.data() + (size_t)t * blockLen + (j - jb);
+                        float *dst = s + (size_t)t * blockLen + (j - jb);
                         if (!allVisible) {
                             if (maskHead) {
                                 float maskVal = half_to_float(maskHead[i * k1 + j]);
@@ -12171,7 +12195,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                             }
                         }
 
-                        const float *qRow = fq.data() + (size_t)t * q2;
+                        const float *qRow = fq + (size_t)t * q2;
                         float dotProduct = 0.0f;
                         int l = 0;
 #ifdef __aarch64__
@@ -12213,7 +12237,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
                 // B: online softmax 状态更新（行最大值 / 归一化因子 / acc 重标定）
                 for (int t = 0; t < rows; t++) {
-                    float *sRow = s.data() + (size_t)t * blockLen;
+                    float *sRow = s + (size_t)t * blockLen;
                     float blockMax = -1e30f;
                     for (int jj = 0; jj < blockLen; jj++) {
                         blockMax = std::max(blockMax, sRow[jj]);
@@ -12230,7 +12254,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         lt += e;
                     }
                     lVal[t] = lVal[t] * correction + lt;
-                    float *accRow = acc.data() + (size_t)t * v2;
+                    float *accRow = acc + (size_t)t * v2;
                     if (correction != 1.0f) {
                         int d = 0;
 #ifdef __aarch64__
@@ -12259,7 +12283,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         if (w == 0.0f) {
                             continue;
                         }
-                        float *oRow = acc.data() + (size_t)t * v2;
+                        float *oRow = acc + (size_t)t * v2;
                         int l = 0;
 #ifdef __aarch64__
                         float32x4_t wv = vdupq_n_f32(w);
@@ -12301,7 +12325,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int t = 0; t < rows; t++) {
                 float denom = std::max(lVal[t], 0.1f);
                 float inv = 1.0f / denom;
-                float *accRow = acc.data() + (size_t)t * v2;
+                float *accRow = acc + (size_t)t * v2;
                 int d = 0;
 #ifdef __aarch64__
                 float32x4_t iv = vdupq_n_f32(inv);
@@ -12365,16 +12389,29 @@ ops += (long long)lines * inputDim * interDim * 2;
             const int rows = qHi - qLo;
             const int base = k1 - q1;
 
-            std::vector<float> fq((size_t)rows * q2);
-            BFloat16ToFloat32(qHead + (size_t)qLo * q2, fq.data(), rows * q2);
+            static thread_local std::vector<float> scratchFq;
+            scratchFq.assign((size_t)rows * q2, 0.0f);
+            float *fq = scratchFq.data();
+            BFloat16ToFloat32(qHead + (size_t)qLo * q2, fq, rows * q2);
 
             // online softmax（flash）：K/V 按 kvBlock 分块，scores 块缓冲
             // 常驻 L2，不再物化 [rows × k1] 的中间分数矩阵。
+            // 临时 buffer 提为线程局部并复用 capacity：本类 task 数量可达
+            // 数百个，每 task 重新 malloc 百 KB 会高频触发 mmap/munmap 与
+            // TLB shootdown，成为 prefill 长序列的瓶颈。
             const int kvBlock = 128;
-            std::vector<float> acc((size_t)rows * v2, 0.0f);
-            std::vector<float> mVal((size_t)rows, -1e30f);
-            std::vector<float> lVal((size_t)rows, 0.0f);
-            std::vector<float> s((size_t)rows * kvBlock);
+            static thread_local std::vector<float> scratchAcc;
+            static thread_local std::vector<float> scratchMVal;
+            static thread_local std::vector<float> scratchLVal;
+            static thread_local std::vector<float> scratchS;
+            scratchAcc.assign((size_t)rows * v2, 0.0f);
+            scratchMVal.assign((size_t)rows, -1e30f);
+            scratchLVal.assign((size_t)rows, 0.0f);
+            scratchS.assign((size_t)rows * kvBlock, 0.0f);
+            float *acc = scratchAcc.data();
+            float *mVal = scratchMVal.data();
+            float *lVal = scratchLVal.data();
+            float *s = scratchS.data();
 
             for (int jb = 0; jb < k1; jb += kvBlock) {
                 const int jEnd = std::min(jb + kvBlock, k1);
@@ -12392,7 +12429,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     const float *kToken = kF32 + (size_t)j * kHeadDim;
                     for (int t = 0; t < rows; t++) {
                         const int i = qLo + t;
-                        float *dst = s.data() + (size_t)t * blockLen + (j - jb);
+                        float *dst = s + (size_t)t * blockLen + (j - jb);
                         if (!allVisible) {
                             if (maskHead) {
                                 float maskVal;
@@ -12408,7 +12445,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                             }
                         }
 
-                        const float *qRow = fq.data() + (size_t)t * q2;
+                        const float *qRow = fq + (size_t)t * q2;
                         float dotProduct = 0.0f;
                         int l = 0;
 #ifdef __aarch64__
@@ -12450,7 +12487,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
                 // B: online softmax 状态更新（行最大值 / 归一化因子 / acc 重标定）
                 for (int t = 0; t < rows; t++) {
-                    float *sRow = s.data() + (size_t)t * blockLen;
+                    float *sRow = s + (size_t)t * blockLen;
                     float blockMax = -1e30f;
                     for (int jj = 0; jj < blockLen; jj++) {
                         blockMax = std::max(blockMax, sRow[jj]);
@@ -12467,7 +12504,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         lt += e;
                     }
                     lVal[t] = lVal[t] * correction + lt;
-                    float *accRow = acc.data() + (size_t)t * v2;
+                    float *accRow = acc + (size_t)t * v2;
                     if (correction != 1.0f) {
                         int d = 0;
 #ifdef __aarch64__
@@ -12496,7 +12533,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         if (w == 0.0f) {
                             continue;
                         }
-                        float *oRow = acc.data() + (size_t)t * v2;
+                        float *oRow = acc + (size_t)t * v2;
                         int l = 0;
 #ifdef __aarch64__
                         float32x4_t wv = vdupq_n_f32(w);
@@ -12538,7 +12575,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int t = 0; t < rows; t++) {
                 float denom = std::max(lVal[t], 0.1f);
                 float inv = 1.0f / denom;
-                float *accRow = acc.data() + (size_t)t * v2;
+                float *accRow = acc + (size_t)t * v2;
                 int d = 0;
 #ifdef __aarch64__
                 float32x4_t iv = vdupq_n_f32(inv);
