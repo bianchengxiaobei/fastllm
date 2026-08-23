@@ -6392,14 +6392,6 @@ namespace fastllm {
                     useDeepSeekV4MoeFast;
                 const bool hasAvx512 =
                     GetCPUInstructInfo()->hasAVX512BF16;
-                static const bool debugMoeFastPath =
-                    std::getenv("FASTLLM_DEBUG_MOE_FASTPATH") != nullptr;
-                if (debugMoeFastPath) {
-                    printf("[fastllm-moe-fastpath] deepSeekV4Mode=%d useFast=%d useDirectQueue=%d useDirectPrepare=%d startType=%d downType=%d\n",
-                           deepSeekV4Mode ? 1 : 0, useDeepSeekV4MoeFast ? 1 : 0,
-                           useDirectGemmQueue ? 1 : 0, useDirectBFloat16Prepare ? 1 : 0,
-                           (int)startDataType, (int)downInputDataType);
-                }
 
                 for (int o = 0; o < bs; o++) {
                     if (profileDetail) {
