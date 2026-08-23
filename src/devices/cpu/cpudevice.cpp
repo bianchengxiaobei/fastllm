@@ -12021,6 +12021,221 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     };
 
+    // GQA 融合版：一个 task 负责 (同一 kv 头的多个连续 q 头) × 一个 query 行块。
+    // K/V 块在外层只流经内存一次，被组内多个 q 头复用。group > 1 时，
+    // 旧实现每个 q 头独立流式读一遍完整 K/V（12MB/头），group=8 即 8× 冗余
+    // DRAM 流量。这里把 kv block 提到最外层，8 个 q 头轮流消费同一块，K/V
+    // 流量降为 1/group。
+    struct MultiThreadPagedAttentionGqaFloat32Op : MultiThreadBaseOp {
+        float *qHeadBase, *oHeadBase, *maskHeadBase;
+        int qStride, oStride, maskStride;
+        int maskHeadDenom; // q0 / batch：该 batch 有多少 q 头共用同一 mask
+        float scale;
+        int q1, q2, k1, v2, group;
+        int kHeadDim, vHeadDim;
+        int qHeadLo, qHeadHi; // 本 task 负责的 q 头区间（共享同一 kv 头）
+        int qLo, qHi;         // query 行区间
+        const float *kF32Base, *vF32Base;
+        int kvHeadIdx;
+
+        MultiThreadPagedAttentionGqaFloat32Op(
+            float *qHeadBase, float *oHeadBase, float *maskHeadBase,
+            int qStride, int oStride, int maskStride, int maskHeadDenom,
+            float scale, int q1, int q2, int k1, int v2, int group,
+            int kHeadDim, int vHeadDim,
+            int qHeadLo, int qHeadHi, int qLo, int qHi,
+            const float *kF32Base, const float *vF32Base, int kvHeadIdx) :
+            qHeadBase(qHeadBase), oHeadBase(oHeadBase), maskHeadBase(maskHeadBase),
+            qStride(qStride), oStride(oStride), maskStride(maskStride),
+            maskHeadDenom(maskHeadDenom),
+            scale(scale), q1(q1), q2(q2), k1(k1), v2(v2), group(group),
+            kHeadDim(kHeadDim), vHeadDim(vHeadDim),
+            qHeadLo(qHeadLo), qHeadHi(qHeadHi), qLo(qLo), qHi(qHi),
+            kF32Base(kF32Base), vF32Base(vF32Base), kvHeadIdx(kvHeadIdx) {}
+
+        void Run() {
+            const int rows = qHi - qLo;
+            const int base = k1 - q1;
+            const int nHead = qHeadHi - qHeadLo;
+            const float *kF32 = kF32Base + (size_t)kvHeadIdx * k1 * kHeadDim;
+            const float *vF32 = vF32Base + (size_t)kvHeadIdx * k1 * vHeadDim;
+
+            const int kvBlock = 128;
+            static thread_local std::vector<float> scratchS;
+            scratchS.assign((size_t)rows * kvBlock, 0.0f);
+            float *s = scratchS.data();
+
+            // 每个 q 头独立维护 online softmax 状态，但 K/V 块只流经内存一次。
+            // acc/mVal/lVal 需按头分片：扩成 [nHead × rows]，跨 kv block 持久。
+            static thread_local std::vector<float> scratchAccH;
+            static thread_local std::vector<float> scratchMValH;
+            static thread_local std::vector<float> scratchLValH;
+            scratchAccH.assign((size_t)nHead * rows * v2, 0.0f);
+            scratchMValH.assign((size_t)nHead * rows, -1e30f);
+            scratchLValH.assign((size_t)nHead * rows, 0.0f);
+            float *accH = scratchAccH.data();
+            float *mValH = scratchMValH.data();
+            float *lValH = scratchLValH.data();
+
+            for (int jb = 0; jb < k1; jb += kvBlock) {
+                const int jEnd = std::min(jb + kvBlock, k1);
+                const int blockLen = jEnd - jb;
+                const bool blockFullyVisible = !maskHeadBase && (jEnd - 1) <= base + qLo;
+                const bool blockFullyInvisible = !maskHeadBase && jb > base + qHi - 1;
+                if (blockFullyInvisible) {
+                    continue;
+                }
+
+                // K/V 块指针：一次加载，组内所有 q 头共用
+                for (int ho = 0; ho < nHead; ho++) {
+                    const int o = qHeadLo + ho;
+                    const float *qHead = qHeadBase + (size_t)o * qStride;
+                    float *oHead = oHeadBase + (size_t)o * oStride;
+                    const float *maskHead = maskHeadBase ? (maskHeadBase + (size_t)(o / maskHeadDenom) * maskStride) : nullptr;
+                    float *mValLocal = mValH + (size_t)ho * rows;
+                    float *lValLocal = lValH + (size_t)ho * rows;
+                    float *accLocal = accH + (size_t)ho * rows * v2;
+
+                    // A: 本块 scores
+                    for (int j = jb; j < jEnd; j++) {
+                        const float *kToken = kF32 + (size_t)j * kHeadDim;
+                        for (int t = 0; t < rows; t++) {
+                            const int i = qLo + t;
+                            float *dst = s + (size_t)t * blockLen + (j - jb);
+                            if (!blockFullyVisible) {
+                                if (maskHead) {
+                                    if (maskHead[i * k1 + j] > 0.99) {
+                                        *dst = -10000.0f;
+                                        continue;
+                                    }
+                                } else if (j > base + i) {
+                                    *dst = -10000.0f;
+                                    continue;
+                                }
+                            }
+                            const float *qRow = qHead + (size_t)i * q2;
+                            float dotProduct = 0.0f;
+                            int l = 0;
+#ifdef __AVX__
+                            __m256 vsum0 = _mm256_setzero_ps();
+                            __m256 vsum1 = _mm256_setzero_ps();
+                            __m256 vsum2 = _mm256_setzero_ps();
+                            __m256 vsum3 = _mm256_setzero_ps();
+                            for (; l + 31 < kHeadDim; l += 32) {
+                                vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                        _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
+                                vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
+                                                        _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
+                                vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
+                                                        _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
+                                vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
+                                                        _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
+                            }
+                            __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
+                                                        _mm256_add_ps(vsum2, vsum3));
+                            for (; l + 7 < kHeadDim; l += 8) {
+                                vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                       _mm256_loadu_ps((const float *) (kToken + l)), vsum);
+                            }
+                            dotProduct += Floatsum(vsum);
+#endif
+                            for (; l < kHeadDim; l++) {
+                                dotProduct += qRow[l] * kToken[l];
+                            }
+                            *dst = dotProduct * scale;
+                        }
+                    }
+
+                    // B: online softmax 状态更新
+                    for (int t = 0; t < rows; t++) {
+                        float *sRow = s + (size_t)t * blockLen;
+                        float blockMax = -1e30f;
+                        for (int jj = 0; jj < blockLen; jj++) {
+                            blockMax = std::max(blockMax, sRow[jj]);
+                        }
+                        float mNew = std::max(mValLocal[t], blockMax);
+                        if (mNew <= -1e29f) {
+                            continue;
+                        }
+                        float correction = (mValLocal[t] <= -1e29f) ? 0.0f : expf(mValLocal[t] - mNew);
+                        float lt = 0.0f;
+                        for (int jj = 0; jj < blockLen; jj++) {
+                            float e = expf(sRow[jj] - mNew);
+                            sRow[jj] = e;
+                            lt += e;
+                        }
+                        lValLocal[t] = lValLocal[t] * correction + lt;
+                        float *accRow = accLocal + (size_t)t * v2;
+                        if (correction != 1.0f) {
+                            int d = 0;
+#ifdef __AVX__
+                            __m256 cv = _mm256_set1_ps(correction);
+                            for (; d + 7 < v2; d += 8) {
+                                _mm256_storeu_ps(accRow + d, _mm256_mul_ps(cv, _mm256_loadu_ps(accRow + d)));
+                            }
+#endif
+                            for (; d < v2; d++) {
+                                accRow[d] *= correction;
+                            }
+                        }
+                        mValLocal[t] = mNew;
+                    }
+
+                    // C: V 块累加
+                    for (int j = jb; j < jEnd; j++) {
+                        const float *vToken = vF32 + (size_t)j * vHeadDim;
+                        for (int t = 0; t < rows; t++) {
+                            float w = s[(size_t)t * blockLen + (j - jb)];
+                            if (w == 0.0f) {
+                                continue;
+                            }
+                            float *oRow = accLocal + (size_t)t * v2;
+                            int l = 0;
+#ifdef __AVX__
+                            __m256 wv = _mm256_set1_ps(w);
+                            for (; l + 31 < v2; l += 32) {
+                                _mm256_storeu_ps(oRow + l,
+                                                 _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                                 _mm256_loadu_ps(oRow + l)));
+                                _mm256_storeu_ps(oRow + l + 8,
+                                                 _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
+                                                                 _mm256_loadu_ps(oRow + l + 8)));
+                                _mm256_storeu_ps(oRow + l + 16,
+                                                 _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
+                                                                 _mm256_loadu_ps(oRow + l + 16)));
+                                _mm256_storeu_ps(oRow + l + 24,
+                                                 _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
+                                                                 _mm256_loadu_ps(oRow + l + 24)));
+                            }
+#endif
+                            for (; l < v2; l++) {
+                                oRow[l] += w * vToken[l];
+                            }
+                        }
+                    }
+
+                    // D: 最终归一化并写出
+                    for (int t = 0; t < rows; t++) {
+                        float denom = std::max(lValLocal[t], 0.1f);
+                        float inv = 1.0f / denom;
+                        const float *accRow = accLocal + (size_t)t * v2;
+                        float *oRow = oHead + (size_t)(qLo + t) * v2;
+                        int d = 0;
+#ifdef __AVX__
+                        __m256 iv = _mm256_set1_ps(inv);
+                        for (; d + 7 < v2; d += 8) {
+                            _mm256_storeu_ps(oRow + d, _mm256_mul_ps(iv, _mm256_loadu_ps(accRow + d)));
+                        }
+#endif
+                        for (; d < v2; d++) {
+                            oRow[d] = accRow[d] * inv;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     struct MultiThreadPagedAttentionConvertKVOp : MultiThreadBaseOp {
         uint8_t *kPagedData, *vPagedData;
         const std::vector<int> *kPageIndex, *vPageIndex;
@@ -12701,28 +12916,25 @@ ops += (long long)lines * inputDim * interDim * 2;
                 }
                 pagedAttnConvSpend = GetSpan(convSt, std::chrono::system_clock::now());
 
-                std::vector<MultiThreadPagedAttentionFloat32Op*> ops;
-                // 任务粒度 = (q 头 × 64 行 query 块)：q0 小于线程数时也能
-                // 填满线程池；同时 K/V 在块内被整块复用（j 外层扫描）。
+                std::vector<MultiThreadPagedAttentionGqaFloat32Op*> ops;
+                // 任务粒度 = (同一 kv 头的 8 个 q 头) × 64 行 query 块：
+                // K/V 块在外层仅流经内存一次，组内 q 头复用，group=8 时
+                // K/V DRAM 流量降为旧实现的 1/8。
                 const int qTileRows = 64;
                 int qBlocks = (q1 + qTileRows - 1) / qTileRows;
-                for (int o = 0; o < q0; o++) {
-                    float *qHead = qd + o * q.strides[0];
-                    float *oHead = od + o * output.strides[0];
-                    float *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
+                for (int c = 0; c < q0; c += group) {
+                    int qHeadHi = std::min(c + group, q0);
                     for (int b = 0; b < qBlocks; b++) {
                         int qLo = b * qTileRows;
                         int qHi = std::min(qLo + qTileRows, q1);
-                        ops.push_back(new MultiThreadPagedAttentionFloat32Op(
-                            qHead, oHead, maskHead, scale,
-                            q1, q2, k1, v2, group, o,
-                            qLo, qHi,
-                            pageLen, kNumHeads, kHeadDim, kUnitSize,
-                            vPageLen, vNumHeads, vHeadDim, vUnitSize,
-                            kPagedData, vPagedData,
-                            &k.pageIndex, &v.pageIndex,
-                            k.lastPageLen, v.lastPageLen,
-                            kF32.data(), vF32.data()));
+                        ops.push_back(new MultiThreadPagedAttentionGqaFloat32Op(
+                            qd, od, maskd,
+                            q.strides[0], output.strides[0], maskStride,
+                            q0 / batch,
+                            scale, q1, q2, k1, v2, group,
+                            kHeadDim, vHeadDim,
+                            c, qHeadHi, qLo, qHi,
+                            kF32.data(), vF32.data(), c / group));
                     }
                 }
                 for (int st = 0; st < (int)ops.size(); st += threads) {
