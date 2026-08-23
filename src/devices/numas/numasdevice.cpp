@@ -6392,6 +6392,14 @@ namespace fastllm {
                     useDeepSeekV4MoeFast;
                 const bool hasAvx512 =
                     GetCPUInstructInfo()->hasAVX512BF16;
+                static const bool debugMoeFastPath =
+                    std::getenv("FASTLLM_DEBUG_MOE_FASTPATH") != nullptr;
+                if (debugMoeFastPath) {
+                    printf("[fastllm-moe-fastpath] deepSeekV4Mode=%d useFast=%d useDirectQueue=%d useDirectPrepare=%d startType=%d downType=%d\n",
+                           deepSeekV4Mode ? 1 : 0, useDeepSeekV4MoeFast ? 1 : 0,
+                           useDirectGemmQueue ? 1 : 0, useDirectBFloat16Prepare ? 1 : 0,
+                           (int)startDataType, (int)downInputDataType);
+                }
 
                 for (int o = 0; o < bs; o++) {
                     if (profileDetail) {
@@ -6716,11 +6724,20 @@ namespace fastllm {
                             // A fused group-32 destination must never be
                             // split between workers because its scale and sum
                             // are shared by all 32 activation values.
-                            int unitRows = canFuseGroup32 ? 64 : 4;
+                            // Larger chunks amortise dispatch + per-column
+                            // HorizontalSum overhead on FP8/BF16 decode GEMMs.
+                            int unitRows = canFuseGroup32 ? 64 : 64;
                             int rowsPerThread =
                                 (totalRows / unitRows) / threadNum;
                             int remainingRows =
                                 (totalRows / unitRows) % threadNum;
+                            if (rowsPerThread == 0) {
+                                unitRows = 4;
+                                rowsPerThread =
+                                    (totalRows / unitRows) / threadNum;
+                                remainingRows =
+                                    (totalRows / unitRows) % threadNum;
+                            }
                             int currentRow = 0;
 
                             for (int tid = 0; tid < threadNum; tid++) {
@@ -7170,11 +7187,18 @@ namespace fastllm {
                             int threadNum =
                                 numaConfig->numaToCpuDict[nid].size();
                             int totalRows = kPer * totalExperts;
-                            int unitRows = 4;
+                            int unitRows = 64;
                             int rowsPerThread =
                                 (totalRows / unitRows) / threadNum;
                             int extraRows =
                                 (totalRows / unitRows) % threadNum;
+                            if (rowsPerThread == 0) {
+                                unitRows = 4;
+                                rowsPerThread =
+                                    (totalRows / unitRows) / threadNum;
+                                extraRows =
+                                    (totalRows / unitRows) % threadNum;
+                            }
                             int currentRow = 0;
                             for (int tid = 0;
                                  tid < threadNum; tid++) {

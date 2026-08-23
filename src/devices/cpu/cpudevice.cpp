@@ -12097,22 +12097,67 @@ ops += (long long)lines * inputDim * interDim * 2;
                     float *accLocal = accH + (size_t)ho * rows * v2;
 
                     // A: 本块 scores
+                    // 一次处理两行 query，共享 kToken 加载，倍增 ILP：每轮
+                    // 8 个独立 FMA 累加器，隐藏 FMA 延迟与 Floatsum 归约。
                     for (int j = jb; j < jEnd; j++) {
                         const float *kToken = kF32 + (size_t)j * kHeadDim;
-                        for (int t = 0; t < rows; t++) {
-                            const int i = qLo + t;
-                            float *dst = s + (size_t)t * blockLen + (j - jb);
-                            if (!blockFullyVisible) {
+                        int t = 0;
+                        for (; t + 1 < rows; t += 2) {
+                            const int i0 = qLo + t;
+                            const int i1 = qLo + t + 1;
+                            float *dst0 = s + (size_t)t * blockLen + (j - jb);
+                            float *dst1 = s + (size_t)(t + 1) * blockLen + (j - jb);
+                            const float *qRow0 = qHead + (size_t)i0 * q2;
+                            const float *qRow1 = qHead + (size_t)i1 * q2;
+                            float dot0 = 0.0f, dot1 = 0.0f;
+                            int l = 0;
+#ifdef __AVX__
+                            __m256 a00 = _mm256_setzero_ps(), a01 = _mm256_setzero_ps(), a02 = _mm256_setzero_ps(), a03 = _mm256_setzero_ps();
+                            __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps(), a12 = _mm256_setzero_ps(), a13 = _mm256_setzero_ps();
+                            for (; l + 31 < kHeadDim; l += 32) {
+                                __m256 k0 = _mm256_loadu_ps((const float *)(kToken + l));
+                                __m256 k1 = _mm256_loadu_ps((const float *)(kToken + l + 8));
+                                __m256 k2 = _mm256_loadu_ps((const float *)(kToken + l + 16));
+                                __m256 k3 = _mm256_loadu_ps((const float *)(kToken + l + 24));
+                                a00 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow0 + l)), k0, a00);
+                                a01 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow0 + l + 8)), k1, a01);
+                                a02 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow0 + l + 16)), k2, a02);
+                                a03 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow0 + l + 24)), k3, a03);
+                                a10 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow1 + l)), k0, a10);
+                                a11 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow1 + l + 8)), k1, a11);
+                                a12 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow1 + l + 16)), k2, a12);
+                                a13 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow1 + l + 24)), k3, a13);
+                            }
+                            __m256 vsum0 = _mm256_add_ps(_mm256_add_ps(a00, a01), _mm256_add_ps(a02, a03));
+                            __m256 vsum1 = _mm256_add_ps(_mm256_add_ps(a10, a11), _mm256_add_ps(a12, a13));
+                            dot0 = Floatsum(vsum0);
+                            dot1 = Floatsum(vsum1);
+                            for (; l + 7 < kHeadDim; l += 8) {
+                                __m256 kv = _mm256_loadu_ps((const float *)(kToken + l));
+                                dot0 += Floatsum(_mm256_mul_ps(_mm256_loadu_ps((const float *)(qRow0 + l)), kv));
+                                dot1 += Floatsum(_mm256_mul_ps(_mm256_loadu_ps((const float *)(qRow1 + l)), kv));
+                            }
+#endif
+                            for (; l < kHeadDim; l++) {
+                                dot0 += qRow0[l] * kToken[l];
+                                dot1 += qRow1[l] * kToken[l];
+                            }
+                            if (blockFullyVisible) {
+                                *dst0 = dot0 * scale;
+                                *dst1 = dot1 * scale;
+                            } else {
                                 if (maskHead) {
-                                    if (maskHead[i * k1 + j] > 0.99) {
-                                        *dst = -10000.0f;
-                                        continue;
-                                    }
-                                } else if (j > base + i) {
-                                    *dst = -10000.0f;
+                                    *dst0 = (maskHead[i0 * k1 + j] > 0.99) ? -10000.0f : dot0 * scale;
+                                    *dst1 = (maskHead[i1 * k1 + j] > 0.99) ? -10000.0f : dot1 * scale;
                                     continue;
                                 }
+                                *dst0 = (j > base + i0) ? -10000.0f : dot0 * scale;
+                                *dst1 = (j > base + i1) ? -10000.0f : dot1 * scale;
                             }
+                        }
+                        for (; t < rows; t++) {
+                            const int i = qLo + t;
+                            float *dst = s + (size_t)t * blockLen + (j - jb);
                             const float *qRow = qHead + (size_t)i * q2;
                             float dotProduct = 0.0f;
                             int l = 0;
@@ -12142,7 +12187,13 @@ ops += (long long)lines * inputDim * interDim * 2;
                             for (; l < kHeadDim; l++) {
                                 dotProduct += qRow[l] * kToken[l];
                             }
-                            *dst = dotProduct * scale;
+                            if (blockFullyVisible) {
+                                *dst = dotProduct * scale;
+                            } else if (maskHead) {
+                                *dst = (maskHead[i * k1 + j] > 0.99) ? -10000.0f : dotProduct * scale;
+                            } else {
+                                *dst = (j > base + i) ? -10000.0f : dotProduct * scale;
+                            }
                         }
                     }
 
