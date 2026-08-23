@@ -2398,37 +2398,80 @@ namespace fastllm {
                     if (n > 31) {
                         std::vector<uint16_t> bf16B_temp((end - st) * m);
                         // 转换fp8到bf16，仅转换需要计算的行[st:end]
-                        int block_size = m;
-                        int num_blocks = (m + block_size - 1) / block_size;
-                        int last_block_size = (m % block_size == 0) ? block_size : (m % block_size);
+                        // perRow = m 字节 fp8 + 4 字节 scale
+                        const size_t perRowB = (size_t)m + sizeof(float);
+#ifdef __AVX2__
+                        const __m128i signMask = _mm_set1_epi8((char)0x80);
+                        const __m128i mantMask = _mm_set1_epi8(0x7F);
+                        const __m128i zero = _mm_setzero_si128();
                         for (int j = st; j < end; j++) {
-                            uint8_t *rowStart = (uint8_t*)B + j * ldb;  // ldb应该是每行的总字节数
-                            uint16_t *bf16B_row = bf16B_temp.data() + (j - st) * m;
-                            
-                            // 按block进行处理
-                            for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
-                                // 计算当前block的大小（最后一个block可能不完整）
-                                int current_block_size = (block_idx == num_blocks - 1) ? last_block_size : block_size;
-                                
-                                // 计算当前block的起始位置
-                                // 每个block占用 128字节(fp8) + 4字节(float scale)
-                                uint8_t *block_start = rowStart + block_idx * (block_size + sizeof(float));
-                                uint8_t *fp8_ptr = block_start;
-                                float *scale_ptr = (float*)(block_start + block_size);
-                                
-                                // 转换当前block中的每个fp8到bf16
-                                int base_idx = block_idx * block_size;
-                                for (int l = 0; l < current_block_size; l++) {
-                                    // fp8转fp32并乘以scale
-                                    float fp32_val = fp8e4m3tofp32.dict[fp8_ptr[l]] * (*scale_ptr);
-                                    
-                                    // fp32转bf16
-                                    uint32_t val;
-                                    memcpy(&val, &fp32_val, sizeof(val));
-                                    bf16B_row[base_idx + l] = (uint16_t)(val >> 16);
-                                }
+                            const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * perRowB;
+                            uint16_t *bf16B_row = bf16B_temp.data() + (size_t)(j - st) * m;
+                            // 每行 scale 在 fp8 数据之后（行末）
+                            const float scale = *(const float*)(rowStart + m);
+                            const __m256 vScale = _mm256_set1_ps(scale);
+                            int l = 0;
+                            // 一次 32 元素：fp8 -> bf16 位运算 -> fp32 -> 乘 scale -> 截断回 bf16
+                            for (; l + 31 < m; l += 32) {
+                                const __m128i b0 = _mm_loadu_si128((const __m128i*)(rowStart + l));
+                                const __m128i b1 = _mm_loadu_si128((const __m128i*)(rowStart + l + 16));
+                                const __m128i s0 = _mm_and_si128(b0, signMask);
+                                const __m128i m0 = _mm_and_si128(b0, mantMask);
+                                const __m128i s1 = _mm_and_si128(b1, signMask);
+                                const __m128i m1 = _mm_and_si128(b1, mantMask);
+                                const __m128i lo0 = _mm_or_si128(_mm_slli_epi16(_mm_unpacklo_epi8(s0, zero), 8),
+                                                                 _mm_slli_epi16(_mm_unpacklo_epi8(m0, zero), 4));
+                                const __m128i hi0 = _mm_or_si128(_mm_slli_epi16(_mm_unpackhi_epi8(s0, zero), 8),
+                                                                 _mm_slli_epi16(_mm_unpackhi_epi8(m0, zero), 4));
+                                const __m128i lo1 = _mm_or_si128(_mm_slli_epi16(_mm_unpacklo_epi8(s1, zero), 8),
+                                                                 _mm_slli_epi16(_mm_unpacklo_epi8(m1, zero), 4));
+                                const __m128i hi1 = _mm_or_si128(_mm_slli_epi16(_mm_unpackhi_epi8(s1, zero), 8),
+                                                                 _mm_slli_epi16(_mm_unpackhi_epi8(m1, zero), 4));
+                                // bf16 转 fp32（左移 16）
+                                const __m256 f0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(lo0), 16));
+                                const __m256 f1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(hi0), 16));
+                                const __m256 f2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(lo1), 16));
+                                const __m256 f3 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(hi1), 16));
+                                // 乘 scale
+                                const __m256 s0v = _mm256_mul_ps(f0, vScale);
+                                const __m256 s1v = _mm256_mul_ps(f1, vScale);
+                                const __m256 s2v = _mm256_mul_ps(f2, vScale);
+                                const __m256 s3v = _mm256_mul_ps(f3, vScale);
+                                // fp32 -> bf16：取高 16 位并 pack
+                                const __m128i packed0 = _mm_packus_epi32(
+                                    _mm256_castsi256_si128(_mm256_srli_epi32(_mm256_castps_si256(s0v), 16)),
+                                    _mm256_extracti128_si256(_mm256_srli_epi32(_mm256_castps_si256(s1v), 16), 1));
+                                const __m128i packed1 = _mm_packus_epi32(
+                                    _mm256_castsi256_si128(_mm256_srli_epi32(_mm256_castps_si256(s2v), 16)),
+                                    _mm256_extracti128_si256(_mm256_srli_epi32(_mm256_castps_si256(s3v), 16), 1));
+                                _mm_storeu_si128((__m128i*)(bf16B_row + l), packed0);
+                                _mm_storeu_si128((__m128i*)(bf16B_row + l + 16), packed1);
+                            }
+                            // 尾部：标量等价操作（fp8 -> fp32 -> 乘 scale -> bf16）
+                            for (; l < m; l++) {
+                                const uint8_t v = rowStart[l];
+                                const uint16_t bf16v = (uint16_t)(((uint16_t)(v & 0x80) << 8) |
+                                                                 ((uint16_t)(v & 0x7F) << 4));
+                                uint32_t bits = (uint32_t)bf16v << 16;
+                                float f;
+                                memcpy(&f, &bits, sizeof(float));
+                                f *= scale;
+                                memcpy(&bits, &f, sizeof(float));
+                                bf16B_row[l] = (uint16_t)(bits >> 16);
                             }
                         }
+#else
+                        for (int j = st; j < end; j++) {
+                            const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * ((size_t)m + sizeof(float));
+                            uint16_t *bf16B_row = bf16B_temp.data() + (size_t)(j - st) * m;
+                            for (int l = 0; l < m; l++) {
+                                float fp32_val = fp8e4m3tofp32.dict[rowStart[l]];
+                                uint32_t val;
+                                memcpy(&val, &fp32_val, sizeof(val));
+                                bf16B_row[l] = (uint16_t)(val >> 16);
+                            }
+                        }
+#endif
 
                         MultiThreadLinearBFloat16BFloat16Op (
                             (uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st, n, m, ldc / sizeof(float), 0, end - st
@@ -12060,23 +12103,27 @@ ops += (long long)lines * inputDim * interDim * 2;
             const float *kF32 = kF32Base + (size_t)kvHeadIdx * k1 * kHeadDim;
             const float *vF32 = vF32Base + (size_t)kvHeadIdx * k1 * vHeadDim;
 
+            // decode / 小 batch（rows<=8）：token 外层复用 K/V，K/V DRAM 只读 1×；
+            // prefill 走下方 else 的 head 外层路径，s 缓冲保持 rows×kvBlock，
+            // 避免 nHead×rows×kvBlock 的大 s 缓冲撑爆 L2 导致 Q 掉出缓存。
+            if (nHead > 1 && rows <= 8) {
             const int kvBlock = 128;
             static thread_local std::vector<float> scratchS;
-            scratchS.assign((size_t)rows * kvBlock, 0.0f);
-            float *s = scratchS.data();
-
-            // 每个 q 头独立维护 online softmax 状态，但 K/V 块只流经内存一次。
-            // acc/mVal/lVal 需按头分片：扩成 [nHead × rows]，跨 kv block 持久。
             static thread_local std::vector<float> scratchAccH;
             static thread_local std::vector<float> scratchMValH;
             static thread_local std::vector<float> scratchLValH;
+            scratchS.assign((size_t)nHead * rows * kvBlock, 0.0f);
             scratchAccH.assign((size_t)nHead * rows * v2, 0.0f);
             scratchMValH.assign((size_t)nHead * rows, -1e30f);
             scratchLValH.assign((size_t)nHead * rows, 0.0f);
+            float *s = scratchS.data();
             float *accH = scratchAccH.data();
             float *mValH = scratchMValH.data();
             float *lValH = scratchLValH.data();
 
+            // token 外层、head 内层：每个 K/V token 只从内存流经一次，
+            // 组内全部 q 头复用。decode(q1=1) 时 K/V DRAM 流量从 nHead×
+            // 降为 1×，是关键提速点；prefill 亦减少 K 的重复加载。
             for (int jb = 0; jb < k1; jb += kvBlock) {
                 const int jEnd = std::min(jb + kvBlock, k1);
                 const int blockLen = jEnd - jb;
@@ -12086,27 +12133,20 @@ ops += (long long)lines * inputDim * interDim * 2;
                     continue;
                 }
 
-                // K/V 块指针：一次加载，组内所有 q 头共用
-                for (int ho = 0; ho < nHead; ho++) {
-                    const int o = qHeadLo + ho;
-                    const float *qHead = qHeadBase + (size_t)o * qStride;
-                    float *oHead = oHeadBase + (size_t)o * oStride;
-                    const float *maskHead = maskHeadBase ? (maskHeadBase + (size_t)(o / maskHeadDenom) * maskStride) : nullptr;
-                    float *mValLocal = mValH + (size_t)ho * rows;
-                    float *lValLocal = lValH + (size_t)ho * rows;
-                    float *accLocal = accH + (size_t)ho * rows * v2;
-
-                    // A: 本块 scores
-                    // 一次处理两行 query，共享 kToken 加载，倍增 ILP：每轮
-                    // 8 个独立 FMA 累加器，隐藏 FMA 延迟与 Floatsum 归约。
-                    for (int j = jb; j < jEnd; j++) {
-                        const float *kToken = kF32 + (size_t)j * kHeadDim;
+                // A: 本块 scores（token 外层，head 内层，复用 kToken）
+                for (int j = jb; j < jEnd; j++) {
+                    const float *kToken = kF32 + (size_t)j * kHeadDim;
+                    for (int ho = 0; ho < nHead; ho++) {
+                        const int o = qHeadLo + ho;
+                        const float *qHead = qHeadBase + (size_t)o * qStride;
+                        const float *maskHead = maskHeadBase ? (maskHeadBase + (size_t)(o / maskHeadDenom) * maskStride) : nullptr;
+                        float *sHead = s + (size_t)ho * rows * blockLen;
                         int t = 0;
                         for (; t + 1 < rows; t += 2) {
                             const int i0 = qLo + t;
                             const int i1 = qLo + t + 1;
-                            float *dst0 = s + (size_t)t * blockLen + (j - jb);
-                            float *dst1 = s + (size_t)(t + 1) * blockLen + (j - jb);
+                            float *dst0 = sHead + (size_t)t * blockLen + (j - jb);
+                            float *dst1 = sHead + (size_t)(t + 1) * blockLen + (j - jb);
                             const float *qRow0 = qHead + (size_t)i0 * q2;
                             const float *qRow1 = qHead + (size_t)i1 * q2;
                             float dot0 = 0.0f, dot1 = 0.0f;
@@ -12145,19 +12185,17 @@ ops += (long long)lines * inputDim * interDim * 2;
                             if (blockFullyVisible) {
                                 *dst0 = dot0 * scale;
                                 *dst1 = dot1 * scale;
+                            } else if (maskHead) {
+                                *dst0 = (maskHead[i0 * k1 + j] > 0.99) ? -10000.0f : dot0 * scale;
+                                *dst1 = (maskHead[i1 * k1 + j] > 0.99) ? -10000.0f : dot1 * scale;
                             } else {
-                                if (maskHead) {
-                                    *dst0 = (maskHead[i0 * k1 + j] > 0.99) ? -10000.0f : dot0 * scale;
-                                    *dst1 = (maskHead[i1 * k1 + j] > 0.99) ? -10000.0f : dot1 * scale;
-                                    continue;
-                                }
                                 *dst0 = (j > base + i0) ? -10000.0f : dot0 * scale;
                                 *dst1 = (j > base + i1) ? -10000.0f : dot1 * scale;
                             }
                         }
                         for (; t < rows; t++) {
                             const int i = qLo + t;
-                            float *dst = s + (size_t)t * blockLen + (j - jb);
+                            float *dst = sHead + (size_t)t * blockLen + (j - jb);
                             const float *qRow = qHead + (size_t)i * q2;
                             float dotProduct = 0.0f;
                             int l = 0;
@@ -12196,10 +12234,16 @@ ops += (long long)lines * inputDim * interDim * 2;
                             }
                         }
                     }
+                }
 
-                    // B: online softmax 状态更新
+                // B: online softmax 状态更新（按头分片）
+                for (int ho = 0; ho < nHead; ho++) {
+                    float *mValLocal = mValH + (size_t)ho * rows;
+                    float *lValLocal = lValH + (size_t)ho * rows;
+                    float *accLocal = accH + (size_t)ho * rows * v2;
+                    float *sHead = s + (size_t)ho * rows * blockLen;
                     for (int t = 0; t < rows; t++) {
-                        float *sRow = s + (size_t)t * blockLen;
+                        float *sRow = sHead + (size_t)t * blockLen;
                         float blockMax = -1e30f;
                         for (int jj = 0; jj < blockLen; jj++) {
                             blockMax = std::max(blockMax, sRow[jj]);
@@ -12231,12 +12275,16 @@ ops += (long long)lines * inputDim * interDim * 2;
                         }
                         mValLocal[t] = mNew;
                     }
+                }
 
-                    // C: V 块累加
-                    for (int j = jb; j < jEnd; j++) {
-                        const float *vToken = vF32 + (size_t)j * vHeadDim;
+                // C: V 块累加（token 外层，head 内层，复用 vToken）
+                for (int j = jb; j < jEnd; j++) {
+                    const float *vToken = vF32 + (size_t)j * vHeadDim;
+                    for (int ho = 0; ho < nHead; ho++) {
+                        float *accLocal = accH + (size_t)ho * rows * v2;
+                        float *sHead = s + (size_t)ho * rows * blockLen;
                         for (int t = 0; t < rows; t++) {
-                            float w = s[(size_t)t * blockLen + (j - jb)];
+                            float w = sHead[(size_t)t * blockLen + (j - jb)];
                             if (w == 0.0f) {
                                 continue;
                             }
@@ -12264,8 +12312,14 @@ ops += (long long)lines * inputDim * interDim * 2;
                             }
                         }
                     }
+                }
 
-                    // D: 最终归一化并写出
+                // D: 最终归一化并写出
+                for (int ho = 0; ho < nHead; ho++) {
+                    const int o = qHeadLo + ho;
+                    float *oHead = oHeadBase + (size_t)o * oStride;
+                    float *lValLocal = lValH + (size_t)ho * rows;
+                    float *accLocal = accH + (size_t)ho * rows * v2;
                     for (int t = 0; t < rows; t++) {
                         float denom = std::max(lValLocal[t], 0.1f);
                         float inv = 1.0f / denom;
@@ -12284,6 +12338,232 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
                 }
             }
+            return;
+            }
+
+            // prefill：head 外层、token 内层。Q 按头常驻 L2，s 缓冲仅
+            // rows×kvBlock；prefill 受 Q 的 L2 流量限制而非 K 的 DRAM
+            // 流量，K 被 8 头重读无碍。
+            {
+                const int kvBlock = 128;
+                static thread_local std::vector<float> scratchS;
+                static thread_local std::vector<float> scratchAccH;
+                static thread_local std::vector<float> scratchMValH;
+                static thread_local std::vector<float> scratchLValH;
+                scratchS.assign((size_t)rows * kvBlock, 0.0f);
+                scratchAccH.assign((size_t)nHead * rows * v2, 0.0f);
+                scratchMValH.assign((size_t)nHead * rows, -1e30f);
+                scratchLValH.assign((size_t)nHead * rows, 0.0f);
+                float *s = scratchS.data();
+                float *accH = scratchAccH.data();
+                float *mValH = scratchMValH.data();
+                float *lValH = scratchLValH.data();
+
+                for (int jb = 0; jb < k1; jb += kvBlock) {
+                    const int jEnd = std::min(jb + kvBlock, k1);
+                    const int blockLen = jEnd - jb;
+                    const bool blockFullyVisible = !maskHeadBase && (jEnd - 1) <= base + qLo;
+                    const bool blockFullyInvisible = !maskHeadBase && jb > base + qHi - 1;
+                    if (blockFullyInvisible) {
+                        continue;
+                    }
+
+                    for (int ho = 0; ho < nHead; ho++) {
+                        const int o = qHeadLo + ho;
+                        const float *qHead = qHeadBase + (size_t)o * qStride;
+                        float *oHead = oHeadBase + (size_t)o * oStride;
+                        const float *maskHead = maskHeadBase ? (maskHeadBase + (size_t)(o / maskHeadDenom) * maskStride) : nullptr;
+                        float *mValLocal = mValH + (size_t)ho * rows;
+                        float *lValLocal = lValH + (size_t)ho * rows;
+                        float *accLocal = accH + (size_t)ho * rows * v2;
+
+                        // A: 本块 scores
+                        for (int j = jb; j < jEnd; j++) {
+                            const float *kToken = kF32 + (size_t)j * kHeadDim;
+                            int t = 0;
+                            for (; t + 1 < rows; t += 2) {
+                                const int i0 = qLo + t;
+                                const int i1 = qLo + t + 1;
+                                float *dst0 = s + (size_t)t * blockLen + (j - jb);
+                                float *dst1 = s + (size_t)(t + 1) * blockLen + (j - jb);
+                                const float *qRow0 = qHead + (size_t)i0 * q2;
+                                const float *qRow1 = qHead + (size_t)i1 * q2;
+                                float dot0 = 0.0f, dot1 = 0.0f;
+                                int l = 0;
+#ifdef __AVX__
+                                __m256 a00 = _mm256_setzero_ps(), a01 = _mm256_setzero_ps(), a02 = _mm256_setzero_ps(), a03 = _mm256_setzero_ps();
+                                __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps(), a12 = _mm256_setzero_ps(), a13 = _mm256_setzero_ps();
+                                for (; l + 31 < kHeadDim; l += 32) {
+                                    __m256 k0 = _mm256_loadu_ps((const float *)(kToken + l));
+                                    __m256 k1 = _mm256_loadu_ps((const float *)(kToken + l + 8));
+                                    __m256 k2 = _mm256_loadu_ps((const float *)(kToken + l + 16));
+                                    __m256 k3 = _mm256_loadu_ps((const float *)(kToken + l + 24));
+                                    a00 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow0 + l)), k0, a00);
+                                    a01 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow0 + l + 8)), k1, a01);
+                                    a02 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow0 + l + 16)), k2, a02);
+                                    a03 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow0 + l + 24)), k3, a03);
+                                    a10 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow1 + l)), k0, a10);
+                                    a11 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow1 + l + 8)), k1, a11);
+                                    a12 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow1 + l + 16)), k2, a12);
+                                    a13 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *)(qRow1 + l + 24)), k3, a13);
+                                }
+                                __m256 vsum0 = _mm256_add_ps(_mm256_add_ps(a00, a01), _mm256_add_ps(a02, a03));
+                                __m256 vsum1 = _mm256_add_ps(_mm256_add_ps(a10, a11), _mm256_add_ps(a12, a13));
+                                dot0 = Floatsum(vsum0);
+                                dot1 = Floatsum(vsum1);
+                                for (; l + 7 < kHeadDim; l += 8) {
+                                    __m256 kv = _mm256_loadu_ps((const float *)(kToken + l));
+                                    dot0 += Floatsum(_mm256_mul_ps(_mm256_loadu_ps((const float *)(qRow0 + l)), kv));
+                                    dot1 += Floatsum(_mm256_mul_ps(_mm256_loadu_ps((const float *)(qRow1 + l)), kv));
+                                }
+#endif
+                                for (; l < kHeadDim; l++) {
+                                    dot0 += qRow0[l] * kToken[l];
+                                    dot1 += qRow1[l] * kToken[l];
+                                }
+                                if (blockFullyVisible) {
+                                    *dst0 = dot0 * scale;
+                                    *dst1 = dot1 * scale;
+                                } else {
+                                    if (maskHead) {
+                                        *dst0 = (maskHead[i0 * k1 + j] > 0.99) ? -10000.0f : dot0 * scale;
+                                        *dst1 = (maskHead[i1 * k1 + j] > 0.99) ? -10000.0f : dot1 * scale;
+                                        continue;
+                                    }
+                                    *dst0 = (j > base + i0) ? -10000.0f : dot0 * scale;
+                                    *dst1 = (j > base + i1) ? -10000.0f : dot1 * scale;
+                                }
+                            }
+                            for (; t < rows; t++) {
+                                const int i = qLo + t;
+                                float *dst = s + (size_t)t * blockLen + (j - jb);
+                                const float *qRow = qHead + (size_t)i * q2;
+                                float dotProduct = 0.0f;
+                                int l = 0;
+#ifdef __AVX__
+                                __m256 vsum0 = _mm256_setzero_ps();
+                                __m256 vsum1 = _mm256_setzero_ps();
+                                __m256 vsum2 = _mm256_setzero_ps();
+                                __m256 vsum3 = _mm256_setzero_ps();
+                                for (; l + 31 < kHeadDim; l += 32) {
+                                    vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                            _mm256_loadu_ps((const float *) (kToken + l)), vsum0);
+                                    vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 8)),
+                                                            _mm256_loadu_ps((const float *) (kToken + l + 8)), vsum1);
+                                    vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 16)),
+                                                            _mm256_loadu_ps((const float *) (kToken + l + 16)), vsum2);
+                                    vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l + 24)),
+                                                            _mm256_loadu_ps((const float *) (kToken + l + 24)), vsum3);
+                                }
+                                __m256 vsum = _mm256_add_ps(_mm256_add_ps(vsum0, vsum1),
+                                                            _mm256_add_ps(vsum2, vsum3));
+                                for (; l + 7 < kHeadDim; l += 8) {
+                                    vsum = _mm256_fmadd_ps(_mm256_loadu_ps((const float *) (qRow + l)),
+                                                           _mm256_loadu_ps((const float *) (kToken + l)), vsum);
+                                }
+                                dotProduct += Floatsum(vsum);
+#endif
+                                for (; l < kHeadDim; l++) {
+                                    dotProduct += qRow[l] * kToken[l];
+                                }
+                                if (blockFullyVisible) {
+                                    *dst = dotProduct * scale;
+                                } else if (maskHead) {
+                                    *dst = (maskHead[i * k1 + j] > 0.99) ? -10000.0f : dotProduct * scale;
+                                } else {
+                                    *dst = (j > base + i) ? -10000.0f : dotProduct * scale;
+                                }
+                            }
+                        }
+
+                        // B: online softmax 状态更新
+                        for (int t = 0; t < rows; t++) {
+                            float *sRow = s + (size_t)t * blockLen;
+                            float blockMax = -1e30f;
+                            for (int jj = 0; jj < blockLen; jj++) {
+                                blockMax = std::max(blockMax, sRow[jj]);
+                            }
+                            float mNew = std::max(mValLocal[t], blockMax);
+                            if (mNew <= -1e29f) {
+                                continue;
+                            }
+                            float correction = (mValLocal[t] <= -1e29f) ? 0.0f : expf(mValLocal[t] - mNew);
+                            float lt = 0.0f;
+                            for (int jj = 0; jj < blockLen; jj++) {
+                                float e = expf(sRow[jj] - mNew);
+                                sRow[jj] = e;
+                                lt += e;
+                            }
+                            lValLocal[t] = lValLocal[t] * correction + lt;
+                            float *accRow = accLocal + (size_t)t * v2;
+                            if (correction != 1.0f) {
+                                int d = 0;
+#ifdef __AVX__
+                                __m256 cv = _mm256_set1_ps(correction);
+                                for (; d + 7 < v2; d += 8) {
+                                    _mm256_storeu_ps(accRow + d, _mm256_mul_ps(cv, _mm256_loadu_ps(accRow + d)));
+                                }
+#endif
+                                for (; d < v2; d++) {
+                                    accRow[d] *= correction;
+                                }
+                            }
+                            mValLocal[t] = mNew;
+                        }
+
+                        // C: V 块累加
+                        for (int j = jb; j < jEnd; j++) {
+                            const float *vToken = vF32 + (size_t)j * vHeadDim;
+                            for (int t = 0; t < rows; t++) {
+                                float w = s[(size_t)t * blockLen + (j - jb)];
+                                if (w == 0.0f) {
+                                    continue;
+                                }
+                                float *oRow = accLocal + (size_t)t * v2;
+                                int l = 0;
+#ifdef __AVX__
+                                __m256 wv = _mm256_set1_ps(w);
+                                for (; l + 31 < v2; l += 32) {
+                                    _mm256_storeu_ps(oRow + l,
+                                                     _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l),
+                                                                     _mm256_loadu_ps(oRow + l)));
+                                    _mm256_storeu_ps(oRow + l + 8,
+                                                     _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 8),
+                                                                     _mm256_loadu_ps(oRow + l + 8)));
+                                    _mm256_storeu_ps(oRow + l + 16,
+                                                     _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 16),
+                                                                     _mm256_loadu_ps(oRow + l + 16)));
+                                    _mm256_storeu_ps(oRow + l + 24,
+                                                     _mm256_fmadd_ps(wv, _mm256_loadu_ps(vToken + l + 24),
+                                                                     _mm256_loadu_ps(oRow + l + 24)));
+                                }
+#endif
+                                for (; l < v2; l++) {
+                                    oRow[l] += w * vToken[l];
+                                }
+                            }
+                        }
+
+                        // D: 最终归一化并写出
+                        for (int t = 0; t < rows; t++) {
+                            float denom = std::max(lValLocal[t], 0.1f);
+                            float inv = 1.0f / denom;
+                            const float *accRow = accLocal + (size_t)t * v2;
+                            float *oRow = oHead + (size_t)(qLo + t) * v2;
+                            int d = 0;
+#ifdef __AVX__
+                            __m256 iv = _mm256_set1_ps(inv);
+                            for (; d + 7 < v2; d += 8) {
+                                _mm256_storeu_ps(oRow + d, _mm256_mul_ps(iv, _mm256_loadu_ps(accRow + d)));
+                            }
+#endif
+                            for (; d < v2; d++) {
+                                oRow[d] = accRow[d] * inv;
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
 
@@ -12294,6 +12574,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         int kNumHeads, kHeadDim, kUnitSize, kLastPageLen;
         int vNumHeads, vHeadDim, vUnitSize, vLastPageLen;
         int k1, headIdx;
+        int tokLo, tokHi; // 本任务负责的 token 区间 [tokLo, tokHi)
         DataType kCacheDataType, vCacheDataType;
         bool isBFloat16;
         float *dstK, *dstV;
@@ -12307,13 +12588,15 @@ ops += (long long)lines * inputDim * interDim * 2;
             int k1, int headIdx,
             DataType kCacheDataType, DataType vCacheDataType,
             bool isBFloat16,
-            float *dstK, float *dstV) :
+            float *dstK, float *dstV,
+            int tokLo = 0, int tokHi = -1) :
             kPagedData(kPagedData), vPagedData(vPagedData),
             kPageIndex(kPageIndex), vPageIndex(vPageIndex),
             pageLen(pageLen), vPageLen(vPageLen),
             kNumHeads(kNumHeads), kHeadDim(kHeadDim), kUnitSize(kUnitSize), kLastPageLen(kLastPageLen),
             vNumHeads(vNumHeads), vHeadDim(vHeadDim), vUnitSize(vUnitSize), vLastPageLen(vLastPageLen),
             k1(k1), headIdx(headIdx),
+            tokLo(tokLo), tokHi(tokHi < 0 ? k1 : tokHi),
             kCacheDataType(kCacheDataType), vCacheDataType(vCacheDataType),
             isBFloat16(isBFloat16), dstK(dstK), dstV(dstV) {}
 
@@ -12326,17 +12609,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                 int currentPageIdx = (*kPageIndex)[pageIdx];
                 int tokensInPage = (pageIdx == kPageIndex->size() - 1) ? kLastPageLen : pageLen;
                 for (int t = 0; t < tokensInPage; t++) {
-                    uint8_t *kDataPtr = kPagedData +
-                        ((size_t)currentPageIdx * pageLen * kNumHeads * kHeadDim +
-                         t * kNumHeads * kHeadDim +
-                         headIdx * kHeadDim) * kUnitSize;
-                    float *dst = dstK + (size_t)kvTokenIdx * kHeadDim;
-                    if (kCacheDataType == DataType::FLOAT32) {
-                        memcpy(dst, kDataPtr, (size_t)kHeadDim * sizeof(float));
-                    } else if (isBFloat16) {
-                        BFloat16ToFloat32((uint16_t*)kDataPtr, dst, kHeadDim);
-                    } else {
-                        Float16ToFloat32((uint16_t*)kDataPtr, dst, kHeadDim);
+                    if (kvTokenIdx >= tokLo && kvTokenIdx < tokHi) {
+                        uint8_t *kDataPtr = kPagedData +
+                            ((size_t)currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                             t * kNumHeads * kHeadDim +
+                             headIdx * kHeadDim) * kUnitSize;
+                        float *dst = dstK + (size_t)kvTokenIdx * kHeadDim;
+                        if (kCacheDataType == DataType::FLOAT32) {
+                            memcpy(dst, kDataPtr, (size_t)kHeadDim * sizeof(float));
+                        } else if (isBFloat16) {
+                            BFloat16ToFloat32((uint16_t*)kDataPtr, dst, kHeadDim);
+                        } else {
+                            Float16ToFloat32((uint16_t*)kDataPtr, dst, kHeadDim);
+                        }
                     }
                     kvTokenIdx++;
                 }
@@ -12346,17 +12631,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                 int currentPageIdx = (*vPageIndex)[pageIdx];
                 int tokensInPage = (pageIdx == vPageIndex->size() - 1) ? vLastPageLen : vPageLen;
                 for (int t = 0; t < tokensInPage; t++) {
-                    uint8_t *vDataPtr = vPagedData +
-                        ((size_t)currentPageIdx * vPageLen * vNumHeads * vHeadDim +
-                         t * vNumHeads * vHeadDim +
-                         headIdx * vHeadDim) * vUnitSize;
-                    float *dst = dstV + (size_t)kvTokenIdx * vHeadDim;
-                    if (vCacheDataType == DataType::FLOAT32) {
-                        memcpy(dst, vDataPtr, (size_t)vHeadDim * sizeof(float));
-                    } else if (isBFloat16) {
-                        BFloat16ToFloat32((uint16_t*)vDataPtr, dst, vHeadDim);
-                    } else {
-                        Float16ToFloat32((uint16_t*)vDataPtr, dst, vHeadDim);
+                    if (kvTokenIdx >= tokLo && kvTokenIdx < tokHi) {
+                        uint8_t *vDataPtr = vPagedData +
+                            ((size_t)currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                             t * vNumHeads * vHeadDim +
+                             headIdx * vHeadDim) * vUnitSize;
+                        float *dst = dstV + (size_t)kvTokenIdx * vHeadDim;
+                        if (vCacheDataType == DataType::FLOAT32) {
+                            memcpy(dst, vDataPtr, (size_t)vHeadDim * sizeof(float));
+                        } else if (isBFloat16) {
+                            BFloat16ToFloat32((uint16_t*)vDataPtr, dst, vHeadDim);
+                        } else {
+                            Float16ToFloat32((uint16_t*)vDataPtr, dst, vHeadDim);
+                        }
                     }
                     kvTokenIdx++;
                 }
@@ -12943,18 +13230,27 @@ ops += (long long)lines * inputDim * interDim * 2;
                 std::vector<float> vF32((size_t)k1 * vNumHeads * vHeadDim);
                 {
                     std::vector<MultiThreadPagedAttentionConvertKVOp*> convOps;
+                    // decode 时 kvHeads 仅 2，conv 若按头分只有 2 路并行；
+                    // 这里再按 token 区间切分，让全部线程参与转换。
+                    int convChunks = std::max(1, threads / std::max(1, kNumHeads));
                     for (int h = 0; h < kNumHeads; h++) {
-                        convOps.push_back(new MultiThreadPagedAttentionConvertKVOp(
-                            kPagedData, vPagedData,
-                            &k.pageIndex, &v.pageIndex,
-                            pageLen, vPageLen,
-                            kNumHeads, kHeadDim, kUnitSize, k.lastPageLen,
-                            vNumHeads, vHeadDim, vUnitSize, v.lastPageLen,
-                            k1, h,
-                            k.pagedKVCacheData->dataType, v.pagedKVCacheData->dataType,
-                            false,
-                            kF32.data() + (size_t)h * k1 * kHeadDim,
-                            vF32.data() + (size_t)h * k1 * vHeadDim));
+                        for (int c = 0; c < convChunks; c++) {
+                            int tokLo = (int)((size_t)c * k1 / convChunks);
+                            int tokHi = (int)((size_t)(c + 1) * k1 / convChunks);
+                            if (tokLo >= tokHi) continue;
+                            convOps.push_back(new MultiThreadPagedAttentionConvertKVOp(
+                                kPagedData, vPagedData,
+                                &k.pageIndex, &v.pageIndex,
+                                pageLen, vPageLen,
+                                kNumHeads, kHeadDim, kUnitSize, k.lastPageLen,
+                                vNumHeads, vHeadDim, vUnitSize, v.lastPageLen,
+                                k1, h,
+                                k.pagedKVCacheData->dataType, v.pagedKVCacheData->dataType,
+                                false,
+                                kF32.data() + (size_t)h * k1 * kHeadDim,
+                                vF32.data() + (size_t)h * k1 * vHeadDim,
+                                tokLo, tokHi));
+                        }
                     }
                     for (int st = 0; st < (int)convOps.size(); st += threads) {
                         int end = std::min(st + threads, (int)convOps.size());
