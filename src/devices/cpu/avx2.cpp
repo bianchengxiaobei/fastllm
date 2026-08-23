@@ -412,7 +412,7 @@ namespace fastllm {
 
         const uint16_t* a0 = A;
         for (int i = 0; i < nb; ++i) {
-            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 32), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
             __m256 w0 = bf16_to_fp32_avx2(
                 _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
             for (int r = 0; r < BROW; ++r) {
@@ -471,8 +471,8 @@ namespace fastllm {
         const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
 
         for (int i = 0; i < nb; ++i) {
-            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 32), _MM_HINT_T0);
-            _mm_prefetch((const char*)(a1 + i * SIMD_WIDTH + 32), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a1 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
             __m256 w0 = bf16_to_fp32_avx2(
                 _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
             __m256 w1 = bf16_to_fp32_avx2(
@@ -780,7 +780,7 @@ namespace fastllm {
         // 输出列按 L2 面板分块：面板内 token 块在里层复用指定面板的权重，
         // 权重每面板只从 DRAM 读 (n/superBlock) 次而非 n 次（superBlock 行
         // 外层）。stream 预取 fp8 权重行，把 QPI/DRAM 延迟藏进 FMA。
-        constexpr int superBlock = 8;
+        constexpr int superBlock = 128;
         const int panelCols = std::max(2, (int)((128 * 1024) / std::max<size_t>(1, perRow)) & ~1);
         thread_local std::vector<float> aBuf;
         if ((size_t)aBuf.size() < (size_t)superBlock * m) {
@@ -821,8 +821,8 @@ namespace fastllm {
                             const __m256 a0 = _mm256_loadu_ps(a + base + p);
                             const __m256 a1 = _mm256_loadu_ps(a + base + p + 8);
                             __m256 w0lo, w0hi, w1lo, w1hi;
-                            _mm_prefetch((const char*)(fp80 + p + 64), _MM_HINT_T0);
-                            _mm_prefetch((const char*)(fp81 + p + 64), _MM_HINT_T0);
+                            _mm_prefetch((const char*)(fp80 + p + 96), _MM_HINT_T0);
+                            _mm_prefetch((const char*)(fp81 + p + 96), _MM_HINT_T0);
                             DecodeFP8E4M3x16_AVX2(fp80 + p, w0lo, w0hi);
                             s0 = _mm256_fmadd_ps(a0, w0lo, s0);
                             s1 = _mm256_fmadd_ps(a1, w0hi, s1);
@@ -879,7 +879,7 @@ namespace fastllm {
 
         // j 外层分块：让 JBLOCK 行权重驻留 L2（256KB/核），B 只从 DRAM 读一次。
         // 原 i 外层结构下 B 会被重复扫 n 遍；这里 A 行在 j 块内复用，命中 L1/L2。
-        const int JBLOCK = std::max(8, std::min(64, (int)(256 * 1024 / perRow)));
+        const int JBLOCK = std::max(8, std::min(64, (int)(128 * 1024 / perRow)));
         for (int jj = st; jj < end; jj += JBLOCK) {
             const int je = std::min(jj + JBLOCK, end);
             for (int i = 0; i < n; i++) {
@@ -902,8 +902,8 @@ namespace fastllm {
                         const __m256 a0 = _mm256_loadu_ps(a + p);
                         const __m256 a1 = _mm256_loadu_ps(a + p + 8);
                         __m256 w0lo, w0hi, w1lo, w1hi;
-                        _mm_prefetch((const char*)(row0 + p + 64), _MM_HINT_T0);
-                        _mm_prefetch((const char*)(row1 + p + 64), _MM_HINT_T0);
+                        _mm_prefetch((const char*)(row0 + p + 96), _MM_HINT_T0);
+                        _mm_prefetch((const char*)(row1 + p + 96), _MM_HINT_T0);
                         DecodeFP8E4M3x16_AVX2(row0 + p, w0lo, w0hi);
                         s0 = _mm256_fmadd_ps(a0, w0lo, s0);
                         s1 = _mm256_fmadd_ps(a1, w0hi, s1);
@@ -1219,7 +1219,7 @@ namespace fastllm {
 
         // 2D 分块：superBlock 行输入在外层，j 面板在内层，面板权重驻留 L2
         // 被 superBlock 行复用，避免 n 次 DRAM 重读；stream 预取权重行。
-        constexpr int superBlock = 8;
+        constexpr int superBlock = 128;
         const int panelCols = std::max(1, (int)((128 * 1024) / std::max<size_t>(1, ldb)));
         for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
             const int superRows = std::min(superBlock, n - iSuper);
@@ -1246,7 +1246,7 @@ namespace fastllm {
                         const __m256i ones = _mm256_set1_epi16(1);
 
                         for (; p + 31 < m; p += 32) {
-                            _mm_prefetch((const char*)(int8B + p + 128), _MM_HINT_T0);
+                            _mm_prefetch((const char*)(int8B + p + 192), _MM_HINT_T0);
                             __m256i bx = _mm256_loadu_si256((const __m256i *) (int8B + p));
                             __m256i by = _mm256_loadu_si256((const __m256i *) (quantizedA + p));
                             acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, by), ones));
@@ -1278,7 +1278,7 @@ namespace fastllm {
 
         // 2D 分块：superBlock 行输入在外层，j 面板在内层，面板权重驻留 L2
         // 被 superBlock 行复用，避免 n 次 DRAM 重读；stream 预取权重行。
-        constexpr int superBlock = 8;
+        constexpr int superBlock = 128;
         const int panelCols = std::max(1, (int)((128 * 1024) / std::max<size_t>(1, ldb)));
         for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
             const int superRows = std::min(superBlock, n - iSuper);
@@ -1305,7 +1305,7 @@ namespace fastllm {
                         const __m256i lowMask = _mm256_set1_epi8(0xf);
                         const __m256i ones = _mm256_set1_epi16(1);
                         for (; p + 31 < m; p += 32) {
-                            _mm_prefetch((const char*)(int4B + p / 2 + 128), _MM_HINT_T0);
+                            _mm_prefetch((const char*)(int4B + p / 2 + 192), _MM_HINT_T0);
                             __m128i orix = _mm_loadu_si128((const __m128i *) (int4B + p / 2));
                             __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
                             __m256i bx = _mm256_and_si256(lowMask, bytex);
@@ -1348,7 +1348,7 @@ namespace fastllm {
 
         // 2D 分块：superBlock 行输入在外层，j 面板在内层，面板权重驻留 L2
         // 被 superBlock 行复用，避免 n 次 DRAM 重读；stream 预取权重行。
-        constexpr int superBlock = 8;
+        constexpr int superBlock = 128;
         const int panelCols = std::max(1, (int)((128 * 1024) / std::max<size_t>(1, ldb)));
         for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
             const int superRows = std::min(superBlock, n - iSuper);
@@ -1376,7 +1376,7 @@ namespace fastllm {
                             const __m256i lowMask = _mm256_set1_epi8(0xf);
                             const __m256i ones = _mm256_set1_epi16(1);
                             for (; p + 31 < groupCnt; p += 32) {
-                                _mm_prefetch((const char*)(int4B + p / 2 + 128), _MM_HINT_T0);
+                                _mm_prefetch((const char*)(int4B + p / 2 + 192), _MM_HINT_T0);
                                 __m128i orix = _mm_loadu_si128((const __m128i *) (int4B + p / 2));
                                 __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
                                 __m256i bx = _mm256_and_si256(lowMask, bytex);
@@ -1429,7 +1429,7 @@ namespace fastllm {
                 const uint16_t* a_row = (const uint16_t*)((const char*)A + ix * stride_a);
                 
                 // 从 f16 转换到 f32 (F16C)
-                _mm_prefetch((const char*)(a_row + i * SIMD_WIDTH + 32), _MM_HINT_T0);
+                _mm_prefetch((const char*)(a_row + i * SIMD_WIDTH + 64), _MM_HINT_T0);
                 __m128i a_f16 = _mm_loadu_si128((const __m128i*)(a_row + i * SIMD_WIDTH));
                 __m256 a_vec = _mm256_cvtph_ps(a_f16);
                 
@@ -1510,8 +1510,8 @@ namespace fastllm {
         const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
 
         for (int i = 0; i < nb; ++i) {
-            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 32), _MM_HINT_T0);
-            _mm_prefetch((const char*)(a1 + i * SIMD_WIDTH + 32), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a1 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
             __m256 w0 = _mm256_cvtph_ps(
                 _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
             __m256 w1 = _mm256_cvtph_ps(
@@ -1941,7 +1941,7 @@ namespace fastllm {
                     vi = _mm256_loadu_ps(inputF32 + l);
                 }
                 for (int c = 0; c < COLS; c++) {
-                    _mm_prefetch((const char*)(weightRows + (size_t)c * packedM + (l >> 1) + 64), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(weightRows + (size_t)c * packedM + (l >> 1) + 96), _MM_HINT_T0);
                     __m256 vw = NVFP4ToFloat32_AVX2(weightRows + (size_t)c * packedM + (l >> 1));
                     blockAcc[c] = _mm256_fmadd_ps(vi, vw, blockAcc[c]);
                 }
@@ -1980,7 +1980,7 @@ namespace fastllm {
         int packedM = m >> 1;
         // 输出列按 L2 面板切：superBlock 行 token 在外层，j 面板在内层，
         // 面板权重驻留 L2 被 superBlock 行复用，避免 n 次 DRAM 重读。
-        constexpr int superBlock = 8;
+        constexpr int superBlock = 128;
         const size_t perWeightRow = (size_t)packedM;
         const int panelCols = std::max(4, std::min(end - st,
             (int)((128 * 1024) / std::max<size_t>(1, perWeightRow)) & ~3));
