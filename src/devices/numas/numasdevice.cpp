@@ -725,6 +725,11 @@ namespace fastllm {
                 context->outputData +
                 (size_t)expertIdx * context->k +
                 (size_t)context->nid * context->kPer);
+            static const bool profileTask =
+                std::getenv("FASTLLM_PROFILE_MOE_TASK") != nullptr;
+            auto t0 = profileTask ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             FastllmGemm(
                 1, context->m, context->k,
                 input,
@@ -738,6 +743,16 @@ namespace fastllm {
                 st, end,
                 context->inputDataType, weight->GetDataType(),
                 DataType::FLOAT32);
+            if (profileTask) {
+                auto t1 = std::chrono::steady_clock::now();
+                printf(
+                    "[fastllm-moe-task] nid=%d task=%d expert=%d "
+                    "m=%d rows=%d %.3f us\n",
+                    context->nid, taskId, expert, context->m,
+                    end - st,
+                    std::chrono::duration<double, std::micro>(
+                        t1 - t0).count());
+            }
         }
 
         void Run() override {
