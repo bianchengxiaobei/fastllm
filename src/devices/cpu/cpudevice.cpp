@@ -2177,7 +2177,7 @@ namespace fastllm {
                         std::chrono::steady_clock::now() :
                         std::chrono::steady_clock::time_point();
                     bool usedAvx2 = false;
-                    if (cpuInstructInfo.hasAVX2 && n > 4) {
+                    if (cpuInstructInfo.hasAVX2 && n >= 1) {
                         usedAvx2 = LinearFloat32BFloat16_AVX2_Kernel(
                             (float*)A, (uint16_t*)B, nullptr, (float*)C,
                             n, m, (int)(ldc / sizeof(float)), st, end);
