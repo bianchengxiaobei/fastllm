@@ -12865,7 +12865,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             // AttentionPaged 路径诊断：确认命中哪个 dtype 分支及形状/并行信息
             static const bool pagedAttnProf = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
             float pagedAttnConvSpend = -1.0f;
-            
+            float pagedAttnComputeSpend = -1.0f;
+            auto pagedAttnTotalSt = std::chrono::system_clock::now();
+
             if (q.dataType == DataType::FLOAT32) {
                 float *qd = (float*)q.cpuData;
                 float *od = (float*)output.cpuData;
@@ -12937,6 +12939,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                             kF32.data(), vF32.data(), c / group));
                     }
                 }
+                auto computeSt = std::chrono::system_clock::now();
                 for (int st = 0; st < (int)ops.size(); st += threads) {
                     int end = std::min(st + threads, (int)ops.size());
                     for (int i = st; i < end; i++) {
@@ -12946,6 +12949,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         pool->Wait(i - st);
                     }
                 }
+                pagedAttnComputeSpend = GetSpan(computeSt, std::chrono::system_clock::now());
                 for (auto *op : ops) delete op;
             } else if (q.dataType == DataType::FLOAT16) {
                 uint16_t *qd = (uint16_t*)q.cpuData;
@@ -13022,6 +13026,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                             kF32.data(), vF32.data()));
                     }
                 }
+                auto computeSt = std::chrono::system_clock::now();
                 for (int st = 0; st < (int)ops.size(); st += threads) {
                     int end = std::min(st + threads, (int)ops.size());
                     for (int i = st; i < end; i++) {
@@ -13031,6 +13036,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         pool->Wait(i - st);
                     }
                 }
+                pagedAttnComputeSpend = GetSpan(computeSt, std::chrono::system_clock::now());
                 for (auto *op : ops) delete op;
             } else if (q.dataType == DataType::BFLOAT16) {
                 uint16_t *qd = (uint16_t*)q.cpuData;
@@ -13110,6 +13116,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                             kF32.data(), vF32.data()));
                     }
                 }
+                auto computeSt = std::chrono::system_clock::now();
                 for (int st = 0; st < (int)ops.size(); st += threads) {
                     int end = std::min(st + threads, (int)ops.size());
                     for (int i = st; i < end; i++) {
@@ -13119,6 +13126,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         pool->Wait(i - st);
                     }
                 }
+                pagedAttnComputeSpend = GetSpan(computeSt, std::chrono::system_clock::now());
                 for (auto *op : ops) delete op;
             } else {
                 ErrorInFastLLM("CpuAttentionPagedOp error: unsupport dataType.\n");
@@ -13127,11 +13135,13 @@ ops += (long long)lines * inputDim * interDim * 2;
             if (pagedAttnProf) {
                 static int pagedAttnLogCnt = 0;
                 int cnt = pagedAttnLogCnt++;
-                printf("[fastllm-paged-attn] #%d dtype=%s cache=%s q0=%d q1=%d q2=%d k1=%d v2=%d group=%d kvHeads=%d threads=%d conv=%.4f s\n",
+                float totalSpend = GetSpan(pagedAttnTotalSt, std::chrono::system_clock::now());
+                printf("[fastllm-paged-attn] #%d dtype=%s cache=%s q0=%d q1=%d q2=%d k1=%d v2=%d group=%d kvHeads=%d threads=%d conv=%.4f compute=%.4f total=%.4f s\n",
                        cnt, GetDataTypeName(q.dataType).c_str(),
                        GetDataTypeName(k.pagedKVCacheData->dataType).c_str(),
                        q0, q1, q2, k1, v2, group, kNumHeads,
-                       (int)GetAlivePool()->threads.size(), pagedAttnConvSpend);
+                       (int)GetAlivePool()->threads.size(), pagedAttnConvSpend,
+                       pagedAttnComputeSpend, totalSpend);
                 fflush(stdout);
             }
         }
