@@ -40,6 +40,10 @@
 #include <functional>
 #include <cstdio>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
@@ -1923,6 +1927,85 @@ namespace fastllm {
             rawTokenBase = retainStart;
         }
 
+#if defined(__AVX2__)
+        // Cephes-style exp matching the CUDA compressed-KV kernel (see
+        // deepseekv4ops.cpp DeepSeekV4Exp256).  Scalar lane for tails.
+        static inline float DeepSeekV4FastExp1(float x) {
+            const float expHi = 88.3762626647949f;
+            const float expLo = -88.3762626647949f;
+            const float log2e = 1.44269504088896341f;
+            const float c1 = 0.693359375f;
+            const float c2 = -2.12194440e-4f;
+            const float p0 = 1.9875691500E-4f;
+            const float p1 = 1.3981999507E-3f;
+            const float p2 = 8.3334519073E-3f;
+            const float p3 = 4.1665795894E-2f;
+            const float p4 = 1.6666665459E-1f;
+            const float p5 = 5.0000001201E-1f;
+            x = std::min(x, expHi);
+            x = std::max(x, expLo);
+            float fx0 = x * log2e + 0.5f;
+            float fx = std::floor(fx0);
+            if (fx > fx0) {
+                fx -= 1.0f;
+            }
+            float tmp = fx * c1;
+            float z = fx * c2;
+            x = x - tmp - z;
+            z = x * x;
+            float y = p0;
+            y = y * x + p1;
+            y = y * x + p2;
+            y = y * x + p3;
+            y = y * x + p4;
+            y = y * x + p5;
+            y = y * z + x + 1.0f;
+            int32_t imm = ((int32_t)fx + 0x7f) << 23;
+            float scale;
+            std::memcpy(&scale, &imm, sizeof(scale));
+            return y * scale;
+        }
+
+        static inline __m256 DeepSeekV4FastExp256(__m256 x) {
+            const __m256 expHi = _mm256_set1_ps(88.3762626647949f);
+            const __m256 expLo = _mm256_set1_ps(-88.3762626647949f);
+            const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+            const __m256 c1 = _mm256_set1_ps(0.693359375f);
+            const __m256 c2 = _mm256_set1_ps(-2.12194440e-4f);
+            const __m256 p0 = _mm256_set1_ps(1.9875691500E-4f);
+            const __m256 p1 = _mm256_set1_ps(1.3981999507E-3f);
+            const __m256 p2 = _mm256_set1_ps(8.3334519073E-3f);
+            const __m256 p3 = _mm256_set1_ps(4.1665795894E-2f);
+            const __m256 p4 = _mm256_set1_ps(1.6666665459E-1f);
+            const __m256 p5 = _mm256_set1_ps(5.0000001201E-1f);
+            const __m256 one = _mm256_set1_ps(1.0f);
+            const __m256 half = _mm256_set1_ps(0.5f);
+            x = _mm256_min_ps(x, expHi);
+            x = _mm256_max_ps(x, expLo);
+            __m256 fx = _mm256_fmadd_ps(x, log2e, half);
+            __m256 tmp = _mm256_floor_ps(fx);
+            __m256 mask = _mm256_cmp_ps(tmp, fx, _CMP_GT_OS);
+            fx = _mm256_sub_ps(tmp, _mm256_and_ps(mask, one));
+            tmp = _mm256_mul_ps(fx, c1);
+            __m256 z = _mm256_mul_ps(fx, c2);
+            x = _mm256_sub_ps(x, tmp);
+            x = _mm256_sub_ps(x, z);
+            z = _mm256_mul_ps(x, x);
+            __m256 y = p0;
+            y = _mm256_fmadd_ps(y, x, p1);
+            y = _mm256_fmadd_ps(y, x, p2);
+            y = _mm256_fmadd_ps(y, x, p3);
+            y = _mm256_fmadd_ps(y, x, p4);
+            y = _mm256_fmadd_ps(y, x, p5);
+            y = _mm256_fmadd_ps(y, z, x);
+            y = _mm256_add_ps(y, one);
+            __m256i imm = _mm256_cvttps_epi32(fx);
+            imm = _mm256_add_epi32(imm, _mm256_set1_epi32(0x7f));
+            imm = _mm256_slli_epi32(imm, 23);
+            return _mm256_mul_ps(y, _mm256_castsi256_ps(imm));
+        }
+#endif
+
         struct BuildCompressedKVRangeOp : MultiThreadBaseOp {
             const float *kv;
             const float *score;
@@ -1947,60 +2030,115 @@ namespace fastllm {
                 return ((uint64_t)b * rawLen + localToken) * wideDim + dimOffset;
             }
 
-            void ScanTerms(int b, int block, int d, float &mx) const {
-                if (overlap) {
-                    if (block > 0) {
-                        for (int r = 0; r < compressRatio; r++) {
-                            int tok = (block - 1) * compressRatio + r;
-                            uint64_t off = RawOffset(b, tok, d);
-                            mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + d]);
-                        }
-                    }
-                    for (int r = 0; r < compressRatio; r++) {
-                        int tok = block * compressRatio + r;
-                        uint64_t off = RawOffset(b, tok, headDim + d);
-                        mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + headDim + d]);
-                    }
-                } else {
-                    for (int r = 0; r < compressRatio; r++) {
-                        int tok = block * compressRatio + r;
-                        uint64_t off = RawOffset(b, tok, d);
-                        mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + d]);
-                    }
-                }
-            }
-
-            void AccumulateTerms(int b, int block, int d, float mx, double &sum, double &value) const {
-                if (overlap) {
-                    if (block > 0) {
-                        for (int r = 0; r < compressRatio; r++) {
-                            int tok = (block - 1) * compressRatio + r;
-                            uint64_t off = RawOffset(b, tok, d);
-                            double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + d]) - mx);
-                            sum += e;
-                            value += e * kv[off];
-                        }
-                    }
-                    for (int r = 0; r < compressRatio; r++) {
-                        int tok = block * compressRatio + r;
-                        uint64_t off = RawOffset(b, tok, headDim + d);
-                        double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + headDim + d]) - mx);
-                        sum += e;
-                        value += e * kv[off];
-                    }
-                } else {
-                    for (int r = 0; r < compressRatio; r++) {
-                        int tok = block * compressRatio + r;
-                        uint64_t off = RawOffset(b, tok, d);
-                        double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + d]) - mx);
-                        sum += e;
-                        value += e * kv[off];
-                    }
-                }
-            }
-
             void Run() override {
                 (void)bsz;
+#if defined(__AVX2__)
+                const __m256 negInf = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
+                const __m256 denomFloor = _mm256_set1_ps(1e-30f);
+                uint64_t idx = st;
+                while (idx < end) {
+                    int d = (int)(idx % headDim);
+                    uint64_t tmp = idx / headDim;
+                    int localBlock = (int)(tmp % blockCount);
+                    int b = (int)(tmp / blockCount);
+                    int block = blockStart + localBlock;
+                    if (d + 8 <= headDim && idx + 8 <= end) {
+                        __m256 svec[256];
+                        const float *kvp[256];
+                        int n = 0;
+                        if (overlap) {
+                            if (block > 0) {
+                                for (int r = 0; r < compressRatio; r++) {
+                                    int tok = (block - 1) * compressRatio + r;
+                                    uint64_t off = RawOffset(b, tok, d);
+                                    kvp[n] = kv + off;
+                                    svec[n] = _mm256_add_ps(
+                                        _mm256_loadu_ps(score + off),
+                                        _mm256_loadu_ps(ape + (uint64_t)r * wideDim + d));
+                                    n++;
+                                }
+                            }
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = block * compressRatio + r;
+                                uint64_t off = RawOffset(b, tok, headDim + d);
+                                kvp[n] = kv + off;
+                                svec[n] = _mm256_add_ps(
+                                    _mm256_loadu_ps(score + off),
+                                    _mm256_loadu_ps(ape + (uint64_t)r * wideDim + headDim + d));
+                                n++;
+                            }
+                        } else {
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = block * compressRatio + r;
+                                uint64_t off = RawOffset(b, tok, d);
+                                kvp[n] = kv + off;
+                                svec[n] = _mm256_add_ps(
+                                    _mm256_loadu_ps(score + off),
+                                    _mm256_loadu_ps(ape + (uint64_t)r * wideDim + d));
+                                n++;
+                            }
+                        }
+                        __m256 mx = negInf;
+                        for (int i = 0; i < n; i++) {
+                            mx = _mm256_max_ps(mx, svec[i]);
+                        }
+                        __m256 sum = _mm256_setzero_ps();
+                        __m256 value = _mm256_setzero_ps();
+                        for (int i = 0; i < n; i++) {
+                            __m256 e = DeepSeekV4FastExp256(_mm256_sub_ps(svec[i], mx));
+                            sum = _mm256_add_ps(sum, e);
+                            value = _mm256_fmadd_ps(e, _mm256_loadu_ps(kvp[i]), value);
+                        }
+                        _mm256_storeu_ps(
+                            compressed + ((uint64_t)b * blockCount + localBlock) * headDim + d,
+                            _mm256_div_ps(value, _mm256_max_ps(sum, denomFloor)));
+                        idx += 8;
+                        continue;
+                    }
+                    float s[256];
+                    const float *kvps[256];
+                    int n = 0;
+                    if (overlap) {
+                        if (block > 0) {
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = (block - 1) * compressRatio + r;
+                                uint64_t off = RawOffset(b, tok, d);
+                                kvps[n] = kv + off;
+                                s[n] = score[off] + ape[(uint64_t)r * wideDim + d];
+                                n++;
+                            }
+                        }
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = block * compressRatio + r;
+                            uint64_t off = RawOffset(b, tok, headDim + d);
+                            kvps[n] = kv + off;
+                            s[n] = score[off] + ape[(uint64_t)r * wideDim + headDim + d];
+                            n++;
+                        }
+                    } else {
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = block * compressRatio + r;
+                            uint64_t off = RawOffset(b, tok, d);
+                            kvps[n] = kv + off;
+                            s[n] = score[off] + ape[(uint64_t)r * wideDim + d];
+                            n++;
+                        }
+                    }
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int i = 0; i < n; i++) {
+                        mx = std::max(mx, s[i]);
+                    }
+                    double sum = 0.0, value = 0.0;
+                    for (int i = 0; i < n; i++) {
+                        float e = DeepSeekV4FastExp1(s[i] - mx);
+                        sum += e;
+                        value += (double)e * kvps[i][0];
+                    }
+                    compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] =
+                        (float)(value / std::max(sum, 1e-30));
+                    idx++;
+                }
+#else
                 for (uint64_t idx = st; idx < end; idx++) {
                     int d = (int)(idx % headDim);
                     uint64_t tmp = idx / headDim;
@@ -2009,13 +2147,54 @@ namespace fastllm {
                     int block = blockStart + localBlock;
 
                     float mx = -std::numeric_limits<float>::infinity();
-                    ScanTerms(b, block, d, mx);
-
                     double sum = 0.0, value = 0.0;
-                    AccumulateTerms(b, block, d, mx, sum, value);
+                    if (overlap) {
+                        if (block > 0) {
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = (block - 1) * compressRatio + r;
+                                uint64_t off = RawOffset(b, tok, d);
+                                mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + d]);
+                            }
+                        }
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = block * compressRatio + r;
+                            uint64_t off = RawOffset(b, tok, headDim + d);
+                            mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + headDim + d]);
+                        }
+                        if (block > 0) {
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = (block - 1) * compressRatio + r;
+                                uint64_t off = RawOffset(b, tok, d);
+                                float e = std::exp(score[off] + ape[(uint64_t)r * wideDim + d] - mx);
+                                sum += e;
+                                value += (double)e * kv[off];
+                            }
+                        }
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = block * compressRatio + r;
+                            uint64_t off = RawOffset(b, tok, headDim + d);
+                            float e = std::exp(score[off] + ape[(uint64_t)r * wideDim + headDim + d] - mx);
+                            sum += e;
+                            value += (double)e * kv[off];
+                        }
+                    } else {
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = block * compressRatio + r;
+                            uint64_t off = RawOffset(b, tok, d);
+                            mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + d]);
+                        }
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = block * compressRatio + r;
+                            uint64_t off = RawOffset(b, tok, d);
+                            float e = std::exp(score[off] + ape[(uint64_t)r * wideDim + d] - mx);
+                            sum += e;
+                            value += (double)e * kv[off];
+                        }
+                    }
                     compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] =
                         (float)(value / std::max(sum, 1e-30));
                 }
+#endif
             }
         };
 
@@ -6699,6 +6878,10 @@ namespace fastllm {
                 for (auto &destination : source.second) {
                     if (destination.first ==
                         "mtp.2.confidence_head.proj.weight") {
+                        // The reference implementation promotes this tiny
+                        // BF16 checkpoint tensor to FP32 because its sigmoid
+                        // output is a scheduling probability, not an
+                        // activation passed into the next model layer.
                         destination.second = DataType::FLOAT32;
                     } else if (isDsparkAux(destination.first)) {
                         destination.second = DataType::BFLOAT16;

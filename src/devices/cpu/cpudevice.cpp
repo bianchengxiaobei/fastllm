@@ -944,7 +944,17 @@ namespace fastllm {
     }
 
     void BFloat16ToFloat16(uint16_t *bfloat16, uint16_t *float16, int len) {
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+#ifdef __AVX2__
+        // bf16 -> f32 (exact) -> f16, matching bf16tofp16.dict
+        for (; i + 7 < len; i += 8) {
+            __m128i b16 = _mm_loadu_si128((const __m128i*)(bfloat16 + i));
+            __m256 f32 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(b16), 16));
+            __m128i f16 = _mm256_cvtps_ph(f32, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128((__m128i*)(float16 + i), f16);
+        }
+#endif
+        for (; i < len; i++) {
             float16[i] = bf16tofp16.dict[bfloat16[i]];
         }
     }
@@ -983,9 +993,7 @@ namespace fastllm {
             data.cpuData = new uint8_t[newBytes];
             uint16_t *cur = (uint16_t*)data.cpuData;
             int len = data.Count(0);
-            for (int i = 0; i < len; i++) {
-                cur[i] = float_to_half(old[i]);
-            }
+            Float32ToFloat16(old, cur, len);
             delete[] old;
         } else if (data.dataType == DataType::BFLOAT16) {
             data.dataType = DataType::FLOAT16;
@@ -1018,9 +1026,7 @@ namespace fastllm {
             data.cpuData = new uint8_t[newBytes];
             float *cur = (float*)data.cpuData;
             int len = data.Count(0);
-            for (int i = 0; i < len; i++) {
-                cur[i] = fp16tofp32.dict[old[i]];
-            }
+            Float16ToFloat32(old, cur, len);
             delete[] old;
         } else if (data.dataType == DataType::BFLOAT16) {
             uint16_t *old = (uint16_t*)data.cpuData;
@@ -1030,10 +1036,7 @@ namespace fastllm {
             data.cpuData = new uint8_t[newBytes];
             float *cur = (float*)data.cpuData;
             int len = data.Count(0);
-            for (int i = 0; i < len; i++) {
-                uint32_t x = (uint32_t)old[i] << 16;
-                cur[i] = *(float*)&x;
-            }
+            BFloat16ToFloat32(old, cur, len);
             delete[] old;
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
@@ -1094,13 +1097,7 @@ namespace fastllm {
         if (input.dataType == DataType::FLOAT16) {
             Float16ToFloat32((uint16_t*)input.cpuData, (float*)output.cpuData, input.Count(0));
         } else if (input.dataType == DataType::BFLOAT16) {
-            uint16_t *src = (uint16_t*)input.cpuData;
-            float *dst = (float*)output.cpuData;
-            int len = input.Count(0);
-            for (int i = 0; i < len; i++) {
-                uint32_t x = (uint32_t)src[i] << 16;
-                dst[i] = *(float*)&x;
-            }
+            BFloat16ToFloat32((uint16_t*)input.cpuData, (float*)output.cpuData, input.Count(0));
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -5865,7 +5862,33 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int i = 0; i < outer; i++) {
                 float mean = 0.f;
                 int j = 0;
-#ifdef __aarch64__
+#if defined(__AVX2__)
+                __m256 sums0 = _mm256_setzero_ps();
+                __m256 sums1 = _mm256_setzero_ps();
+                for (; j + 31 < channels; j += 32) {
+                    __m256 v0 = _mm256_loadu_ps(input + j);
+                    __m256 v1 = _mm256_loadu_ps(input + j + 8);
+                    __m256 v2 = _mm256_loadu_ps(input + j + 16);
+                    __m256 v3 = _mm256_loadu_ps(input + j + 24);
+                    sums0 = _mm256_fmadd_ps(v0, v0, sums0);
+                    sums1 = _mm256_fmadd_ps(v1, v1, sums1);
+                    sums0 = _mm256_fmadd_ps(v2, v2, sums0);
+                    sums1 = _mm256_fmadd_ps(v3, v3, sums1);
+                }
+                for (; j + 7 < channels; j += 8) {
+                    __m256 v = _mm256_loadu_ps(input + j);
+                    sums0 = _mm256_fmadd_ps(v, v, sums0);
+                }
+                {
+                    __m256 sums = _mm256_add_ps(sums0, sums1);
+                    __m128 lo = _mm256_castps256_ps128(sums);
+                    __m128 hi = _mm256_extractf128_ps(sums, 1);
+                    __m128 s = _mm_add_ps(lo, hi);
+                    s = _mm_hadd_ps(s, s);
+                    s = _mm_hadd_ps(s, s);
+                    mean = _mm_cvtss_f32(s);
+                }
+#elif defined(__aarch64__)
                 float32x4_t sums = vdupq_n_f32(0.0);
                 for (; j + 3 < channels; j += 4) {
                     float32x4_t vi = vld1q_f32(input + j);
@@ -5878,7 +5901,15 @@ ops += (long long)lines * inputDim * interDim * 2;
                 }
                 float scale = 1.0 / sqrt(mean / channels + eps);
                 j = 0;
-#ifdef __aarch64__
+#if defined(__AVX2__)
+                __m256 vscale = _mm256_set1_ps(scale);
+                for (; j + 7 < channels; j += 8) {
+                    __m256 vi = _mm256_loadu_ps(input + j);
+                    __m256 vw = _mm256_loadu_ps(weight + j);
+                    _mm256_storeu_ps(output + j,
+                        _mm256_mul_ps(_mm256_mul_ps(vi, vscale), vw));
+                }
+#elif defined(__aarch64__)
                 float32x4_t vscale = vdupq_n_f32(scale);
                 for (; j + 3 < channels; j += 4) {
                     float32x4_t vi = vld1q_f32(input + j);
@@ -5897,11 +5928,11 @@ ops += (long long)lines * inputDim * interDim * 2;
     };
 
     static void RunMultiThreadRMSNormFloat(float *output, float *input, float *weight, int outer, int channels, float eps, AliveThreadPool *pool) {
-        if (outer == 1) {
+        if (outer <= 1 || (long long)outer * channels < 65536) {
             (MultiThreadRMSNormFloatOp(output, input, weight, outer, channels, eps)).Run();
             return;
         }
-        int threadNum = pool->threads.size();
+        int threadNum = std::min((int)pool->threads.size(), outer);
         int per = outer / pool->threads.size();
         int cur = 0;
         std::vector<fastllm::MultiThreadRMSNormFloatOp*> ops;
@@ -5932,12 +5963,56 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int i = 0; i < outer; i++) {
                 float mean = 0.f;
                 int j = 0;
+#ifdef __AVX2__
+                {
+                    __m256 sums0 = _mm256_setzero_ps();
+                    __m256 sums1 = _mm256_setzero_ps();
+                    for (; j + 15 < channels; j += 16) {
+                        __m256 lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(input + j)));
+                        __m256 hi = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(input + j + 8)));
+                        sums0 = _mm256_fmadd_ps(lo, lo, sums0);
+                        sums1 = _mm256_fmadd_ps(hi, hi, sums1);
+                    }
+                    for (; j + 7 < channels; j += 8) {
+                        __m256 lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(input + j)));
+                        sums0 = _mm256_fmadd_ps(lo, lo, sums0);
+                    }
+                    __m256 sums = _mm256_add_ps(sums0, sums1);
+                    __m128 lo128 = _mm256_castps256_ps128(sums);
+                    __m128 hi128 = _mm256_extractf128_ps(sums, 1);
+                    __m128 s = _mm_add_ps(lo128, hi128);
+                    s = _mm_hadd_ps(s, s);
+                    s = _mm_hadd_ps(s, s);
+                    mean = _mm_cvtss_f32(s);
+                }
+#endif
                 for (; j < channels; j++) {
                     float x = fp16tofp32.dict[input[j]];
                     mean += x * x;
                 }
                 float scale = 1.0 / sqrt(mean / channels + eps);
                 j = 0;
+#ifdef __AVX2__
+                {
+                    __m256 vscale = _mm256_set1_ps(scale);
+                    for (; j + 15 < channels; j += 16) {
+                        __m256 lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(input + j)));
+                        __m256 hi = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(input + j + 8)));
+                        __m256 olo = _mm256_mul_ps(_mm256_mul_ps(lo, vscale), _mm256_loadu_ps(weight + j));
+                        __m256 ohi = _mm256_mul_ps(_mm256_mul_ps(hi, vscale), _mm256_loadu_ps(weight + j + 8));
+                        _mm_storeu_si128((__m128i*)(output + j),
+                            _mm256_cvtps_ph(olo, _MM_FROUND_TO_NEAREST_INT));
+                        _mm_storeu_si128((__m128i*)(output + j + 8),
+                            _mm256_cvtps_ph(ohi, _MM_FROUND_TO_NEAREST_INT));
+                    }
+                    for (; j + 7 < channels; j += 8) {
+                        __m256 lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(input + j)));
+                        __m256 olo = _mm256_mul_ps(_mm256_mul_ps(lo, vscale), _mm256_loadu_ps(weight + j));
+                        _mm_storeu_si128((__m128i*)(output + j),
+                            _mm256_cvtps_ph(olo, _MM_FROUND_TO_NEAREST_INT));
+                    }
+                }
+#endif
                 for (; j < channels; j++) {
                     output[j] = float_to_half(fp16tofp32.dict[input[j]] * scale * weight[j]);
                 }
@@ -5984,12 +6059,69 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int i = 0; i < outer; i++) {
                 float mean = 0.f;
                 int j = 0;
+#ifdef __AVX2__
+                {
+                    __m256 sums0 = _mm256_setzero_ps();
+                    __m256 sums1 = _mm256_setzero_ps();
+                    for (; j + 15 < channels; j += 16) {
+                        __m256i packed = _mm256_loadu_si256((const __m256i*)(input + j));
+                        __m256 lo = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(packed)), 16));
+                        __m256 hi = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(packed, 1)), 16));
+                        sums0 = _mm256_fmadd_ps(lo, lo, sums0);
+                        sums1 = _mm256_fmadd_ps(hi, hi, sums1);
+                    }
+                    for (; j + 7 < channels; j += 8) {
+                        __m128i packed = _mm_loadu_si128((const __m128i*)(input + j));
+                        __m256 lo = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
+                        sums0 = _mm256_fmadd_ps(lo, lo, sums0);
+                    }
+                    __m256 sums = _mm256_add_ps(sums0, sums1);
+                    __m128 lo128 = _mm256_castps256_ps128(sums);
+                    __m128 hi128 = _mm256_extractf128_ps(sums, 1);
+                    __m128 s = _mm_add_ps(lo128, hi128);
+                    s = _mm_hadd_ps(s, s);
+                    s = _mm_hadd_ps(s, s);
+                    mean = _mm_cvtss_f32(s);
+                }
+#endif
                 for (; j < channels; j++) {
                     float x = bf16tofp32.dict[input[j]];
                     mean += x * x;
                 }
                 float scale = 1.0 / sqrt(mean / channels + eps);
                 j = 0;
+#ifdef __AVX2__
+                {
+                    __m256 vscale = _mm256_set1_ps(scale);
+                    for (; j + 15 < channels; j += 16) {
+                        __m256i packed = _mm256_loadu_si256((const __m256i*)(input + j));
+                        __m256 lo = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(packed)), 16));
+                        __m256 hi = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(packed, 1)), 16));
+                        __m256 olo = _mm256_mul_ps(_mm256_mul_ps(lo, vscale), _mm256_loadu_ps(weight + j));
+                        __m256 ohi = _mm256_mul_ps(_mm256_mul_ps(hi, vscale), _mm256_loadu_ps(weight + j + 8));
+                        __m128i shiftedLo = _mm256_castsi256_si128(
+                            _mm256_srli_epi32(_mm256_castps_si256(olo), 16));
+                        __m128i shiftedHi = _mm256_extracti128_si256(
+                            _mm256_srli_epi32(_mm256_castps_si256(ohi), 16), 0);
+                        _mm_storeu_si128((__m128i*)(output + j), _mm_packus_epi32(shiftedLo, shiftedHi));
+                    }
+                    for (; j + 7 < channels; j += 8) {
+                        __m128i packed = _mm_loadu_si128((const __m128i*)(input + j));
+                        __m256 lo = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
+                        __m256 olo = _mm256_mul_ps(_mm256_mul_ps(lo, vscale), _mm256_loadu_ps(weight + j));
+                        __m256i shifted = _mm256_srli_epi32(_mm256_castps_si256(olo), 16);
+                        _mm_storeu_si128((__m128i*)(output + j), _mm_packus_epi32(
+                            _mm256_castsi256_si128(shifted),
+                            _mm256_extracti128_si256(shifted, 1)));
+                    }
+                }
+#endif
                 for (; j < channels; j++) {
                     float val = bf16tofp32.dict[input[j]] * scale * weight[j];
                     uint32_t tmp;

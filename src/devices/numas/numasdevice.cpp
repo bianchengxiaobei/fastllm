@@ -2538,6 +2538,8 @@ namespace fastllm {
                                 scratch + start,
                                 current + start, count);
                         } else {
+                            // 融合：bias 加法 + BF16 RNE 转换，单遍完成，
+                            // 不再回写 scratch 后二次遍历。
                             int column = start;
 #ifdef __AVX2__
                             for (; column + 7 < end; column += 8) {
@@ -2545,18 +2547,40 @@ namespace fastllm {
                                     scratch + column);
                                 __m256 b = _mm256_loadu_ps(
                                     finalizeBias + column);
-                                _mm256_storeu_ps(
-                                    scratch + column,
-                                    _mm256_add_ps(v, b));
+                                __m256i float_vec =
+                                    _mm256_castps_si256(
+                                        _mm256_add_ps(v, b));
+                                __m256i lsb = _mm256_and_si256(
+                                    _mm256_srli_epi32(
+                                        float_vec, 16),
+                                    _mm256_set1_epi32(1));
+                                __m256i rounding =
+                                    _mm256_add_epi32(
+                                        _mm256_set1_epi32(
+                                            0x7FFF), lsb);
+                                __m256i shifted = _mm256_srli_epi32(
+                                    _mm256_add_epi32(
+                                        float_vec, rounding), 16);
+                                __m128i lo =
+                                    _mm256_castsi256_si128(shifted);
+                                __m128i hi =
+                                    _mm256_extracti128_si256(
+                                        shifted, 1);
+                                _mm_storeu_si128(
+                                    (__m128i*)(current + column),
+                                    _mm_packus_epi32(lo, hi));
                             }
 #endif
                             for (; column < end; column++) {
-                                scratch[column] +=
+                                float v = scratch[column] +
                                     finalizeBias[column];
+                                uint32_t val;
+                                memcpy(&val, &v, sizeof(val));
+                                val += 0x7FFFu +
+                                    ((val >> 16) & 1u);
+                                current[column] =
+                                    (uint16_t)(val >> 16);
                             }
-                            Float32ToBFloat16(
-                                scratch + start,
-                                current + start, count);
                         }
                     }
                 } else if (finalizeBias != nullptr) {

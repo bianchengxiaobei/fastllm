@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -44,6 +45,49 @@ namespace fastllm {
         memcpy(&ret, &x, sizeof(float));
         return ret;
     }
+
+#if defined(__AVX2__)
+    // Cephes-style exp, ~1e-7 relative accuracy.  Matches expf quality and
+    // mirrors the float exp used by the CUDA compressed-KV kernel.
+    static inline __m256 DeepSeekV4Exp256(__m256 x) {
+        const __m256 expHi = _mm256_set1_ps(88.3762626647949f);
+        const __m256 expLo = _mm256_set1_ps(-88.3762626647949f);
+        const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+        const __m256 c1 = _mm256_set1_ps(0.693359375f);
+        const __m256 c2 = _mm256_set1_ps(-2.12194440e-4f);
+        const __m256 p0 = _mm256_set1_ps(1.9875691500E-4f);
+        const __m256 p1 = _mm256_set1_ps(1.3981999507E-3f);
+        const __m256 p2 = _mm256_set1_ps(8.3334519073E-3f);
+        const __m256 p3 = _mm256_set1_ps(4.1665795894E-2f);
+        const __m256 p4 = _mm256_set1_ps(1.6666665459E-1f);
+        const __m256 p5 = _mm256_set1_ps(5.0000001201E-1f);
+        const __m256 one = _mm256_set1_ps(1.0f);
+        const __m256 half = _mm256_set1_ps(0.5f);
+        x = _mm256_min_ps(x, expHi);
+        x = _mm256_max_ps(x, expLo);
+        __m256 fx = _mm256_fmadd_ps(x, log2e, half);
+        __m256 tmp = _mm256_floor_ps(fx);
+        __m256 mask = _mm256_cmp_ps(tmp, fx, _CMP_GT_OS);
+        fx = _mm256_sub_ps(tmp, _mm256_and_ps(mask, one));
+        tmp = _mm256_mul_ps(fx, c1);
+        __m256 z = _mm256_mul_ps(fx, c2);
+        x = _mm256_sub_ps(x, tmp);
+        x = _mm256_sub_ps(x, z);
+        z = _mm256_mul_ps(x, x);
+        __m256 y = p0;
+        y = _mm256_fmadd_ps(y, x, p1);
+        y = _mm256_fmadd_ps(y, x, p2);
+        y = _mm256_fmadd_ps(y, x, p3);
+        y = _mm256_fmadd_ps(y, x, p4);
+        y = _mm256_fmadd_ps(y, x, p5);
+        y = _mm256_fmadd_ps(y, z, x);
+        y = _mm256_add_ps(y, one);
+        __m256i imm = _mm256_cvttps_epi32(fx);
+        imm = _mm256_add_epi32(imm, _mm256_set1_epi32(0x7f));
+        imm = _mm256_slli_epi32(imm, 23);
+        return _mm256_mul_ps(y, _mm256_castsi256_ps(imm));
+    }
+#endif
 
     namespace {
         struct DeepSeekV4ActivationQuantizationTask : MultiThreadBaseOp {
@@ -122,7 +166,75 @@ namespace fastllm {
                     }
                     float scale = 1.0f / std::sqrt(
                         (float)(sumSquares / channels) + eps);
-                    for (int channel = 0; channel < channels; channel++) {
+                    int channel = 0;
+#if defined(__AVX2__)
+                    const __m256 vscale = _mm256_set1_ps(scale);
+                    const __m256i rneBias = _mm256_set1_epi32(0x7FFF);
+                    const bool aligned =
+                        ((uintptr_t)destination & 15u) == 0;
+                    for (; channel + 15 < channels; channel += 16) {
+                        __m256i packed = _mm256_loadu_si256(
+                            (const __m256i*)(source + channel));
+                        __m256 lo = _mm256_castsi256_ps(_mm256_slli_epi32(
+                            _mm256_cvtepu16_epi32(
+                                _mm256_castsi256_si128(packed)), 16));
+                        __m256 hi = _mm256_castsi256_ps(_mm256_slli_epi32(
+                            _mm256_cvtepu16_epi32(
+                                _mm256_extracti128_si256(packed, 1)), 16));
+                        __m256 olo = _mm256_mul_ps(_mm256_mul_ps(
+                            lo, vscale), _mm256_loadu_ps(weight + channel));
+                        __m256 ohi = _mm256_mul_ps(_mm256_mul_ps(
+                            hi, vscale), _mm256_loadu_ps(weight + channel + 8));
+                        __m256i blo = _mm256_castps_si256(olo);
+                        __m256i bhi = _mm256_castps_si256(ohi);
+                        __m256i slo = _mm256_srli_epi32(_mm256_add_epi32(
+                            blo, _mm256_add_epi32(
+                                rneBias, _mm256_and_si256(
+                                    _mm256_srli_epi32(blo, 16),
+                                    _mm256_set1_epi32(1)))), 16);
+                        __m256i shi = _mm256_srli_epi32(_mm256_add_epi32(
+                            bhi, _mm256_add_epi32(
+                                rneBias, _mm256_and_si256(
+                                    _mm256_srli_epi32(bhi, 16),
+                                    _mm256_set1_epi32(1)))), 16);
+                        __m128i packedOut = _mm_packus_epi32(
+                            _mm256_castsi256_si128(slo),
+                            _mm256_castsi256_si128(shi));
+                        if (aligned) {
+                            _mm_stream_si128(
+                                (__m128i*)(destination + channel), packedOut);
+                        } else {
+                            _mm_storeu_si128(
+                                (__m128i*)(destination + channel), packedOut);
+                        }
+                    }
+                    for (; channel + 7 < channels; channel += 8) {
+                        __m128i packed = _mm_loadu_si128(
+                            (const __m128i*)(source + channel));
+                        __m256 lo = _mm256_castsi256_ps(_mm256_slli_epi32(
+                            _mm256_cvtepu16_epi32(packed), 16));
+                        __m256 olo = _mm256_mul_ps(_mm256_mul_ps(
+                            lo, vscale), _mm256_loadu_ps(weight + channel));
+                        __m256i bits = _mm256_castps_si256(olo);
+                        __m256i shifted = _mm256_srli_epi32(
+                            _mm256_add_epi32(
+                                bits, _mm256_add_epi32(
+                                    rneBias, _mm256_and_si256(
+                                        _mm256_srli_epi32(bits, 16),
+                                        _mm256_set1_epi32(1)))), 16);
+                        __m128i packedOut = _mm_packus_epi32(
+                            _mm256_castsi256_si128(shifted),
+                            _mm256_extracti128_si256(shifted, 1));
+                        if (aligned) {
+                            _mm_stream_si128(
+                                (__m128i*)(destination + channel), packedOut);
+                        } else {
+                            _mm_storeu_si128(
+                                (__m128i*)(destination + channel), packedOut);
+                        }
+                    }
+#endif
+                    for (; channel < channels; channel++) {
                         float value =
                             BFloat16BitsToFloat32(source[channel]);
                         destination[channel] = Float32ToBFloat16RNEBits(
@@ -232,6 +344,19 @@ namespace fastllm {
                 _mm512_storeu_si512(
                     (__m512i*)(output + i), expanded);
             }
+#elif defined(__AVX2__)
+            for (; i + 16 <= count; i += 16) {
+                __m256i packed = _mm256_loadu_si256(
+                    (const __m256i*)(src + i));
+                __m256i lo = _mm256_slli_epi32(
+                    _mm256_cvtepu16_epi32(
+                        _mm256_castsi256_si128(packed)), 16);
+                __m256i hi = _mm256_slli_epi32(
+                    _mm256_cvtepu16_epi32(
+                        _mm256_extracti128_si256(packed, 1)), 16);
+                _mm256_storeu_si256((__m256i*)(output + i), lo);
+                _mm256_storeu_si256((__m256i*)(output + i + 8), hi);
+            }
 #endif
             for (; i < count; i++) {
                 output[i] = DeepSeekV4HcPreBFloat16ToFloat(src[i]);
@@ -272,7 +397,35 @@ namespace fastllm {
             }
         } else if (output.dataType == DataType::BFLOAT16) {
             uint16_t *dst = (uint16_t*)output.cpuData;
-            for (size_t i = 0; i < values.size(); i++) {
+            size_t i = 0;
+#if defined(__AVX2__)
+            const __m256i rneBias = _mm256_set1_epi32(0x7FFF);
+            for (; i + 16 <= values.size(); i += 16) {
+                __m256i b0 = _mm256_loadu_si256(
+                    (const __m256i*)(values.data() + i));
+                __m256i b1 = _mm256_loadu_si256(
+                    (const __m256i*)(values.data() + i + 8));
+                __m256i s0 = _mm256_srli_epi32(_mm256_add_epi32(
+                    b0, _mm256_add_epi32(
+                        rneBias, _mm256_and_si256(
+                            _mm256_srli_epi32(b0, 16),
+                            _mm256_set1_epi32(1)))), 16);
+                __m256i s1 = _mm256_srli_epi32(_mm256_add_epi32(
+                    b1, _mm256_add_epi32(
+                        rneBias, _mm256_and_si256(
+                            _mm256_srli_epi32(b1, 16),
+                            _mm256_set1_epi32(1)))), 16);
+                __m128i lo = _mm_packus_epi32(
+                    _mm256_castsi256_si128(s0),
+                    _mm256_extracti128_si256(s0, 1));
+                __m128i hi = _mm_packus_epi32(
+                    _mm256_castsi256_si128(s1),
+                    _mm256_extracti128_si256(s1, 1));
+                _mm_storeu_si128((__m128i*)(dst + i), lo);
+                _mm_storeu_si128((__m128i*)(dst + i + 8), hi);
+            }
+#endif
+            for (; i < values.size(); i++) {
                 dst[i] = DeepSeekV4HcPreFloatToBFloat16(values[i]);
             }
         } else {
@@ -328,6 +481,24 @@ namespace fastllm {
         }
     }
 
+#if defined(__SSE2__) || defined(_M_X64)
+    static inline void DeepSeekV4Rotate4Pairs(
+            const float *xy, __m128 c, __m128 s, float *out) {
+        // xy = [x0, y0, x1, y1, x2, y2, x3, y3]
+        // c  = [c0, c1, c2, c3], s = [s0, s1, s2, s3]
+        // out = [x0c0-y0s0, x0s0+y0c0, x1c1-y1s1, x1s1+y1c1,
+        //        x2c2-y2s2, x2s2+y2c2, x3c3-y3s3, x3s3+y3c3]
+        __m128 a = _mm_loadu_ps(xy);
+        __m128 b = _mm_loadu_ps(xy + 4);
+        __m128 x = _mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+        __m128 y = _mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1));
+        __m128 re = _mm_sub_ps(_mm_mul_ps(x, c), _mm_mul_ps(y, s));
+        __m128 im = _mm_add_ps(_mm_mul_ps(x, s), _mm_mul_ps(y, c));
+        _mm_storeu_ps(out, _mm_unpacklo_ps(re, im));
+        _mm_storeu_ps(out + 4, _mm_unpackhi_ps(re, im));
+    }
+#endif
+
     static void DeepSeekV4ApplyRotaryReference(std::vector<float> &x, const std::vector<int> &dims,
                                                int ropeDim, float base, int startPos,
                                                int originalSeqLen, float factor,
@@ -348,7 +519,17 @@ namespace fastllm {
                     uint64_t rowIndex = dims.size() == 4 ? (((uint64_t)b * seqlen + s) * heads + h)
                                                          : ((uint64_t)b * seqlen + s);
                     float *row = x.data() + rowIndex * dim + off;
-                    for (int i = 0; i < ropeDim; i += 2) {
+                    int i = 0;
+#if defined(__SSE2__) || defined(_M_X64)
+                    for (; i + 8 <= ropeDim; i += 8) {
+                        __m128 cv = _mm_loadu_ps(
+                            &cosValues[(uint64_t)s * pairs + i / 2]);
+                        __m128 sv = _mm_loadu_ps(
+                            &sinValues[(uint64_t)s * pairs + i / 2]);
+                        DeepSeekV4Rotate4Pairs(row + i, cv, sv, row + i);
+                    }
+#endif
+                    for (; i < ropeDim; i += 2) {
                         float c = cosValues[(uint64_t)s * pairs + i / 2];
                         float sn = sinValues[(uint64_t)s * pairs + i / 2];
                         float a = row[i], bb = row[i + 1];
@@ -358,6 +539,22 @@ namespace fastllm {
                 }
             }
         }
+    }
+
+    static inline float DeepSeekV4CeilPowerOfTwo(float value) {
+        // The caller clamps value to the normal-float range.  For a normal
+        // positive float, ceil(log2(value)) is its unbiased exponent plus one
+        // exactly when the mantissa is non-zero.  Constructing the result's
+        // exponent avoids libm log2/ceil/pow for every block.
+        uint32_t bits;
+        memcpy(&bits, &value, sizeof(bits));
+        uint32_t powerBits = bits & 0x7F800000U;
+        if ((bits & 0x007FFFFFU) != 0) {
+            powerBits += 0x00800000U;
+        }
+        float result;
+        memcpy(&result, &powerBits, sizeof(result));
+        return result;
     }
 
     static void DeepSeekV4ActQuantInplaceReference(std::vector<float> &x, const std::vector<int> &dims,
@@ -372,7 +569,7 @@ namespace fastllm {
                 for (int d = start; d < end; d++) {
                     amax = std::max(amax, std::fabs(row[d]));
                 }
-                float scale = std::pow(2.0f, std::ceil(std::log2(amax / 448.0f)));
+                float scale = DeepSeekV4CeilPowerOfTwo(amax / 448.0f);
                 for (int d = start; d < end; d++) {
                     float q = std::max(-448.0f, std::min(448.0f, row[d] / scale));
                     row[d] = DeepSeekV4HcPreBFloat16ToFloat(DeepSeekV4HcPreFloatToBFloat16(q)) * scale;
@@ -380,6 +577,135 @@ namespace fastllm {
             }
         }
     }
+
+    static inline void DeepSeekV4RotaryRow(
+            float *row, const float *cosRow, const float *sinRow,
+            int ropeDim, int off) {
+        float *r = row + off;
+        int i = 0;
+#if defined(__SSE2__) || defined(_M_X64)
+        for (; i + 8 <= ropeDim; i += 8) {
+            __m128 cv = _mm_loadu_ps(cosRow + i / 2);
+            __m128 sv = _mm_loadu_ps(sinRow + i / 2);
+            DeepSeekV4Rotate4Pairs(r + i, cv, sv, r + i);
+        }
+#endif
+        for (; i < ropeDim; i += 2) {
+            float c = cosRow[i / 2], sn = sinRow[i / 2];
+            float a = r[i], b = r[i + 1];
+            r[i] = a * c - b * sn;
+            r[i + 1] = a * sn + b * c;
+        }
+    }
+
+    static inline void DeepSeekV4QuantRow(
+            float *row, int quantDim, int blockSize) {
+#if defined(__AVX2__)
+        const __m256i absMask = _mm256_set1_epi32(0x7FFFFFFF);
+        const __m256 v448 = _mm256_set1_ps(448.0f);
+        const __m256 vn448 = _mm256_set1_ps(-448.0f);
+        const __m256i rneBias = _mm256_set1_epi32(0x7FFF);
+        const __m256i rneMask = _mm256_set1_epi32(1);
+        for (int start = 0; start < quantDim; start += blockSize) {
+            int end = std::min(start + blockSize, quantDim);
+            __m256 m0 = _mm256_set1_ps(1e-4f);
+            __m256 m1 = m0;
+            int d = start;
+            for (; d + 16 <= end; d += 16) {
+                __m256 a0 = _mm256_castsi256_ps(_mm256_and_si256(
+                    _mm256_castps_si256(_mm256_loadu_ps(row + d)),
+                    absMask));
+                __m256 a1 = _mm256_castsi256_ps(_mm256_and_si256(
+                    _mm256_castps_si256(_mm256_loadu_ps(row + d + 8)),
+                    absMask));
+                m0 = _mm256_max_ps(m0, a0);
+                m1 = _mm256_max_ps(m1, a1);
+            }
+            __m128 lo = _mm256_castps256_ps128(m0);
+            __m128 hi = _mm256_extractf128_ps(m0, 1);
+            __m128 mx = _mm_max_ps(lo, hi);
+            lo = _mm256_castps256_ps128(m1);
+            hi = _mm256_extractf128_ps(m1, 1);
+            mx = _mm_max_ps(mx, _mm_max_ps(lo, hi));
+            mx = _mm_max_ps(mx, _mm_shuffle_ps(
+                mx, mx, _MM_SHUFFLE(2, 3, 0, 1)));
+            mx = _mm_max_ps(mx, _mm_shuffle_ps(
+                mx, mx, _MM_SHUFFLE(1, 0, 3, 2)));
+            float amax = _mm_cvtss_f32(mx);
+            for (; d < end; d++) {
+                amax = std::max(amax, std::fabs(row[d]));
+            }
+            float scale = DeepSeekV4CeilPowerOfTwo(amax / 448.0f);
+            __m256 vscale = _mm256_set1_ps(scale);
+            __m256 invScale = _mm256_set1_ps(1.0f / scale);
+            for (d = start; d + 8 <= end; d += 8) {
+                __m256 q = _mm256_mul_ps(
+                    _mm256_loadu_ps(row + d), invScale);
+                q = _mm256_max_ps(vn448, _mm256_min_ps(v448, q));
+                __m256i bits = _mm256_castps_si256(q);
+                __m256i rounded = _mm256_srli_epi32(_mm256_add_epi32(
+                    bits, _mm256_add_epi32(
+                        rneBias, _mm256_and_si256(
+                            _mm256_srli_epi32(bits, 16), rneMask))), 16);
+                __m256 back = _mm256_castsi256_ps(
+                    _mm256_slli_epi32(rounded, 16));
+                _mm256_storeu_ps(
+                    row + d, _mm256_mul_ps(back, vscale));
+            }
+            for (; d < end; d++) {
+                float q = std::max(-448.0f, std::min(448.0f, row[d] / scale));
+                row[d] = DeepSeekV4HcPreBFloat16ToFloat(
+                    DeepSeekV4HcPreFloatToBFloat16(q)) * scale;
+            }
+        }
+#else
+        for (int start = 0; start < quantDim; start += blockSize) {
+            int end = std::min(start + blockSize, quantDim);
+            float amax = 1e-4f;
+            for (int d = start; d < end; d++) {
+                amax = std::max(amax, std::fabs(row[d]));
+            }
+            float scale = DeepSeekV4CeilPowerOfTwo(amax / 448.0f);
+            for (int d = start; d < end; d++) {
+                float q = std::max(-448.0f, std::min(448.0f, row[d] / scale));
+                row[d] = DeepSeekV4HcPreBFloat16ToFloat(
+                    DeepSeekV4HcPreFloatToBFloat16(q)) * scale;
+            }
+        }
+#endif
+    }
+
+    struct DeepSeekV4RotaryQuantRowsTask : MultiThreadBaseOp {
+        float *values;
+        const float *ropeCos;
+        const float *ropeSin;
+        int totalRows, seqlen, heads, dim, ropeDim, quantDim, blockSize;
+        int taskId, taskCount;
+
+        DeepSeekV4RotaryQuantRowsTask(
+            float *values, const float *ropeCos, const float *ropeSin,
+            int totalRows, int seqlen, int heads, int dim, int ropeDim,
+            int quantDim, int blockSize, int taskId, int taskCount
+        ) : values(values), ropeCos(ropeCos), ropeSin(ropeSin),
+            totalRows(totalRows), seqlen(seqlen), heads(heads), dim(dim),
+            ropeDim(ropeDim), quantDim(quantDim), blockSize(blockSize),
+            taskId(taskId), taskCount(taskCount) {}
+
+        void Run() override {
+            int off = dim - ropeDim;
+            int pairs = ropeDim / 2;
+            int rowBegin = (int)((int64_t)totalRows * taskId / taskCount);
+            int rowEnd = (int)((int64_t)totalRows * (taskId + 1) / taskCount);
+            for (int r = rowBegin; r < rowEnd; r++) {
+                int seq = (r / heads) % seqlen;
+                float *row = values + (uint64_t)r * dim;
+                DeepSeekV4RotaryRow(row, ropeCos + (uint64_t)seq * pairs,
+                                    ropeSin + (uint64_t)seq * pairs,
+                                    ropeDim, off);
+                DeepSeekV4QuantRow(row, quantDim, blockSize);
+            }
+        }
+    };
 
     static inline float DeepSeekV4RoundBFloat16(float value) {
         return DeepSeekV4HcPreBFloat16ToFloat(
@@ -401,22 +727,6 @@ namespace fastllm {
         for (int d = 0; d < dim; d++) {
             row[d] = DeepSeekV4RoundBFloat16(row[d] * scale);
         }
-    }
-
-    static inline float DeepSeekV4CeilPowerOfTwo(float value) {
-        // The caller clamps value to the normal-float range.  For a normal
-        // positive float, ceil(log2(value)) is its unbiased exponent plus one
-        // exactly when the mantissa is non-zero.  Constructing the result's
-        // exponent avoids libm log2/ceil/pow for every 32-value FP4 block.
-        uint32_t bits;
-        memcpy(&bits, &value, sizeof(bits));
-        uint32_t powerBits = bits & 0x7F800000U;
-        if ((bits & 0x007FFFFFU) != 0) {
-            powerBits += 0x00800000U;
-        }
-        float result;
-        memcpy(&result, &powerBits, sizeof(result));
-        return result;
     }
 
     static inline float DeepSeekV4QuantizeDequantizeFp4(float value,
@@ -652,6 +962,12 @@ namespace fastllm {
             int rowEnd = (int)((int64_t)totalRows * (taskId + 1) / taskCount);
             int ropeOffset = dim - ropeDim;
             int ropePairs = ropeDim / 2;
+#if defined(__AVX2__)
+            const int simdChunk = 16;
+            const __m256i rneBias = _mm256_set1_epi32(0x7FFF);
+            const __m256i rneMask = _mm256_set1_epi32(1);
+            float xy[8];
+#endif
             for (int rowIdx = rowBegin; rowIdx < rowEnd; rowIdx++) {
                 uint16_t *row = values + (uint64_t)rowIdx * dim;
                 double squareSum = 0.0;
@@ -662,6 +978,87 @@ namespace fastllm {
                 float scale = 1.0f /
                     std::sqrt((float)(squareSum / dim) + eps);
 
+#if defined(__AVX2__)
+                const __m256 vscale = _mm256_set1_ps(scale);
+                int d = 0;
+                for (; d + simdChunk <= ropeOffset; d += simdChunk) {
+                    __m256i packed = _mm256_loadu_si256(
+                        (const __m256i*)(row + d));
+                    __m256 lo = _mm256_castsi256_ps(_mm256_slli_epi32(
+                        _mm256_cvtepu16_epi32(
+                            _mm256_castsi256_si128(packed)), 16));
+                    __m256 hi = _mm256_castsi256_ps(_mm256_slli_epi32(
+                        _mm256_cvtepu16_epi32(
+                            _mm256_extracti128_si256(packed, 1)), 16));
+                    __m256i blo = _mm256_castps_si256(
+                        _mm256_mul_ps(lo, vscale));
+                    __m256i bhi = _mm256_castps_si256(
+                        _mm256_mul_ps(hi, vscale));
+                    __m256i slo = _mm256_srli_epi32(_mm256_add_epi32(
+                        blo, _mm256_add_epi32(
+                            rneBias, _mm256_and_si256(
+                                _mm256_srli_epi32(blo, 16), rneMask))), 16);
+                    __m256i shi = _mm256_srli_epi32(_mm256_add_epi32(
+                        bhi, _mm256_add_epi32(
+                            rneBias, _mm256_and_si256(
+                                _mm256_srli_epi32(bhi, 16), rneMask))), 16);
+                    __m128i outLo = _mm_packus_epi32(
+                        _mm256_castsi256_si128(slo),
+                        _mm256_extracti128_si256(slo, 1));
+                    __m128i outHi = _mm_packus_epi32(
+                        _mm256_castsi256_si128(shi),
+                        _mm256_extracti128_si256(shi, 1));
+                    _mm_storeu_si128((__m128i*)(row + d), outLo);
+                    _mm_storeu_si128((__m128i*)(row + d + 8), outHi);
+                }
+                for (; d < ropeOffset; d++) {
+                    row[d] = DeepSeekV4HcPreFloatToBFloat16(
+                        DeepSeekV4HcPreBFloat16ToFloat(row[d]) * scale);
+                }
+
+                int sequence = (rowIdx / heads) % seqlen;
+                const float *cosRow =
+                    ropeCos + (uint64_t)sequence * ropePairs;
+                const float *sinRow =
+                    ropeSin + (uint64_t)sequence * ropePairs;
+                int pair = 0;
+                for (; pair + 4 <= ropePairs; pair += 4) {
+                    int dd = ropeOffset + pair * 2;
+                    __m128i packed = _mm_loadu_si128(
+                        (const __m128i*)(row + dd));
+                    __m256 f = _mm256_castsi256_ps(_mm256_slli_epi32(
+                        _mm256_cvtepu16_epi32(packed), 16));
+                    f = _mm256_mul_ps(f, vscale);
+                    _mm256_storeu_ps(xy, f);
+                    DeepSeekV4Rotate4Pairs(
+                        xy, _mm_loadu_ps(cosRow + pair),
+                        _mm_loadu_ps(sinRow + pair), xy);
+                    __m256i bits = _mm256_castps_si256(
+                        _mm256_loadu_ps(xy));
+                    __m256i shifted = _mm256_srli_epi32(_mm256_add_epi32(
+                        bits, _mm256_add_epi32(
+                            rneBias, _mm256_and_si256(
+                                _mm256_srli_epi32(bits, 16), rneMask))), 16);
+                    __m128i out = _mm_packus_epi32(
+                        _mm256_castsi256_si128(shifted),
+                        _mm256_extracti128_si256(shifted, 1));
+                    _mm_storeu_si128((__m128i*)(row + dd), out);
+                }
+                for (; pair < ropePairs; pair++) {
+                    int dd = ropeOffset + pair * 2;
+                    float a =
+                        DeepSeekV4HcPreBFloat16ToFloat(row[dd]) * scale;
+                    float b =
+                        DeepSeekV4HcPreBFloat16ToFloat(row[dd + 1]) * scale;
+                    float rotatedA =
+                        a * cosRow[pair] - b * sinRow[pair];
+                    float rotatedB =
+                        a * sinRow[pair] + b * cosRow[pair];
+                    row[dd] = DeepSeekV4HcPreFloatToBFloat16(rotatedA);
+                    row[dd + 1] =
+                        DeepSeekV4HcPreFloatToBFloat16(rotatedB);
+                }
+#else
                 for (int d = 0; d < ropeOffset; d++) {
                     float value =
                         DeepSeekV4HcPreBFloat16ToFloat(row[d]) * scale;
@@ -687,6 +1084,7 @@ namespace fastllm {
                     row[d + 1] =
                         DeepSeekV4HcPreFloatToBFloat16(rotatedB);
                 }
+#endif
             }
         }
     };
@@ -726,6 +1124,8 @@ namespace fastllm {
 
     void CpuScaleQRatoryOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        const bool profile = std::getenv("FASTLLM_PROFILE_ROPE") != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
         Data &q = *(datas.find("q")->second);
         int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
         int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
@@ -753,6 +1153,12 @@ namespace fastllm {
             DeepSeekV4ScaleQRatoryBFloat16Rows(
                 (uint16_t*)q.cpuData, bsz * seqlen * heads, seqlen, heads,
                 dim, ropeDim, eps, ropeCos, ropeSin);
+            if (profile) {
+                const auto t1 = std::chrono::steady_clock::now();
+                printf("[fastllm-profile-rope] ScaleQRatory(bf16) bsz=%d seqlen=%d heads=%d dim=%d seconds=%.6f\n",
+                       bsz, seqlen, heads, dim,
+                       std::chrono::duration<double>(t1 - t0).count());
+            }
             return;
         }
 
@@ -776,10 +1182,18 @@ namespace fastllm {
         q.dataType = DataType::BFLOAT16;
         q.Resize({bsz, seqlen, heads, dim});
         DeepSeekV4HcPreWriteFloatData(qv, q);
+        if (profile) {
+            const auto t1 = std::chrono::steady_clock::now();
+            printf("[fastllm-profile-rope] ScaleQRatory bsz=%d seqlen=%d heads=%d dim=%d seconds=%.6f\n",
+                   bsz, seqlen, heads, dim,
+                   std::chrono::duration<double>(t1 - t0).count());
+        }
     }
 
     void CpuDeepSeekV4RotaryQuantOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        const bool profile = std::getenv("FASTLLM_PROFILE_ROPE") != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
         Data &input = *(datas.find("input")->second);
         int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
         int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
@@ -802,13 +1216,55 @@ namespace fastllm {
 
         std::vector<int> dims = input.dims;
         auto values = DeepSeekV4HcPreReadFloatData(input);
-        DeepSeekV4ApplyRotaryReference(values, dims, ropeDim, ropeBase, startPos,
-                                       originalSeqLen, ropeFactor, betaFast, betaSlow, posStep);
-        DeepSeekV4ActQuantInplaceReference(values, dims, quantDim, blockSize);
+
+        int bsz = dims[0], seqlen = dims[1];
+        int heads = dims.size() == 4 ? dims[2] : 1;
+        int totalRows = bsz * seqlen * heads;
+        std::vector<float> ropeCos, ropeSin;
+        DeepSeekV4BuildRotaryCache(
+            seqlen, ropeDim, ropeBase, startPos, originalSeqLen,
+            ropeFactor, betaFast, betaSlow, posStep, false, ropeCos, ropeSin);
+
+        if (totalRows <= 1 || quantDim <= 0) {
+            DeepSeekV4RotaryQuantRowsTask(
+                values.data(), ropeCos.data(), ropeSin.data(), totalRows,
+                seqlen, heads, dim, ropeDim, quantDim, blockSize, 0, 1).Run();
+        } else {
+            AliveThreadPool *pool = GetAlivePool();
+            int firstThread = pool->curActivateThreadInterval.first;
+            int availableThreads = std::max(
+                1, pool->curActivateThreadInterval.second - firstThread);
+            int threadCount = std::min(availableThreads, totalRows);
+            if (threadCount <= 1 || totalRows < 64) {
+                DeepSeekV4RotaryQuantRowsTask(
+                    values.data(), ropeCos.data(), ropeSin.data(), totalRows,
+                    seqlen, heads, dim, ropeDim, quantDim, blockSize, 0, 1).Run();
+            } else {
+                std::vector<DeepSeekV4RotaryQuantRowsTask*> tasks;
+                tasks.reserve(threadCount);
+                for (int thread = 0; thread < threadCount; thread++) {
+                    tasks.push_back(new DeepSeekV4RotaryQuantRowsTask(
+                        values.data(), ropeCos.data(), ropeSin.data(), totalRows,
+                        seqlen, heads, dim, ropeDim, quantDim, blockSize,
+                        thread, threadCount));
+                    pool->PushOp(firstThread + thread, tasks.back());
+                }
+                for (int thread = 0; thread < threadCount; thread++) {
+                    pool->Wait(firstThread + thread);
+                    delete tasks[thread];
+                }
+            }
+        }
 
         input.dataType = DataType::BFLOAT16;
         input.Resize(dims);
         DeepSeekV4HcPreWriteFloatData(values, input);
+        if (profile) {
+            const auto t1 = std::chrono::steady_clock::now();
+            printf("[fastllm-profile-rope] RotaryQuant dims=%d seqlen=%d dim=%d seconds=%.6f\n",
+                   (int)dims.size(), dims.size() >= 2 ? dims[dims.size() - 2] : 0, dim,
+                   std::chrono::duration<double>(t1 - t0).count());
+        }
     }
 
     static inline double DeepSeekV4SparseAttentionDot(
@@ -2884,31 +3340,106 @@ namespace fastllm {
                     for (int r = 0; r < compressRatio; r++) {
                         int tok = (block - 1) * compressRatio + r;
                         uint64_t off = RawOffset(b, tok, d);
-                        double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + d]) - mx);
+                        float e = std::exp(score[off] + ape[(uint64_t)r * wideDim + d] - mx);
                         sum += e;
-                        value += e * kv[off];
+                        value += (double)e * kv[off];
                     }
                 }
                 for (int r = 0; r < compressRatio; r++) {
                     int tok = block * compressRatio + r;
                     uint64_t off = RawOffset(b, tok, headDim + d);
-                    double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + headDim + d]) - mx);
+                    float e = std::exp(score[off] + ape[(uint64_t)r * wideDim + headDim + d] - mx);
                     sum += e;
-                    value += e * kv[off];
+                    value += (double)e * kv[off];
                 }
             } else {
                 for (int r = 0; r < compressRatio; r++) {
                     int tok = block * compressRatio + r;
                     uint64_t off = RawOffset(b, tok, d);
-                    double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + d]) - mx);
+                    float e = std::exp(score[off] + ape[(uint64_t)r * wideDim + d] - mx);
                     sum += e;
-                    value += e * kv[off];
+                    value += (double)e * kv[off];
                 }
             }
         }
 
         void Run() override {
             (void)bsz;
+#if defined(__AVX2__)
+            const __m256 negInf = _mm256_set1_ps(-FLT_MAX);
+            const __m256 denomFloor = _mm256_set1_ps(1e-30f);
+            uint64_t idx = st;
+            while (idx < end) {
+                int d = (int)(idx % headDim);
+                uint64_t tmp = idx / headDim;
+                int localBlock = (int)(tmp % blockCount);
+                int b = (int)(tmp / blockCount);
+                int block = blockStart + localBlock;
+                if (d + 8 <= headDim && idx + 8 <= end) {
+                    // Fuse the old scan + accumulate split: gather each
+                    // score+ape term once, then max and exp-accumulate from the
+                    // cached vectors instead of re-gathering.
+                    __m256 svec[256];
+                    const float *kvp[256];
+                    int n = 0;
+                    if (overlap) {
+                        if (block > 0) {
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = (block - 1) * compressRatio + r;
+                                uint64_t off = RawOffset(b, tok, d);
+                                kvp[n] = kv + off;
+                                svec[n] = _mm256_add_ps(
+                                    _mm256_loadu_ps(score + off),
+                                    _mm256_loadu_ps(ape + (uint64_t)r * wideDim + d));
+                                n++;
+                            }
+                        }
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = block * compressRatio + r;
+                            uint64_t off = RawOffset(b, tok, headDim + d);
+                            kvp[n] = kv + off;
+                            svec[n] = _mm256_add_ps(
+                                _mm256_loadu_ps(score + off),
+                                _mm256_loadu_ps(ape + (uint64_t)r * wideDim + headDim + d));
+                            n++;
+                        }
+                    } else {
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = block * compressRatio + r;
+                            uint64_t off = RawOffset(b, tok, d);
+                            kvp[n] = kv + off;
+                            svec[n] = _mm256_add_ps(
+                                _mm256_loadu_ps(score + off),
+                                _mm256_loadu_ps(ape + (uint64_t)r * wideDim + d));
+                            n++;
+                        }
+                    }
+                    __m256 mx = negInf;
+                    for (int i = 0; i < n; i++) {
+                        mx = _mm256_max_ps(mx, svec[i]);
+                    }
+                    __m256 sum = _mm256_setzero_ps();
+                    __m256 value = _mm256_setzero_ps();
+                    for (int i = 0; i < n; i++) {
+                        __m256 e = DeepSeekV4Exp256(_mm256_sub_ps(svec[i], mx));
+                        sum = _mm256_add_ps(sum, e);
+                        value = _mm256_fmadd_ps(e, _mm256_loadu_ps(kvp[i]), value);
+                    }
+                    _mm256_storeu_ps(
+                        compressed + ((uint64_t)b * blockCount + localBlock) * headDim + d,
+                        _mm256_div_ps(value, _mm256_max_ps(sum, denomFloor)));
+                    idx += 8;
+                    continue;
+                }
+                float mx = -FLT_MAX;
+                ScanTerms(b, block, d, mx);
+                double sum = 0.0, value = 0.0;
+                AccumulateTerms(b, block, d, mx, sum, value);
+                compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] =
+                    (float)(value / std::max(sum, 1e-30));
+                idx++;
+            }
+#else
             for (uint64_t idx = st; idx < end; idx++) {
                 int d = (int)(idx % headDim);
                 uint64_t tmp = idx / headDim;
@@ -2924,6 +3455,7 @@ namespace fastllm {
                 compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] =
                     (float)(value / std::max(sum, 1e-30));
             }
+#endif
         }
     };
 
@@ -3113,7 +3645,44 @@ namespace fastllm {
               flatDim(flatDim), mixSt(mixSt), mixEnd(mixEnd) {}
 
         void Run() override {
-            for (int m = mixSt; m < mixEnd; m++) {
+            int m = mixSt;
+#if defined(__AVX2__) && defined(__FMA__)
+            constexpr int RB = 8;
+            for (; m + RB <= mixEnd; m += RB) {
+                __m256 acc[RB];
+                const float *w[RB];
+                for (int r = 0; r < RB; r++) {
+                    acc[r] = _mm256_setzero_ps();
+                    w[r] = fn + (uint64_t)(m + r) * flatDim;
+                }
+                float tail[RB];
+                for (int r = 0; r < RB; r++) {
+                    tail[r] = 0.0f;
+                }
+                int k = 0;
+                for (; k + 8 <= flatDim; k += 8) {
+                    __m256 xv = _mm256_loadu_ps(xrow + k);
+                    for (int r = 0; r < RB; r++) {
+                        acc[r] = _mm256_fmadd_ps(
+                            xv, _mm256_loadu_ps(w[r] + k), acc[r]);
+                    }
+                }
+                for (; k < flatDim; k++) {
+                    for (int r = 0; r < RB; r++) {
+                        tail[r] += xrow[k] * w[r][k];
+                    }
+                }
+                for (int r = 0; r < RB; r++) {
+                    __m128 low = _mm256_castps256_ps128(acc[r]);
+                    __m128 high = _mm256_extractf128_ps(acc[r], 1);
+                    __m128 halves = _mm_add_ps(low, high);
+                    halves = _mm_hadd_ps(halves, halves);
+                    halves = _mm_hadd_ps(halves, halves);
+                    mixes[m + r] = (_mm_cvtss_f32(halves) + tail[r]) * rsqrt;
+                }
+            }
+#endif
+            for (; m < mixEnd; m++) {
                 double v = 0.0;
                 const float *w = fn + (uint64_t)m * flatDim;
                 for (int k = 0; k < flatDim; k++) {
@@ -3126,13 +3695,22 @@ namespace fastllm {
 
     static void DeepSeekV4HcPreComputeDotsCpu(const float *xrow, const float *fn, float *mixes,
                                               float rsqrt, int flatDim, int mixHc) {
+        constexpr int RB = 8;
+        // 单 token 总量只有 mixHc * flatDim 次 MAC，拆分线程的调度开销可能
+        // 超过计算本身；规模太小时直接在当前线程用 AVX2 一次跑完。
+        const uint64_t totalMacs = (uint64_t)mixHc * flatDim;
+        const uint64_t singleThreadMacs = 1 << 20;
+        if (totalMacs <= singleThreadMacs) {
+            DeepSeekV4HcPreDotsOp op(xrow, fn, mixes, rsqrt, flatDim, 0, mixHc);
+            op.Run();
+            return;
+        }
         auto *pool = GetAlivePool();
         int firstThread = pool->curActivateThreadInterval.first;
         int availableThreads = std::max(
             1, pool->curActivateThreadInterval.second - firstThread);
-        constexpr int decodeDotTasks = 12;
         int threadNum = std::min(
-            availableThreads, std::min(mixHc, decodeDotTasks));
+            availableThreads, std::max(1, mixHc / RB));
         std::vector<DeepSeekV4HcPreDotsOp*> ops;
         ops.reserve(threadNum);
         int per = (mixHc + threadNum - 1) / threadNum;
@@ -3484,12 +4062,42 @@ namespace fastllm {
             }
             memcpy(comb + (uint64_t)t * hcMult * hcMult, combLocal.data(),
                    hcMult * hcMult * sizeof(float));
-            for (int d = 0; d < dim; d++) {
+            float *yrow = y.data() + (uint64_t)t * dim;
+#if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__FMA__)
+            int d = 0;
+            for (; d + 8 <= dim; d += 8) {
+                __m512d acc = _mm512_setzero_pd();
+                const float *xp = xrow + d;
+                for (int h = 0; h < hcMult; h++) {
+                    acc = _mm512_fmadd_pd(
+                        _mm512_set1_pd((double)pre[h]),
+                        _mm512_cvtps_pd(_mm256_loadu_ps(xp + (uint64_t)h * dim)),
+                        acc);
+                }
+                _mm256_storeu_ps(yrow + d, _mm512_cvtpd_ps(acc));
+            }
+#elif defined(__AVX2__) && defined(__FMA__)
+            int d = 0;
+            for (; d + 4 <= dim; d += 4) {
+                __m256d acc = _mm256_setzero_pd();
+                const float *xp = xrow + d;
+                for (int h = 0; h < hcMult; h++) {
+                    acc = _mm256_fmadd_pd(
+                        _mm256_set1_pd((double)pre[h]),
+                        _mm256_cvtps_pd(_mm_loadu_ps(xp + (uint64_t)h * dim)),
+                        acc);
+                }
+                _mm_storeu_ps(yrow + d, _mm256_cvtpd_ps(acc));
+            }
+#else
+            int d = 0;
+#endif
+            for (; d < dim; d++) {
                 double v = 0.0;
                 for (int h = 0; h < hcMult; h++) {
                     v += (double)pre[h] * xrow[(uint64_t)h * dim + d];
                 }
-                y[(uint64_t)t * dim + d] = (float)v;
+                yrow[d] = (float)v;
             }
         }
         DeepSeekV4HcPreWriteFloatData(y, output);
