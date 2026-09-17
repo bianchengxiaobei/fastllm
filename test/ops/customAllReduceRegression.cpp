@@ -1,4 +1,5 @@
 #include "fastllm.h"
+#include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 
 #include <cuda_bf16.h>
@@ -20,6 +21,7 @@ namespace {
 constexpr size_t kSmallBytes = 16 * 1024;
 constexpr size_t kLargeBytes = 1024 * 1024;
 constexpr size_t kDecodeB8Bytes = 80 * 1024;
+constexpr size_t kCaptureMissBytes = 40 * 1024;
 constexpr int kGraphCollectivesPerReplay = 32;
 constexpr int kGraphReplayIterations = 16;
 
@@ -418,6 +420,226 @@ bool RunGraphFusedRegression(const std::vector<int> &devices,
     return ok;
 }
 
+template <typename T>
+bool RunGraphInPlaceOrderingRegression(const std::vector<int> &devices,
+                                       int dataType,
+                                       const char *typeName,
+                                       bool &tested) {
+    tested = false;
+    if (devices.size() != 2) {
+        return true;
+    }
+    const int count = (int)(kSmallBytes / sizeof(T));
+    if (!FastllmCudaCustomAllReduceCanRun(count, dataType, devices[0])) {
+        return true;
+    }
+    tested = true;
+
+    std::vector<void *> inputs(2, nullptr);
+    std::vector<std::vector<T> > hostInputs(2);
+    std::vector<cudaGraphExec_t> graphExecs(2, nullptr);
+    bool ok = true;
+    for (int rank = 0; rank < 2; ++rank) {
+        hostInputs[rank].assign(
+            count, HostFromFloat<T>((float)(rank + 1) * 1.0e-3f));
+        ok = ok && CheckCuda(cudaSetDevice(devices[rank]), "cudaSetDevice") &&
+             CheckCuda(cudaMalloc(&inputs[rank], sizeof(T) * count),
+                       "cudaMalloc(graph in-place input)");
+    }
+    if (ok) {
+        ok = CopyInputs(devices, inputs, hostInputs, count);
+    }
+
+    // Register the peer tuple outside capture, then restore the inputs because
+    // the registration warmup performs a real in-place reduction.
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            return FastllmCudaCustomAllReduce(
+                inputs[rank], inputs[rank], count,
+                dataType, devices[rank]);
+        });
+    }
+    if (ok) {
+        ok = CopyInputs(devices, inputs, hostInputs, count);
+    }
+
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            cudaGraph_t graph = nullptr;
+            bool localOk = CheckCuda(cudaStreamBeginCapture(
+                cudaStreamPerThread, cudaStreamCaptureModeRelaxed),
+                "cudaStreamBeginCapture(in-place)") &&
+                FastllmCudaCustomAllReduce(
+                    inputs[rank], inputs[rank], count,
+                    dataType, devices[rank]) &&
+                CheckCuda(cudaStreamEndCapture(cudaStreamPerThread, &graph),
+                          "cudaStreamEndCapture(in-place)") &&
+                graph != nullptr;
+            if (localOk) {
+                localOk = CheckCuda(cudaGraphInstantiate(
+                    &graphExecs[rank], graph, 0),
+                    "cudaGraphInstantiate(in-place)");
+            }
+            if (graph != nullptr) {
+                cudaGraphDestroy(graph);
+            }
+            return localOk;
+        });
+    }
+
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            // Let rank 0 enqueue first. A correct system-scope final barrier
+            // still prevents its next replay from overwriting data that rank
+            // 1 has not finished reading from the previous replay.
+            if (rank == 1) {
+                for (int spin = 0; spin < 4096; ++spin) {
+                    std::this_thread::yield();
+                }
+            }
+            for (int iteration = 0;
+                 iteration < kGraphReplayIterations; ++iteration) {
+                if (!CheckCuda(cudaGraphLaunch(
+                        graphExecs[rank], cudaStreamPerThread),
+                        "cudaGraphLaunch(in-place)")) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+
+    T expectedValue = HostAddRounded(hostInputs[0][0], hostInputs[1][0]);
+    for (int iteration = 1; iteration < kGraphReplayIterations; ++iteration) {
+        expectedValue = HostAddRounded(expectedValue, expectedValue);
+    }
+    if (ok) {
+        ok = CopyAndCheck(
+            devices, inputs, std::vector<T>(count, expectedValue), count,
+            std::string(typeName) +
+                " CUDA Graph in-place ordering");
+    }
+
+    for (int rank = 0; rank < 2; ++rank) {
+        if (graphExecs[rank] != nullptr) {
+            cudaSetDevice(devices[rank]);
+            cudaGraphExecDestroy(graphExecs[rank]);
+        }
+    }
+    std::vector<void *> unusedOutputs(devices.size(), nullptr);
+    FreeBuffers(devices, inputs, unusedOutputs);
+    return ok;
+}
+
+bool CaptureAllReduceGraph(void *input, void *output, int count,
+                           int dataType, int device,
+                           cudaGraphExec_t &graphExec) {
+    FastllmCudaClearThreadError();
+    cudaGraph_t graph = nullptr;
+    if (!CheckCuda(cudaStreamBeginCapture(
+            cudaStreamPerThread, cudaStreamCaptureModeRelaxed),
+            "cudaStreamBeginCapture(capture-miss)")) {
+        return false;
+    }
+
+    FastllmNcclAllReduce(input, output, count, dataType, device);
+    const bool bodyOk = !FastllmCudaGetThreadError();
+    const bool endOk = CheckCuda(cudaStreamEndCapture(
+        cudaStreamPerThread, &graph),
+        "cudaStreamEndCapture(capture-miss)");
+    bool ok = bodyOk && endOk && graph != nullptr;
+    if (ok) {
+        ok = CheckCuda(cudaGraphInstantiate(&graphExec, graph, 0),
+                       "cudaGraphInstantiate(capture-miss)");
+    }
+    if (graph != nullptr) {
+        cudaGraphDestroy(graph);
+    }
+    return ok;
+}
+
+template <typename T>
+bool RunGraphCaptureMissFallbackRegression(
+        const std::vector<int> &devices, int dataType,
+        const char *typeName, bool &tested) {
+    tested = false;
+    const int ranks = (int)devices.size();
+    const int count = (int)(kCaptureMissBytes / sizeof(T));
+    if (!FastllmCudaCustomAllReduceCanRun(
+            count, dataType, devices[0])) {
+        return true;
+    }
+    tested = true;
+
+    std::vector<void *> inputs(ranks, nullptr);
+    std::vector<void *> outputs(ranks, nullptr);
+    std::vector<std::vector<T> > hostInputs(ranks);
+    std::vector<T> expected(count);
+    std::vector<cudaGraphExec_t> graphExecs(ranks, nullptr);
+    bool ok = true;
+
+    for (int rank = 0; rank < ranks; ++rank) {
+        hostInputs[rank].resize(count);
+        for (int index = 0; index < count; ++index) {
+            hostInputs[rank][index] = HostFromFloat<T>(
+                (float)(rank + 1) + (float)(index % 7) * 0.25f);
+        }
+    }
+    for (int index = 0; index < count; ++index) {
+        float sum = 0.0f;
+        for (int rank = 0; rank < ranks; ++rank) {
+            sum += HostToFloat(hostInputs[rank][index]);
+        }
+        expected[index] = HostFromFloat<T>(sum);
+    }
+
+    for (int rank = 0; rank < ranks && ok; ++rank) {
+        ok = CheckCuda(cudaSetDevice(devices[rank]), "cudaSetDevice") &&
+             CheckCuda(cudaMalloc(&inputs[rank], sizeof(T) * count),
+                       "cudaMalloc(capture-miss input)") &&
+             CheckCuda(cudaMalloc(&outputs[rank], sizeof(T) * count),
+                       "cudaMalloc(capture-miss output)");
+    }
+    if (ok) {
+        ok = CopyInputs(devices, inputs, hostInputs, count);
+    }
+
+    // Deliberately skip an eager custom-all-reduce warmup for this pointer
+    // tuple. The first lookup therefore happens during capture and must let
+    // FastllmNcclAllReduce record its NCCL fallback without setting the graph
+    // thread error.
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            return CaptureAllReduceGraph(
+                inputs[rank], outputs[rank], count, dataType,
+                devices[rank], graphExecs[rank]);
+        });
+    }
+
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            return CheckCuda(cudaGraphLaunch(
+                graphExecs[rank], cudaStreamPerThread),
+                "cudaGraphLaunch(capture-miss)");
+        });
+    }
+    if (ok) {
+        ok = CopyAndCheck(
+            devices, outputs, expected, count,
+            std::string(typeName) +
+                " CUDA Graph registration-miss fallback");
+    }
+
+    for (int rank = 0; rank < ranks; ++rank) {
+        if (graphExecs[rank] != nullptr) {
+            cudaSetDevice(devices[rank]);
+            cudaGraphExecDestroy(graphExecs[rank]);
+        }
+    }
+    FreeBuffers(devices, inputs, outputs);
+    return ok;
+}
+
 bool SupportedRankCount(int ranks) {
     return ranks == 2 || ranks == 4 || ranks == 6 || ranks == 8;
 }
@@ -545,6 +767,13 @@ int main() {
         return 1;
     }
 
+    bool graphCaptureMissFallbackTested = false;
+    if (!RunGraphCaptureMissFallbackRegression<half>(
+            devices, (int)fastllm::DataType::FLOAT16, "FP16",
+            graphCaptureMissFallbackTested)) {
+        return 1;
+    }
+
     int selectedPaths = 0;
     int testedPaths = 0;
     if (!RunAllSelectedPaths(devices, selectedPaths, testedPaths)) {
@@ -552,12 +781,16 @@ int main() {
     }
     float fp16B8GraphFusedUs = 0.0f;
     float bf16B8GraphFusedUs = 0.0f;
+    bool graphInPlaceOrderingTested = false;
     if (!RunGraphFusedRegression<half>(
             devices, (int)fastllm::DataType::FLOAT16, "FP16",
             fp16B8GraphFusedUs) ||
         !RunGraphFusedRegression<__nv_bfloat16>(
             devices, (int)fastllm::DataType::BFLOAT16, "BF16",
-            bf16B8GraphFusedUs)) {
+            bf16B8GraphFusedUs) ||
+        !RunGraphInPlaceOrderingRegression<half>(
+            devices, (int)fastllm::DataType::FLOAT16, "FP16",
+            graphInPlaceOrderingTested)) {
         return 1;
     }
     if (actualEnabled && selectedPaths == 0) {
@@ -641,6 +874,10 @@ int main() {
               << ", tested_paths=" << testedPaths
               << ", fp16_b8_graph_fused_us=" << fp16B8GraphFusedUs
               << ", bf16_b8_graph_fused_us=" << bf16B8GraphFusedUs
+              << ", graph_capture_miss_fallback="
+              << graphCaptureMissFallbackTested
+              << ", graph_inplace_ordering="
+              << graphInPlaceOrderingTested
               << ", reset_reinit=1, switched_group="
               << switchedGroupTested << ")\n";
     return 0;

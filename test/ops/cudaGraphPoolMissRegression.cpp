@@ -12,6 +12,68 @@
 
 namespace {
 
+bool RunExternalCaptureQueryRegression() {
+    bool passed = false;
+    std::string error;
+    std::thread worker([&]() {
+        FastllmCudaSetDevice(0);
+        void *pointer = nullptr;
+        cudaGraph_t graph = nullptr;
+        bool captureStarted = false;
+        if (FastllmCudaGraphIsCapturing()) {
+            error = "exact capture query reported an idle stream as active";
+            return;
+        }
+        if (cudaMalloc(&pointer, 1) != cudaSuccess) {
+            error = "failed to allocate external-capture probe storage";
+            return;
+        }
+        if (cudaStreamBeginCapture(
+                cudaStreamPerThread,
+                cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            error = "failed to start external CUDA stream capture";
+        } else {
+            captureStarted = true;
+        }
+        if (error.empty() && !FastllmCudaGraphIsCapturing()) {
+            error = "exact query missed an externally started capture";
+        }
+        if (error.empty() && !FastllmCudaGraphIsCapturingFast()) {
+            error = "external capture was not latched for hot-path queries";
+        }
+        if (error.empty() &&
+            cudaMemsetAsync(pointer, 0, 1, cudaStreamPerThread) !=
+                cudaSuccess) {
+            error = "failed to record work in external CUDA capture";
+        }
+        if (captureStarted) {
+            cudaError_t endState =
+                cudaStreamEndCapture(cudaStreamPerThread, &graph);
+            if (error.empty() && endState != cudaSuccess) {
+                error = "failed to finish external CUDA stream capture";
+            }
+        }
+        if (graph != nullptr) {
+            cudaGraphDestroy(graph);
+        }
+        if (pointer != nullptr) {
+            cudaFree(pointer);
+        }
+        if (error.empty() && FastllmCudaGraphIsCapturing()) {
+            error = "exact capture query remained active after capture end";
+        }
+        if (error.empty() && FastllmCudaGraphIsCapturingFast()) {
+            error = "hot-path capture query remained active after capture end";
+        }
+        passed = error.empty();
+    });
+    worker.join();
+    if (!passed) {
+        std::cerr << error << "\n";
+    }
+    return passed;
+}
+
 bool RunDeferredBigBufferClearRegression() {
     FastllmCudaSetDevice(0);
     constexpr size_t kDeferredBytes = 304ULL * 1024ULL * 1024ULL;
@@ -76,6 +138,9 @@ int main() {
     if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount <= 0) {
         std::cerr << "no CUDA device available for graph pool-miss regression\n";
         return 2;
+    }
+    if (!RunExternalCaptureQueryRegression()) {
+        return 17;
     }
     const int participants = std::min(deviceCount, 4);
     FastllmCudaSetDevice(0);
@@ -192,6 +257,41 @@ int main() {
         return 7;
     }
 
+    size_t freeBytes = 0, totalBytes = 0;
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess ||
+        totalBytes == 0) {
+        std::cerr << "failed to query CUDA capacity for allocator regression\n";
+        return 8;
+    }
+    const size_t impossibleReserveBytes =
+        totalBytes < std::numeric_limits<size_t>::max()
+            ? totalBytes + 1
+            : totalBytes;
+    // Exercise the real cudaMalloc OOM path before seeding the serve reserve.
+    // Both optional allocators must clear CUDA's last-error slot and preserve
+    // FastLLM's thread/capture error state when only capacity is insufficient.
+    FastllmCudaClearThreadError();
+    FastllmCudaClearGraphError();
+    cudaGetLastError();
+    void *capacityProbe = nullptr;
+    if (FastllmCudaTryMalloc(&capacityProbe, impossibleReserveBytes) !=
+            FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE ||
+        capacityProbe != nullptr || FastllmCudaGetThreadError() ||
+        FastllmCudaGetGraphError() ||
+        cudaPeekAtLastError() != cudaSuccess) {
+        std::cerr << "optional pooled OOM did not preserve CUDA error state\n";
+        return 20;
+    }
+    if (FastllmCudaTryDirectMalloc(
+            &capacityProbe, impossibleReserveBytes) !=
+            FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE ||
+        capacityProbe != nullptr || FastllmCudaGetThreadError() ||
+        FastllmCudaGetGraphError() ||
+        cudaPeekAtLastError() != cudaSuccess) {
+        std::cerr << "optional direct OOM did not preserve CUDA error state\n";
+        return 21;
+    }
+
     // Reserve construction must expose capacity failures without discarding
     // blocks already prepared for frozen serving or poisoning graph state.
     constexpr size_t reserveBytes = 3ULL * 1024ULL * 1024ULL;
@@ -204,16 +304,6 @@ int main() {
         std::cerr << "failed to seed non-destructive CUDA serve reserve\n";
         return 8;
     }
-    size_t freeBytes = 0, totalBytes = 0;
-    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess ||
-        totalBytes == 0) {
-        std::cerr << "failed to query CUDA capacity for reserve regression\n";
-        return 9;
-    }
-    const size_t impossibleReserveBytes =
-        totalBytes < std::numeric_limits<size_t>::max()
-            ? totalBytes + 1
-            : totalBytes;
     if (FastllmCudaTryMallocBigBuffers(impossibleReserveBytes, 1) != 0 ||
         FastllmCudaGetThreadError() || FastllmCudaGetGraphError()) {
         std::cerr << "failed reserve allocation was not reported cleanly\n";
@@ -258,6 +348,40 @@ int main() {
         return 0;
     }
 
+    // Optional acceleration workspaces may fall back when the frozen pool has
+    // insufficient capacity. Both pooled and direct try-allocation APIs must
+    // report that condition without poisoning thread or graph error state.
+    FastllmCudaClearThreadError();
+    FastllmCudaClearGraphError();
+    cudaGetLastError();
+    void *optional = nullptr;
+    if (FastllmCudaTryMalloc(&optional, missBytes) !=
+            FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE ||
+        optional != nullptr || FastllmCudaGetThreadError() ||
+        FastllmCudaGetGraphError() ||
+        cudaPeekAtLastError() != cudaSuccess) {
+        std::cerr << "optional pooled allocation did not report a clean "
+                     "capacity failure\n";
+        return 12;
+    }
+    if (FastllmCudaTryDirectMalloc(&optional, 1) !=
+            FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE ||
+        optional != nullptr || FastllmCudaGetThreadError() ||
+        FastllmCudaGetGraphError() ||
+        cudaPeekAtLastError() != cudaSuccess) {
+        std::cerr << "optional direct allocation did not report a clean "
+                     "capacity failure\n";
+        return 13;
+    }
+    if (FastllmCudaTryMalloc(&optional, warmedBytes) !=
+            FASTLLM_CUDA_TRY_MALLOC_SUCCESS ||
+        optional == nullptr || FastllmCudaGetThreadError() ||
+        FastllmCudaGetGraphError()) {
+        std::cerr << "optional pooled allocation did not reuse warmed storage\n";
+        return 14;
+    }
+    FastllmCudaFree(optional);
+
     // Acquire every reserve block simultaneously after the freeze.  This can
     // only succeed from the existing pool, so an OOM retry that discarded the
     // blocks above cannot be hidden by allocating replacements here.
@@ -266,7 +390,7 @@ int main() {
         void *reserved = FastllmCudaMalloc(reserveBytes);
         if (reserved == nullptr) {
             std::cerr << "failed reserve allocation discarded existing blocks\n";
-            return 12;
+            return 15;
         }
         reservedBlocks.push_back(reserved);
     }
@@ -277,7 +401,7 @@ int main() {
     void *reused = FastllmCudaMalloc(warmedBytes);
     if (reused == nullptr) {
         std::cerr << "frozen allocator did not reuse warmed CUDA storage\n";
-        return 13;
+        return 16;
     }
     FastllmCudaFree(reused);
 
@@ -285,14 +409,14 @@ int main() {
     if (FastllmCudaMalloc(missBytes) != nullptr ||
         !FastllmCudaGetThreadError()) {
         std::cerr << "frozen allocator did not reject a CUDA pool miss\n";
-        return 14;
+        return 17;
     }
     FastllmCudaClearThreadError();
 
     reused = FastllmCudaMalloc(warmedBytes);
     if (reused == nullptr) {
         std::cerr << "rejected pool miss discarded warmed CUDA storage\n";
-        return 15;
+        return 18;
     }
     FastllmCudaFree(reused);
 
@@ -300,7 +424,7 @@ int main() {
     if (FastllmCudaDirectMalloc(1) != nullptr ||
         !FastllmCudaGetThreadError()) {
         std::cerr << "frozen allocator allowed a direct CUDA allocation\n";
-        return 16;
+        return 19;
     }
     FastllmCudaClearThreadError();
 

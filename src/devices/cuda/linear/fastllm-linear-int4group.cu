@@ -394,6 +394,19 @@ static std::unordered_map<const fastllm::Data*, void*> g_sm70AwqHandles;
 // 重排成功后释放原始 INT4_GROUP 权重，定义在后面，这里前置声明。
 static void FastllmCudaInt4GroupReleaseOriginalWeight(fastllm::Data &weight);
 
+static void FastllmCudaInt4GroupReleaseHostMetadata(fastllm::Data &weight) {
+    std::vector<float>().swap(weight.scales);
+    std::vector<float>().swap(weight.mins);
+    std::vector<int>().swap(weight.zeros);
+    std::vector<fastllm::LowBitConfig>().swap(weight.perChannelsConfigs);
+    std::vector<int>().swap(weight.weightSum);
+}
+
+static bool FastllmCudaInt4GroupHasSm70AwqOnDevice(const fastllm::Data &weight) {
+    auto it = g_sm70AwqHandles.find(&weight);
+    return it != g_sm70AwqHandles.end() && it->second != nullptr;
+}
+
 // weight: [k, m] 每字节两个 nibble（输出在外、输入在内），偶数输入在高位。
 // 输出 out: [K=m, N=k] 行主序，out[in * k + outIdx] = 该 (输入 in, 输出 outIdx) 的 4bit 值。
 __global__ void FastllmInt4GroupToAwqU16Kernel(const uint8_t *weight, uint16_t *out, int m, int k) {
@@ -484,11 +497,12 @@ static bool FastllmCudaInt4GroupEnsureSm70AwqOnDevice(fastllm::Data &weight, int
 
     // dU16 已经从原始权重重排出量化值，scale/zero 也已拷到 device，原始 INT4_GROUP
     // 权重（weight.cudaData）此后不再需要：GEMM 走 handle->tmWeight/tmScales。
-    // 这里在 Prepare 之前就释放，并用 FastllmCudaClearBigBuffer 把池中空闲显存真正
-    // 归还给 OS——Prepare 内部用的是原生 cudaMalloc，只能向 OS 申请显存。否则
-    // 原始权重虽被标记空闲仍滞留在 fastllm 显存池里，Prepare 仍会 OOM。
+    // 这里在 Prepare 之前就释放，并把当前设备池中的空闲显存真正归还给 OS；Prepare
+    // 内部用的是原生 cudaMalloc，否则原始权重虽已空闲仍会滞留在 fastllm 显存池中。
+    // 不能从 TP worker 清理其它设备：其它 rank 可能已经进入 NCCL，跨设备 cudaFree
+    // 会等待那个 rank，而它同时在等待本 rank 提交同一个 collective，形成死锁。
     FastllmCudaInt4GroupReleaseOriginalWeight(weight);
-    FastllmCudaClearBigBuffer();
+    FastllmCudaClearBigBufferCurrentDevice();
 
     void *handle = fastllm::awq_sm70::Prepare(dU16, dScales, dZeros, K, N, numGroups, groupCnt, 0);
 
@@ -985,7 +999,7 @@ static bool FastllmCudaInt4GroupEnsureMarlinOnDevice(fastllm::Data &weight, int 
     // experts are prepared lazily that pool can retain several GB and starve
     // KV/prefill allocations. The final Marlin buffer is still marked busy, so
     // clearing idle pool entries here only releases the two obsolete buffers.
-    FastllmCudaClearBigBuffer();
+    FastllmCudaClearBigBufferCurrentDevice();
 
     std::vector<half> hostScales;
     std::vector<uint32_t> hostZeros;
@@ -1036,6 +1050,50 @@ static half *FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(fastllm::Data &weigh
         weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX] = (void*)cudaBiasData;
     }
     return (half*)weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX];
+}
+
+bool FastllmCudaPrepareInt4GroupWeight(fastllm::Data &weight) {
+    if (weight.dataType != fastllm::DataType::INT4_GROUP ||
+        weight.dims.size() != 2 || weight.dataDeviceIds.empty()) {
+        return false;
+    }
+
+    // Routed experts still need their source AWQ tensors for the fused decode
+    // pointer table, so they must not be eagerly converted to either backend.
+    const bool routedMoeWeight =
+        weight.name.find(".mlp.experts.") != std::string::npos ||
+        weight.name.find(".block_sparse_moe.experts.") != std::string::npos;
+    if (routedMoeWeight) {
+        return false;
+    }
+
+    const int previousDevice = FastllmCudaGetDevice();
+    const int device = weight.dataDeviceIds.front();
+    FastllmCudaSetDevice(device);
+    const int k = weight.dims[0];
+    const int m = weight.dims[1];
+    const int group = weight.group;
+    const bool hasZeroPoints =
+        group > 0 && weight.zeros.size() == (size_t)k * group;
+
+    bool prepared = FastllmCudaInt4GroupHasMarlinOnDevice(weight);
+    if (!prepared && weight.cudaData != nullptr && hasZeroPoints &&
+        FastllmCudaInt4GroupMarlinEnabled(1, m, k, weight.groupCnt)) {
+        prepared = FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
+    }
+    if (!prepared) {
+        prepared = FastllmCudaInt4GroupHasSm70AwqOnDevice(weight);
+    }
+    if (!prepared && weight.cudaData != nullptr && hasZeroPoints &&
+        FastllmCudaInt4GroupSm70AwqEnabled(1, m, k, weight.groupCnt)) {
+        prepared = FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k);
+    }
+    if (prepared) {
+        FastllmCudaInt4GroupReleaseHostMetadata(weight);
+    }
+
+    FastllmCudaSetDevice(previousDevice);
+    return prepared;
 }
 
 static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
@@ -1925,13 +1983,18 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
     // device-side expert pointer table needed by the fused path.
     bool routedMoeWeight = weight.name.find(".mlp.experts.") != std::string::npos ||
                            weight.name.find(".block_sparse_moe.experts.") != std::string::npos;
-    bool useMarlin = weight.zeros.size() == (size_t)k * group &&
-                     !routedMoeWeight &&
-                     FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
-                     FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
-    bool useSm70Awq = !useMarlin && weight.zeros.size() == (size_t)k * group &&
-                      FastllmCudaInt4GroupSm70AwqEnabled(n, m, k, groupCnt) &&
-                      FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k);
+    const bool hasMarlin = FastllmCudaInt4GroupHasMarlinOnDevice(weight);
+    bool useMarlin = !routedMoeWeight &&
+                     (hasMarlin ||
+                      (weight.zeros.size() == (size_t)k * group &&
+                       FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
+                       FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k)));
+    const bool hasSm70Awq = FastllmCudaInt4GroupHasSm70AwqOnDevice(weight);
+    bool useSm70Awq = !useMarlin &&
+                      (hasSm70Awq ||
+                       (weight.zeros.size() == (size_t)k * group &&
+                        FastllmCudaInt4GroupSm70AwqEnabled(n, m, k, groupCnt) &&
+                        FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k)));
     if (!useMarlin && !useSm70Awq) {
         if (weight.cudaData == nullptr) {
             FastllmCudaInt4GroupFallbackUnavailable();

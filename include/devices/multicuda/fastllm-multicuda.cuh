@@ -65,6 +65,8 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 // prefill tensors can be bandwidth-bound on the direct-peer implementation
 // even though it is faster for decode tensors.
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
+// Requires an initialized TP communicator and matching submissions on every rank.
+bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.
 // Callers use this preflight to preserve their existing NCCL fallback without
 // first changing the reduction's compute or accumulation order.
@@ -116,6 +118,17 @@ namespace fastllm {
 
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
+    struct MultiCudaAsyncMLPHandle;
+    // Submit gateup -> SwiGLU -> down as one asynchronous task per rank and
+    // retain the all-reduced result on every rank.  The caller may run CPU
+    // work between begin and finish; finish joins the worker streams back to
+    // the caller streams before the result is consumed.
+    std::shared_ptr<MultiCudaAsyncMLPHandle>
+    MultiCudaBeginMLPKeepReplicated(
+        Data &input, Data &gateupWeight, Data &downWeight,
+        Data &gateupOutput, Data &swigluOutput, Data &output);
+    bool MultiCudaFinishMLPKeepReplicated(
+        std::shared_ptr<MultiCudaAsyncMLPHandle> &handle);
     // Computes the rank-local column-linear partials without reducing them.
     // The returned tensor temporarily uses replicated storage so a following
     // fused collective can consume one partial from every device.
@@ -153,4 +166,15 @@ namespace fastllm {
     // can be captured by a multi-device CUDA Graph.
     bool MultiCudaRepeatToReplicated(Data &input, int axis, int repeatTimes,
                                      Data &output);
+    bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output);
+    // Copy a dense activation replica directly to owned CPU storage. Returns
+    // false without changing either tensor when the layout requires CopyFrom.
+    bool MultiCudaCopyReplicaToCpu(Data &dst, const Data &src,
+                                    const std::vector<int> &devices);
+    // Run the original AddTo and HcPost kernels in one rank-local dispatch.
+    // Retains the intermediate dtype rounding; false means no add was executed.
+    // A compact CPU input is copied on each worker's stream;
+    // the synchronous copy stages its source before the callback returns.
+    bool MultiCudaDeepSeekV41AddHcPost(Data &input, Data &shared, Data &residual,
+                                      Data &post, Data &comb, Data &output);
 }

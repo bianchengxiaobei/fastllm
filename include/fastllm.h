@@ -30,6 +30,7 @@
 #endif
 
 namespace fastllm {
+    struct RopeConfig;
     class Data;
 
     class FastllmEnv {
@@ -52,6 +53,7 @@ namespace fastllm {
     };
 
     const FastllmEnv &GetFastllmEnv();
+    void SetCudaGraph(bool v);
 
     struct ModelLoadProgress {
         std::string stage;
@@ -75,11 +77,13 @@ namespace fastllm {
     void SetMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
     void SetLayeredMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
     void SetMoeDeviceLayers(int layers);
+    void SetNgramDevice(const std::string &device);
 
     std::map <std::string, int> GetDeviceMap();
     std::map <std::string, int> GetMoeDeviceMap();
     std::map <std::string, int> GetLayeredMoeDeviceMap();
     int GetMoeDeviceLayers();
+    std::string GetNgramDevice();
     std::string SelectDeviceFromMap(const std::map <std::string, int> &deviceMap, int current, int total);
 
     Data *GetEmptyData();
@@ -96,6 +100,10 @@ namespace fastllm {
     bool GetCudaEmbeddingRequested();
     void SetCudaSlabMB(int mb);
     int GetCudaSlabMB();
+    void SetMoeCudaCacheBytes(uint64_t bytes);
+    uint64_t GetMoeCudaCacheBytes();
+    void SetMoeCpuCacheBytes(uint64_t bytes);
+    uint64_t GetMoeCpuCacheBytes();
     int GetThreads();
     bool GetKVCacheInCPU();
     bool GetHistoryCacheInCPU();
@@ -181,6 +189,8 @@ namespace fastllm {
         std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
         std::vector <std::string> tool_call_parameter_name_prefixes;
         std::vector <int> tool_call_allowed_token_ids;
+        // Emitted prefix snapshot; speculative branches advance a private copy.
+        std::string tool_call_generated_text;
         bool tool_call_content_sampling_enabled = false;
         // Set on the per-step config after Kimi-K3 has drained DSpark's
         // scheduler-ahead queue. DSpark then samples from its batched target
@@ -324,6 +334,7 @@ namespace fastllm {
         BASE3_GROUP = 12, // 三元量化，-1 0 1
         INT32 = 13, // int32
         NVFP4 = 14, // packed fp4 e2m1 + compact e8m0 block scales
+        FP4_E2M1 = 15, // KV-only: each page has packed E2M1 then E4M3 block-16 scales
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         FP8_E4M3_BLOCK_128 = 1000, // fp8e4m3, block = 128
         AWQ_4BIT_128 = 1001, // awq, bits = 4, group = 128
@@ -340,6 +351,13 @@ namespace fastllm {
         // Internal NUMA layout for NVFP4 blockM=32 weights:
         // [16 packed fp4 bytes] [one inline E8M0 scale byte].
         NVFP4_BLOCK_32_E8M0 = 1009,
+        // Compact, lossless safetensors NVFP4 layout. Packed E2M1 weights are
+        // followed by planar raw E4M3 block-16 scales. Tensor-level dequant
+        // multipliers are retained in Data::scales.
+        NVFP4_BLOCK_16_E4M3 = 1010,
+        // Internal NUMA layout: each 32-row tile stores packed block-16
+        // weights, then FP32 scales, retaining gate/up row interleaving.
+        NVFP4_BLOCK_16_PLANAR = 1011,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -384,6 +402,31 @@ namespace fastllm {
     uint8_t *GetNVFP4ScaleData(Data &data);
     const uint8_t *GetNVFP4ScaleData(const Data &data);
     float NVFP4E8M0ScaleToFloat(uint8_t v);
+    constexpr int NVFP4_PLANAR_TILE_ROWS = 32;
+    #ifdef __CUDACC__
+    __host__ __device__
+    #endif
+    inline size_t NVFP4PlanarWeightOffset(int row, int blocks, int block = 0) {
+        return size_t(row / NVFP4_PLANAR_TILE_ROWS) * NVFP4_PLANAR_TILE_ROWS * blocks * 12 +
+            (size_t(row % NVFP4_PLANAR_TILE_ROWS) * blocks + block) * 8;
+    }
+    #ifdef __CUDACC__
+    __host__ __device__
+    #endif
+    inline size_t NVFP4PlanarScaleOffset(int row, int blocks, int block = 0) {
+        return size_t(row / NVFP4_PLANAR_TILE_ROWS) * NVFP4_PLANAR_TILE_ROWS * blocks * 12 +
+            size_t(NVFP4_PLANAR_TILE_ROWS) * blocks * 8 +
+            (size_t(row % NVFP4_PLANAR_TILE_ROWS) * blocks + block) * sizeof(float);
+    }
+    void PackCompactE4M3NVFP4Block16Rows(
+        int rows, int columns, const uint8_t *weights,
+        const uint8_t *scaleBytes,
+        const std::vector<float> &globalScales,
+        int blockK, int blockM, uint8_t *destination,
+        int destinationRowStart, int destinationRows,
+        bool crossSwiglu = false, bool planar = false);
+    void ConvertCompactE4M3NVFP4ToBlock16(
+        Data &data, bool crossSwiglu = false);
 
     enum DataDevice {
         CPU = 0, CUDA = 1
@@ -489,6 +532,10 @@ namespace fastllm {
 
 	    void *cudaData = nullptr;
         bool cudaDataBorrowed = false; // cudaData points into another owner and should not be freed directly
+        // Set only when this object owns entries in the DeepSeek-V4 CUDA
+        // route-table registry, so ordinary temporary tensors can skip the
+        // registry mutex in their destructor.
+        bool hasDeepSeekV4RouteTableCache = false;
         std::vector <void*> extraCudaData;
         std::vector <void*> extraCudaHalfData;
 
@@ -513,6 +560,11 @@ namespace fastllm {
         std::vector <float> scales, mins;
         std::vector <int> zeros;
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
+        // Lazily materialized effective FP32 block scales for the compact
+        // E4M3 NVFP4 CPU path. CUDA keeps using the raw one-byte scales. The
+        // vector belongs to the weight so queued worker tasks retain a stable
+        // data pointer until they finish.
+        std::vector <float> cpuNVFP4Scales;
 
         std::vector <uint16_t> halfScales; // 某些量化方式使用float16的scales
 
@@ -551,6 +603,11 @@ namespace fastllm {
         bool forceGGUFFp32Dequant = false;
 
         std::vector <uint8_t*> numasData; // numa数据
+        // True only when RegisterNumas has verified that every inline E8M0
+        // scale in an NVFP4 block32 shard can absorb the kernel's 2^64
+        // compensation without overflow.  Unknown and ineligible weights
+        // remain false and use the generic scale path.
+        bool numasNVFP4AllScalesFuseMagic = false;
         bool isPinned = false; // 是否使用pinned memory (page-locked)
 
         std::vector <int> cpuIntDatas; // 锁定在cpu上的int数据
@@ -919,7 +976,8 @@ namespace fastllm {
                 float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu,
                 bool expertParallel = false, float swigluLimit = 0.0f,
                 bool deepSeekV4Mode = false,
-                Data *pairedReduceInput = nullptr);
+                Data *pairedReduceInput = nullptr, int activationQuantBlock = 128,
+                bool quantizeSharedExpert = false);
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
                 Data &gate, Data &up, Data &down, Data &w1,
@@ -942,6 +1000,25 @@ namespace fastllm {
     void Conv1DPerChannel(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, 
             int kernel, int stride, int pad, Data &output);
 
+    // Single-token causal depthwise convolution. The float32 state has shape
+    // [batch, channels, kernel] and is shifted/updated in place; input is
+    // [batch, channels, 1], output is float32 [batch, 1, channels].
+    void CausalDepthwiseConv1DDecode(const Data &input, const Data &weight,
+                                     Data &state, int kernel, bool silu,
+                                     Data &output);
+
+    // Multi-token causal depthwise convolution in token-major layout.
+    // input is [batch, sequence, channels], the float32 state is
+    // [batch, channels, kernel] and is updated in place. The output has the
+    // same shape as input and is float32 by default; callers may request an
+    // activation storage type without materializing a separate conversion.
+    void CausalDepthwiseConv1DPrefill(const Data &input, const Data &weight,
+                                      Data &state, int kernel, bool silu,
+                                      Data &output);
+    void CausalDepthwiseConv1DPrefill(const Data &input, const Data &weight,
+                                      Data &state, int kernel, bool silu,
+                                      Data &output, DataType outputType);
+
     void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output);
 
     void Embedding(const Data &input, Data &weight, Data &output);
@@ -951,6 +1028,107 @@ namespace fastllm {
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
 
     void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output);
+
+    // Fused one-token GDN recurrence from packed, convolved Q/K/V and raw
+    // alpha/beta gates.  The state remains float32; CPU and CUDA share this
+    // executor contract, while backends may specialize common head sizes.
+    void GatedDeltaRuleDecode(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output);
+
+    // Small or general multi-token recurrence in token-major layout.  It
+    // advances the same float32 state in causal token order while allowing a
+    // backend to keep the whole sequence inside one operation.
+    void GatedDeltaRuleSequence(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output,
+            Data *stateOutput = nullptr);
+
+    // Qwen4-Exp hyper-connection primitives.  Keeping these behind the regular
+    // executor lets CPU and CUDA share one model path while avoiding the many
+    // Split/Cat/elementwise launches in the operator-composed reference.
+    void Qwen4GroupedRMSNorm(const Data &input, const Data &weight,
+                             float eps, int groups, Data &output);
+    // PLE keeps the ngram table lookup on the host, but the projection tail
+    // uses regular executor operations so CUDA does not round-trip the full
+    // sequence through host memory. PLEGate produces float32 gated values;
+    // PLECausalConv consumes the normalized values and returns both the
+    // residual result and the next float32 convolution history.
+    void Qwen4PLEGate(const Data &key, const Data &query,
+                      const Data &value, int groups, Data &output);
+    void Qwen4PLECausalConv(const Data &normalized, const Data &gated,
+                            const Data &weight, const Data &history,
+                            int kernel, int dilation, Data &output,
+                            Data &newHistory);
+    void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
+                       int groups, Data &output);
+    // Project low-rank logits and mix hyper-connection groups in one
+    // executor operation. Backends may keep the rounded projection in its
+    // native storage type instead of materializing a wider intermediate.
+    void Qwen4HyperMixProjected(const Data &normalized,
+                                const Data &lowRank, Data &upWeight,
+                                int groups, Data &output);
+    // Compute the two bias-free hyper-connection projections and apply their
+    // prepare/injection activations.  Backends may fuse the independent
+    // projections, while the executor contract remains available on CPU.
+    // By default outputs retain the input type; outputType can request a
+    // wider storage type without changing the projection arithmetic.
+    void Qwen4HyperProject(const Data &normalized, Data &downWeight,
+                           Data &injectionWeight, int groups,
+                           Data &activated, Data &injection);
+    void Qwen4HyperProject(const Data &normalized, Data &downWeight,
+                           Data &injectionWeight, int groups,
+                           Data &activated, Data &injection,
+                           DataType outputType);
+    // Fuse the low-rank scale and SiLU without changing either projection's
+    // GEMM geometry or the independent injection-gate dataflow.
+    void Qwen4HyperPrepare(const Data &lowRankProjection, int groups,
+                           Data &activated);
+    void Qwen4HyperInject(const Data &logits, int groups, Data &output);
+    void Qwen4HyperCombine(const Data &hyperInput, const Data &blockOutput,
+                           const Data &injection, int groups, Data &output);
+    // Hyper-connection residual update followed by grouped RMSNorm.  The
+    // residual is rounded to hyperInput's dtype before normalization, exactly
+    // matching Qwen4HyperCombine + Qwen4GroupedRMSNorm while avoiding the
+    // intermediate launch and reload. normalizedStorage optionally receives
+    // the same normalized values in a caller-selected activation type.
+    void Qwen4HyperCombineRMSNorm(
+        const Data &hyperInput, const Data &blockOutput,
+        const Data &injection, const Data &normWeight,
+        float eps, int groups, Data &residual, Data &normalized);
+    void Qwen4HyperCombineRMSNorm(
+        const Data &hyperInput, const Data &blockOutput,
+        const Data &injection, const Data &normWeight,
+        float eps, int groups, Data &residual, Data &normalized,
+        Data *normalizedStorage,
+        DataType normalizedStorageType = DataType::FLOAT16);
+    // Qwen4 QSA primitives. QSASelect scores compressed block keys, selects
+    // the highest-scoring blocks, and expands them to sorted token indices.
+    // queryStart >= 0 enables row-wise causal selection for prefill: row r can
+    // only select keys [0, queryStart + r]. QSABuildMask converts the indices
+    // to the standard attention-mask contract; SparseAttention consumes them
+    // directly without materializing a sequence-by-context mask. All
+    // operations are available through the normal CPU/CUDA executor.
+    void Qwen4QSASelect(const Data &query, const Data &compressedKeys,
+                        int keyLength, int heads, int headDim,
+                        int tokenBudget, int compressRatio, Data &indices,
+                        int queryStart = -1);
+    void Qwen4QSABuildMask(const Data &indices, const Data &reference,
+                           int keyLength, Data &mask);
+    void Qwen4SparseAttention(const Data &query, const Data &key,
+                              const Data &value, const Data &indices,
+                              int group, float scale, Data &output);
+    // Compatibility alias for callers that used the original model-specific
+    // name before GatedDeltaRuleDecode became a standard operation.
+    void Qwen4GatedDeltaRuleDecode(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output);
 
     // Kimi-K3 operators.  These are dispatched through the regular FastLLM
     // executor; the CPU backend is the first implementation.
@@ -984,7 +1162,9 @@ namespace fastllm {
             const Data &q, const Data &k, const Data &v,
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
-            Data &state, Data &output);
+            Data &state, Data &output,
+            bool normalizeQKInFp32 = false,
+            bool roundBetaToBfloat16 = false);
 
     // Replays only the recurrent-state transition for the first `tokens`
     // rows of a captured verification batch.
@@ -992,7 +1172,9 @@ namespace fastllm {
             const Data &k, const Data &v,
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
-            int tokens, Data &state);
+            int tokens, Data &state,
+            bool normalizeKInFp32 = false,
+            bool roundBetaToBfloat16 = false);
 
     void KimiK3RMSNormSigmoidGate(
             const Data &input, const Data &gate, const Data &weight,
@@ -1063,6 +1245,11 @@ namespace fastllm {
     void Split(const Data &input, int axis, int start, int end, Data &output);
 
     void Repeat(const Data &input, int axis, int repeatTimes, Data &output);
+
+    // input0 += Repeat(input1, axis, repeatTimes) * alpha without
+    // materializing the repeated tensor.
+    void RepeatAddTo(Data &input0, const Data &input1, int axis,
+                     int repeatTimes, float alpha = 1.0f);
 
     void Copy(const Data &input, Data &output);
 
@@ -1135,6 +1322,10 @@ namespace fastllm {
 
     void Sigmoid(const Data &input, Data &output);
 
+    // input *= cast_like(input, sigmoid(gate)). The gate may be a scalar,
+    // have the same shape as input, or broadcast over contiguous channels.
+    void SigmoidMulTo(Data &input, const Data &gate);
+
     void Normalize(const Data &input, Data &output, int axis);
 
     void Exp(const Data &input, Data &output);
@@ -1184,6 +1375,8 @@ namespace fastllm {
 
     void SelectExpert(const Data &logits, Data &index, Data &score, int topk, bool needNorm = false, float routeScale = 1.0f, const Data *gateBias = nullptr); // MOE专家选择
 
+    void FusedSoftmaxSelectExpert(const Data &logits, Data &index, Data &score, int topk, bool needNorm = false, float routeScale = 1.0f, const Data *gateBias = nullptr); // Softmax与MOE专家选择融合
+
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
 
     void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int positionStride = 1); // 2D position embedding, 相邻的维度旋转
@@ -1226,7 +1419,7 @@ namespace fastllm {
         Data &insertIndexs, Data &insertPositions,
         int q_heads, int k_heads, int head_dim,
         int rotaryDim, float eps, float ropeTheta, float ropeScale,
-        int pageLen, int batch, bool doQKNorm = true, Data *lastPageLens = nullptr);
+        int pageLen, int batch, bool doQKNorm = true, Data *lastPageLens = nullptr, const RopeConfig *ropeConfig = nullptr);
 
     void Step3p5QKVRMSNormRopeSplitAppendPagedCache(
         Data &qkv, Data &qNormWeight, Data &kNormWeight,

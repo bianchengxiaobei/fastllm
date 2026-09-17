@@ -8,13 +8,18 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "fastllm-cublas-prefill.cuh"
+#include "devices/cuda/fastllm-cuda-fp8.h"
+#include "fastllm-fp8-marlin-gemv.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -42,7 +47,7 @@ static bool Fp8MarlinEnvFlagDefaultEnabled(const char *name, bool defaultValue) 
 // (device stubs under __CUDA_ARCH__ < 750) and fall back to GEMV here. SM120
 // and SM121 use CUTLASS FP8 prefill kernels that require the original row-major
 // weights, so do not destructively repack them during warmup by default.
-static bool Fp8MarlinDeviceSupported() {
+static bool Fp8MarlinDeviceSupported(int &runtimeArch) {
 #ifdef CUDA_NO_TENSOR_CORE
     return false;
 #else
@@ -53,6 +58,7 @@ static bool Fp8MarlinDeviceSupported() {
         return false;
     }
     int arch = major * 10 + minor;
+    runtimeArch = arch;
     bool defaultEnabled = true;
 #if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
     defaultEnabled = defaultEnabled && arch != 120;
@@ -63,6 +69,101 @@ static bool Fp8MarlinDeviceSupported() {
     return arch >= 75 &&
            Fp8MarlinEnvFlagDefaultEnabled("FASTLLM_CUDA_FP8_MARLIN", defaultEnabled);
 #endif
+}
+
+static bool Fp8MarlinShouldPreserveRowMajorForTriton(int arch) {
+#if defined(_WIN32) || defined(USE_ROCM)
+    (void)arch;
+    return false;
+#else
+    if (arch != 89) {
+        return false;
+    }
+    const char *globalEnv = std::getenv("FASTLLM_CUDA_TRITON");
+    if (globalEnv != nullptr && globalEnv[0] != '\0') {
+        return Fp8MarlinEnvFlagDefaultEnabled(
+                   "FASTLLM_CUDA_TRITON", false) &&
+               Fp8MarlinEnvFlagDefaultEnabled(
+                   "FASTLLM_CUDA_TRITON_LINEAR_FP8", true);
+    }
+    return Fp8MarlinEnvFlagDefaultEnabled(
+        "FASTLLM_CUDA_TRITON_LINEAR_FP8", false);
+#endif
+}
+
+constexpr int FP8_PREFILL_MIN_ROWS = 1024;
+constexpr int FP8_PREFILL_SMALL_WORKSPACE_MIN_ROWS = 1536;
+
+static bool Fp8PrefillMatrixSupported(int sizeN, int sizeK) {
+    // Small matrices remain launch-bound and can still favour Marlin at large M.
+    return sizeN >= 1024 && sizeK >= 1024;
+}
+
+static bool Fp8PrefillEnabled() {
+    static const bool enabled = Fp8MarlinEnvFlagDefaultEnabled(
+        "FASTLLM_CUDA_FP8_PREFILL_CUBLAS", true);
+    return enabled;
+}
+
+static bool Fp8UseMultiRowGemv(int arch, int rows, int sizeN, int sizeK) {
+    if ((arch != 80 && arch != 86) || rows < 2 || rows > 3) return false;
+    // SM86 measurements favor GEMV at 2-3 tokens on wide expansion matrices.
+    // Down/narrow projections and >=4 rows retain Marlin GEMM by default.
+    return sizeN >= 16384 && sizeK >= 4096 && sizeK <= sizeN / 2;
+}
+
+using fastllm_cuda_prefill::State;
+using fastllm_cuda_prefill::CheckCuda;
+using fastllm_cuda_prefill::CheckCublas;
+
+#include "fastllm-fp8-prefill-dequant.cuh"
+
+static bool Fp8PrefillCublas(State *state,
+        const half *input, const uint32_t *weight, const half *scales,
+        half *output, int rows, int sizeN, int sizeK) {
+    if (state == nullptr || rows < FP8_PREFILL_MIN_ROWS) return false;
+    cudaStreamCaptureStatus capture;
+    CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    const int chunkN = int(std::min(size_t(sizeN),
+        state->capacity / (size_t(sizeK) * sizeof(half))) / 64 * 64);
+    if (chunkN < 1024) return false;
+    // Full-matrix and >=64 MiB sliced scans cross Marlin around M=960; 1024
+    // retains a margin across SM75 shapes. 32 MiB slices have regressions at
+    // M=1024, so use 1536 there. Smaller unmeasured slices stay on Marlin.
+    if (chunkN < sizeN && state->capacity < 64ULL * 1024 * 1024 &&
+        (state->capacity < 32ULL * 1024 * 1024 ||
+         rows < FP8_PREFILL_SMALL_WORKSPACE_MIN_ROWS)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(state->mutex);
+    // Order quantized prefill submissions to the dedicated cuBLAS handle.
+    // Shared attention scratch also relies on the existing worker stream order.
+    CheckCuda(cudaStreamWaitEvent(cudaStreamPerThread, state->completed, 0));
+    fastllm_cuda_prefill::SetPointerMode(state, CUBLAS_POINTER_MODE_HOST);
+    const half alpha = __float2half_rn(1), beta = __float2half_rn(0);
+    for (int offset = 0; offset < sizeN; offset += chunkN) {
+        const int count = std::min(chunkN, sizeN - offset);
+        Fp8PrefillDequantKernel<<<dim3(count / 64, (sizeK + 255) / 256), 256, 0, cudaStreamPerThread>>>(
+            weight, scales, state->scratch, sizeN, sizeK, offset);
+        CheckCuda(cudaPeekAtLastError());
+        // FP16 accumulation is intentional for the measured SM75 speedup.
+        // Dequantized weights match Marlin, but GEMM results are not bitwise equal.
+        CheckCublas(cublasGemmEx(state->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            count, rows, sizeK, &alpha, state->scratch, CUDA_R_16F, sizeK,
+            input, CUDA_R_16F, sizeK, &beta, output + offset, CUDA_R_16F, sizeN,
+            CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    CheckCuda(cudaEventRecord(state->completed, cudaStreamPerThread));
+    if (!state->fp8Logged) {
+        int device = 0;
+        CheckCuda(cudaGetDevice(&device));
+        std::fprintf(stderr,
+            "[FP8 prefill cuBLAS] GPU %d: active, rows=%d N=%d K=%d; capacity=%zu.\n",
+            device, rows, sizeN, sizeK, state->capacity);
+        state->fp8Logged = true;
+    }
+    return true;
 }
 
 static bool HasFp8MarlinOnDevice(const fastllm::Data &weight) {
@@ -218,21 +319,26 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
     FastllmCudaClearThreadError();
     std::vector<half> hostScales;
     BuildFp8MarlinPermutedScales(weight, m, k, hostScales);
-    half *marlinScales = (half *)FastllmCudaMalloc(hostScales.size() * sizeof(half));
+    // Long-lived auxiliary data must not pin oversized pooled temporaries.
+    half *marlinScales = (half *)FastllmCudaDirectMalloc(hostScales.size() * sizeof(half));
     if (marlinScales == nullptr || FastllmCudaGetThreadError()) {
+        if (marlinScales != nullptr) FastllmCudaDirectFree(marlinScales);
         FastllmCudaClearThreadError();
         return false;
     }
     FastllmCudaCopyFromHostToDevice(marlinScales, hostScales.data(),
-                                    hostScales.size() * sizeof(half));
+                                  hostScales.size() * sizeof(half));
 
     int sms = 0, dev = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     int workspaceInts = std::max(1, sms * 4);
-    int *workspace = (int *)FastllmCudaMalloc((size_t)workspaceInts * sizeof(int));
+    // These locks live as long as the weight. Do not pin a much larger idle
+    // temporary from the small-buffer pool for a roughly 1 KiB allocation.
+    int *workspace = (int *)FastllmCudaDirectMalloc((size_t)workspaceInts * sizeof(int));
     if (workspace == nullptr || FastllmCudaGetThreadError()) {
-        FastllmCudaFree(marlinScales);
+        if (workspace != nullptr) FastllmCudaDirectFree(workspace);
+        FastllmCudaDirectFree(marlinScales);
         FastllmCudaClearThreadError();
         return false;
     }
@@ -249,8 +355,8 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
     uint32_t *stdQWeight = (uint32_t *)FastllmCudaMalloc(qweightBytes);
     if (stdQWeight == nullptr || FastllmCudaGetThreadError()) {
         if (stdQWeight) FastllmCudaFree(stdQWeight);
-        FastllmCudaFree(workspace);
-        FastllmCudaFree(marlinScales);
+        FastllmCudaDirectFree(workspace);
+        FastllmCudaDirectFree(marlinScales);
         FastllmCudaClearThreadError();
         return false;
     }
@@ -267,8 +373,8 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
     // intentionally retain up to 300 MB of idle big buffers per device.
     FastllmCudaForceFree(stdQWeight);
     if (!repacked || syncState != cudaSuccess) {
-        FastllmCudaFree(workspace);
-        FastllmCudaFree(marlinScales);
+        FastllmCudaDirectFree(workspace);
+        FastllmCudaDirectFree(marlinScales);
         if (syncState != cudaSuccess) {
             printf("Error: FP8 Marlin in-place repack failed: %s.\n",
                    cudaGetErrorString(syncState));
@@ -292,6 +398,19 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
 
 }  // namespace
 
+bool FastllmCudaDequantFp8MarlinForCublas(fastllm::Data &weight, void *destination) {
+    if (weight.dataType != fastllm::DataType::FP8_E4M3 ||
+        weight.dims.size() != 2 || !destination || !HasFp8MarlinOnDevice(weight) ||
+        weight.blockM != 128 || weight.blockK != 128 ||
+        weight.dims[0] % 64 || weight.dims[1] % 128) return false;
+    Fp8PrefillDequantKernel<<<dim3(weight.dims[0] / 64, (weight.dims[1] + 255) / 256),
+                              256, 0, cudaStreamPerThread>>>(
+        static_cast<const uint32_t *>(weight.cudaData),
+        static_cast<const half *>(weight.extraCudaHalfData[FP8_MARLIN_SCALES_HALF_IDX]),
+        static_cast<half *>(destination), weight.dims[0], weight.dims[1], 0);
+    return true;
+}
+
 extern "C" bool FastllmCudaHasFp8MarlinLayout(
         const fastllm::Data &weight) {
     return HasFp8MarlinOnDevice(weight);
@@ -300,17 +419,44 @@ extern "C" bool FastllmCudaHasFp8MarlinLayout(
 extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
         const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
         fastllm::Data &output, int n, int m, int k) {
-    if (!Fp8MarlinDeviceSupported() || n < 1 ||
+    int arch = 0;
+    if (!Fp8MarlinDeviceSupported(arch) || n < 1 ||
         weight.dataType != fastllm::DataType::FP8_E4M3 ||
         weight.blockM != FP8_GROUP_SIZE || weight.blockK != FP8_GROUP_SIZE ||
         m % 64 != 0 || k % 64 != 0 || m % FP8_GROUP_SIZE != 0) {
         return false;
     }
 
-    // Keep batch-one decode on GEMV. Before conversion the caller can use the
+#if defined(FASTLLM_ENABLE_DEEPGEMM_FP8_SM90)
+    // DeepGEMM prefill and native GEMV share row-major weights on SM90.
+    // Preserve fresh eligible weights; already packed weights still use Marlin.
+    if (arch == 90 && k % 128 == 0 &&
+        weight.scales.size() == (size_t)(m / 128) * (k / 128) &&
+        !HasFp8MarlinOnDevice(weight)) {
+        return false;
+    }
+#endif
+
+    // Triton SM89 FP8 consumes row-major weights, while Marlin repacks cudaData
+    // in place during warmup. Preserve fresh eligible weights so Triton remains
+    // available; already packed weights continue using Marlin.
+    if (bias.dims.empty() && !weight.scales.empty() &&
+        !HasFp8MarlinOnDevice(weight) &&
+        Fp8MarlinShouldPreserveRowMajorForTriton(arch)) {
+        return false;
+    }
+
+    // Warm the dedicated handle before the KV budget is calibrated, even
+    // though the small warmup GEMM itself still goes through Marlin/GEMV.
+    // Decode avoids the state lookup and CUDA event operations entirely.
+    auto *prefillState = (arch == 75 || arch == 80 || arch == 86) && Fp8PrefillMatrixSupported(k, m) &&
+        (n >= FP8_PREFILL_MIN_ROWS || FastllmCudaGetNcclForceSync()) &&
+        Fp8PrefillEnabled() ? fastllm_cuda_prefill::GetState(arch, true) : nullptr;
+
+    // Keep small decode on the packed layout. Before conversion the caller can use the
     // original-layout GEMV directly; during synchronized warmup convert first
     // and use the coalesced GEMV above, avoiding a second CUDA module path.
-    if (n == 1) {
+    if (n == 1 || Fp8UseMultiRowGemv(arch, n, k, m)) {
         if (!HasFp8MarlinOnDevice(weight)) {
             if (!FastllmCudaGetNcclForceSync() ||
                 !EnsureFp8MarlinOnDevice(weight, m, k)) {
@@ -324,10 +470,20 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
         auto *cudaScales = (const float *)weight.extraCudaData[0];
         auto *cudaBias = bias.dims.empty()
             ? nullptr : (const half *)weight.extraCudaHalfData[0];
-        FastllmFp8MarlinLayoutGemvKernel<<<k / 8, 256, 0, cudaStreamPerThread>>>(
-            cudaInput, marlinWeight, cudaScales, cudaBias, cudaOutput, k, m);
+        if (n == 1) {
+            FastllmFp8MarlinLayoutGemvKernel<<<k / 8, 256, 0, cudaStreamPerThread>>>(
+                cudaInput, marlinWeight, cudaScales, cudaBias, cudaOutput, k, m);
+        } else {
+            if (n == 2) {
+                fastllm_fp8_marlin::MultiRowGemv<2><<<k / 8, 256, 0, cudaStreamPerThread>>>(
+                    cudaInput, marlinWeight, cudaScales, cudaBias, cudaOutput, k, m);
+            } else {
+                fastllm_fp8_marlin::MultiRowGemv<3><<<k / 8, 256, 0, cudaStreamPerThread>>>(
+                    cudaInput, marlinWeight, cudaScales, cudaBias, cudaOutput, k, m);
+            }
+        }
         if (cudaPeekAtLastError() != cudaSuccess) {
-            printf("Error: FP8 Marlin-layout batch-one GEMV launch failed.\n");
+            printf("Error: FP8 Marlin-layout GEMV launch failed (rows=%d).\n", n);
             throw("fp8 marlin-layout gemv error");
         }
         FastllmCudaFinishInput(input, cudaInput);
@@ -352,9 +508,13 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
     auto *workspace = (int *)weight.extraCudaData[FP8_MARLIN_WORKSPACE_IDX];
     auto *marlinScales = (const half *)weight.extraCudaHalfData[FP8_MARLIN_SCALES_HALF_IDX];
 
-    bool ok = FastllmCudaMarlinHalfFP8Gemm(
-        cudaInput, marlinWeight, marlinScales, cudaOutput,
-        n, k, m, FP8_GROUP_SIZE, workspace);
+    bool ok = Fp8PrefillCublas(prefillState, cudaInput, marlinWeight,
+                              marlinScales, cudaOutput, n, k, m);
+    if (!ok) {
+        ok = FastllmCudaMarlinHalfFP8Gemm(
+            cudaInput, marlinWeight, marlinScales, cudaOutput,
+            n, k, m, FP8_GROUP_SIZE, workspace);
+    }
 
     if (!ok) {
         printf("Error: FP8 Marlin GEMM failed after the CUDA weight was repacked in place.\n");

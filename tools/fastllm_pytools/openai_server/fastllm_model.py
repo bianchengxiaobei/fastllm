@@ -13,14 +13,30 @@ class FastLLmModel:
             getattr(model, "configured_context_window_limit", None)
         )
         is_kimi_k3 = self._is_kimi_k3(model)
-        reasoning_efforts = ["low", "high", "max"] if is_kimi_k3 else []
-        default_reasoning_effort = "max" if is_kimi_k3 else None
+        is_glm5_next = self._is_glm5_next(model)
+        is_qwen_reasoning = (
+            self._is_qwen3_5(model) or self._is_qwen4_exp(model))
+        if is_kimi_k3 or is_glm5_next:
+            reasoning_efforts = ["none", "low", "high", "max"]
+            default_reasoning_effort = "max"
+        elif is_qwen_reasoning:
+            reasoning_efforts = ["none", "low", "medium", "xhigh"]
+            default_reasoning_effort = "xhigh"
+        else:
+            reasoning_efforts = []
+            default_reasoning_effort = None
+        input_modalities = (
+            ["text", "image"]
+            if getattr(model, "mmproj_path", "") else ["text"])
 
         context_window_candidates = [
             value for value in (current_model_context_window, kv_cache_token_limit)
             if value is not None
         ]
         context_window = min(context_window_candidates) if context_window_candidates else 32768
+        resolved_context = getattr(model, "context_config", None)
+        if isinstance(resolved_context, dict) and resolved_context.get("configured"):
+            context_window = self._positive_int(resolved_context.get("context_window")) or context_window
         auto_compact_token_limit = max(1, context_window * 9 // 10)
 
         self.context_window = context_window
@@ -47,8 +63,8 @@ class FastLLmModel:
                 "supported_in_api": True,
                 "available_in_plans": [],
                 "priority": 0,
-                "input_modalities": ["text"],
-                "inputModalities": ["text"],
+                "input_modalities": input_modalities,
+                "inputModalities": input_modalities,
                 "supports_personality": False,
                 "supportsPersonality": False,
                 "additional_speed_tiers": [],
@@ -196,3 +212,94 @@ class FastLLmModel:
             except Exception:
                 pass
         return False
+
+    @staticmethod
+    def _is_qwen3_5(model):
+        qwen3_5_types = {
+            "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
+        }
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                if get_type() in qwen3_5_types:
+                    return True
+            except Exception:
+                pass
+
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures") or []
+        architecture = architectures[0] if architectures else ""
+        model_type = config.get("model_type", "")
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type", "")
+            if isinstance(text_config, dict) else "")
+        return (
+            architecture in {
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            }
+            or model_type in qwen3_5_types
+            or text_model_type in qwen3_5_types
+        )
+
+    @staticmethod
+    def _is_glm5_next(model):
+        detector = getattr(model, "_is_glm5_next", None)
+        if callable(detector):
+            try:
+                return bool(detector())
+            except Exception:
+                pass
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                if get_type() in {"glm5_next", "glm5_next_text"}:
+                    return True
+            except Exception:
+                pass
+
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures") or []
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type", "")
+            if isinstance(text_config, dict) else "")
+        return (
+            "Glm5NextForConditionalGeneration" in architectures
+            or config.get("model_type") == "glm5_next"
+            or text_model_type == "glm5_next_text"
+        )
+
+    @staticmethod
+    def _is_qwen4_exp(model):
+        qwen4_exp_types = {"qwen4_exp", "qwen4_exp_text"}
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                if get_type() in qwen4_exp_types:
+                    return True
+            except Exception:
+                pass
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures") or []
+        architecture = architectures[0] if architectures else ""
+        model_type = config.get("model_type", "")
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type", "")
+            if isinstance(text_config, dict) else "")
+        return (
+            architecture in {
+                "Qwen4ExpForConditionalGeneration",
+                "Qwen4ExpForCausalLM",
+            }
+            or model_type in qwen4_exp_types
+            or text_model_type in qwen4_exp_types
+        )

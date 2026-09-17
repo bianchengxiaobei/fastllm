@@ -17,12 +17,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
+#include <stdexcept>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
+#include "devices/multicuda/ncclsubmitrendezvous.h"
+#include "devices/multicuda/tp2prefill.h"
+#include "devices/cuda/fastllm-cuda-fp8.h"
+#ifndef USE_ROCM
+#include "devices/multicuda/tp2mlppipeline.cuh"
+#endif
 #include "fastllm.h"
 #include "utils.h"
 #include "gguf.h"
@@ -678,7 +686,8 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     // carries the tensor-level dequant multipliers needed when preparing the
     // Marlin layout, so every tensor-parallel shard must retain that metadata.
     // Shape-dependent scale arrays for other formats are split below instead.
-    if (src.dataType == fastllm::DataType::NVFP4_BLOCK_16) {
+    if (src.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+        src.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3) {
         dst.scales = src.scales;
     }
     dst.perChannelAxis = src.perChannelAxis;
@@ -741,6 +750,48 @@ static void ResetMultiDeviceData(fastllm::Data &data) {
     data.multiDeviceDatas.clear();
     data.multiDeviceData = false;
     data.ClearTensorParallelLayout();
+}
+
+static void ReleaseMultiCudaSplitSource(fastllm::Data &weight) {
+    if (!weight.multiDeviceData) {
+        return;
+    }
+    // Preserve SplitMultiCudaWeight's previous behavior for temporary tensors
+    // as well as model weights, while also returning the vector capacity.
+    std::vector<int>().swap(weight.weightSum);
+    if (!weight.isModelWeight) {
+        return;
+    }
+
+    // SplitMultiCudaWeight gives every requested device an owned local tensor.
+    // Keeping the original host allocation after that point doubles the packed
+    // weight storage during tensor-parallel inference.  The parent Data remains
+    // as logical metadata and owns the local tensors, but no longer needs its
+    // source payload.
+    if (weight.cpuData != nullptr) {
+        if (!weight.isFake) {
+#ifdef USE_MMAP
+            if (weight.mapFile == nullptr) {
+                delete[] weight.cpuData;
+            }
+#else
+            delete[] weight.cpuData;
+#endif
+        }
+        weight.cpuData = nullptr;
+    }
+    weight.mapFile.reset();
+
+    // INT4_GROUP metadata is copied into the local shards below.  In
+    // particular, asymmetric group-32 checkpoints otherwise retain a full
+    // scales/mins/zeros triplet in the parent in addition to all shard-local
+    // copies.
+    if (weight.dataType == fastllm::DataType::INT4_GROUP) {
+        std::vector<float>().swap(weight.scales);
+        std::vector<float>().swap(weight.mins);
+        std::vector<int>().swap(weight.zeros);
+        std::vector<fastllm::LowBitConfig>().swap(weight.perChannelsConfigs);
+    }
 }
 
 void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool copyData) {
@@ -1230,8 +1281,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     }
                     curLen += copyLen;
                 }
-            } else if (weight.dataType == fastllm::DataType::NVFP4 &&
-                       weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) {
+            } else if ((weight.dataType == fastllm::DataType::NVFP4 &&
+                        weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3) {
                 size_t rowBytes = fastllm::GetNVFP4WeightBytes(1, m);
                 size_t srcWeightBytes = fastllm::GetNVFP4WeightBytes(k, m);
                 size_t dstWeightBytes = fastllm::GetNVFP4WeightBytes(len, m);
@@ -1420,8 +1472,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                                                 sizeof(float),
                                                 k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                 }
-            } else if (weight.dataType == fastllm::DataType::NVFP4 &&
-                       weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) {
+            } else if ((weight.dataType == fastllm::DataType::NVFP4 &&
+                        weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3) {
                 size_t srcRowBytes = fastllm::GetNVFP4WeightBytes(1, m);
                 size_t dstRowBytes = fastllm::GetNVFP4WeightBytes(1, len);
                 size_t srcWeightBytes = fastllm::GetNVFP4WeightBytes(k, m);
@@ -1825,7 +1878,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     }
     ClearGGUFExtraCudaCaches(weight);
     weight.cudaData = nullptr;
-    weight.weightSum.clear();
+    ReleaseMultiCudaSplitSource(weight);
     return true;
 }
 
@@ -2038,6 +2091,15 @@ static bool g_ncclInitialized = false;
 static int g_ncclWorldSize = 0;
 static std::atomic<uint64_t> g_ncclGeneration{0};
 static std::mutex g_ncclInitMutex;
+// Follows the main communicator group's lifetime. As with g_ncclComms,
+// initialization/replacement must not overlap active collectives.
+static std::unique_ptr<fastllm::NcclSubmitRendezvous> g_ncclSubmitRendezvous;
+#ifndef USE_ROCM
+// Experimental opt-in, initialized with the main communicator before warmup.
+// Keep small collectives and graph capture on the established paths.
+static std::unique_ptr<fastllm::TP2WHT6AllReduce> g_tp2WHT6AllReduce;
+static std::map<int, std::unique_ptr<fastllm::TP2MlpPipeline>> g_tp2MlpPipelines;
+#endif
 
 struct FastllmNcclGraphPeerComms {
     int devices[2] = {-1, -1};
@@ -2176,6 +2238,11 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // every rank will consistently reject the stale state and use NCCL.
     g_ncclGeneration.fetch_add(1, std::memory_order_acq_rel);
     FastllmCudaCustomAllReduceReset();
+    g_ncclSubmitRendezvous.reset();
+#ifndef USE_ROCM
+    g_tp2WHT6AllReduce.reset();
+    g_tp2MlpPipelines.clear();
+#endif
 
     for (auto &it : g_ncclComms) {
         if (it.second != nullptr) {
@@ -2210,6 +2277,14 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         
     g_ncclInitialized = true;
     g_ncclWorldSize = numGPUs;
+    // Every multi-rank TP group meets around NCCL submission: even-rank
+    // collectives also fall back to NCCL for large tensors, and a rank
+    // entering the next GEMM/allocator while a peer is still submitting can
+    // deadlock on the CUDA driver lock (upstream #722: TP=2 + MTP long
+    // context prefill stalled at the 256-page boundary).
+    if (numGPUs > 1) {
+        g_ncclSubmitRendezvous.reset(new fastllm::NcclSubmitRendezvous(numGPUs));
+    }
     // Initialize the optional graph-safe small all-reduce before any captured
     // collective.  Failure is non-fatal: FastllmNcclAllReduce keeps NCCL as
     // the established fallback.
@@ -2217,6 +2292,48 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // 通知 CUDA 分配器：NCCL 已激活。此后真实 cudaMalloc 前会先排空在途集合通信，
     // 避免 cudaMalloc 与 NCCL 主机 proxy 争用 CUDA 驱动锁导致的跨 rank 死锁。
     FastllmCudaSetNcclActive(true);
+#ifndef USE_ROCM
+    auto enabled = [](const char *name) {
+        const char *value = std::getenv(name);
+        return value && std::strcmp(value, "1") == 0;
+    };
+    const bool wht6 = enabled("FASTLLM_TP2_WHT6_ALLREDUCE");
+    const bool overlap = enabled("FASTLLM_TP2_MLP_OVERLAP");
+    if (numGPUs == 2 && (wht6 || overlap)) {
+        // Decide for the whole group before either rank can enter a collective.
+        // Other architectures keep their existing paths even if flags are set.
+        bool ampere = true;
+        for (int device : uniqueDevices) {
+            cudaDeviceProp properties{};
+            cudaError_t status = cudaGetDeviceProperties(&properties, device);
+            if (status != cudaSuccess) {
+                cudaGetLastError();
+                ampere = false;
+                break;
+            }
+            ampere = ampere && properties.major == 8 &&
+                (properties.minor == 0 || properties.minor == 6);
+        }
+        if (ampere && overlap) {
+            for (int device : uniqueDevices) {
+                g_tp2MlpPipelines.emplace(device, std::make_unique<fastllm::TP2MlpPipeline>());
+            }
+        }
+        if (ampere && wht6) {
+            auto candidate = std::make_unique<fastllm::TP2WHT6AllReduce>();
+            cudaError_t status = candidate->Init(uniqueDevices[0], uniqueDevices[1]);
+            if (status == cudaSuccess) {
+                g_tp2WHT6AllReduce = std::move(candidate);
+                printf("[Fastllm] TP2 WHT6 enabled: GPU %d/%d, 1-32 MiB, eager FP16 contributions.\n",
+                       uniqueDevices[0], uniqueDevices[1]);
+            } else {
+                printf("[Fastllm] TP2 WHT6 initialization failed (%s); using NCCL.\n",
+                       cudaGetErrorString(status));
+                cudaGetLastError();
+            }
+        }
+    }
+#endif
     printf("NCCL Initialized for %d devices.\n", numGPUs);
     return true;
 }
@@ -2861,6 +2978,136 @@ static bool FastllmCanUseTP2P2PAllReduceAddImpl(
     return true;
 }
 
+bool FastllmCanUseTP2WHT6AllReduceAdd(int count, int dataType, int deviceId) {
+#ifndef USE_ROCM
+    if (!g_tp2WHT6AllReduce || g_ncclWorldSize != 2 ||
+        dataType != fastllm::DataType::FLOAT16 || count <= 0) return false;
+    size_t bytes = (size_t)count * sizeof(half);
+    if (bytes < 1024ULL * 1024 || bytes > fastllm::TP2WHT6AllReduce::Capacity) return false;
+    if (g_ncclRanks.find(deviceId) == g_ncclRanks.end()) return false;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cudaError_t status = cudaStreamIsCapturing(cudaStreamPerThread, &capture);
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        checkCudaErrors("Error: TP2 WHT6 capture query failed!", status);
+        return false;
+    }
+    return capture == cudaStreamCaptureStatusNone;
+#else
+    return false;
+#endif
+}
+
+bool FastllmTryTP2WHT6AllReduceAdd(const fastllm::Data &partial,
+                                  fastllm::Data &residual, int deviceId) {
+#ifndef USE_ROCM
+    if (!g_tp2WHT6AllReduce || partial.dataType != residual.dataType || partial.Count(0) != residual.Count(0) ||
+        !partial.cudaData || !residual.cudaData ||
+        !FastllmCanUseTP2WHT6AllReduceAdd(partial.Count(0), partial.dataType, deviceId)) return false;
+    int count = partial.Count(0);
+    size_t bytes = (size_t)count * sizeof(half);
+    auto rank = g_ncclRanks.find(deviceId);
+    cudaError_t status = g_tp2WHT6AllReduce->Run(rank->second, partial.cudaData, residual.cudaData,
+        count, cudaStreamPerThread, residual.cudaData);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "Error: TP2 WHT6 AllReduce GPU %d: %s (%s)\n", deviceId,
+                     cudaGetErrorString(status), g_tp2WHT6AllReduce->Error().c_str());
+        if (g_ncclSubmitRendezvous) g_ncclSubmitRendezvous->Abort("TP2 WHT6 AllReduce failed");
+        FastllmCudaSetThreadError();
+        return true; // Never take NCCL fallback after entering the collective.
+    }
+    if (FastllmNcclPostSyncEnabled(cudaStreamPerThread)) {
+        status = cudaStreamSynchronize(cudaStreamPerThread);
+        checkCudaErrors("Error: TP2 WHT6 warmup synchronization failed!", status);
+    } else {
+        static thread_local bool reported = false;
+        if (!reported) {
+            reported = true;
+            printf("[Fastllm] TP2 WHT6 active on GPU %d: %zu -> %zu bytes, residual uncompressed.\n",
+                   deviceId, bytes, ((size_t)count + 31) / 32 * sizeof(fastllm::TP2HostWHT6Block));
+        }
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmTryTP2MlpOverlap(const fastllm::Data &input,
+        fastllm::Data &gateUp, const fastllm::Data &gateUpBias,
+        fastllm::Data &down, const fastllm::Data &downBias,
+        fastllm::Data &residual, int deviceId) {
+#ifndef USE_ROCM
+    if (g_tp2MlpPipelines.empty() || g_ncclWorldSize != 2 || !g_ncclSubmitRendezvous ||
+        FastllmCudaGetNcclForceSync() ||
+        !gateUpBias.dims.empty() || !downBias.dims.empty() ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        residual.dataType != fastllm::DataType::FLOAT16 ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        residual.dataDevice != fastllm::DataDevice::CUDA ||
+        !input.cudaData || !residual.cudaData || input.dims.empty() ||
+        input.dims.back() != 5120 || input.Count(0) != 2048 * 5120 ||
+        residual.Count(0) != input.Count(0) ||
+        gateUp.dims != std::vector<int>({17408, 5120}) ||
+        down.dims != std::vector<int>({5120, 8704})) {
+        return false;
+    }
+    auto validWeight = [](const fastllm::Data &weight) {
+        return weight.dataType == fastllm::DataType::FP8_E4M3 &&
+            FastllmCudaHasFp8MarlinLayout(weight) && weight.cudaData &&
+            weight.blockM == 128 && weight.blockK == 128;
+    };
+    if (!validWeight(gateUp) || !validWeight(down)) return false;
+    auto rankIt = g_ncclRanks.find(deviceId);
+    auto commIt = g_ncclComms.find(deviceId);
+    if (rankIt == g_ncclRanks.end() || commIt == g_ncclComms.end() || !commIt->second) return false;
+    using Backend = fastllm::TP2MlpReduction::Backend;
+    Backend backend = g_tp2WHT6AllReduce ? Backend::WHT6 : Backend::Nccl;
+    fastllm::TP2MlpReduction reduction(rankIt->second, backend, commIt->second,
+        g_ncclSubmitRendezvous.get(), g_tp2WHT6AllReduce.get());
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cudaError_t captureState = cudaStreamIsCapturing(cudaStreamPerThread, &capture);
+    if (captureState != cudaSuccess) {
+        reduction.Abort("TP2 MLP stream capture query failed");
+        FastllmCudaSetThreadError();
+        throw std::runtime_error("TP2 MLP stream capture query failed");
+    }
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    // Entries are created with the idle communicator, and never inserted by
+    // serving threads. Each device has exactly one TP worker and pipeline.
+    auto pipelineIt = g_tp2MlpPipelines.find(deviceId);
+    if (pipelineIt == g_tp2MlpPipelines.end()) return false;
+    auto *pipeline = pipelineIt->second.get();
+    auto require = [&](cudaError_t status) {
+        if (status != cudaSuccess) {
+            reduction.Abort(cudaGetErrorString(status));
+            FastllmCudaSetThreadError();
+            throw std::runtime_error(std::string("TP2 MLP overlap: ") + cudaGetErrorString(status));
+        }
+    };
+    if (!pipeline->Matches(2048, 5120, 8704)) {
+        // Drain earlier compute-stream collectives before the first raw CUDA
+        // allocation. The steady-state path only uses the preallocated storage.
+        require(cudaStreamSynchronize(cudaStreamPerThread));
+        require(pipeline->Init(2048, 5120, 8704));
+        std::printf("[Fastllm] TP2 MLP overlap active on GPU %d: 2048 tokens -> 4 x 512, cuBLAS + %s.\n",
+                    deviceId, reduction.Name());
+        std::fflush(stdout);
+    }
+    if (!FastllmCudaDequantFp8MarlinForCublas(gateUp, pipeline->GateUpWeight()) ||
+        !FastllmCudaDequantFp8MarlinForCublas(down, pipeline->DownWeight())) {
+        require(cudaErrorInvalidValue);
+    }
+    require(cudaGetLastError());
+    require(pipeline->Run(static_cast<const half *>(input.cudaData),
+        static_cast<half *>(residual.cudaData), getFastllmCublasHandle(),
+        reduction, cudaStreamPerThread));
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool FastllmCanUseTP2P2PAllReduceAdd(int count, int dataType, int deviceId) {
     return FastllmCanUseTP2P2PAllReduceAddImpl(
         count, dataType, deviceId, nullptr);
@@ -3086,6 +3333,9 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
     } else {
         // 如果有其他类型，需在此补充
         printf("Error: Unknown dataType %d for NCCL\n", dataType);
+        if (g_ncclSubmitRendezvous) {
+            g_ncclSubmitRendezvous->Abort("unsupported AllReduce data type");
+        }
         FastllmCudaSetThreadError();
         return;
     }
@@ -3093,13 +3343,56 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
     // 3. 执行 AllReduce
     // op: ncclSum (求和)
     cudaStream_t stream = cudaStreamPerThread;
-    
+    auto *rendezvous = g_ncclSubmitRendezvous.get();
+    int rank = -1;
+    if (rendezvous != nullptr) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        cudaError_t state = cudaStreamIsCapturing(stream, &capture);
+        if (state != cudaSuccess) {
+            rendezvous->Abort("AllReduce stream capture query failed");
+            printf("Error: AllReduce capture query on device %d: %s\n",
+                   deviceId, cudaGetErrorString(state));
+            cudaGetLastError();
+            FastllmCudaSetThreadError();
+            return;
+        }
+        if (capture != cudaStreamCaptureStatusNone) {
+            rendezvous = nullptr;
+        } else {
+            auto it = g_ncclRanks.find(deviceId);
+            if (it != g_ncclRanks.end()) {
+                rank = it->second;
+            }
+        }
+    }
+    auto waitForRanks = [&](fastllm::NcclSubmitRendezvous::Phase phase) {
+        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType)) {
+            return true;
+        }
+        printf("Error: AllReduce submission on device %d: %s\n",
+               deviceId, rendezvous->Error().c_str());
+        FastllmCudaSetThreadError();
+        return false;
+    };
+    // A rank entering the next GEMM while peers are still in NCCL submission
+    // can deadlock on CUDA driver locks (observed with odd TP on RTX 5090).
+    // Meet before submission AND after every rank's ncclAllReduce returns.
+    // Do not wait for GPU completion or add host barriers to CUDA Graphs.
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::Before)) {
+        return;
+    }
     // 注意：ncclAllReduce 发射是异步的
     ncclResult_t res = ncclAllReduce(data, dest, count, ncclType, ncclSum, comm, stream);
     
     if (res != ncclSuccess) {
+        if (rendezvous != nullptr) {
+            rendezvous->Abort("ncclAllReduce submission failed");
+        }
         printf("Error: ncclAllReduce failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
         FastllmCudaSetThreadError();
+        return;
+    }
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::After)) {
         return;
     }
     // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
@@ -3118,6 +3411,31 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
                                   int dataType, int deviceId) {
     FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
+}
+
+bool FastllmNcclAllGather(const void* data, void* dest, int count,
+                         int dataType, int deviceId) {
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
+    ncclDataType_t type = ncclFloat;
+    if (data == nullptr || dest == nullptr || count <= 0 || comm == nullptr ||
+        !FastllmNcclResolveDataType(dataType, type, "AllGather")) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const cudaStream_t stream = cudaStreamPerThread;
+    const ncclResult_t result = ncclAllGather(data, dest, count, type, comm, stream);
+    if (result != ncclSuccess) {
+        printf("Error: ncclAllGather failed on device %d: %s\n",
+               deviceId, ncclGetErrorString(result));
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    if (FastllmNcclPostSyncEnabled(stream)) {
+        const cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: CUDA error when synchronizing NCCL allgather!", state);
+        return state == cudaSuccess;
+    }
+    return true;
 }
 
 // Sums all ranks but materializes the result only on root.  This is preferable

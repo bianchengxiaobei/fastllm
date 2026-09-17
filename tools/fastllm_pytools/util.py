@@ -5,6 +5,12 @@ import sys
 import subprocess
 import glob
 import math
+from decimal import Decimal, InvalidOperation, localcontext
+
+try:
+    from .gguf_metadata import get_gguf_model_config
+except ImportError:
+    from gguf_metadata import get_gguf_model_config
 
 def _positive_int(value: str) -> int:
     try:
@@ -14,6 +20,48 @@ def _positive_int(value: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return value
+
+def _memory_size_bytes(value) -> int:
+    """Parse a non-negative binary memory size such as 3g or 512m."""
+    maximum = (1 << 64) - 1
+    if isinstance(value, int):
+        if value < 0:
+            raise argparse.ArgumentTypeError("must be a non-negative size")
+        if value > maximum:
+            raise argparse.ArgumentTypeError("size is too large")
+        return value
+    text = str(value).strip().lower()
+    suffixes = {
+        "kib": 1 << 10, "ki": 1 << 10, "kb": 1 << 10, "k": 1 << 10,
+        "mib": 1 << 20, "mi": 1 << 20, "mb": 1 << 20, "m": 1 << 20,
+        "gib": 1 << 30, "gi": 1 << 30, "gb": 1 << 30, "g": 1 << 30,
+    }
+    factor = 1
+    number = text
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if text.endswith(suffix):
+            factor = suffixes[suffix]
+            number = text[:-len(suffix)].strip()
+            break
+    try:
+        parsed = Decimal(number)
+    except InvalidOperation:
+        raise argparse.ArgumentTypeError(
+            "must be a size such as 3g, 512m, or 0")
+    if not parsed.is_finite() or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative size")
+    if parsed > maximum:
+        raise argparse.ArgumentTypeError("size is too large")
+    if 0 < parsed < Decimal(1) / factor:
+        raise argparse.ArgumentTypeError("size is too small")
+    # Preserve byte boundaries, including UINT64_MAX. Float parsing rounds
+    # large valid integers up to 2^64 and can silently accept overflow.
+    with localcontext() as context:
+        context.prec = max(28, len(parsed.as_tuple().digits) + 10)
+        bytes_ = parsed * factor
+    if bytes_ > maximum:
+        raise argparse.ArgumentTypeError("size is too large")
+    return int(bytes_)
 
 def _has_cuda_device() -> bool:
     if os.path.exists("/dev/nvidia0") or os.path.isdir("/proc/driver/nvidia/gpus"):
@@ -25,6 +73,54 @@ def _has_cuda_device() -> bool:
                               timeout=8).returncode == 0
     except Exception:
         return False
+
+def _uses_non_nvidia_cuda_compatible_build() -> bool:
+    """Recognize accelerator builds that intentionally expose CUDA devices."""
+    try:
+        info_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                 "build_info.json")
+        with open(info_path, "r", encoding="utf-8") as info_file:
+            build_info = json.load(info_file)
+        return bool(build_info.get("USE_ROCM") or
+                    build_info.get("USE_IVCOREX"))
+    except Exception:
+        return False
+
+def _is_nvidia_cuda_platform() -> bool:
+    """Identify an NVIDIA-only accelerator host without using CUDA APIs."""
+    if _uses_non_nvidia_cuda_compatible_build():
+        return False
+    try:
+        accelerator_vendors = set()
+        has_nvidia_display_controller = False
+        for device_path in glob.glob("/sys/bus/pci/devices/*"):
+            vendor_path = os.path.join(device_path, "vendor")
+            class_path = os.path.join(device_path, "class")
+            try:
+                with open(vendor_path, "r", encoding="ascii") as vendor_file:
+                    vendor = vendor_file.read().strip().lower()
+                with open(class_path, "r", encoding="ascii") as class_file:
+                    device_class = class_file.read().strip().lower()
+            except Exception:
+                continue
+            if (device_class.startswith("0x03") or
+                    device_class.startswith("0x12")):
+                accelerator_vendors.add(vendor)
+            if device_class.startswith("0x03") and vendor == "0x10de":
+                has_nvidia_display_controller = True
+        if accelerator_vendors:
+            # Server boards commonly expose an ASPEED or Matrox BMC as a VGA
+            # controller alongside the compute GPUs.  They are display-only
+            # management devices and must not make an NVIDIA host look mixed.
+            bmc_display_vendors = {"0x1a03", "0x102b"}
+            compute_vendors = accelerator_vendors - bmc_display_vendors
+            return (has_nvidia_display_controller and
+                    compute_vendors == {"0x10de"})
+    except Exception:
+        pass
+    # Do not fall back to CUDA-compatible APIs or vendor utility shims.  If
+    # PCI identity is unavailable, the platform is not positively NVIDIA.
+    return False
 
 def _normalize_mtp_arg(value) -> int:
     try:
@@ -58,6 +154,16 @@ def _uses_thread_tp(tp) -> bool:
         return False
     spec = str(tp).strip().lower()
     return spec not in ["", "false", "off", "none", "disable"]
+
+def _uses_single_cuda_device(device) -> bool:
+    """Return whether the ordinary device map selects exactly one CUDA GPU."""
+    spec = str(device or "").strip().lower()
+    if spec == "cuda":
+        return True
+    if not spec.startswith("cuda:"):
+        return False
+    payload = spec.split(":", 1)[1].strip()
+    return payload != "" and "," not in payload
 
 def _arg_enabled(value) -> bool:
     if isinstance(value, bool):
@@ -125,6 +231,44 @@ def _cuda_driver_device_info(device_ids):
     except Exception:
         return {}
 
+def _nvidia_cuda_compute_capabilities(device_ids):
+    """Query NVIDIA compute capabilities after vendor detection succeeds."""
+    try:
+        import ctypes
+        driver = ctypes.CDLL("libcuda.so.1")
+        driver.cuInit.argtypes = [ctypes.c_uint]
+        driver.cuInit.restype = ctypes.c_int
+        driver.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        driver.cuDeviceGet.restype = ctypes.c_int
+        driver.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int),
+                                                 ctypes.c_int, ctypes.c_int]
+        driver.cuDeviceGetAttribute.restype = ctypes.c_int
+        if driver.cuInit(0) != 0:
+            return {}
+
+        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR/MINOR.
+        compute_capability_major = 75
+        compute_capability_minor = 76
+        result = {}
+        for ordinal in device_ids:
+            device = ctypes.c_int()
+            compute_major = ctypes.c_int()
+            compute_minor = ctypes.c_int()
+            if driver.cuDeviceGet(ctypes.byref(device), ordinal) != 0:
+                return {}
+            if driver.cuDeviceGetAttribute(ctypes.byref(compute_major),
+                                           compute_capability_major,
+                                           device.value) != 0:
+                return {}
+            if driver.cuDeviceGetAttribute(ctypes.byref(compute_minor),
+                                           compute_capability_minor,
+                                           device.value) != 0:
+                return {}
+            result[ordinal] = compute_major.value * 10 + compute_minor.value
+        return result
+    except Exception:
+        return {}
+
 def _auto_balanced_cuda_spec(device_ids) -> str:
     infos = _cuda_driver_device_info(device_ids)
     sm_counts = [infos.get(i, {}).get("sm_count", 0) for i in device_ids]
@@ -163,6 +307,17 @@ def _thread_tp_cuda_device_ids(tp):
         if device.isdigit():
             result.append(int(device))
     return result
+
+def _cuda_graph_auto_supported(cuda_spec) -> bool:
+    """Apply the SM75 cutoff only to positively identified NVIDIA systems."""
+    if not _is_nvidia_cuda_platform():
+        return True
+    device_ids = _thread_tp_cuda_device_ids(cuda_spec)
+    if not device_ids:
+        return False
+    capabilities = _nvidia_cuda_compute_capabilities(device_ids)
+    return all(capabilities.get(device_id, 0) > 75
+               for device_id in device_ids)
 
 def _configure_multicuda_worker_affinity(tp, threads):
     """Keep GPU launch workers off the NUMA MoE worker cores when possible."""
@@ -316,6 +471,58 @@ def apply_page_size_default(args):
             args.page_size = 16
     return args
 
+def apply_image_embedding_cache_env(args):
+    capacity = getattr(args, "image_embedding_cache", None)
+    if capacity is not None:
+        os.environ["FASTLLM_IMAGE_EMBEDDING_CACHE_BYTES"] = str(_memory_size_bytes(capacity))
+
+def apply_vision_device_env(args):
+    device = getattr(args, "vision_device", None)
+    if device is None:
+        device = os.environ.get("FASTLLM_QWEN35_VISION_DEVICE", "auto")
+    os.environ["FASTLLM_QWEN35_VISION_DEVICE"] = _vision_device(device)
+
+
+def apply_multimodal_warmup_env(args, is_qwen35_model):
+    if not getattr(args, "multimodal", False):
+        os.environ.pop("FASTLLM_QWEN35_MM_MAX_PATCHES", None)
+        return
+    if not is_qwen35_model:
+        raise ValueError("--multimodal startup preallocation currently supports Qwen3.5/Qwen3.8 models")
+    try:
+        from .qwen35_multimodal_native import get_qwen35_multimodal_config
+    except ImportError:
+        from qwen35_multimodal_native import get_qwen35_multimodal_config
+    model_config = {}
+    processor_path = args.path
+    if not os.path.isdir(processor_path):
+        processor_path = getattr(args, "ori", "") or os.path.dirname(processor_path)
+    config_path = os.path.join(processor_path, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as handle:
+            model_config = json.load(handle)
+    config = get_qwen35_multimodal_config(processor_path, model_config)
+    if min(config["patch_size"], config["temporal_patch_size"], config["merge_size"]) <= 0:
+        raise ValueError("Invalid multimodal patch size in processor configuration")
+    patch_area = config["patch_size"] ** 2
+    # Do not divide the video limit by temporal_patch_size: short clips
+    # are padded after resizing and can consume the full pixel budget.
+    max_pixels = max(config["image_max_pixels"], config["video_max_pixels"])
+    max_patches = max((max_pixels + patch_area - 1) // patch_area, config["merge_size"] ** 2)
+    os.environ["FASTLLM_QWEN35_MM_MAX_PATCHES"] = str(max_patches)
+
+
+def _vision_device(value):
+    device = str(value).strip().lower() or "auto"
+    if device in ("auto", "cpu", "cuda"):
+        return device
+    if device.startswith("cuda:"):
+        index = device[5:]
+        if index and index.isascii() and index.isdecimal() and int(index) <= 2147483647:
+            return "cuda:" + str(int(index))
+    raise argparse.ArgumentTypeError("vision device must be auto, cpu, cuda, or cuda:N (N >= 0)")
+
+
 def apply_prefix_cache_env(args):
     prefix_cache = getattr(args, "prefix_cache", "")
     if (prefix_cache != ""):
@@ -344,30 +551,115 @@ def _fastllm_env_flag_enabled(name: str, fallback_name: str = "") -> bool:
         return False
     return str(value).strip().lower() in ["1", "true", "on", "yes"]
 
-def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
-    """Select the tested Qwen3.5 CUDA TP fast path without deployment env vars.
+def _single_cuda_total_memory_bytes(device) -> int:
+    """Best-effort VRAM query for an ordinary single CUDA device mapping."""
+    spec = str(device or "").strip().lower()
+    if spec == "cuda":
+        logical_device = 0
+    elif spec.startswith("cuda:"):
+        payload = spec.split(":", 1)[1].strip()
+        if not payload.isdigit():
+            return 0
+        logical_device = int(payload)
+    else:
+        return 0
 
-    Environment variables remain authoritative debugging overrides.  The
-    automatic path is deliberately limited to the configuration for which the
-    scheduler can safely fall back row-by-row: CUDA thread TP, no MTP, and no
-    low-memory mode.
+    identifier = str(logical_device)
+    visible = [item.strip() for item in
+               os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+               if item.strip()]
+    if visible:
+        if logical_device >= len(visible):
+            return 0
+        identifier = visible[logical_device]
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-i", identifier, "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=8)
+        if result.returncode != 0:
+            return 0
+        first_line = result.stdout.splitlines()[0].strip()
+        return int(float(first_line)) * 1024 * 1024
+    except Exception:
+        return 0
+
+def _qwen35_gguf_needs_low_memory_fast_paths(args) -> bool:
+    """Detect GGUFs that cannot keep embedding/handoff state on the GPU."""
+    path = str(getattr(args, "path", "") or "")
+    if not path.lower().endswith(".gguf") or not os.path.isfile(path):
+        return False
+    total_memory = _single_cuda_total_memory_bytes(
+        getattr(args, "device", ""))
+    if total_memory <= 0:
+        return False
+    # CUDA context, cuBLAS, activations and one KV page still need headroom.
+    # Above 90%, keeping the large vocabulary output/embedding path on GPU is
+    # not viable on a 32 GiB card (for example Qwen3.5/Qwen3.8 Q8_K_XL).
+    return os.path.getsize(path) >= int(total_memory * 0.90)
+
+def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
+    """Select tested Qwen3.5 CUDA fast paths without deployment env vars.
+
+    Environment variables remain authoritative debugging overrides, except
+    --low_gpu_mem always disables CUDA embedding and GPU token handoff. The
+    automatic path is limited to ordinary single-GPU CUDA or CUDA thread TP,
+    no MTP or external DFlash, and no --low mode. DFlash keeps the
+    embedding table on the host by default; its target and draft paths share
+    one table dtype and only transfer the selected hidden rows.
     """
     tp_arg = getattr(args, "tp", "")
     device = getattr(args, "device", "")
+    speculative_algorithm = str(
+        getattr(args, "speculative_algorithm", "") or "").strip().lower()
+    cuda_execution = (_uses_thread_tp(tp_arg) or
+                      _uses_single_cuda_device(device))
     eligible = (is_qwen35_model and mtp == 0 and
+                speculative_algorithm != "dflash" and
                 not bool(getattr(args, "low", False)) and
-                _uses_thread_tp(tp_arg) and _uses_cuda_device(device))
-
-    if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
-        os.environ["FASTLLM_CUDA_GRAPH"] = "1"
+                cuda_execution and _uses_cuda_device(device))
 
     handoff_env = "FASTLLM_GPU_TOKEN_HANDOFF"
+    low_gpu_mem = bool(getattr(args, "low_gpu_mem", False))
+    if low_gpu_mem:
+        args.cuda_embedding = False
+        os.environ[handoff_env] = "0"
+        print(
+            "[Fastllm] --low_gpu_mem: CUDA embedding and GPU token handoff "
+            "disabled; CUDA graph selection is unchanged.",
+            flush=True,
+        )
+    low_memory_gguf = eligible and _qwen35_gguf_needs_low_memory_fast_paths(
+        args)
+    if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
+        # Decode graph capture itself is small enough for the large-GGUF
+        # configuration.  The material VRAM cost comes from implicitly moving
+        # the vocabulary embedding/output tensors to CUDA.
+        cuda_spec = tp_arg if _uses_thread_tp(tp_arg) else device
+        if _cuda_graph_auto_supported(cuda_spec):
+            os.environ["FASTLLM_CUDA_GRAPH"] = "1"
+        else:
+            print(
+                "[Fastllm] Qwen3.5 auto CUDA graph disabled: every NVIDIA "
+                "CUDA device must have compute capability greater than 7.5.",
+                flush=True,
+            )
     if eligible and handoff_env not in os.environ:
-        os.environ[handoff_env] = "1"
+        os.environ[handoff_env] = "0" if low_memory_gguf else "1"
+    if low_memory_gguf:
+        print(
+            "[Fastllm] Qwen3.5 large-GGUF memory guard: keeping CUDA "
+            "graph while disabling automatic GPU token handoff and CUDA "
+            "embedding; explicit command-line settings remain "
+            "authoritative.",
+            flush=True,
+        )
 
     graph_enabled = _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")
     handoff_enabled = _fastllm_env_flag_enabled(handoff_env)
-    if is_qwen35_model and (graph_enabled or handoff_enabled):
+    if is_qwen35_model and not low_gpu_mem and (
+            handoff_enabled or (graph_enabled and not low_memory_gguf)):
         # Qwen3.5 handoff keeps sampled tokens on device, and graph replay also
         # benefits from avoiding a host embedding round trip.
         args.cuda_embedding = True
@@ -437,11 +729,45 @@ def _configure_triton_compiler_python() -> str:
         )
     return detected
 
+def _configure_sm89_fp8_linear_triton(args) -> str:
+    global_env_name = "FASTLLM_CUDA_TRITON"
+    op_env_name = "FASTLLM_CUDA_TRITON_LINEAR_FP8"
+    python_env_name = "FASTLLM_CUDA_TRITON_PYTHON"
+    if global_env_name in os.environ or op_env_name in os.environ:
+        return ""
+
+    device_ids = _thread_tp_cuda_device_ids(getattr(args, "tp", ""))
+    if not device_ids:
+        device_ids = _thread_tp_cuda_device_ids(
+            getattr(args, "device", ""))
+    capabilities = _nvidia_cuda_compute_capabilities(device_ids)
+    if not any(capability == 89 for capability in capabilities.values()):
+        return ""
+
+    detected = _find_triton_python()
+    if not detected:
+        print(
+            "[Fastllm] SM89 FP8 Linear Triton is unavailable in the "
+            "current Python environment; built-in CUDA will be used.",
+            flush=True,
+        )
+        return ""
+
+    os.environ[python_env_name] = detected
+    os.environ[op_env_name] = "1"
+    print(
+        "[Fastllm] SM89 FP8 Linear Triton enabled automatically with "
+        "the current Python environment: %s" % detected,
+        flush=True,
+    )
+    return detected
+
 def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
     return (architecture in [
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "MiniMaxM1ForCausalLM",
@@ -452,18 +778,31 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "Glm4MoeForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen3_8FlashNextForConditionalGeneration",
         "MiniMaxM2ForCausalLM",
         "HYV3ForCausalLM",
         "LagunaForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "Dots3NoteForCausalLM",
+        "Glm5NextForConditionalGeneration",
     ] or model_type in [
-        "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
-        "kimi_k3",
-    ] or text_model_type == "qwen3_5_moe_text")
+        "deepseek_v4", "deepseek_v41", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
+        "kimi_k3", "dots3_note", "glm5_next", "glm5_next_text", "qwen4_exp",
+        "qwen3_8_flash_next",
+    ] or text_model_type in [
+        "deepseek_v41_text", "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
+        "qwen3_8_flash_next_text",
+    ])
 
-def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
-    return (architecture == "DeepseekV4ForCausalLM" or
-            model_type == "deepseek_v4")
+def _prefers_multicuda_tp(architecture: str, model_type: str = "",
+                          text_model_type: str = "") -> bool:
+    # DeepSeek-V4.1 与 V4 共用同一套 multicuda 张量并行实现（注意力按 query head
+    # 切分 + wo_b 列切 all-reduce），--tp N 同样要落到 multicuda 执行器上。
+    return (architecture in ("DeepseekV4ForCausalLM",
+                             "DeepseekV41ForCausalLM") or
+            model_type in ("deepseek_v4", "deepseek_v41") or
+            text_model_type == "deepseek_v41_text")
 
 def _prefers_laguna_hybrid_tp(architecture: str, model_type: str = "") -> bool:
     return (architecture == "LagunaForCausalLM" or
@@ -475,25 +814,53 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
     parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
+    parser.add_argument('--low_gpu_mem', action = 'store_true',
+                        help = '降低显存占用：强制关闭CUDA embedding和GPU token handoff，保留原有CUDA Graph策略；优先于--cuda_embedding及handoff环境变量')
     parser.add_argument('--dtype', type = str, default = "auto", help = '权重类型（读取HF模型时有效；auto默认使用float16，带缩放因子的FP8源权重保持FP8）')
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
+    parser.add_argument('--fast_prefill', '--fast-prefill', action = 'store_true',
+                        help = '启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；默认关闭')
     parser.add_argument('--device', type = str, help = '使用的设备')
+    parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
+                        type = _vision_device, default = None,
+                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N；默认auto，CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
+    parser.add_argument('--multimodal', action = 'store_true',
+                        help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
+    parser.add_argument('--moe_cuda_cache', '--moe-cuda-cache',
+                        dest = 'moe_cuda_cache', type = _memory_size_bytes,
+                        default = 0,
+                        help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
+    parser.add_argument('--moe_cpu_cache', '--moe-cpu-cache',
+                        dest = 'moe_cpu_cache', type = _memory_size_bytes,
+                        default = 0,
+                        help = 'moe_device=disk 时的专家内存缓存总上限，如32g；0表示关闭')
+    parser.add_argument('--image-embedding-cache', '--image_embedding_cache',
+                        dest = 'image_embedding_cache', type = _memory_size_bytes, default = None,
+                        help = 'Qwen3.5图片embedding的CPU缓存上限，如512m或1g；默认512m，0关闭')
+    parser.add_argument('--ngram_device', '--ngram-device', dest = 'ngram_device',
+                        choices = ['cpu', 'disk'], default = 'cpu',
+                        help = 'ngram表存放位置；cpu常驻内存（默认），disk从checkpoint按行读取以降低内存占用')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
     parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
     parser.add_argument("--enable_thinking", type = str, default = "", help = "是否开启硬思考开关（需要模型支持）")
     parser.add_argument("--cuda_shared_expert", "--cuda_se", type = str, default = "true", help = "是否使用cuda来执行共享专家")
     parser.add_argument("--enable_amx", "--amx", type = str, default = "false", help = "是否开启amx加速")
+    parser.add_argument("--max_context_length", "--max-context-length", dest = "max_context_length",
+                        type = _positive_int, default = -1,
+                        help = "单会话输入和输出合计的最大token数；超出模型配置时需要有效的RoPE扩展，容量不足则启动失败")
+    parser.add_argument("--rope_scaling", "--rope-scaling", default = "",
+                        help = "RoPE扩展配置：yarn或JSON；仅对已支持的模型布局生效")
     parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
     parser.add_argument("--page_size", type = int, default = -1, help = "设置paged cache每页的大小（token数），默认multicuda为16，其它设备使用后端默认值")
     parser.add_argument("--prefix_cache", "--prefix-cache", dest = "prefix_cache", type = str, default = "",
@@ -509,15 +876,24 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
-    parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--mtp_fp8_draft_head", "--mtp-fp8-draft-head",
+                        type = int, choices = [0, 1], default = None,
+                        help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
     parser.add_argument("--dspark", type = int, default = 0,
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
-                        help = "投机解码算法；当前支持 dspark")
-    parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path", "--dspark_model",
+                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash")
+    parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
+                        "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
-                        help = "DSpark draft model 的 Hugging Face 目录")
+                        help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可直接指定 mtp.safetensors")
+    parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
+                        help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
+    parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
+                        dest = "speculative_num_draft_tokens", type = int, default = -1,
+                        help = "DFlash 每轮 block token 数（含 anchor），默认读取 draft config")
     parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
                         dest = "speculative_dspark_block_size", type = int, default = -1,
                         help = "DSpark block size；默认读取 draft config")
@@ -531,6 +907,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
     parser.add_argument('--dtype_config', type = str, default = "", help = '指定权重类型配置文件')
     parser.add_argument('--ori', type = str, default = "", help = '原始模型权重，读取GGUF文件时可以使用')
+    parser.add_argument('--mmproj', type = str, default = "", help = '多模态投影GGUF文件（仅在读取GGUF主模型时有效）')
 
     parser.add_argument('--tool_call_parser', type = str, default = "auto", help = '使用的tool_call_parser类型')
     parser.add_argument('--chat_template', type = str, default = "", help = '使用的chat_template文件')
@@ -542,9 +919,6 @@ def add_server_args(parser):
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--api_key", type = str, default = "", help = "API Key")
-    parser.add_argument("--max_context_length", "--max-context-length", dest = "max_context_length",
-                        type = _positive_int, default = -1,
-                        help = "限制单会话输入和输出合计的最大token数；默认取模型上限和KV Cache总容量的较小值")
     parser.add_argument("--temperature", type = float, default = None, help = "覆盖服务端默认 temperature，未指定则使用模型默认值")
     parser.add_argument("--top_p", type = float, default = None, help = "覆盖服务端默认 top_p，未指定则使用模型默认值")
     parser.add_argument("--top_k", type = int, default = None, help = "覆盖服务端默认 top_k，未指定则使用模型默认值")
@@ -591,38 +965,177 @@ def make_normal_llm_model(args, startup_progress = None):
 
     user_set_device = bool(args.device and args.device != "")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
+    if str(getattr(args, "speculative_algorithm", "") or "").strip().lower() == "off":
+        # Explicitly disabling speculation takes precedence over saved draft settings.
+        args.mtp = args.dspark = 0
+        args.draft_tokens = -1
+        args.speculative_draft_model_path = ""
+        args.speculative_algorithm = ""
     mtp = _normalize_mtp_arg(getattr(args, "mtp", 0))
     args.mtp = mtp
     speculative_algorithm = str(
         getattr(args, "speculative_algorithm", "") or "").strip().lower()
     speculative_draft_path = str(
         getattr(args, "speculative_draft_model_path", "") or "").strip()
+    draft_tokens = int(getattr(args, "draft_tokens", -1))
     dspark_tokens = int(getattr(args, "dspark", 0) or 0)
     if dspark_tokens < 0:
         raise ValueError("--dspark must be >= 0")
+    if mtp > 0 and dspark_tokens > 0:
+        raise ValueError("MTP and --dspark cannot be enabled together")
+    if mtp > 0 and not speculative_algorithm:
+        speculative_algorithm = "mtp"
     if dspark_tokens > 0 and not speculative_algorithm:
         speculative_algorithm = "dspark"
-    if speculative_draft_path and not speculative_algorithm:
+    draft_config = None
+    draft_architectures = []
+    draft_text_config = {}
+    draft_has_mtp_weights = False
+    if speculative_draft_path:
+        speculative_draft_path = os.path.abspath(
+            os.path.expanduser(speculative_draft_path))
+        draft_is_file = os.path.isfile(speculative_draft_path)
+        draft_config_dir = (os.path.dirname(speculative_draft_path)
+                            if draft_is_file else speculative_draft_path)
+        draft_config_path = os.path.join(draft_config_dir, "config.json")
+        if not os.path.isfile(draft_config_path):
+            raise ValueError(
+                "speculative draft model has no adjacent config.json: %s" %
+                speculative_draft_path)
+        with open(draft_config_path, "r", encoding = "utf-8") as file:
+            draft_config = json.load(file)
+        draft_architectures = draft_config.get("architectures", [])
+        draft_text_config = draft_config.get("text_config", draft_config)
+        if not isinstance(draft_text_config, dict):
+            draft_text_config = {}
+        draft_has_mtp_weights = (
+            (draft_is_file and
+             speculative_draft_path.lower().endswith(".safetensors")) or
+            os.path.isfile(os.path.join(draft_config_dir, "mtp.safetensors")))
+        if not draft_has_mtp_weights:
+            draft_index_path = os.path.join(
+                draft_config_dir, "model.safetensors.index.json")
+            if os.path.isfile(draft_index_path):
+                with open(draft_index_path, "r", encoding = "utf-8") as file:
+                    draft_index = json.load(file)
+                draft_weight_map = draft_index.get("weight_map", {})
+                draft_has_mtp_weights = isinstance(
+                    draft_weight_map, dict) and any(
+                        str(name).startswith("mtp.")
+                        for name in draft_weight_map)
+        if not speculative_algorithm:
+            if "DFlash2DraftModel" in draft_architectures:
+                speculative_algorithm = "dflash"
+            elif "DSparkDraftModel" in draft_architectures:
+                speculative_algorithm = "dspark"
+            elif (draft_has_mtp_weights and
+                  int(draft_text_config.get("mtp_num_hidden_layers", 0) or 0) > 0):
+                speculative_algorithm = "mtp"
+            else:
+                raise ValueError(
+                    "cannot infer draft type from checkpoint: %s" %
+                    speculative_draft_path)
+    if draft_tokens > 0 and not speculative_algorithm and not speculative_draft_path:
         speculative_algorithm = "dspark"
-    if speculative_algorithm and speculative_algorithm != "dspark":
-        raise ValueError("--speculative_algorithm currently only supports dspark")
+    if (speculative_algorithm == "dspark" and not speculative_draft_path and
+            draft_tokens > 0):
+        if dspark_tokens > 0 and dspark_tokens != draft_tokens:
+            raise ValueError(
+                "--draft_tokens and --dspark specify different token counts")
+        dspark_tokens = draft_tokens
+        args.dspark = dspark_tokens
+    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash"):
+        raise ValueError(
+            "--speculative_algorithm currently supports off, mtp, dspark or dflash")
+    if speculative_algorithm == "dspark" and mtp > 0:
+        raise ValueError("MTP and DSpark cannot be enabled together")
     if (speculative_algorithm == "dspark" and not speculative_draft_path and
             dspark_tokens <= 0):
         raise ValueError(
             "DSpark requires either --dspark N for an embedded checkpoint or "
             "--speculative_draft_model_path")
-    if speculative_draft_path:
-        os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
-        speculative_draft_path = os.path.abspath(
-            os.path.expanduser(speculative_draft_path))
-        draft_config_path = os.path.join(speculative_draft_path, "config.json")
-        if not os.path.isfile(draft_config_path):
+    for env_name in (
+            "FASTLLM_DSPARK_MODEL_PATH",
+            "FASTLLM_DSPARK_TOKENS",
+            "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD",
+            "FASTLLM_DFLASH_MODEL_PATH",
+            "FASTLLM_DFLASH_BLOCK_SIZE"):
+        os.environ.pop(env_name, None)
+    if speculative_algorithm == "dflash":
+        if not speculative_draft_path:
             raise ValueError(
-                "DSpark draft directory has no config.json: %s" %
+                "DFlash requires --speculative_draft_model_path")
+        if not os.path.isdir(speculative_draft_path):
+            raise ValueError(
+                "DFlash draft checkpoint must be a directory: %s" %
                 speculative_draft_path)
-        with open(draft_config_path, "r", encoding = "utf-8") as file:
-            draft_config = json.load(file)
-        draft_architectures = draft_config.get("architectures", [])
+        if mtp > 0:
+            raise ValueError("DFlash and --mtp cannot be enabled together")
+        if dspark_tokens > 0:
+            raise ValueError("DFlash and --dspark cannot be enabled together")
+        if "DFlash2DraftModel" not in draft_architectures:
+            raise ValueError(
+                "draft checkpoint is not DFlash2DraftModel: %s" %
+                speculative_draft_path)
+        dflash_config = draft_config.get("dflash_config", {})
+        configured_block = int(dflash_config.get("block_size", 0))
+        requested_block = int(
+            getattr(args, "speculative_num_draft_tokens", -1))
+        if draft_tokens > 0:
+            draft_block = draft_tokens + 1
+            if requested_block > 0 and requested_block != draft_block:
+                raise ValueError(
+                    "--draft_tokens and --speculative_num_draft_tokens "
+                    "specify different DFlash block sizes")
+            requested_block = draft_block
+        if requested_block <= 0:
+            requested_block = configured_block
+        if (draft_tokens > 0 and
+                not 1 <= draft_tokens < configured_block):
+            raise ValueError(
+                "DFlash --draft_tokens must be in [1, checkpoint block_size - 1] "
+                "(requested=%d, checkpoint block_size=%d)" %
+                (draft_tokens, configured_block))
+        if configured_block < 2 or not 2 <= requested_block <= configured_block:
+            raise ValueError(
+                "DFlash block tokens must be in [2, checkpoint block_size] "
+                "(requested=%d, checkpoint=%d)" %
+                (requested_block, configured_block))
+        os.environ["FASTLLM_DFLASH_MODEL_PATH"] = speculative_draft_path
+        os.environ["FASTLLM_DFLASH_BLOCK_SIZE"] = str(requested_block)
+        args.speculative_draft_model_path = speculative_draft_path
+        args.speculative_algorithm = "dflash"
+    elif speculative_algorithm == "mtp":
+        if dspark_tokens > 0:
+            raise ValueError("MTP and --dspark cannot be enabled together")
+        if speculative_draft_path:
+            if not draft_has_mtp_weights:
+                raise ValueError(
+                    "MTP checkpoint contains no mtp.* safetensors: %s" %
+                    speculative_draft_path)
+            draft_model_type = str(
+                draft_text_config.get("model_type", "") or "")
+            if draft_model_type not in ("qwen3_5", "qwen3_5_text"):
+                raise ValueError(
+                    "external MTP checkpoint must be Qwen3.5, got model_type=%s" %
+                    draft_model_type)
+        if draft_tokens > 0:
+            if mtp > 0 and mtp != draft_tokens:
+                raise ValueError(
+                    "--mtp and --draft_tokens specify different MTP draft counts")
+            mtp = draft_tokens
+        elif mtp <= 0 and speculative_draft_path:
+            mtp = 5
+        if mtp <= 0:
+            raise ValueError("MTP requires --mtp N or an external --draft checkpoint")
+        args.mtp = mtp
+        args.speculative_draft_model_path = speculative_draft_path
+        args.speculative_algorithm = "mtp"
+    elif speculative_draft_path:
+        if not os.path.isdir(speculative_draft_path):
+            raise ValueError(
+                "DSpark draft checkpoint must be a directory: %s" %
+                speculative_draft_path)
         if "DSparkDraftModel" not in draft_architectures:
             raise ValueError(
                 "draft checkpoint is not DSparkDraftModel: %s" %
@@ -637,7 +1150,15 @@ def make_normal_llm_model(args, startup_progress = None):
                 "FastLLM currently requires the DSpark runtime block size "
                 "to match the checkpoint (requested=%d, checkpoint=%d)" %
                 (requested_block, configured_block))
+        if (draft_tokens > 0 and
+                not 1 <= draft_tokens <= configured_block):
+            raise ValueError(
+                "DSpark --draft_tokens must be in [1, checkpoint block_size] "
+                "(requested=%d, checkpoint block_size=%d)" %
+                (draft_tokens, configured_block))
         os.environ["FASTLLM_DSPARK_MODEL_PATH"] = speculative_draft_path
+        if draft_tokens > 0:
+            os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
         confidence_threshold = float(getattr(
             args, "speculative_dspark_confidence_threshold", 0.5))
         if not 0.0 <= confidence_threshold <= 1.0:
@@ -648,7 +1169,6 @@ def make_normal_llm_model(args, startup_progress = None):
         args.speculative_draft_model_path = speculative_draft_path
         args.speculative_algorithm = "dspark"
     else:
-        os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
         if dspark_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(dspark_tokens)
             confidence_threshold = float(getattr(
@@ -659,9 +1179,6 @@ def make_normal_llm_model(args, startup_progress = None):
             os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(
                 confidence_threshold)
             args.speculative_algorithm = "dspark"
-        else:
-            os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
-            os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
 
     usenuma = False
     try:
@@ -698,20 +1215,35 @@ def make_normal_llm_model(args, startup_progress = None):
     config_path = os.path.join(args.path, "config.json")
     if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
         config_path = os.path.join(args.ori, "config.json")
+    gguf_config = None
+    if (not os.path.exists(config_path) and os.path.isfile(args.path) and
+            args.path.lower().endswith(".gguf")):
+        gguf_config = get_gguf_model_config(args.path)
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
+    is_deepseek_v41_model = False
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
     is_qwen35_model = False
-    if (os.path.exists(config_path)):
+    is_qwen38_flash_next_model = False
+    is_deepseek_v4_model = False
+    is_dots3_note_model = False
+    if (os.path.exists(config_path) or gguf_config is not None):
         try:
-            with open(config_path, "r", encoding="utf-8") as file:
-                config = json.load(file)
-            architecture = config["architectures"][0]
+            if gguf_config is None:
+                with open(config_path, "r", encoding="utf-8") as file:
+                    config = json.load(file)
+            else:
+                config = gguf_config
+            architectures = config.get("architectures", [])
+            architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
             is_laguna_model = (architecture == 'LagunaForCausalLM' or
                                 model_type == 'laguna')
+            is_dots3_note_model = (
+                architecture == 'Dots3NoteForCausalLM' or
+                model_type == 'dots3_note')
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
@@ -723,6 +1255,28 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type in ("qwen3_5", "qwen3_5_moe") or
                 text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
             )
+            is_qwen38_flash_next_model = (
+                architecture in ("Qwen3_8FlashNextForConditionalGeneration",
+                                 "Qwen4ExpForConditionalGeneration") or
+                model_type in ("qwen3_8_flash_next", "qwen4_exp") or
+                text_model_type in ("qwen3_8_flash_next_text", "qwen4_exp_text")
+            )
+            is_deepseek_v4_model = (
+                architecture in ("DeepseekV4ForCausalLM",
+                                 "DeepSeekV4ForCausalLM") or
+                model_type == "deepseek_v4"
+            )
+            # DeepSeek-V4.1 的内置 DSpark 草稿层同样存放在 mtp.*，但配置在 text_config 里，
+            # 校验较短前缀时保留训练 block；候选数更大时扩展整个运行时草稿 block。
+            is_deepseek_v41_model = (
+                architecture in ("DeepseekV41ForCausalLM",
+                                 "DeepSeekV41ForCausalLM") or
+                model_type == "deepseek_v41" or
+                text_model_type == "deepseek_v41_text"
+            )
+            dspark_config = config
+            if is_deepseek_v41_model and isinstance(config.get("text_config"), dict):
+                dspark_config = config["text_config"]
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
@@ -732,18 +1286,47 @@ def make_normal_llm_model(args, startup_progress = None):
                             "Kimi-K3, got architecture=%s model_type=%s" %
                             (architecture, model_type))
                 else:
-                    is_deepseek_v4 = (
-                        architecture in ("DeepseekV4ForCausalLM",
-                                         "DeepSeekV4ForCausalLM") or
-                        model_type == "deepseek_v4")
-                    if not is_deepseek_v4:
+                    if not (is_deepseek_v4_model or is_deepseek_v41_model):
                         raise ValueError(
-                            "--dspark N requires a DeepSeek-V4 checkpoint with "
+                            "Embedded DSpark requires a DeepSeek-V4 / V4.1 checkpoint with "
                             "embedded mtp.* DSpark weights, got architecture=%s "
                             "model_type=%s" % (architecture, model_type))
+                    checkpoint_block = int(dspark_config.get(
+                        "dspark_block_size", 0) or 0)
+                    target_layers = dspark_config.get("dspark_target_layer_ids", [])
+                    noise_token = int(dspark_config.get(
+                        "dspark_noise_token_id", -1) or -1)
+                    if (checkpoint_block <= 0 or not target_layers or
+                            noise_token < 0):
+                        raise ValueError(
+                            "DeepSeek-V4 checkpoint is missing embedded DSpark "
+                            "configuration")
+                    if is_deepseek_v41_model:
+                        if dspark_tokens < 1:
+                            raise ValueError(
+                                "DeepSeek-V4.1 DSpark draft tokens must be positive "
+                                "(requested=%d)" % dspark_tokens)
+                    elif dspark_tokens < checkpoint_block:
+                        raise ValueError(
+                            "DSpark draft tokens must be at least the checkpoint training "
+                            "block size (requested=%d, checkpoint=%d)" %
+                            (dspark_tokens, checkpoint_block))
+            elif speculative_algorithm == "dflash":
+                if not is_qwen35_model:
+                    raise ValueError(
+                        "DFlash2 draft checkpoints currently require a Qwen3.5 "
+                        "target, got architecture=%s model_type=%s" %
+                        (architecture, model_type))
+            elif speculative_algorithm == "mtp":
+                if is_deepseek_v4_model:
+                    if speculative_draft_path:
+                        raise ValueError(
+                            "DeepSeek-V4 MTP uses the checkpoint's embedded "
+                            "DSpark weights and does not accept an external draft")
                     checkpoint_block = int(config.get(
                         "dspark_block_size", 0) or 0)
-                    target_layers = config.get("dspark_target_layer_ids", [])
+                    target_layers = config.get(
+                        "dspark_target_layer_ids", [])
                     noise_token = int(config.get(
                         "dspark_noise_token_id", -1) or -1)
                     if (checkpoint_block <= 0 or not target_layers or
@@ -751,11 +1334,41 @@ def make_normal_llm_model(args, startup_progress = None):
                         raise ValueError(
                             "DeepSeek-V4 checkpoint is missing embedded DSpark "
                             "configuration")
-                    if dspark_tokens < checkpoint_block:
+                    if mtp < checkpoint_block:
                         raise ValueError(
-                            "--dspark must be at least the checkpoint training "
-                            "block size (requested=%d, checkpoint=%d)" %
-                            (dspark_tokens, checkpoint_block))
+                            "DeepSeek-V4 MTP draft tokens must be at least the "
+                            "checkpoint training block size "
+                            "(requested=%d, checkpoint=%d)" %
+                            (mtp, checkpoint_block))
+                    confidence_threshold = float(getattr(
+                        args, "speculative_dspark_confidence_threshold", 0.5))
+                    if not 0.0 <= confidence_threshold <= 1.0:
+                        raise ValueError(
+                            "--speculative_dspark_confidence_threshold must be "
+                            "in [0, 1]")
+                    dspark_tokens = mtp
+                    args.dspark = mtp
+                    os.environ["FASTLLM_DSPARK_TOKENS"] = str(mtp)
+                    os.environ[
+                        "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"
+                    ] = str(confidence_threshold)
+                    args.speculative_algorithm = "dspark"
+                    speculative_algorithm = "dspark"
+                    print(
+                        "[Fastllm] DeepSeek-V4 --mtp uses the checkpoint's "
+                        "embedded DSpark draft weights.",
+                        flush=True,
+                    )
+                elif not (is_qwen35_model or is_qwen38_flash_next_model):
+                    raise ValueError(
+                        "MTP currently requires a Qwen3.5 or Qwen3.8-Flash-Next target, got "
+                        "architecture=%s model_type=%s" %
+                        (architecture, model_type))
+                if (not is_deepseek_v4_model and speculative_draft_path and not (
+                        os.path.isfile(args.path) and
+                        args.path.lower().endswith(".gguf"))):
+                    raise ValueError(
+                        "external MTP attachment currently requires a GGUF target")
             is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)
 
             is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
@@ -786,8 +1399,14 @@ def make_normal_llm_model(args, startup_progress = None):
                 architecture == 'LagunaForCausalLM' or model_type == 'laguna' or
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
+                architecture == 'Qwen4ExpForConditionalGeneration' or
+                architecture == 'Qwen3_8FlashNextForConditionalGeneration' or
+                model_type in ('qwen4_exp', 'qwen3_8_flash_next') or
+                text_model_type in ('qwen4_exp_text', 'qwen3_8_flash_next_text') or
                 architecture == 'Glm4MoeForCausalLM' or architecture == 'GlmMoeDsaForCausalLM' or
+                architecture == 'Glm5NextForConditionalGeneration' or
                 architecture == 'HYV3ForCausalLM' or model_type == 'glm_moe_dsa' or
+                model_type == 'glm5_next' or text_model_type == 'glm5_next_text' or
                 model_type == 'hy_v3' or
                 architecture == 'KimiK3ForConditionalGeneration' or
                 model_type == 'kimi_k3'):
@@ -807,8 +1426,12 @@ def make_normal_llm_model(args, startup_progress = None):
                 is_thread_tp_moe_model = True
             if (_prefers_laguna_hybrid_tp(architecture, model_type)):
                 is_laguna_hybrid_tp_model = True
-            if (_prefers_multicuda_tp(architecture, model_type)):
+            if (_prefers_multicuda_tp(architecture, model_type, text_model_type)):
                 is_multicuda_tp_model = True
+            if (architecture == 'DeepseekV41ForCausalLM' or
+                    model_type == 'deepseek_v41' or
+                    text_model_type == 'deepseek_v41_text'):
+                is_deepseek_v41_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
@@ -886,6 +1509,16 @@ def make_normal_llm_model(args, startup_progress = None):
             args.cuda_slab = (96 if is_laguna_hybrid_tp_model and
                               _thread_tp_cuda_device_count(args.tp) == 4
                               else 256)
+    if (is_qwen38_flash_next_model and args.cuda_slab <= 0 and
+            _uses_cuda_device(args.device) and
+            (args.moe_device_layers >= 0 or
+             _uses_cuda_device(args.moe_device))):
+        # ModelOpt NVFP4 expands each 16-value expert block to twelve bytes.
+        # One Qwen3.8 expert therefore uses 2.34375 MiB for merged gate-up and
+        # 1.171875 MiB for down.  A 225 MiB slab packs 64 experts exactly and
+        # avoids CUDA page/allocation overhead from tens of thousands of tiny
+        # expert tensors.
+        args.cuda_slab = 225
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
@@ -925,6 +1558,17 @@ def make_normal_llm_model(args, startup_progress = None):
             args.atype = "float32"
     if (args.moe_device == ""):
         args.moe_device = args.device
+    if (is_dots3_note_model and
+            str(args.moe_device).strip().lower() == "cpu"):
+        os.environ.setdefault("FASTLLM_CPU_FP8_DECODE_ROW_TILE", "4")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_PREFILL_FUSED", "1")
+        os.environ.setdefault("FASTLLM_CPU_FP8_SMALL_BATCH", "1")
+        os.environ.setdefault(
+            "FASTLLM_DOTS3_NOTE_PREFILL_MAX_EXPERT_BATCH", "5")
+        os.environ.setdefault(
+            "FASTLLM_DOTS3_NOTE_PREFILL_LPT_SCHEDULE", "1")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_PREFETCH_WEIGHTS", "1")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_CPU_LM_HEAD", "1")
     raw_main_device = str(args.device or "").strip()
     os.environ["FASTLLM_CUDAPP_SERIAL"] = "1" if raw_main_device.lower().startswith("cudapp=") else "0"
 
@@ -932,12 +1576,16 @@ def make_normal_llm_model(args, startup_progress = None):
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
-            if (atype_was_auto):
+            if (atype_was_auto and not is_deepseek_v41_model):
+                # DeepSeek-V4.1 的 SetDataType 只接受 float32（推理精度由模型内部
+                # 自己按 BF16 走），--tp 不能像其它模型那样把 atype 改成 float16。
                 args.atype = "bfloat16" if is_laguna_model else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
         if (is_laguna_model and _uses_thread_tp(tp_arg)):
+            args.moe_atype = "bfloat16"
+        elif (architecture == "Dots3NoteForCausalLM" or model_type == "dots3_note"):
             args.moe_atype = "bfloat16"
         elif (_uses_cuda_device(args.moe_device)):
             args.moe_atype = "float16"
@@ -950,9 +1598,19 @@ def make_normal_llm_model(args, startup_progress = None):
             args.device = expanded
     if (args.moe_device and args.moe_device != ""):
         args.moe_device = expand_cudapp_device(args.moe_device)
+    _configure_sm89_fp8_linear_triton(args)
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
+    os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
+        "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
     from ftllm import llm
+    if hasattr(llm, "set_cuda_graph"):
+        llm.set_cuda_graph(_fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))
     llm.set_moe_device_layers(-1)
+    llm.set_moe_cuda_cache(
+        _memory_size_bytes(getattr(args, "moe_cuda_cache", 0)))
+    llm.set_moe_cpu_cache(
+        _memory_size_bytes(getattr(args, "moe_cpu_cache", 0)))
+    llm.set_ngram_device(args.ngram_device)
     if (args.device and args.device != ""):
         try:
             import ast
@@ -993,8 +1651,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 llm.set_device_map(args.moe_device, True)
     llm.set_cpu_threads(args.threads)
     llm.set_cpu_low_mem(args.low)
-    if (args.cuda_embedding):
-        llm.set_cuda_embedding(True)
+    if (args.cuda_embedding or getattr(args, "low_gpu_mem", False)):
+        llm.set_cuda_embedding(bool(args.cuda_embedding))
     llm.set_cuda_shared_expert(
         args.cuda_shared_expert.lower() not in ["", "false", "0", "off"]
     )
@@ -1006,11 +1664,21 @@ def make_normal_llm_model(args, startup_progress = None):
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
     apply_prefix_cache_env(args)
+    apply_image_embedding_cache_env(args)
+    apply_vision_device_env(args)
+    apply_multimodal_warmup_env(args, is_qwen35_model)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
         llm.set_cuda_slab(args.cuda_slab)
     os.environ["FASTLLM_QWEN35_ENABLE_MTP"] = str(mtp)
+    mtp_fp8_draft_head = getattr(args, "mtp_fp8_draft_head", None)
+    if mtp_fp8_draft_head is not None:
+        # Explicit arguments override the environment; omission preserves it.
+        os.environ["FASTLLM_MTP_FP8_DRAFT_HEAD"] = "1" if _arg_enabled(mtp_fp8_draft_head) else "0"
+    os.environ["FASTLLM_QWEN4_ENABLE_MTP"] = str(
+        mtp if is_qwen38_flash_next_model else 0)
+    os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"] = str(mtp)
     graph = None
     if (args.custom != ""):
         import importlib.util
@@ -1030,10 +1698,24 @@ def make_normal_llm_model(args, startup_progress = None):
     if startup_progress is not None:
         startup_progress.progress("initializing", 1, 1)
         llm.set_model_load_progress_callback(startup_progress.model_load_progress)
+    max_context_length = getattr(args, "max_context_length", -1)
+    rope_scaling = getattr(args, "rope_scaling", "")
+    # Non-HF loaders still support the original, shrink-only context limit.
+    # Explicit RoPE options must reach the constructor's capability check.
+    legacy_context_limit = (max_context_length > 0 and not rope_scaling and
+                            (graph is not None or not os.path.isdir(args.path)))
+    model = None
     try:
         model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
                             moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
-                            dtype_config = args.dtype_config, ori_model_path = args.ori, chat_template = args.chat_template, tool_call_parser = args.tool_call_parser)
+                            dtype_config = args.dtype_config, ori_model_path = args.ori,
+                            chat_template = args.chat_template,
+                            tool_call_parser = args.tool_call_parser,
+                            external_mtp_path = (speculative_draft_path
+                                if speculative_algorithm == "mtp" else ""),
+                            mmproj_path = args.mmproj,
+                            max_context_length = -1 if legacy_context_limit else max_context_length,
+                            rope_scaling = rope_scaling)
         llm.report_model_load_progress("weights_finalize", 0, 1)
         if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
             model.enable_thinking = False
@@ -1048,14 +1730,13 @@ def make_normal_llm_model(args, startup_progress = None):
             model.set_moe_experts(args.moe_experts)
         if (args.max_batch > 0):
             model.set_max_batch(args.max_batch)
-        model.native_context_window = model.get_max_input_len()
-        model.configured_context_window_limit = None
-        max_context_length = getattr(args, "max_context_length", -1)
-        if (max_context_length == 0 or max_context_length < -1):
-            raise ValueError("--max_context_length must be a positive integer")
+        if not getattr(model, "native_context_window", None):
+            model.native_context_window = model.get_max_input_len()
         if (max_context_length > 0):
+            if legacy_context_limit:
+                model.set_max_context_length(max_context_length)
             model.configured_context_window_limit = max_context_length
-            effective_context_length = model.set_max_context_length(max_context_length)
+            effective_context_length = model.get_max_input_len()
             print("[Fastllm] Per-session context window limit: %d tokens "
                   "(requested=%d, model max=%d)." %
                   (effective_context_length, max_context_length, model.native_context_window))
@@ -1078,6 +1759,10 @@ def make_normal_llm_model(args, startup_progress = None):
                 % (args.max_batch, effective_max_batch, effective_max_batch)
             )
         return model
+    except Exception:
+        if model is not None:
+            model.release_memory()
+        raise
     finally:
         if startup_progress is not None:
             llm.set_model_load_progress_callback(None)

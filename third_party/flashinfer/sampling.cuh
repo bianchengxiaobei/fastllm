@@ -37,8 +37,22 @@
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
-using MaxReduceOp = cuda::maximum<>;
-using MinReduceOp = cuda::minimum<>;
+// cuda::maximum/minimum are absent from CCCL 2.7 (CUDA 12.8), while the old
+// cub::Max/Min aliases are absent from newer CCCL releases. Keep these tiny
+// operators local so the vendored sampling kernels build with both layouts.
+struct MaxReduceOp {
+  template <typename T>
+  __host__ __device__ constexpr T operator()(const T& lhs, const T& rhs) const {
+    return lhs < rhs ? rhs : lhs;
+  }
+};
+
+struct MinReduceOp {
+  template <typename T>
+  __host__ __device__ constexpr T operator()(const T& lhs, const T& rhs) const {
+    return rhs < lhs ? rhs : lhs;
+  }
+};
 
 namespace flashinfer {
 
@@ -1894,7 +1908,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
     float u = curand_uniform(&curand_state);
-    if (u * p < q) {
+    // curand_uniform includes 1. Accept p == q unconditionally: rejecting
+    // identical distributions would leave an empty residual distribution.
+    if (q > 0.f && (q >= p || u * p < q)) {
       // accept the draft models output
       output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = draft_id;
     } else {
@@ -1910,7 +1926,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
     float u = curand_uniform(&curand_state);
-    if (u * p < q) {
+    // curand_uniform includes 1. Accept p == q unconditionally: rejecting
+    // identical distributions would leave an empty residual distribution.
+    if (q > 0.f && (q >= p || u * p < q)) {
       ++accepted_token_num;
     }
   }

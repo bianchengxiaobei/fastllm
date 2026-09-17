@@ -1,10 +1,11 @@
+import ast
 import json
 import os
 import shlex
 import subprocess
 import sys
 import unicodedata
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 try:
@@ -15,51 +16,29 @@ except ImportError:
 
 Choice = Tuple[str, str]
 ModelGroup = Tuple[str, str, Sequence[Choice]]
-PATH_COMPLETION_FIELDS = {"model", "cache_dir", "ori"}
+PATH_COMPLETION_FIELDS = {
+    "model",
+    "cache_dir",
+    "ori",
+    "speculative_draft_model_path",
+}
 DIRECTORY_COMPLETION_FIELDS = {"cache_dir", "ori"}
 CONTENT_MAX_WIDTH = 96
 PANEL_MAX_HEIGHT = 28
 PANEL_PADDING_X = 2
 PANEL_PADDING_Y = 1
 DEFAULT_ESCDELAY_MS = 25
-QWEN_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
-    ("Qwen/Qwen3.6-27B-FP8", "Qwen3.6-27B-FP8"),
-    ("Qwen/Qwen3-0.6B", "Qwen3-0.6B"),
-    ("Qwen/Qwen3-1.7B", "Qwen3-1.7B"),
-    ("Qwen/Qwen3-4B", "Qwen3-4B"),
-    ("Qwen/Qwen3-8B", "Qwen3-8B"),
-    ("Qwen/Qwen3-14B", "Qwen3-14B"),
-    ("Qwen/Qwen3-32B", "Qwen3-32B"),
-    ("Qwen/Qwen3-30B-A3B", "Qwen3-30B-A3B"),
-    ("Qwen/Qwen3-235B-A22B", "Qwen3-235B-A22B"),
-)
-DEEPSEEK_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1-Distill-Qwen-7B"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "DeepSeek-R1-Distill-Qwen-14B"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", "DeepSeek-R1-Distill-Qwen-32B"),
-)
-MINIMAX_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
-    ("MiniMax/MiniMax-Text-01", "MiniMax-Text-01"),
-    ("MiniMax/MiniMax-M1-40k", "MiniMax-M1-40k"),
-    ("MiniMax/MiniMax-M1-80k", "MiniMax-M1-80k"),
-)
+DEFAULT_MODELSCOPE_MODEL_ID = "Qwen/Qwen3.8-27B-FP8"
 HOT_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
-    ("Qwen/Qwen3.6-27B-FP8", "Qwen3.6-27B-FP8"),
-    ("Qwen/Qwen3-0.6B", "Qwen3-0.6B"),
-    ("Qwen/Qwen3-8B", "Qwen3-8B"),
-    ("Qwen/Qwen3-30B-A3B", "Qwen3-30B-A3B"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1-Distill-Qwen-7B"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", "DeepSeek-R1-Distill-Qwen-32B"),
-    ("MiniMax/MiniMax-M1-40k", "MiniMax-M1-40k"),
+    (DEFAULT_MODELSCOPE_MODEL_ID, "Qwen3.8-27B-FP8"),
+    ("QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4", "Qwen3.8-27B-QUASAR-NVFP4"),
+    ("z-lab/Qwen3.8-27B-DFlash2", "Qwen3.8-27B-DFlash2"),
 )
 CUSTOM_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("custom", "自定义模型ID"),
 )
 MODELSCOPE_MODEL_GROUPS: Sequence[ModelGroup] = (
     ("hot", "热门模型", HOT_MODELSCOPE_MODEL_CHOICES),
-    ("qwen", "千问系列", QWEN_MODELSCOPE_MODEL_CHOICES),
-    ("deepseek", "DeepSeek系列", DEEPSEEK_MODELSCOPE_MODEL_CHOICES),
-    ("minimax", "MiniMax系列", MINIMAX_MODELSCOPE_MODEL_CHOICES),
     ("custom", "自定义", CUSTOM_MODELSCOPE_MODEL_CHOICES),
 )
 MODELSCOPE_MODEL_GROUP_CHOICES: Sequence[Choice] = tuple(
@@ -99,6 +78,7 @@ class DeployConfig:
     moe_device: str = "numa"
     moe_device_layers: str = "10000"
     moe_device_custom: str = ""
+    ngram_device: str = "auto"
     dtype: str = "auto"
     dtype_custom: str = ""
     moe_dtype: str = "auto"
@@ -112,23 +92,32 @@ class DeployConfig:
     threads: str = "auto"
     kv_cache_limit: str = "auto"
     mtp: str = "auto"
+    speculative_algorithm: str = "auto"
+    speculative_draft_model_path: str = ""
+    draft_tokens: str = "auto"
     max_batch: str = "auto"
     max_context_length: str = "auto"
+    rope_scaling: str = ""
     temperature: str = ""
     top_p: str = ""
     top_k: str = ""
     repeat_penalty: str = ""
     api_key: str = ""
     hide_input: bool = False
+    webui_max_token: str = "4096"
+    webui_think: str = "false"
     cache_dir: str = ""
     ori: str = ""
     extra_args: str = ""
     env_vars: str = ""
+    config_mode: str = "custom"
+    enable_speculative_decoding: bool = False
+    low_gpu_mem: bool = False
 
 
 @dataclass
 class ModelScopeDownloadConfig:
-    model_id: str = "Qwen/Qwen3-0.6B"
+    model_id: str = DEFAULT_MODELSCOPE_MODEL_ID
     model_id_custom: str = ""
     target_dir: str = ""
     max_workers: str = "4"
@@ -155,14 +144,26 @@ COMMAND_CHOICES: Sequence[Choice] = (
 )
 
 DEVICE_CHOICES: Sequence[Choice] = (
+    ("auto", "自动"),
     ("cuda", "CUDA 单卡"),
     ("tp", "多卡张量并行"),
     ("cudapp", "多卡串行"),
     ("cpu", "CPU"),
+    ("numa", "NUMA CPU"),
+    ("custom", "自定义"),
 )
 
 MOE_DEVICE_CHOICES: Sequence[Choice] = (
+    ("cpu", "CPU"),
+    ("cuda", "CUDA"),
     ("numa", "NUMA CPU"),
+    ("disk", "Disk"),
+    ("custom", "自定义设备映射"),
+)
+
+NGRAM_DEVICE_CHOICES: Sequence[Choice] = (
+    ("auto", "自动/不指定"),
+    ("cpu", "CPU"),
     ("disk", "Disk"),
 )
 
@@ -194,6 +195,7 @@ KV_CACHE_DTYPE_CHOICES: Sequence[Choice] = (
     ("float16", "float16"),
     ("bfloat16", "bfloat16"),
     ("fp8_e4m3", "fp8"),
+    ("fp4", "fp4（Qwen3.5 CUDA）"),
 )
 
 MOE_ATYPE_CHOICES: Sequence[Choice] = (
@@ -207,6 +209,18 @@ ENABLE_THINKING_CHOICES: Sequence[Choice] = (
     ("auto", "自动"),
     ("true", "开启"),
     ("false", "关闭"),
+)
+
+SPECULATIVE_ALGORITHM_CHOICES: Sequence[Choice] = (
+    ("off", "关闭推测解码"),
+    ("auto", "自动识别"),
+    ("mtp", "MTP"),
+    ("dflash", "DFlash2"),
+    ("dspark", "DSpark"),
+)
+
+SPECULATIVE_ALGORITHM_VALUES = frozenset(
+    value for value, _label in SPECULATIVE_ALGORITHM_CHOICES
 )
 
 
@@ -299,6 +313,26 @@ FIELDS: Sequence[FormField] = (
         visible=lambda c: c.enable_moe_hybrid,
     ),
     FormField(
+        "moe_device_custom",
+        "MOE自定义设备映射",
+        "text",
+        "例如 {'cuda':1,'numa':8,'disk':1}，表示按比例分配专家层。",
+        visible=lambda c: c.enable_moe_hybrid and c.moe_device == "custom",
+    ),
+    FormField(
+        "ngram_device",
+        "N-gram存储设备",
+        "choice",
+        "Qwen4 等模型的大型 PLE 表默认放在 CPU；内存不足时可选 Disk。",
+        NGRAM_DEVICE_CHOICES,
+    ),
+    FormField(
+        "low_gpu_mem",
+        "低显存模式",
+        "bool",
+        "减少运行时显存占用，为上下文缓存留出更多空间。",
+    ),
+    FormField(
         "gpu_mem_ratio",
         "显存利用率",
         "text",
@@ -310,16 +344,35 @@ FIELDS: Sequence[FormField] = (
         "text",
         "分块 prefill 的切片大小；调小可以减少显存占用，auto 表示不指定。",
     ),
-    FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16 或 fp8。", KV_CACHE_DTYPE_CHOICES),
-    FormField("mtp", "MTP", "text", "Qwen3.5 MTP 每步生成的 draft token 数；0 表示关闭，1-8 开启，auto 表示不指定。"),
+    FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16、fp8 或 fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）。", KV_CACHE_DTYPE_CHOICES),
+    FormField("mtp", "MTP", "text", "支持 MTP 的模型每步生成的 draft token 数；0 表示关闭，1-8 开启，auto 表示不指定。"),
+    FormField(
+        "speculative_algorithm",
+        "推测算法",
+        "choice",
+        "关闭推测解码、自动识别 draft checkpoint，或显式选择 MTP、DFlash2、DSpark。",
+        SPECULATIVE_ALGORITHM_CHOICES,
+    ),
+    FormField(
+        "speculative_draft_model_path",
+        "Draft模型路径",
+        "text",
+        "外置 MTP、DFlash2 或 DSpark checkpoint；留空使用模型内置能力。",
+    ),
+    FormField(
+        "draft_tokens",
+        "Draft Token数",
+        "text",
+        "每轮最多使用的 draft token 数；auto 表示读取 checkpoint 配置。",
+    ),
     FormField("max_batch", "最大Batch", "text", "每次最多同时推理的询问数量；auto 表示不指定。"),
     FormField(
         "max_context_length",
         "单会话上下文",
         "text",
-        "限制单会话输入和输出合计的最大 token 数；auto 表示取模型与 KV Cache 上限的较小值。",
-        visible=lambda c: c.command == "server",
+        "单会话输入和输出合计的最大 token 数；扩展需要有效 RoPE 配置，容量不足时启动失败。",
     ),
+    FormField("rope_scaling", "RoPE扩展", "text", "留空沿用模型配置；填 yarn 或 JSON 参数。"),
     FormField("moe_atype", "MOE激活类型", "choice", "MOE层激活类型，可使用 auto、float32、float16 或 bfloat16。", MOE_ATYPE_CHOICES),
     FormField("enable_thinking", "思考开关", "choice", "是否开启硬思考开关，需要模型支持。", ENABLE_THINKING_CHOICES),
     FormField("tokens", "tokens数量", "text", "设置总 token 数量；auto 表示不指定。"),
@@ -337,6 +390,21 @@ FIELDS: Sequence[FormField] = (
         "text",
         "设置后 server 会校验 Bearer token；留空表示不校验。",
         visible=lambda c: c.command == "server",
+    ),
+    FormField(
+        "webui_max_token",
+        "WebUI最大输出Token",
+        "text",
+        "网页聊天单次生成的最大 token 数。",
+        visible=lambda c: c.command == "webui",
+    ),
+    FormField(
+        "webui_think",
+        "WebUI思考模式",
+        "choice",
+        "开启后在缺少 <think> 起始标记时补齐该标记。",
+        ENABLE_THINKING_CHOICES[1:],
+        visible=lambda c: c.command == "webui",
     ),
     FormField("extra_args", "其它参数", "text", "直接追加到 ftllm 命令末尾，例如 --cuda_slab 1024。"),
     FormField("env_vars", "环境变量", "text", "启动前设置环境变量，格式 KEY=VALUE KEY2=VALUE2，例如 FASTLLM_ACTIVATE_NUMA=ON。"),
@@ -365,6 +433,8 @@ BASIC_FIELD_KEYS = {
     "enable_moe_hybrid",
     "moe_device",
     "moe_device_layers",
+    "moe_device_custom",
+    "ngram_device",
 }
 
 
@@ -431,6 +501,30 @@ def _resolve_custom(value: str, custom_value: str) -> str:
     if value == "auto":
         return ""
     return value.strip()
+
+
+def _is_valid_custom_device_map(value: str) -> bool:
+    value = str(value).strip()
+    if not value:
+        return False
+    try:
+        parsed = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return False
+    if isinstance(parsed, dict):
+        return bool(parsed) and all(
+            isinstance(device, str)
+            and bool(device.strip())
+            and isinstance(weight, (int, float))
+            and not isinstance(weight, bool)
+            and weight > 0
+            for device, weight in parsed.items()
+        )
+    if isinstance(parsed, list):
+        return bool(parsed) and all(
+            isinstance(device, str) and bool(device.strip()) for device in parsed
+        )
+    return False
 
 
 def is_gguf_model(model_path: str) -> bool:
@@ -801,7 +895,7 @@ def normalize_main_device_config(config: DeployConfig):
     device = str(config.device).strip()
     lower = device.lower()
     if lower in ("", "auto"):
-        config.device = "cuda"
+        config.device = "auto"
         config.cuda_device_id = config.cuda_device_id.strip() or "0"
     elif lower.startswith("cudapp="):
         spec = device.split("=", 1)[1].strip()
@@ -834,15 +928,21 @@ def normalize_main_device_config(config: DeployConfig):
         config.tp = config.tp.strip() or "2"
 
 
-def normalize_moe_hybrid_config(config: DeployConfig, has_enable_field: bool, has_layers_field: bool):
+def normalize_moe_hybrid_config(
+    config: DeployConfig,
+    has_enable_field: bool,
+    has_device_field: bool,
+    has_layers_field: bool,
+):
     moe_device = str(config.moe_device).strip().lower()
-    if not has_enable_field and moe_device in ("numa", "disk"):
+    supported_devices = ("cpu", "cuda", "numa", "disk", "custom")
+    if not has_enable_field and has_device_field and moe_device in supported_devices:
         config.enable_moe_hybrid = True
         if not has_layers_field:
             config.moe_device_layers = "-1"
 
     if config.enable_moe_hybrid:
-        if moe_device not in ("numa", "disk"):
+        if moe_device not in supported_devices:
             config.moe_device = "numa"
         else:
             config.moe_device = moe_device
@@ -850,17 +950,41 @@ def normalize_moe_hybrid_config(config: DeployConfig, has_enable_field: bool, ha
             config.moe_device_layers = "10000"
 
 
+def _normalize_speculative_config(config: DeployConfig) -> DeployConfig:
+    if str(config.speculative_algorithm).strip().lower() == "off":
+        return replace(config, speculative_algorithm="off", mtp="0", draft_tokens="auto",
+                       speculative_draft_model_path="", enable_speculative_decoding=False)
+    return config
+
+
 def config_from_dict(data: dict) -> DeployConfig:
     config = DeployConfig()
     valid_keys = {field.name for field in fields(DeployConfig)}
     has_enable_moe_hybrid = "enable_moe_hybrid" in data
+    has_moe_device = "moe_device" in data
     has_moe_device_layers = "moe_device_layers" in data
     for key, value in data.items():
-        if key in valid_keys:
-            setattr(config, key, value)
+        if key not in valid_keys:
+            continue
+        default = getattr(config, key)
+        if isinstance(default, bool):
+            if isinstance(value, str):
+                value = value.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                value = bool(value)
+        elif isinstance(default, str):
+            value = "" if value is None else str(value)
+        setattr(config, key, value)
+    if config.config_mode not in ("long_context", "high_concurrency", "custom"):
+        config.config_mode = "custom"
     normalize_main_device_config(config)
-    normalize_moe_hybrid_config(config, has_enable_moe_hybrid, has_moe_device_layers)
-    return config
+    normalize_moe_hybrid_config(
+        config,
+        has_enable_moe_hybrid,
+        has_moe_device,
+        has_moe_device_layers,
+    )
+    return _normalize_speculative_config(config)
 
 
 def config_title(config: DeployConfig) -> str:
@@ -922,7 +1046,7 @@ def apply_main_device_defaults(config: DeployConfig, old_device: str, new_device
 
 
 def apply_moe_hybrid_defaults(config: DeployConfig):
-    if config.moe_device not in ("numa", "disk"):
+    if config.moe_device not in ("cpu", "cuda", "numa", "disk", "custom"):
         config.moe_device = "numa"
     if not str(config.moe_device_layers).strip():
         config.moe_device_layers = "10000"
@@ -995,10 +1119,21 @@ def complete_path_prefix(raw_prefix: str, directories_only: bool = False) -> Lis
 
 
 def build_fastllm_argv(config: DeployConfig) -> List[str]:
+    config = _normalize_speculative_config(config)
     argv = ["ftllm", config.command]
     model = _expand_user_path(config.model.strip())
     if model:
         argv.append(model)
+
+    if config.command == "webui":
+        # WebUI connects to an API server; inference options belong to the
+        # separately launched model service, including for saved profiles.
+        _add_option(argv, "--port", config.port.strip())
+        _add_option(argv, "--max_token", config.webui_max_token.strip())
+        _add_option(argv, "--api_key", config.api_key.strip())
+        if config.extra_args.strip():
+            argv.extend(shlex.split(config.extra_args.strip()))
+        return argv
 
     device, tp = _resolve_main_device_args(config)
     dtype = _resolve_custom(config.dtype, config.dtype_custom)
@@ -1007,9 +1142,20 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "--device", device)
     _add_option(argv, "--tp", tp)
     if config.enable_moe_hybrid:
-        _add_option(argv, "--moe_device", config.moe_device.strip())
+        _add_option(
+            argv,
+            "--moe_device",
+            _resolve_custom(config.moe_device, config.moe_device_custom),
+        )
         _add_option(argv, "--moe_device_layers", config.moe_device_layers.strip())
+    _add_option(
+        argv,
+        "--ngram_device",
+        _optional_text(str(config.ngram_device).strip().lower()),
+    )
     _add_option(argv, "--gpu_mem_ratio", _optional_text(config.gpu_mem_ratio))
+    if config.low_gpu_mem:
+        argv.append("--low_gpu_mem")
     _add_option(argv, "--chunked_prefill_size", _optional_text(config.chunked_prefill_size))
     _add_option(argv, "--kv_cache_dtype", _optional_text(config.kv_cache_dtype))
     _add_option(argv, "--moe_atype", _optional_text(config.moe_atype))
@@ -1019,30 +1165,39 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "--moe_dtype", moe_dtype)
     _add_option(argv, "-t", _optional_text(config.threads))
     _add_option(argv, "--kv_cache_limit", _optional_text(config.kv_cache_limit))
-    _add_option(argv, "--mtp", _optional_text(config.mtp))
+    if config.speculative_algorithm != "off":
+        _add_option(argv, "--mtp", _optional_text(config.mtp))
+        _add_option(argv, "--speculative_algorithm", _optional_text(config.speculative_algorithm))
+    _add_option(
+        argv,
+        "--speculative_draft_model_path",
+        _expand_user_path(config.speculative_draft_model_path.strip()),
+    )
+    _add_option(argv, "--draft_tokens", _optional_text(config.draft_tokens))
     _add_option(argv, "--max_batch", _optional_text(config.max_batch))
     _add_option(argv, "--cache_dir", _expand_user_path(config.cache_dir.strip()))
     if is_gguf_model(config.model):
         _add_option(argv, "--ori", _expand_user_path(config.ori.strip()))
 
+    _add_option(argv, "--max_context_length", _optional_text(config.max_context_length))
+    _add_option(argv, "--rope_scaling", config.rope_scaling.strip())
     if config.command == "server":
         _add_option(argv, "--model_name", effective_model_name(config))
         _add_option(argv, "--host", config.host.strip())
         _add_option(argv, "--port", config.port.strip())
         _add_option(argv, "--api_key", config.api_key.strip())
-        _add_option(argv, "--max_context_length", _optional_text(config.max_context_length))
         _add_option(argv, "--temperature", config.temperature.strip())
         _add_option(argv, "--top_p", config.top_p.strip())
         _add_option(argv, "--top_k", config.top_k.strip())
         _add_option(argv, "--repeat_penalty", config.repeat_penalty.strip())
         if config.hide_input:
             argv.append("--hide_input")
-    elif config.command == "webui":
-        _add_option(argv, "--port", config.port.strip())
-
     extra_args = config.extra_args.strip()
     if extra_args:
         argv.extend(shlex.split(extra_args))
+    # An explicit Off selection also overrides old speculative flags in extra_args.
+    if config.speculative_algorithm == "off":
+        argv.extend(["--speculative_algorithm", "off"])
     return argv
 
 
@@ -1054,84 +1209,152 @@ def build_fastllm_command(config: DeployConfig) -> str:
     return " ".join(env_prefix + [shlex.quote(part) for part in build_fastllm_argv(config)])
 
 
-def validate_config(config: DeployConfig) -> List[str]:
+def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = None) -> List[str]:
+    config = _normalize_speculative_config(config)
     errors = []
+
+    def add_error(message, *field_names):
+        errors.append(message)
+        if field_errors is not None:
+            field_errors.append({"message": message, "fields": list(field_names)})
+
     model_path = _expand_user_path(config.model.strip())
     if not model_path:
-        errors.append("模型路径不能为空。")
+        add_error("模型路径不能为空。", "model")
     elif is_gguf_model(model_path):
         if not os.path.isfile(model_path):
-            errors.append("GGUF模型路径必须是已存在的本地 .gguf 文件。")
+            add_error("GGUF模型路径必须是已存在的本地 .gguf 文件。", "model")
     elif not os.path.isdir(model_path):
-        errors.append("模型路径必须是已存在的本地模型目录，或 .gguf 文件。")
+        add_error("模型路径必须是已存在的本地模型目录，或 .gguf 文件。", "model")
 
     ori_path = _expand_user_path(config.ori.strip())
     if is_gguf_model(config.model) and ori_path and not os.path.isdir(ori_path):
-        errors.append("模型配置文件夹必须是已存在的本地目录。")
+        add_error("模型配置文件夹必须是已存在的本地目录。", "ori")
 
     if config.command in ("server", "webui"):
         try:
             port = int(config.port)
             if port < 1 or port > 65535:
-                errors.append("端口必须在 1-65535 之间。")
+                add_error("端口必须在 1-65535 之间。", "port")
         except ValueError:
-            errors.append("端口必须是整数。")
+            add_error("端口必须是整数。", "port")
 
-    for label, value in (
-        ("预处理分片大小", config.chunked_prefill_size),
-        ("最大Batch", config.max_batch),
-        ("单会话上下文", config.max_context_length),
-        ("tokens数量", config.tokens),
-        ("线程数", config.threads),
+    if config.command == "webui":
+        if (
+            not _is_positive_int_or_auto(config.webui_max_token)
+            or _is_auto_or_empty(config.webui_max_token)
+        ):
+            add_error("WebUI最大输出Token必须是正整数。", "webui_max_token")
+        if config.webui_think not in ("true", "false"):
+            add_error("WebUI思考模式必须是 true 或 false。", "webui_think")
+
+    for field_name, label, value in (
+        ("chunked_prefill_size", "预处理分片大小", config.chunked_prefill_size),
+        ("max_batch", "最大Batch", config.max_batch),
+        ("max_context_length", "单会话上下文", config.max_context_length),
+        ("tokens", "tokens数量", config.tokens),
+        ("threads", "线程数", config.threads),
+        ("draft_tokens", "Draft Token数", config.draft_tokens),
     ):
         if not _is_positive_int_or_auto(value):
-            errors.append(f"{label}必须是正整数或 auto。")
+            add_error(f"{label}必须是正整数或 auto。", field_name)
 
     if not _is_mtp_value(config.mtp):
-        errors.append("MTP 必须是 0-8 的整数或 auto。")
+        add_error("MTP 必须是 0-8 的整数或 auto。", "mtp")
+
+    speculative_algorithm = str(config.speculative_algorithm).strip().lower()
+    if (
+        speculative_algorithm
+        and speculative_algorithm not in SPECULATIVE_ALGORITHM_VALUES
+    ):
+        add_error("推测算法必须是 off、auto、mtp、dflash 或 dspark。", "speculative_algorithm")
+
+    draft_path = _expand_user_path(config.speculative_draft_model_path.strip())
+    draft_path_exists = bool(
+        draft_path
+        and (os.path.isdir(draft_path) or os.path.isfile(draft_path))
+    )
+    if draft_path and not draft_path_exists:
+        add_error("Draft模型路径必须是已存在的本地目录或文件。", "speculative_draft_model_path")
+
+    try:
+        mtp_tokens = int(str(config.mtp).strip())
+    except ValueError:
+        mtp_tokens = 0
+    try:
+        draft_tokens = int(str(config.draft_tokens).strip())
+    except ValueError:
+        draft_tokens = 0
+
+    if speculative_algorithm == "dflash":
+        if not draft_path:
+            add_error("DFlash2 必须指定 Draft模型路径。", "speculative_draft_model_path")
+        elif draft_path_exists and not os.path.isdir(draft_path):
+            add_error("DFlash2 的 Draft模型路径必须是目录。", "speculative_draft_model_path")
+        if mtp_tokens > 0:
+            add_error("DFlash2 和 MTP 不能同时启用。", "speculative_algorithm", "mtp")
+    elif speculative_algorithm == "mtp":
+        if not draft_path and mtp_tokens <= 0:
+            add_error("内置 MTP 必须指定 1-8 的 MTP token 数。", "mtp")
+        if mtp_tokens > 0 and draft_tokens > 0 and mtp_tokens != draft_tokens:
+            add_error("MTP Token 数和 Draft Token 数必须一致。", "mtp", "draft_tokens")
+    elif speculative_algorithm == "dspark":
+        if draft_path_exists and not os.path.isdir(draft_path):
+            add_error("DSpark 的 Draft模型路径必须是目录。", "speculative_draft_model_path")
+        if not draft_path and draft_tokens <= 0:
+            add_error("内置 DSpark 必须指定 Draft Token 数。", "draft_tokens")
+        if mtp_tokens > 0:
+            add_error("DSpark 和 MTP 不能同时启用。", "speculative_algorithm", "mtp")
 
     if not _is_ratio(config.gpu_mem_ratio):
-        errors.append("显存利用率必须是 0 到 1 之间的数字，例如 0.9。")
+        add_error("显存利用率必须是 0 到 1 之间的数字，例如 0.9。", "gpu_mem_ratio")
 
     if config.command == "server" and not config.host.strip():
-        errors.append("监听地址不能为空。")
+        add_error("监听地址不能为空。", "host")
     if config.device == "cuda" and not _is_valid_cuda_device_id(config.cuda_device_id):
-        errors.append("CUDA卡号必须是非负整数；留空表示 0。")
+        add_error("CUDA卡号必须是非负整数；留空表示 0。", "cuda_device_id")
     if config.device == "cudapp" and not _is_valid_cudapp_spec(config.cudapp):
-        errors.append("串行参数格式不对。请输入正整数卡数，例如 4；或输入至少两个卡号，例如 0,1,2。")
+        add_error("串行参数格式不对。请输入正整数卡数，例如 4；或输入至少两个卡号，例如 0,1,2。", "cudapp")
     if config.device == "tp" and not _is_valid_tp_spec(config.tp):
-        errors.append("TP卡数/ID格式不对。请输入卡数，例如 1 或 4；或输入卡号，例如 0、cuda:1、0,2,3。")
+        add_error("TP卡数/ID格式不对。请输入卡数，例如 1 或 4；或输入卡号，例如 0、cuda:1、0,2,3。", "tp")
     if config.device == "custom" and not config.device_custom.strip():
-        errors.append("选择自定义主设备时必须填写自定义主设备。")
+        add_error("选择自定义主设备时必须填写自定义主设备。", "device_custom")
     if config.enable_moe_hybrid:
-        if config.moe_device not in ("numa", "disk"):
-            errors.append("MOE推理设备只能选择 NUMA CPU 或 Disk。")
+        if config.moe_device not in ("cpu", "cuda", "numa", "disk", "custom"):
+            add_error("MOE推理设备配置无效。", "moe_device")
+        if (
+            config.moe_device == "custom"
+            and not _is_valid_custom_device_map(config.moe_device_custom)
+        ):
+            add_error("自定义MOE设备映射格式无效，请填写设备列表或正权重映射。", "moe_device_custom")
         if not _is_valid_moe_device_layers(config.moe_device_layers):
-            errors.append("MOE设备层数格式不对。请输入正整数，例如 8；或输入 -1 表示全部 MOE 层。")
+            add_error("MOE设备层数格式不对。请输入正整数，例如 8；或输入 -1 表示全部 MOE 层。", "moe_device_layers")
+    if str(config.ngram_device).strip().lower() not in ("", "auto", "cpu", "disk"):
+        add_error("N-gram存储设备只能选择 CPU、Disk 或 auto。", "ngram_device")
     if config.dtype == "custom" and not config.dtype_custom.strip():
-        errors.append("选择自定义权重类型时必须填写自定义权重类型。")
+        add_error("选择自定义权重类型时必须填写自定义权重类型。", "dtype_custom")
     if config.moe_dtype == "custom" and not config.moe_dtype_custom.strip():
-        errors.append("选择自定义MOE类型时必须填写自定义MOE类型。")
+        add_error("选择自定义MOE类型时必须填写自定义MOE类型。", "moe_dtype_custom")
 
     if not _is_optional_float(config.temperature, min_value=0):
-        errors.append("temperature 必须是大于等于 0 的数字，或留空使用模型默认值。")
+        add_error("temperature 必须是大于等于 0 的数字，或留空使用模型默认值。", "temperature")
     if not _is_optional_float(config.top_p, min_value=0, max_value=1):
-        errors.append("top_p 必须是 0 到 1 之间的数字，或留空使用模型默认值。")
+        add_error("top_p 必须是 0 到 1 之间的数字，或留空使用模型默认值。", "top_p")
     if not _is_optional_positive_int(config.top_k):
-        errors.append("top_k 必须是正整数，或留空使用模型默认值。")
+        add_error("top_k 必须是正整数，或留空使用模型默认值。", "top_k")
     if not _is_optional_float(config.repeat_penalty, min_value=0):
-        errors.append("repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。")
+        add_error("repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。", "repeat_penalty")
 
     if config.extra_args.strip():
         try:
             shlex.split(config.extra_args)
         except ValueError as exc:
-            errors.append(f"额外参数无法解析: {exc}")
+            add_error(f"额外参数无法解析: {exc}", "extra_args")
     if config.env_vars.strip():
         try:
             parse_env_vars(config.env_vars)
         except ValueError as exc:
-            errors.append(str(exc))
+            add_error(str(exc), "env_vars")
     return errors
 
 

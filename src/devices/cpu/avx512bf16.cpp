@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <array>
+#include <limits>
 #include <vector>
 #include <cstring>
 #include <algorithm>
@@ -285,6 +287,184 @@ namespace fastllm {
         return true;
     }
 
+#ifdef __AVX512BF16__
+    static inline __m512bh FP8E4M3ToMagicBFloat16_AVX512BF16(
+            const uint8_t *weightData) {
+        const __m256i bytes = _mm256_loadu_si256(
+            (const __m256i*)weightData);
+        const __m512i words = _mm512_cvtepu8_epi16(bytes);
+        const __m512i shifted = _mm512_slli_epi16(words, 4);
+        // Shifting the raw byte by four puts the FP8 sign in bit 11.
+        // For negative values, xor bits 11 and 15 to move that sign to
+        // the BF16 sign position.  The remaining bits are the same magic-
+        // exponent representation used by the scalar-row fallback below.
+        const __mmask32 negative = _mm512_test_epi16_mask(
+            words, _mm512_set1_epi16(0x80));
+        const __m512i signFixed = _mm512_xor_si512(
+            shifted, _mm512_set1_epi16((short)0x8800));
+        return (__m512bh)_mm512_mask_blend_epi16(
+            negative, shifted, signFixed);
+    }
+
+    template <int rows>
+    static inline void LinearBFloat16FP8E4M3DecodeRows_AVX512BF16(
+            const uint16_t *inputData,
+            const uint8_t *weightData,
+            const float *biasData,
+            float *outputData,
+            int m, int k, int rowStart,
+            int blockK, int blockM, const float *scales,
+            int ms, float magicScale) {
+        __m512 sums[rows];
+        for (int row = 0; row < rows; row++) {
+            sums[row] = _mm512_setzero_ps();
+        }
+
+        for (int midx = 0; midx < ms; midx++) {
+            __m512 blockSums[rows];
+            for (int row = 0; row < rows; row++) {
+                blockSums[row] = _mm512_setzero_ps();
+            }
+
+            int l = midx * blockM;
+            const int blockEnd = std::min(m, l + blockM);
+            for (; l + 31 < blockEnd; l += 32) {
+                const __m512bh input = (__m512bh)_mm512_loadu_si512(
+                    (const __m512i*)(inputData + l));
+                for (int row = 0; row < rows; row++) {
+                    const __m512bh weight =
+                        FP8E4M3ToMagicBFloat16_AVX512BF16(
+                            weightData + (size_t)(rowStart + row) * m + l);
+                    blockSums[row] = _mm512_dpbf16_ps(
+                        blockSums[row], input, weight);
+                }
+            }
+
+            for (int row = 0; row < rows; row++) {
+                const float scale = scales[
+                    (rowStart + row) / blockK * ms + midx];
+                sums[row] = _mm512_fmadd_ps(
+                    blockSums[row], _mm512_set1_ps(scale), sums[row]);
+            }
+        }
+
+        for (int row = 0; row < rows; row++) {
+            const int outputRow = rowStart + row;
+            const float bias = biasData == nullptr ? 0.0f : biasData[outputRow];
+            outputData[outputRow] =
+                bias + _mm512_reduce_add_ps(sums[row]) * magicScale;
+        }
+        (void)k;
+    }
+
+    template <int inputRows, int weightRows>
+    static inline void LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16(
+            const uint16_t *inputData,
+            const uint8_t *weightData,
+            const float *biasData,
+            float *outputData,
+            int m, int k, int rowStart,
+            int blockK, int blockM, const float *scales,
+            int ms, float magicScale) {
+        __m512 sums[inputRows][weightRows];
+        for (int inputRow = 0; inputRow < inputRows; inputRow++) {
+            for (int weightRow = 0; weightRow < weightRows; weightRow++) {
+                sums[inputRow][weightRow] = _mm512_setzero_ps();
+            }
+        }
+
+        for (int midx = 0; midx < ms; midx++) {
+            __m512 blockSums[inputRows][weightRows];
+            for (int inputRow = 0; inputRow < inputRows; inputRow++) {
+                for (int weightRow = 0; weightRow < weightRows;
+                     weightRow++) {
+                    blockSums[inputRow][weightRow] = _mm512_setzero_ps();
+                }
+            }
+
+            int l = midx * blockM;
+            const int blockEnd = std::min(m, l + blockM);
+            for (; l + 31 < blockEnd; l += 32) {
+                __m512bh inputs[inputRows];
+                for (int inputRow = 0; inputRow < inputRows; inputRow++) {
+                    inputs[inputRow] = (__m512bh)_mm512_loadu_si512(
+                        (const __m512i*)(inputData +
+                            (size_t)inputRow * m + l));
+                }
+                for (int weightRow = 0; weightRow < weightRows;
+                     weightRow++) {
+                    const __m512bh weight =
+                        FP8E4M3ToMagicBFloat16_AVX512BF16(
+                            weightData +
+                            (size_t)(rowStart + weightRow) * m + l);
+                    for (int inputRow = 0; inputRow < inputRows;
+                         inputRow++) {
+                        blockSums[inputRow][weightRow] =
+                            _mm512_dpbf16_ps(
+                                blockSums[inputRow][weightRow],
+                                inputs[inputRow], weight);
+                    }
+                }
+            }
+
+            for (int weightRow = 0; weightRow < weightRows;
+                 weightRow++) {
+                const float scale = scales[
+                    (rowStart + weightRow) / blockK * ms + midx];
+                const __m512 scaleVector = _mm512_set1_ps(scale);
+                for (int inputRow = 0; inputRow < inputRows;
+                     inputRow++) {
+                    sums[inputRow][weightRow] = _mm512_fmadd_ps(
+                        blockSums[inputRow][weightRow], scaleVector,
+                        sums[inputRow][weightRow]);
+                }
+            }
+        }
+
+        for (int inputRow = 0; inputRow < inputRows; inputRow++) {
+            for (int weightRow = 0; weightRow < weightRows;
+                 weightRow++) {
+                const int outputRow = rowStart + weightRow;
+                const float bias = biasData == nullptr ?
+                    0.0f : biasData[outputRow];
+                outputData[(size_t)inputRow * k + outputRow] =
+                    bias + _mm512_reduce_add_ps(
+                        sums[inputRow][weightRow]) * magicScale;
+            }
+        }
+    }
+
+    static int GetFP8DecodeRowTile_AVX512BF16() {
+        // Read this once so the GEMV hot path remains a simple, predictable
+        // row loop.  Model setup may select four rows, while an explicit value
+        // of one provides an independent fallback on another CPU.
+        static const int tile = []() {
+            const char *value = std::getenv(
+                "FASTLLM_CPU_FP8_DECODE_ROW_TILE");
+            if (value == nullptr || value[0] == '\0') {
+                return 1;
+            }
+            const int requested = std::atoi(value);
+            return requested >= 8 ? 8 : requested >= 4 ? 4 :
+                   requested >= 2 ? 2 : 1;
+        }();
+        return tile;
+    }
+
+    static bool GetFP8SmallBatchEnabled_AVX512BF16() {
+        static const bool enabled = []() {
+            const char *value = std::getenv(
+                "FASTLLM_CPU_FP8_SMALL_BATCH");
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "off") != 0;
+        }();
+        return enabled;
+    }
+
+#endif
+
     bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, 
                         int ks, int ms, float magicScale) {
@@ -309,6 +489,69 @@ namespace fastllm {
             }
             return LinearBFloat16BFloat16_AVX512BF16_Kernel(inputData, tempBF16.data(), biasData ? biasData + st : nullptr, 
                 outputData + st, n, m, k, 0, end - st);
+        }
+
+        if (n >= 2 && n <= 5 && GetFP8SmallBatchEnabled_AVX512BF16()) {
+            int row = st;
+            if (n == 2) {
+                for (; row + 4 <= end; row += 4) {
+                    LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<2, 4>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            } else if (n == 3) {
+                for (; row + 2 <= end; row += 2) {
+                    LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<3, 2>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            } else if (n == 4) {
+                for (; row + 2 <= end; row += 2) {
+                    LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<4, 2>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            } else {
+                for (; row + 2 <= end; row += 2) {
+                    LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<5, 2>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            }
+            if (row == end) {
+                return true;
+            }
+            st = row;
+        }
+
+        if (n == 1) {
+            int row = st;
+            const int tile = GetFP8DecodeRowTile_AVX512BF16();
+            if (tile >= 8) {
+                for (; row + 8 <= end; row += 8) {
+                    LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<8>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            }
+            if (tile >= 4) {
+                for (; row + 4 <= end; row += 4) {
+                    LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<4>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            }
+            if (tile >= 2) {
+                for (; row + 2 <= end; row += 2) {
+                    LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<2>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            }
+            if (row == end) {
+                return true;
+            }
+            st = row;
         }
 
         for (int i = 0; i < n; i++) {
@@ -357,13 +600,85 @@ namespace fastllm {
         return false;
     }
 
+#ifdef __AVX512BF16__
+    static inline void
+    LinearBFloat16FP8E4M3Block128TwoRows_AVX512BF16(
+            const uint16_t *inputData, const uint8_t *weightData,
+            float *outputData, int m, int k, int st, int end,
+            size_t perRow, float magicScale) {
+        constexpr int blockM = 128;
+        const int numBlocks = (m + blockM - 1) / blockM;
+        const __m256i signMask = _mm256_set1_epi8((char)0x80);
+        const __m256i valueMask = _mm256_set1_epi8(0x7f);
+
+        for (int outputRow = st; outputRow < end; outputRow++) {
+            __m512 sum0 = _mm512_setzero_ps();
+            __m512 sum1 = _mm512_setzero_ps();
+
+            const uint8_t *rowData =
+                weightData + (size_t)outputRow * perRow;
+            for (int block = 0; block < numBlocks; block++) {
+                __m512 blockSum0 = _mm512_setzero_ps();
+                __m512 blockSum1 = _mm512_setzero_ps();
+
+                const uint8_t *fp8 =
+                    rowData + (size_t)block * (blockM + sizeof(float));
+                const int blockStart = block * blockM;
+                const int blockEnd = std::min(blockStart + blockM, m);
+                for (int column = blockStart; column + 31 < blockEnd;
+                     column += 32) {
+                    const __m256i bytes = _mm256_loadu_si256(
+                        (const __m256i*)(fp8 + column - blockStart));
+                    const __m512i signWords = _mm512_cvtepu8_epi16(
+                        _mm256_and_si256(bytes, signMask));
+                    const __m512i valueWords = _mm512_cvtepu8_epi16(
+                        _mm256_and_si256(bytes, valueMask));
+                    const __m512bh weights = (__m512bh)_mm512_or_si512(
+                        _mm512_slli_epi16(signWords, 8),
+                        _mm512_slli_epi16(valueWords, 4));
+                    const __m512bh input0 =
+                        (__m512bh)_mm512_loadu_si512(
+                            (const __m512i*)(inputData + column));
+                    const __m512bh input1 =
+                        (__m512bh)_mm512_loadu_si512(
+                            (const __m512i*)(inputData + m + column));
+                    blockSum0 = _mm512_dpbf16_ps(
+                        blockSum0, input0, weights);
+                    blockSum1 = _mm512_dpbf16_ps(
+                        blockSum1, input1, weights);
+                }
+
+                float scale;
+                std::memcpy(&scale, fp8 + blockM, sizeof(scale));
+                const __m512 scaleVector = _mm512_set1_ps(scale);
+                sum0 = _mm512_fmadd_ps(
+                    blockSum0, scaleVector, sum0);
+                sum1 = _mm512_fmadd_ps(
+                    blockSum1, scaleVector, sum1);
+            }
+
+            outputData[outputRow] =
+                _mm512_reduce_add_ps(sum0) * magicScale;
+            outputData[(size_t)k + outputRow] =
+                _mm512_reduce_add_ps(sum1) * magicScale;
+        }
+    }
+
+#endif
+
     bool LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX512BF16__
         static int block_size = 128;
         size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
         float magicScale = pow(2, 120);
-        
+
+        if (n == 2) {
+            LinearBFloat16FP8E4M3Block128TwoRows_AVX512BF16(
+                inputData, weightData, outputData,
+                m, k, st, end, perRow, magicScale);
+            return true;
+        }
         for (int i = 0; i < n; i++) {
             uint16_t *bf16A = inputData + i * m;
             float *floatC = outputData + i * k;
@@ -616,6 +931,25 @@ namespace fastllm {
         return ret;
     }
 
+    // Keep this table in read-only data: dynamic initialization in this
+    // AVX512-compiled file can execute unsupported instructions at library load.
+    // Exact powers of two also avoid a lazy-initialization guard in the kernels.
+    alignas(64) static constexpr std::array<float, 256>
+    NVFP4_E8M0_COMBINED_SCALE_LOOKUP = []() {
+        std::array<float, 256> values{};
+        values[0] = 0x1p-63f;
+        for (int value = 1; value <= 190; value++) {
+            values[value] = values[value - 1] * 2.0f;
+        }
+        // Above 190, the kernel applies the magic scale separately.
+        values[191] = 0x1p64f;
+        for (int value = 192; value <= 254; value++) {
+            values[value] = values[value - 1] * 2.0f;
+        }
+        values[255] = std::numeric_limits<float>::infinity();
+        return values;
+    }();
+
     static inline float GetNVFP4ScaleValue(const float *scales, const uint8_t *scaleBytes, size_t idx) {
         return scales != nullptr ? scales[idx] : NVFP4E8M0ScaleToFloatFast(scaleBytes[idx]);
     }
@@ -702,12 +1036,140 @@ namespace fastllm {
         }
     }
 
+    // A grouped expert prefill contains several tokens using the same weight
+    // rows. Decode each block once, then update independent token accumulators.
+    // Preserve each output's dpbf16/FMA accumulation and final reduction.
+    // COMBINE_SCALE moves the exact magic power of two onto bounded scales;
+    // other values retain the singleton kernel's separate scale multiply.
+    template <int TOKENS, int COLS, bool useLookup, bool COMBINE_SCALE>
+    static inline void LinearBFloat16NVFP4BatchCols_AVX512BF16(
+        const uint16_t *input, const uint8_t *weightRows, const float *biasData, float *output,
+        int outputCol, int m, int k, int blockK, const float *scales, const uint8_t *scaleBytes
+    ) {
+        __m512 acc[TOKENS][COLS];
+#pragma GCC unroll 8
+        for (int t = 0; t < TOKENS; ++t) {
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c) acc[t][c] = _mm512_setzero_ps();
+        }
+        const int blocks = m / 32, packedM = m / 2;
+        const bool commonScale = outputCol / blockK == (outputCol + COLS - 1) / blockK;
+        const __m512 magic = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
+        const __m512i lookup = NVFP4BFloat16Lookup_AVX512BF16();
+        for (int block = 0; block < blocks; ++block) {
+            __m512bh inputs[TOKENS];
+#pragma GCC unroll 8
+            for (int t = 0; t < TOKENS; ++t)
+                inputs[t] = (__m512bh)_mm512_loadu_si512(input + (size_t)t * m + block * 32);
+            auto getScale = [&](size_t index) {
+                if constexpr (COMBINE_SCALE) {
+                    return scales ? scales[index] * NVFP4_MAGIC_SCALE :
+                        NVFP4_E8M0_COMBINED_SCALE_LOOKUP[scaleBytes[index]];
+                }
+                return GetNVFP4ScaleValue(scales, scaleBytes, index);
+            };
+            const float sharedScale = getScale((size_t)(outputCol / blockK) * blocks + block);
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c) {
+                const __m512bh weight = NVFP4ToBFloat16Linear_AVX512BF16<useLookup>(
+                    weightRows + (size_t)c * packedM + block * 16, lookup);
+                const __m512 scale = _mm512_set1_ps(commonScale ? sharedScale :
+                    getScale((size_t)((outputCol + c) / blockK) * blocks + block));
+#pragma GCC unroll 8
+                for (int t = 0; t < TOKENS; ++t) {
+                    const __m512 dot = _mm512_dpbf16_ps(_mm512_setzero_ps(), inputs[t], weight);
+                    if constexpr (COMBINE_SCALE)
+                        acc[t][c] = _mm512_fmadd_ps(dot, scale, acc[t][c]);
+                    else
+                        acc[t][c] = _mm512_fmadd_ps(_mm512_mul_ps(dot, magic), scale, acc[t][c]);
+                }
+            }
+        }
+#pragma GCC unroll 8
+        for (int t = 0; t < TOKENS; ++t) {
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c)
+                output[(size_t)t * k + c] = (biasData ? biasData[outputCol + c] : 0.0f) +
+                    _mm512_reduce_add_ps(acc[t][c]);
+        }
+    }
+
+    template <int TOKENS, bool useLookup, bool COMBINE_SCALE>
+    static inline void LinearBFloat16NVFP4Batch_AVX512BF16(
+        const uint16_t *input, const uint8_t *weight, const float *bias, float *output,
+        int m, int k, int st, int end, int blockK, const float *scales, const uint8_t *scaleBytes
+    ) {
+        constexpr int COLS = TOKENS > 4 ? 2 : 4;
+        int row = st;
+        for (; row + COLS <= end; row += COLS)
+            LinearBFloat16NVFP4BatchCols_AVX512BF16<TOKENS, COLS, useLookup, COMBINE_SCALE>(
+                input, weight + (size_t)row * (m / 2), bias, output + row,
+                row, m, k, blockK, scales, scaleBytes);
+#define V41_NVFP4_BATCH_TAIL(COLS) \
+        case COLS: LinearBFloat16NVFP4BatchCols_AVX512BF16<TOKENS, COLS, useLookup, COMBINE_SCALE>( \
+            input, weight + (size_t)row * (m / 2), bias, output + row, \
+            row, m, k, blockK, scales, scaleBytes); break
+        switch (end - row) {
+            V41_NVFP4_BATCH_TAIL(1);
+            V41_NVFP4_BATCH_TAIL(2);
+            V41_NVFP4_BATCH_TAIL(3);
+        }
+#undef V41_NVFP4_BATCH_TAIL
+    }
+
     template <bool useLookup>
     static inline bool LinearBFloat16NVFP4_AVX512BF16_Run(
         uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM,
         const float *scales, const uint8_t *scaleBytes, int ms
     ) {
+        static const bool reuseTokens = std::getenv("FASTLLM_DSV41_DISABLE_NVFP4_TOKEN_REUSE") == nullptr;
+        if (n > 1 && blockM == 32 && m % 32 == 0 && reuseTokens) {
+            // Multiplying by the magic power of two is exact while finite.
+            // Move it to the scale to remove a multiply per token/block, but
+            // retain the original path for inputs or scales that could overflow.
+            uint16_t maxInput = 0;
+            for (size_t i = 0; i < (size_t)n * m; ++i)
+                maxInput = std::max(maxInput, uint16_t(inputData[i] & 0x7fff));
+            bool combineScale = maxInput <= 0x7b80; // abs(input) <= 2^120, excluding NaN/Inf
+            const size_t scaleBegin = (size_t)(st / blockK) * ms;
+            const size_t scaleEnd = (size_t)((end + blockK - 1) / blockK) * ms;
+            if (scales) {
+                for (size_t i = scaleBegin; i < scaleEnd; ++i)
+                    combineScale = combineScale && std::fabs(scales[i]) <= 0x1p63f;
+            } else {
+                uint8_t minScale = 255, maxScale = 0;
+                for (size_t i = scaleBegin; i < scaleEnd; ++i) {
+                    minScale = std::min(minScale, scaleBytes[i]);
+                    maxScale = std::max(maxScale, scaleBytes[i]);
+                }
+                // E8M0 zero is a subnormal FP32 scale. Keep its original
+                // multiply so callers' denormals-are-zero mode is respected.
+                combineScale = combineScale && minScale > 0 && maxScale <= 190;
+            }
+            for (int token = 0; token < n; token += 8) {
+                const uint16_t *input = inputData + (size_t)token * m;
+                float *output = outputData + (size_t)token * k;
+#define V41_NVFP4_BATCH_TOKENS(TOKENS) \
+                case TOKENS: \
+                    if (combineScale) LinearBFloat16NVFP4Batch_AVX512BF16<TOKENS, useLookup, true>( \
+                        input, weightData, biasData, output, m, k, st, end, blockK, scales, scaleBytes); \
+                    else LinearBFloat16NVFP4Batch_AVX512BF16<TOKENS, useLookup, false>( \
+                        input, weightData, biasData, output, m, k, st, end, blockK, scales, scaleBytes); break
+                switch (std::min(8, n - token)) {
+                    V41_NVFP4_BATCH_TOKENS(1);
+                    V41_NVFP4_BATCH_TOKENS(2);
+                    V41_NVFP4_BATCH_TOKENS(3);
+                    V41_NVFP4_BATCH_TOKENS(4);
+                    V41_NVFP4_BATCH_TOKENS(5);
+                    V41_NVFP4_BATCH_TOKENS(6);
+                    V41_NVFP4_BATCH_TOKENS(7);
+                    V41_NVFP4_BATCH_TOKENS(8);
+                }
+#undef V41_NVFP4_BATCH_TOKENS
+            }
+            return true;
+        }
         int packedM = m >> 1;
         for (int i = 0; i < n; i++) {
             const uint16_t *input = inputData + (size_t)i * m;
@@ -745,7 +1207,7 @@ namespace fastllm {
     }
 #endif
 
-    template <bool useLookup>
+    template <bool useLookup, bool PLANAR = false>
     static bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run(
         const void *A, long lda,
         const void *B, long ldb,
@@ -760,20 +1222,26 @@ namespace fastllm {
             const uint16_t *input = (const uint16_t*)((const uint8_t*)A + (size_t)i * lda);
             float *output = (float*)((uint8_t*)C + (size_t)i * ldc);
             for (int j = st; j < end; j++) {
-                const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * ldb;
+                const int blocks = (m - 1) / 16 + 1;
+                constexpr int weightStride = PLANAR ? 8 : 12;
+                constexpr int scaleStride = PLANAR ? sizeof(float) : 12;
+                const uint8_t *rowStart = (const uint8_t*)B +
+                    (PLANAR ? NVFP4PlanarWeightOffset(j, blocks) : (size_t)j * ldb);
+                const uint8_t *rowScales = PLANAR
+                    ? (const uint8_t*)B + NVFP4PlanarScaleOffset(j, blocks) : rowStart + 8;
                 int block = 0;
-                int blocks = (m - 1) / 16 + 1;
                 __m512 scaledSum = _mm512_setzero_ps();
                 while (block < blocks) {
-                    const uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
+                    const uint8_t *blockStart = rowStart + block * weightStride;
+                    const uint8_t *scaleStart = rowScales + block * scaleStride;
                     float scale;
-                    memcpy(&scale, blockStart + 8, sizeof(float));
+                    memcpy(&scale, scaleStart, sizeof(float));
                     int l = block * 16;
 
                     if (block + 1 < blocks && l + 31 < m) {
-                        const uint8_t *nextBlockStart = rowStart + (block + 1) * (8 + sizeof(float));
+                        const uint8_t *nextBlockStart = blockStart + weightStride;
                         float nextScale;
-                        memcpy(&nextScale, nextBlockStart + 8, sizeof(float));
+                        memcpy(&nextScale, scaleStart + scaleStride, sizeof(float));
                         if (scale == nextScale) {
                             __m512bh vi = (__m512bh)_mm512_loadu_si512((const __m512i*)(input + l));
                             __m512bh vw =
@@ -811,11 +1279,17 @@ namespace fastllm {
         const void *A, long lda,
         const void *B, long ldb,
         void *C, long ldc,
-        int n, int m, int k, int st, int end
+        int n, int m, int k, int st, int end, bool planar
     ) {
         static const bool useLookup =
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_CPU_NVFP4_LUT") == nullptr;
+        if (planar) {
+            return useLookup ? FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run<true, true>(
+                A, lda, B, ldb, C, ldc, n, m, k, st, end) :
+                FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run<false, true>(
+                A, lda, B, ldb, C, ldc, n, m, k, st, end);
+        }
         return useLookup ?
             FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run<true>(
                 A, lda, B, ldb, C, ldc, n, m, k, st, end) :
@@ -823,7 +1297,7 @@ namespace fastllm {
                 A, lda, B, ldb, C, ldc, n, m, k, st, end);
     }
 
-    template <bool useLookup>
+    template <bool useLookup, bool PLANAR = false>
     static bool FastllmGemmFloat32NVFP4Block16_AVX512BF16_Run(
         const void *A, long lda,
         const void *B, long ldb,
@@ -838,20 +1312,26 @@ namespace fastllm {
             const float *input = (const float*)((const uint8_t*)A + (size_t)i * lda);
             float *output = (float*)((uint8_t*)C + (size_t)i * ldc);
             for (int j = st; j < end; j++) {
-                const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * ldb;
+                const int blocks = (m - 1) / 16 + 1;
+                constexpr int weightStride = PLANAR ? 8 : 12;
+                constexpr int scaleStride = PLANAR ? sizeof(float) : 12;
+                const uint8_t *rowStart = (const uint8_t*)B +
+                    (PLANAR ? NVFP4PlanarWeightOffset(j, blocks) : (size_t)j * ldb);
+                const uint8_t *rowScales = PLANAR
+                    ? (const uint8_t*)B + NVFP4PlanarScaleOffset(j, blocks) : rowStart + 8;
                 int block = 0;
-                int blocks = (m - 1) / 16 + 1;
                 __m512 scaledSum = _mm512_setzero_ps();
                 while (block < blocks) {
-                    const uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
+                    const uint8_t *blockStart = rowStart + block * weightStride;
+                    const uint8_t *scaleStart = rowScales + block * scaleStride;
                     float scale;
-                    memcpy(&scale, blockStart + 8, sizeof(float));
+                    memcpy(&scale, scaleStart, sizeof(float));
                     int l = block * 16;
 
                     if (block + 1 < blocks && l + 31 < m) {
-                        const uint8_t *nextBlockStart = rowStart + (block + 1) * (8 + sizeof(float));
+                        const uint8_t *nextBlockStart = blockStart + weightStride;
                         float nextScale;
-                        memcpy(&nextScale, nextBlockStart + 8, sizeof(float));
+                        memcpy(&nextScale, scaleStart + scaleStride, sizeof(float));
                         if (scale == nextScale) {
                             __m512 in0 = _mm512_loadu_ps(input + l);
                             __m512 in1 = _mm512_loadu_ps(input + l + 16);
@@ -893,11 +1373,17 @@ namespace fastllm {
         const void *A, long lda,
         const void *B, long ldb,
         void *C, long ldc,
-        int n, int m, int k, int st, int end
+        int n, int m, int k, int st, int end, bool planar
     ) {
         static const bool useLookup =
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_CPU_NVFP4_LUT") == nullptr;
+        if (planar) {
+            return useLookup ? FastllmGemmFloat32NVFP4Block16_AVX512BF16_Run<true, true>(
+                A, lda, B, ldb, C, ldc, n, m, k, st, end) :
+                FastllmGemmFloat32NVFP4Block16_AVX512BF16_Run<false, true>(
+                A, lda, B, ldb, C, ldc, n, m, k, st, end);
+        }
         return useLookup ?
             FastllmGemmFloat32NVFP4Block16_AVX512BF16_Run<true>(
                 A, lda, B, ldb, C, ldc, n, m, k, st, end) :
@@ -1097,7 +1583,9 @@ namespace fastllm {
                 A, lda, B, ldb, C, ldc, n, m, k, st, end);
     }
 
-    template <int ROWS, bool useLookup>
+    template <int ROWS, bool useLookup, bool fullBlocks = false,
+              bool useScaleLookup = false,
+              bool allScalesFuseMagic = false>
     static bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run(
         const void *A, long lda,
         const void *B, long ldb,
@@ -1110,7 +1598,9 @@ namespace fastllm {
         const __m512 magicVec = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
         const __m512i bf16Lookup =
             NVFP4BFloat16Lookup_AVX512BF16();
-        const int blocks = (m + 31) / 32;
+        const float *combinedScaleLookup = useScaleLookup ?
+            NVFP4_E8M0_COMBINED_SCALE_LOOKUP.data() : nullptr;
+        const int blocks = fullBlocks ? m / 32 : (m + 31) / 32;
         for (int j = st; j < end; j++) {
             const uint8_t *rowStart =
                 (const uint8_t*)B + (size_t)j * ldb;
@@ -1121,9 +1611,13 @@ namespace fastllm {
             for (int block = 0; block < blocks; block++) {
                 const uint8_t *blockStart = rowStart + block * 17;
                 const uint8_t scaleByte = blockStart[16];
-                const bool fuseMagicScale = scaleByte <= 190;
+                const bool fuseMagicScale =
+                    allScalesFuseMagic || scaleByte <= 190;
                 __m512 scaleVec;
-                if (fuseMagicScale) {
+                if constexpr (useScaleLookup) {
+                    scaleVec = _mm512_set1_ps(
+                        combinedScaleLookup[scaleByte]);
+                } else if (fuseMagicScale) {
                     // Both E8M0 and the internal magic compensation are
                     // powers of two.  In this exponent range their product
                     // is finite, so fold them into one exact scale and
@@ -1140,7 +1634,6 @@ namespace fastllm {
                         NVFP4E8M0ScaleToFloatFast(scaleByte));
                 }
                 const int l = block * 32;
-                const int blockElems = std::min(32, m - l);
                 const __m512bh vw =
                     NVFP4ToBFloat16Linear_AVX512BF16<useLookup>(
                         blockStart, bf16Lookup);
@@ -1148,16 +1641,28 @@ namespace fastllm {
                     const uint16_t *input =
                         (const uint16_t*)((const uint8_t*)A +
                             (size_t)row * lda);
-                    const __m512bh vi = blockElems == 32 ?
-                        (__m512bh)_mm512_loadu_si512(
-                            (const __m512i*)(input + l)) :
-                        (__m512bh)_mm512_maskz_loadu_epi16(
-                            (__mmask32)((1u << blockElems) - 1u),
-                            input + l);
+                    __m512bh vi;
+                    if constexpr (fullBlocks) {
+                        vi = (__m512bh)_mm512_loadu_si512(
+                            (const __m512i*)(input + l));
+                    } else {
+                        const int blockElems = std::min(32, m - l);
+                        vi = blockElems == 32 ?
+                            (__m512bh)_mm512_loadu_si512(
+                                (const __m512i*)(input + l)) :
+                            (__m512bh)_mm512_maskz_loadu_epi16(
+                                (__mmask32)((1u << blockElems) - 1u),
+                                input + l);
+                    }
                     const __m512 sum = _mm512_dpbf16_ps(
                         _mm512_setzero_ps(), vi, vw);
-                    const __m512 adjustedSum = fuseMagicScale ?
-                        sum : _mm512_mul_ps(sum, magicVec);
+                    __m512 adjustedSum;
+                    if constexpr (allScalesFuseMagic) {
+                        adjustedSum = sum;
+                    } else {
+                        adjustedSum = fuseMagicScale ?
+                            sum : _mm512_mul_ps(sum, magicVec);
+                    }
                     scaledSums[row] = _mm512_fmadd_ps(
                         adjustedSum, scaleVec, scaledSums[row]);
                 }
@@ -1172,6 +1677,49 @@ namespace fastllm {
 #else
         return false;
 #endif
+    }
+
+    bool FastllmGemmBFloat16NVFP4Block32E8M0FullBlocks_AVX512BF16(
+        const void *A, long lda,
+        const void *B, long ldb,
+        void *C, long ldc,
+        int n, int m, int k, int st, int end,
+        bool useScaleLookup, bool allScalesFuseMagic
+    ) {
+        if ((m & 31) != 0) {
+            return false;
+        }
+        // Removing the per-block overflow guard helps the memory-bound
+        // single-row GEMV.  Multi-row kernels reuse each decoded weight and
+        // did not benefit consistently, so keep their smaller generic body.
+        if (n == 1 && useScaleLookup && allScalesFuseMagic) {
+            return FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run<
+                1, true, true, true, true>(
+                A, lda, B, ldb, C, ldc, m, st, end);
+        }
+#define FASTLLM_RUN_NVFP4_BLOCK32_FULL(ROWS) \
+        if (useScaleLookup) { \
+            return FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run< \
+                ROWS, true, true, true>( \
+                A, lda, B, ldb, C, ldc, m, st, end); \
+        } \
+        return FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run< \
+            ROWS, true, true, false>( \
+            A, lda, B, ldb, C, ldc, m, st, end)
+        switch (n) {
+            case 1: FASTLLM_RUN_NVFP4_BLOCK32_FULL(1);
+            case 2: FASTLLM_RUN_NVFP4_BLOCK32_FULL(2);
+            case 3: FASTLLM_RUN_NVFP4_BLOCK32_FULL(3);
+            case 4: FASTLLM_RUN_NVFP4_BLOCK32_FULL(4);
+            case 5: FASTLLM_RUN_NVFP4_BLOCK32_FULL(5);
+            case 6: FASTLLM_RUN_NVFP4_BLOCK32_FULL(6);
+            case 7: FASTLLM_RUN_NVFP4_BLOCK32_FULL(7);
+            case 8: FASTLLM_RUN_NVFP4_BLOCK32_FULL(8);
+            default: break;
+        }
+#undef FASTLLM_RUN_NVFP4_BLOCK32_FULL
+        (void)k;
+        return false;
     }
 
     bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(

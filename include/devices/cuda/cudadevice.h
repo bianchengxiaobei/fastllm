@@ -18,6 +18,9 @@ namespace fastllm {
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaSwigluReshape(Data &input, Data &output);
     void DoCudaSwiglu(Data &input, Data &output);
+    bool CanUseCudaCutlassSwigluLinear(int rows, bool tensorParallel = false);
+    bool CanUseCudaTritonSwigluLinear(int rows = 0, bool hasBias = false, bool packedWeight = false);
+    bool DoCudaTritonSwigluLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaGegluReshape(Data &input, Data &output);
     void DoCudaGeglu(Data &input, Data &output);
     void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output);
@@ -241,7 +244,87 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class CudaRepeatAddToOp : CpuRepeatAddToOp {
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CudaCopyOp : CpuCopyOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4GroupedRMSNormOp : CpuQwen4GroupedRMSNormOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4PLEGateOp : CpuQwen4PLEGateOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4PLECausalConvOp : CpuQwen4PLECausalConvOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4HyperMixOp : CpuQwen4HyperMixOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4HyperProjectOp : CpuQwen4HyperProjectOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4HyperPrepareOp : CpuQwen4HyperPrepareOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4HyperInjectOp : CpuQwen4HyperInjectOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4HyperCombineOp : CpuQwen4HyperCombineOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4HyperCombineRMSNormOp : CpuQwen4HyperCombineRMSNormOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4QSASelectOp : CpuQwen4QSASelectOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4QSABuildMaskOp : CpuQwen4QSABuildMaskOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4SparseAttentionOp : CpuQwen4SparseAttentionOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaCausalDepthwiseConv1DDecodeOp : CpuCausalDepthwiseConv1DDecodeOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaCausalDepthwiseConv1DPrefillOp : CpuCausalDepthwiseConv1DPrefillOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen4GatedDeltaRuleDecodeOp : CpuQwen4GatedDeltaRuleDecodeOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -281,6 +364,67 @@ namespace fastllm {
     };
 
     class CudaDeepSeekV4UpdateWindowKVCacheOp : CpuDeepSeekV4UpdateWindowKVCacheOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41HcMixOp : CpuDeepSeekV41HcMixOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41HcApplyPreOp : CpuDeepSeekV41HcApplyPreOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41EngramApplyOp : CpuDeepSeekV41EngramApplyOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41RotaryQuantOp : CpuDeepSeekV41RotaryQuantOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41CompressOp : CpuDeepSeekV41CompressOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41IndexerScoreOp : CpuDeepSeekV41IndexerScoreOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41CandidateBlocksOp : CpuDeepSeekV41CandidateBlocksOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41IndexerTopKOp : CpuDeepSeekV41IndexerTopKOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41SparseAttentionOp : CpuDeepSeekV41SparseAttentionOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41WindowStoreOp : CpuDeepSeekV41WindowStoreOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41QuantizeActivationOp : CpuDeepSeekV41QuantizeActivationOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41QuantizeKVOp : CpuDeepSeekV41QuantizeKVOp {
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
@@ -338,6 +482,10 @@ namespace fastllm {
     };
 
     class CudaSigmoidOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaSigmoidMulToOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

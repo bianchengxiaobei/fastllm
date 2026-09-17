@@ -141,6 +141,16 @@ namespace fastllm {
     };
 
     struct DeepSeekV4HistoryCacheMemory {
+        DeepSeekV4HistoryCacheMemory() = default;
+        DeepSeekV4HistoryCacheMemory(
+            const DeepSeekV4HistoryCacheMemory &other);
+        DeepSeekV4HistoryCacheMemory &operator=(
+            const DeepSeekV4HistoryCacheMemory &other);
+        DeepSeekV4HistoryCacheMemory(
+            DeepSeekV4HistoryCacheMemory &&other) noexcept = default;
+        DeepSeekV4HistoryCacheMemory &operator=(
+            DeepSeekV4HistoryCacheMemory &&other) noexcept = default;
+
         std::vector<int> inputToken;
         int tokens = 0;
         int blockCount = 0;
@@ -319,6 +329,10 @@ namespace fastllm {
         bool UseTensorParallelRoutedExperts() const {
             return dsparkEnabled;
         }
+
+        // 本类内置的 DSpark（DeepSeek-V4 Flash 的 mtp.0/1/2）由 FASTLLM_DSPARK_TOKENS 开启。
+        // DeepSeek-V4.1 的草稿层结构不同，由 DeepSeekV41Model 自行解析与实现，这里返回 false。
+        virtual bool UsesEmbeddedV4Dspark() const { return true; }
 
         // 推理
         virtual int Forward(
@@ -525,7 +539,13 @@ namespace fastllm {
 
         std::vector<int> SampleDsparkTargetRows(
                 Data &headInput,
+                const GenerationConfig &generationConfig,
+                const std::vector<int> &proposalTokens,
+                std::vector<unsigned char> &verificationAccepted,
                 DeepSeekV4DsparkContext *persistentContext = nullptr);
+
+        bool DsparkSupportsGenerationConfig(
+                const GenerationConfig &generationConfig) const;
 
         int ForwardDspark(
                 const Data &inputIds,

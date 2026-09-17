@@ -3,6 +3,7 @@
 #define FASTLLM_BASELLM_H
 
 #include "fastllm.h"
+#include "contextconfig.h"
 #include "baseblock.h"
 #include "template.h"
 
@@ -184,7 +185,18 @@ namespace fastllm {
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
 
-        virtual void InitParams(); // 初始化参数信息 
+        virtual void InitParams(); // 初始化参数信息
+        virtual ModelContextSpec GetContextSpec() const { return {}; }
+        void ConfigureContext(const ContextOptions &options);
+        void InitContextParams(RoPEType &type, float &theta, float &factor, int &rotaryDim);
+        void ValidateContextCapacity();
+        const RopeConfig *YarnConfig() const {
+            return contextPlan.configured && contextPlan.rope.IsYarn() ? &contextPlan.rope : nullptr;
+        }
+        int RopeReferenceLength() const {
+            return contextPlan.configured && contextPlan.declaredLength > 0 ? contextPlan.declaredLength : max_positions;
+        }
+        ContextPlan contextPlan;
 
         // 根据原始的tensorNames获得映射表
         virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
@@ -223,6 +235,15 @@ namespace fastllm {
 
         // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
         virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
+
+        // Models that need the original host representation for finalization
+        // may defer eager NUMA packing performed by the weight loader. The
+        // ordinary AutoWarmup/lazy NUMA paths remain available afterwards.
+        virtual bool ShouldDelaySpecialWeightNumaRegistration(
+                const std::string &weightName) const {
+            (void)weightName;
+            return false;
+        }
 
         // special weight 默认跟随 MoE 设备映射；同时包含非 MoE TP 权重的模型可覆盖此选择。
         virtual std::string SelectSpecialWeightDevice(const std::string &weightName,
@@ -347,6 +368,11 @@ namespace fastllm {
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
 
+        // Token-growing pools not present in the target-model warmup caches
+        // (for example an MTP layer). Reserve these before choosing KV pages;
+        // they are materialized only after the final capacity calibration.
+        virtual long long GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const { return 0; }
+
         // Fixed per-device CUDA capacity that must still be available after
         // model-specific serving high-water warmup. Unlike runtime reserve,
         // this cost is not multiplied by the active request count.
@@ -416,6 +442,9 @@ namespace fastllm {
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
+
+        void PrepareToolCallConstraint(GenerationConfig &generationConfig);
+        void AdvanceToolCallConstraintText(std::string &text, int tokenId);
 
         virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 
@@ -516,6 +545,11 @@ namespace fastllm {
         std::map <std::string, int> specialWeightLayerIds;
         std::set <std::string> cantQuantLinears; // 不能量化的Linear层
         std::set <std::string> moeLinears;
+        // Model-declared ngram tables can follow an independent placement
+        // policy.  Today they support resident host memory (cpu) or lazy
+        // row-wise checkpoint reads (disk).
+        std::set <std::string> ngramWeights;
+        std::string ngramDevice = "cpu";
 
         std::vector<std::vector<float> > sin, cos;
 
@@ -541,6 +575,20 @@ namespace fastllm {
         bool UseLayeredMoeDevice(int layerId) const;
         std::string SelectMoeDeviceForLayer(int layerId) const;
         void ApplyMoeDeviceMapForLayer(int layerId) const;
+        // Common model integration for the optional CUDA expert cache. A
+        // model only supplies its standard MergeMOE tables and identifies
+        // which source weights must remain on the host until preparation.
+        bool MoeCudaCacheRequested() const;
+        bool PrepareMoeCudaCache(
+                const std::vector<std::vector<Data *>> &layerWeights);
+        bool TryApplyMoeCudaCache(
+                const Data &input, const Data &index, const Data &score,
+                std::vector<Data *> &weights,
+                const std::string &outputDevice,
+                MoeGateType gateType = MoeGateSwiglu) const;
+        bool MoeCudaCacheAvailable(std::vector<Data *> &weights) const;
+        void ReleaseMoeCudaCache(
+                std::vector<std::vector<Data *>> &layerWeights) const;
         bool ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const;
         bool ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const;
         bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;

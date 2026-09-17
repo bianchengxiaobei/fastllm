@@ -4,6 +4,7 @@
 #include "fastllm.h"
 
 namespace fastllm {
+    struct RopeConfig;
     /*
     output += Linear(input, weight, bias)
     */
@@ -100,6 +101,7 @@ namespace fastllm {
         int rotary_dim, float rms_norm_eps,
         float rope_base, float rope_factor, int max_positions,
         int rope_type, // RoPEType enum value
+        const RopeConfig *ropeConfig,
         bool kvCacheInCPU,
         bool isPrefill,
         Data *hiddenStates,
@@ -126,7 +128,8 @@ namespace fastllm {
         bool expertParallel = false,
         float swigluLimit = 0.0f,
         bool deepSeekV4Mode = false,
-        Data *pairedReduceInput = nullptr
+        Data *pairedReduceInput = nullptr, int activationQuantBlock = 128,
+        bool quantizeSharedExpert = false
     );
 
     class basellm;

@@ -207,17 +207,6 @@ __device__ __forceinline__ __nv_bfloat16 CustomArDowncast<__nv_bfloat16>(float v
     return __float2bfloat16(v);
 }
 
-__device__ __forceinline__ void CustomArStoreVolatile(CustomArFlag *ptr,
-                                                       CustomArFlag value) {
-    asm volatile("st.volatile.global.u32 [%1], %0;" :: "r"(value), "l"(ptr));
-}
-
-__device__ __forceinline__ CustomArFlag CustomArLoadVolatile(CustomArFlag *ptr) {
-    CustomArFlag value;
-    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
-    return value;
-}
-
 __device__ __forceinline__ void CustomArStoreRelease(CustomArFlag *ptr,
                                                       CustomArFlag value) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -233,7 +222,7 @@ __device__ __forceinline__ CustomArFlag CustomArLoadAcquire(CustomArFlag *ptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
 #else
-    asm volatile("ld.volatile.global.u32 %0, [%1]; membar.gl;" :
+    asm volatile("ld.volatile.global.u32 %0, [%1]; membar.sys;" :
                  "=r"(value) : "l"(ptr));
 #endif
     return value;
@@ -245,9 +234,14 @@ __device__ __forceinline__ void CustomArBarrierStart(
         int rank) {
     CustomArFlag next = self->flag[blockIdx.x] + 1;
     if (threadIdx.x < Ranks) {
-        CustomArStoreVolatile(
+        // Publishing the start flag also publishes every rank-local input
+        // write queued before this collective.  Plain volatile accesses only
+        // constrain the issuing GPU and are not a cross-device memory-order
+        // primitive, which allowed a skewed CUDA Graph replay to observe the
+        // flag before the peer input was globally visible.
+        CustomArStoreRelease(
             &allSignals.signals[threadIdx.x]->start[blockIdx.x][rank], next);
-        while (CustomArLoadVolatile(
+        while (CustomArLoadAcquire(
                    &self->start[blockIdx.x][threadIdx.x]) != next) {
         }
     }
@@ -257,9 +251,11 @@ __device__ __forceinline__ void CustomArBarrierStart(
     }
 }
 
-// The final barrier only prevents in-place overwrite while peers are still
-// reading. Keep this byte-for-byte equivalent to the original fast volatile
-// handshake used by decode-sized one-stage reductions.
+// The final barrier prevents in-place overwrite or allocator reuse while a
+// peer is still reading.  It therefore needs the same system-scope ordering as
+// the publish barrier: a peer's completion flag must become visible only after
+// all of its reads have completed, and observing that flag must precede the
+// local overwrite.
 template <int Ranks>
 __device__ __forceinline__ void CustomArBarrierFinal(
         const CustomArRankSignals &allSignals, CustomArSignal *self,
@@ -267,9 +263,9 @@ __device__ __forceinline__ void CustomArBarrierFinal(
     __syncthreads();
     CustomArFlag next = self->flag[blockIdx.x] + 1;
     if (threadIdx.x < Ranks) {
-        CustomArStoreVolatile(
+        CustomArStoreRelease(
             &allSignals.signals[threadIdx.x]->end[blockIdx.x][rank], next);
-        while (CustomArLoadVolatile(
+        while (CustomArLoadAcquire(
                    &self->end[blockIdx.x][threadIdx.x]) != next) {
         }
     }
@@ -889,6 +885,7 @@ struct CustomArState {
     int pushBlocks = 0;
     bool pushAvailable = false;
     bool pushUsePdl = false;
+    bool captureFallbackLogged = false;
     std::map<std::vector<uintptr_t>, std::vector<CustomArRankData *> > registrations;
 
     uint64_t generation = 0;
@@ -896,10 +893,23 @@ struct CustomArState {
     int pendingCount = 0;
     int pendingType = -1;
     bool pendingMismatch = false;
+    // Per-rank call ordinals identify *which* tensor a peer is on.  The
+    // pointer tuple alone pairs ranks by arrival order, so any asymmetry in
+    // the ranks' collective call streams shifts every later round (silent
+    // wrong results, or an out-of-range read of a freed peer buffer).
+    uint64_t rankCallSequence[kCustomArMaxRanks]{};
+    uint64_t pendingSequences[kCustomArMaxRanks]{};
+    bool sequenceDesyncLogged = false;
     bool lastRegistrationOk = false;
-    bool lastCaptureRegistrationMiss = false;
+    bool lastRegistrationMissDuringCapture = false;
     std::vector<void *> pendingInputs;
     std::vector<char> pendingCapturing;
+    // Pointer-local guard results (non-null and 16-byte aligned).  Unlike the
+    // byte size and dtype, a pointer's alignment can differ from rank to rank,
+    // so this must not be decided locally: every rank folds its own flag in
+    // here and the rendezvous makes the launch-or-fall-back decision
+    // collective.
+    std::vector<char> pendingAligned;
     std::vector<CustomArRankData *> lastRankData;
 };
 
@@ -1078,6 +1088,17 @@ bool BuildCustomArRegistration(CustomArState &state,
     bool ok = true;
     for (int rank = 0; rank < (int)inputs.size(); ++rank) {
         FastllmCudaSetDevice(state.devices[rank]);
+        // Registration runs on the last arriving worker, including for its
+        // peers' devices. Their pools may contain temporaries returned while
+        // writes are still queued on another per-thread stream. Drain those
+        // writers before reusing storage for this persistent pointer table.
+        // This is only the cold registration path; cached tuples and graph
+        // replay do not synchronize here.
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
         rankData[rank] = reinterpret_cast<CustomArRankData *>(
             FastllmCudaMalloc(sizeof(CustomArRankData)));
         if (rankData[rank] == nullptr) {
@@ -1087,6 +1108,14 @@ bool BuildCustomArRegistration(CustomArState &state,
         cudaError_t copyState = cudaMemcpy(rankData[rank], &hostData,
                                            sizeof(hostData),
                                            cudaMemcpyHostToDevice);
+        // The last arriving worker publishes metadata for every GPU on its
+        // own per-thread streams. A pageable H2D cudaMemcpy may return before
+        // the device copy completes; the other workers consume these tables
+        // on different streams as soon as the host rendezvous is released.
+        // Finish each cold registration before publishing the pointer tuple.
+        if (copyState == cudaSuccess) {
+            copyState = cudaStreamSynchronize(cudaStreamPerThread);
+        }
         if (copyState != cudaSuccess) {
             cudaGetLastError();
             ok = false;
@@ -1109,6 +1138,7 @@ bool BuildCustomArRegistration(CustomArState &state,
 
 bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
                                     void *input, int count, int dataType,
+                                    bool localEligible,
                                     CustomArRankData *&rankData) {
     // Registration is itself collective.  A local-pointer-only lookup is
     // unsafe because allocators can reuse an address on some ranks but not on
@@ -1133,6 +1163,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         state.pendingMismatch = false;
         state.pendingInputs.assign(state.devices.size(), nullptr);
         state.pendingCapturing.assign(state.devices.size(), 0);
+        state.pendingAligned.assign(state.devices.size(), 0);
     } else if (state.pendingCount != count || state.pendingType != dataType) {
         state.pendingMismatch = true;
     }
@@ -1142,6 +1173,8 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
     } else {
         state.pendingInputs[rank] = input;
         state.pendingCapturing[rank] = capturing ? 1 : 0;
+        state.pendingAligned[rank] = localEligible ? 1 : 0;
+        state.pendingSequences[rank] = state.rankCallSequence[rank]++;
     }
     state.pendingMismatch = state.pendingMismatch || !captureQueryOk;
     state.arrived++;
@@ -1151,6 +1184,32 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         bool inputsValid = !state.pendingMismatch;
         for (void *ptr : inputs) {
             inputsValid = inputsValid && ptr != nullptr;
+        }
+        // Fold in every rank's local pointer-eligibility (non-null and 16-byte
+        // aligned).  A rank with an unusable local view must not have bailed
+        // out before arriving here: had it done so its peers would spin in this
+        // rendezvous, or in the device barrier, forever.  One bad rank now
+        // drops all ranks to NCCL together.
+        for (char eligible : state.pendingAligned) {
+            inputsValid = inputsValid && eligible != 0;
+        }
+        // A desynchronised call stream shifts the arrival-order pairing by
+        // one; refuse the round so it falls back to NCCL instead of
+        // reducing the wrong peer tensor (or reading a freed buffer).
+        for (int other = 1; other < (int)state.devices.size() && inputsValid;
+             ++other) {
+            if (state.pendingSequences[other] != state.pendingSequences[0]) {
+                inputsValid = false;
+                state.pendingMismatch = true;
+                if (rank == 0 && !state.sequenceDesyncLogged) {
+                    state.sequenceDesyncLogged = true;
+                    std::fprintf(stderr,
+                                 "[Fastllm] custom all-reduce call "
+                                 "sequences desynchronized across ranks; "
+                                 "falling back to NCCL.\n");
+                    std::fflush(stderr);
+                }
+            }
         }
         std::vector<uintptr_t> key;
         key.reserve(inputs.size());
@@ -1174,7 +1233,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
                 state.registrations[key] = rankDatas;
             }
         }
-        state.lastCaptureRegistrationMiss =
+        state.lastRegistrationMissDuringCapture =
             inputsValid && anyCapturing && !alreadyRegistered;
         state.lastRegistrationOk = ok;
         state.lastRankData = ok ? rankDatas :
@@ -1189,12 +1248,19 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
     }
 
     if (!state.lastRegistrationOk) {
-        if (state.lastCaptureRegistrationMiss) {
-            FastllmCudaSetThreadError();
-            if (rank == 0) {
+        if (state.lastRegistrationMissDuringCapture) {
+            // Registration allocates device metadata and copies the peer
+            // pointer tuple, so it cannot be built while a stream is being
+            // captured.  No custom kernel has launched yet, and the
+            // rendezvous above makes this miss collective across all ranks.
+            // Let the caller capture its NCCL/non-fused fallback instead of
+            // poisoning an otherwise valid graph.
+            if (rank == 0 && !state.captureFallbackLogged) {
+                state.captureFallbackLogged = true;
                 std::fprintf(stderr,
-                             "[Fastllm] custom all-reduce rejected an "
-                             "unregistered pointer tuple during capture.\n");
+                             "[Fastllm] custom all-reduce is falling back "
+                             "inside CUDA Graph for pointer tuples first "
+                             "seen during capture.\n");
                 std::fflush(stderr);
             }
         }
@@ -1427,9 +1493,18 @@ bool LaunchCustomArPairAdd(CustomArState &state,
 bool RunCustomArCandidate(void *data, void *dest, int count,
                           int dataType, int deviceId,
                           bool requireEnabledPath = false) {
-    if (data == nullptr || dest == nullptr || count <= 0) {
+    if (count <= 0) {
         return false;
     }
+    // The kernels access data/dest as 16-byte aligned packets; a misaligned or
+    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
+    // 13).  Whether *this* rank's pointers are usable is local information and
+    // must not be decided here: a rank that returned early would leave its
+    // peers waiting in the rendezvous (or in the device barrier) forever.
+    // Record the flag and let the collective rendezvous below drop every rank
+    // to NCCL together.
+    const bool localEligible = data != nullptr && dest != nullptr &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
     size_t typeBytes = CustomArTypeBytes(dataType);
     size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1447,7 +1522,7 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
 
     CustomArRankData *rankData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, rankData)) {
+                                        dataType, localEligible, rankData)) {
         return false;
     }
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
@@ -1497,10 +1572,17 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
 bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
                                  int count, int dataType, int deviceId,
                                  bool requireEnabledPath = false) {
-    if (first == nullptr || second == nullptr || dest == nullptr ||
-        count <= 0) {
+    if (count <= 0) {
         return false;
     }
+    // The kernel reads first/second and writes dest as 16-byte aligned
+    // packets; a misaligned or null view would fault on the device
+    // (cudaErrorMisalignedAddress, Xid 13).  This is local information, so it
+    // goes into the collective rendezvous rather than an early return (see
+    // RunCustomArCandidate).
+    const bool localEligible = first != nullptr && second != nullptr &&
+        dest != nullptr &&
+        (((uintptr_t)first | (uintptr_t)second | (uintptr_t)dest) & 15u) == 0;
     const size_t typeBytes = CustomArTypeBytes(dataType);
     const size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1519,9 +1601,11 @@ bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
     CustomArRankData *firstRankData = nullptr;
     CustomArRankData *secondRankData = nullptr;
     if (!FindOrRegisterCustomArPointers(
-            state, rank, first, count, dataType, firstRankData) ||
+            state, rank, first, count, dataType, localEligible,
+            firstRankData) ||
         !FindOrRegisterCustomArPointers(
-            state, rank, second, count, dataType, secondRankData)) {
+            state, rank, second, count, dataType, localEligible,
+            secondRankData)) {
         return false;
     }
     if (dataType == fastllm::DataType::FLOAT16) {
@@ -1545,9 +1629,15 @@ bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
 bool RunCustomArAddCandidate(void *data, void *dest, int count,
                              int dataType, int deviceId,
                              bool requireEnabledPath = false) {
-    if (data == nullptr || dest == nullptr || count <= 0) {
+    if (count <= 0) {
         return false;
     }
+    // The kernel reads data/dest as 16-byte aligned packets; a misaligned or
+    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
+    // 13).  This is local information, so it goes into the collective
+    // rendezvous rather than an early return (see RunCustomArCandidate).
+    const bool localEligible = data != nullptr && dest != nullptr &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
     size_t typeBytes = CustomArTypeBytes(dataType);
     size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1566,7 +1656,7 @@ bool RunCustomArAddCandidate(void *data, void *dest, int count,
 
     CustomArRankData *rankData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, rankData)) {
+                                        dataType, localEligible, rankData)) {
         return false;
     }
     if (dataType == fastllm::DataType::FLOAT16) {
@@ -1867,9 +1957,12 @@ bool CheckCustomArCorrectnessTyped(const CustomArState &state,
             expected[index] += CustomArHostToFloat<T>(host[index]);
         }
         FastllmCudaSetDevice(state.devices[rank]);
+        // The rank workers consume these buffers on other per-thread streams.
+        // Pageable H2D copies and memset may still be running when they return.
         ok = cudaMemcpy(buffers.inputs[rank], host.data(), bytes,
                         cudaMemcpyHostToDevice) == cudaSuccess &&
-             cudaMemset(buffers.outputs[rank], 0, bytes) == cudaSuccess;
+             cudaMemset(buffers.outputs[rank], 0, bytes) == cudaSuccess &&
+             cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
         if (!ok) {
             cudaGetLastError();
         }
@@ -1987,8 +2080,8 @@ bool BenchmarkCustomArPath(const CustomArState &state,
     CustomArRankOperation measuredNccl = eagerNccl;
     float ignoredUs = 0.0f;
 
-    // Register the benchmark pointer tuple outside capture. A registration
-    // miss during capture is intentionally rejected by the production path.
+    // Register the benchmark pointer tuple outside capture so this benchmark
+    // measures the custom path instead of the graph-safe NCCL fallback.
     if (!ZeroCustomArBenchInputs(state.devices, buffers, bytes) ||
         !RunCustomArRankOperation(state.devices, 1, eagerCustom, ignoredUs)) {
         return false;
@@ -2214,10 +2307,19 @@ void FastllmCudaCustomAllReduceReset() {
         state.pendingCount = 0;
         state.pendingType = -1;
         state.pendingMismatch = false;
+        for (uint64_t &sequence : state.rankCallSequence) {
+            sequence = 0;
+        }
+        for (uint64_t &sequence : state.pendingSequences) {
+            sequence = 0;
+        }
+        state.sequenceDesyncLogged = false;
         state.lastRegistrationOk = false;
-        state.lastCaptureRegistrationMiss = false;
+        state.lastRegistrationMissDuringCapture = false;
+        state.captureFallbackLogged = false;
         state.pendingInputs.clear();
         state.pendingCapturing.clear();
+        state.pendingAligned.clear();
         state.lastRankData.clear();
         state.generation++;
     }

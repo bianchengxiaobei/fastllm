@@ -3,6 +3,7 @@
 //
 
 #include "model.h"
+#include "devices/disk/diskdevice.h"
 
 #include <cstring>
 #include <csignal>
@@ -40,6 +41,7 @@ struct FASTLLM_PYTOOLS_INIT {
 } fastllm_pytools_init;
 
 static thread_local std::string fastllmPytoolsWarmupError;
+static thread_local std::string fastllmPytoolsContextResult;
 
 extern "C" {
     typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
@@ -87,8 +89,27 @@ extern "C" {
         fastllm::SetCudaEmbedding(cuda_embedding);
     }
 
+    DLL_EXPORT void set_cuda_graph(bool cuda_graph) {
+        fastllm::SetCudaGraph(cuda_graph);
+    }
+
     DLL_EXPORT void set_cuda_slab(int mb) {
         fastllm::SetCudaSlabMB(mb);
+    }
+
+    DLL_EXPORT void set_moe_cuda_cache(uint64_t bytes) {
+        fastllm::SetMoeCudaCacheBytes(bytes);
+    }
+
+    DLL_EXPORT void set_moe_cpu_cache(uint64_t bytes) {
+        fastllm::SetMoeCpuCacheBytes(bytes);
+    }
+
+    DLL_EXPORT void get_disk_moe_cache_stats(uint64_t *values) {
+        auto s = fastllm::GetDiskMoeCacheStats();
+        uint64_t result[] = {s.cpuBytes, s.cudaBytes, s.cpuHits, s.cudaHits, s.misses,
+            s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions};
+        std::copy(result, result + 9, values);
     }
 
     DLL_EXPORT void disable_cuda_malloc() {
@@ -180,6 +201,10 @@ extern "C" {
         fastllm::SetMoeDeviceLayers(layers);
     }
 
+    DLL_EXPORT void set_ngram_device(const char *device) {
+        fastllm::SetNgramDevice(device == nullptr ? "cpu" : device);
+    }
+
     DLL_EXPORT struct ModelManager {
         std::mutex locker;
         std::map <int, std::unique_ptr<fastllm::basellm> > models;
@@ -257,6 +282,42 @@ extern "C" {
         return ret;
     }
 
+    static bool is_supported_tool_call_constraint_format(
+            const std::string &format) {
+        return format == "deepseek_v4_dsml" ||
+               format == "deepseek_v41_dsml" || format == "dots_xml";
+    }
+
+    static std::vector<std::string> default_tool_call_name_prefixes(
+            const std::string &format, bool parameter) {
+        if (format == "dots_xml") {
+            return {parameter ? "<parameter name=\"" : "<invoke name=\""};
+        }
+        if (format == "deepseek_v41_dsml") {
+            // V4.1 renames every DSML tag with a leading space.
+            if (parameter) {
+                return {
+                    "<｜DSML｜ parameter name=\"",
+                    "<\\DSML\\ parameter name=\"",
+                };
+            }
+            return {
+                "<｜DSML｜ invoke name=\"",
+                "<\\DSML\\ invoke name=\"",
+            };
+        }
+        if (parameter) {
+            return {
+                "<｜DSML｜parameter name=\"",
+                "<\\DSML\\parameter name=\"",
+            };
+        }
+        return {
+            "<｜DSML｜invoke name=\"",
+            "<\\DSML\\invoke name=\"",
+        };
+    }
+
     static bool apply_tool_call_constraint_json(
             fastllm::GenerationConfig &config,
             const std::string &payload) {
@@ -290,9 +351,11 @@ extern "C" {
         if (!nameConstraint.is_object()) {
             nameConstraint = root;
         }
+        std::string constraintFormat =
+            nameConstraint["format"].string_value();
         if (!nameConstraint.is_object() ||
             nameConstraint["type"].string_value() != "tool_name_enum" ||
-            nameConstraint["format"].string_value() != "deepseek_v4_dsml") {
+            !is_supported_tool_call_constraint_format(constraintFormat)) {
             return false;
         }
 
@@ -302,8 +365,8 @@ extern "C" {
         }
         auto prefixes = read_string_array(nameConstraint["invoke_name_prefixes"]);
         if (prefixes.empty()) {
-            prefixes.push_back("<｜DSML｜invoke name=\"");
-            prefixes.push_back("<\\DSML\\invoke name=\"");
+            prefixes = default_tool_call_name_prefixes(
+                constraintFormat, false);
         }
         std::string terminator = nameConstraint["name_terminator"].string_value();
         if (terminator.empty()) {
@@ -321,15 +384,15 @@ extern "C" {
         json11::Json parameterNameConstraint = root["parameter_name_constraint"];
         if (parameterNameConstraint.is_object() &&
             parameterNameConstraint["type"].string_value() == "tool_parameter_name_enum" &&
-            parameterNameConstraint["format"].string_value() == "deepseek_v4_dsml") {
+            parameterNameConstraint["format"].string_value() == constraintFormat) {
             auto parameterNames = read_string_array_map(
                     parameterNameConstraint["parameter_names_by_tool"]);
             if (!parameterNames.empty()) {
                 auto parameterPrefixes = read_string_array(
                         parameterNameConstraint["parameter_name_prefixes"]);
                 if (parameterPrefixes.empty()) {
-                    parameterPrefixes.push_back("<｜DSML｜parameter name=\"");
-                    parameterPrefixes.push_back("<\\DSML\\parameter name=\"");
+                    parameterPrefixes = default_tool_call_name_prefixes(
+                        constraintFormat, true);
                 }
                 config.tool_call_parameter_name_constraint_enabled = true;
                 config.tool_call_allowed_parameter_names = std::move(parameterNames);
@@ -401,10 +464,62 @@ extern "C" {
         return id;
     }
 
+    DLL_EXPORT const char *get_llm_context_result() {
+        return fastllmPytoolsContextResult.c_str();
+    }
+
+    DLL_EXPORT const char *get_llm_context_config(int modelId) {
+        auto model = models.GetModel(modelId);
+        fastllmPytoolsContextResult = model->contextPlan.ToJson();
+        return fastllmPytoolsContextResult.c_str();
+    }
+
+    DLL_EXPORT int create_llm_model_fromhf_with_context(char *path, int dataType, int groupCnt,
+            bool skipTokenizer, char *lora, bool useMoe, int moeDataType, int moeGroupCnt,
+            char *dtypeConfigString, int maxLength, char *ropeScaling) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            std::lock_guard<std::mutex> guard(models.locker);
+            auto model = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType,
+                groupCnt, skipTokenizer, "", lora, false, useMoe, (fastllm::DataType)moeDataType,
+                moeGroupCnt, dtypeConfigString, {maxLength, ropeScaling == nullptr ? "" : ropeScaling});
+            int id = models.models.size();
+            models.models[id] = std::move(model);
+            return id;
+        } catch (const std::exception &error) {
+            fastllmPytoolsContextResult = error.what();
+        } catch (const char *error) {
+            fastllmPytoolsContextResult = error == nullptr ? "unknown model initialization error" : error;
+        } catch (...) {
+            fastllmPytoolsContextResult = "unknown model initialization error";
+        }
+        return -1;
+    }
+
     DLL_EXPORT int create_llm_model_from_gguf(char *path, char *oriPath) {
         models.locker.lock();
         int id = models.models.size();
         models.models[id] = fastllm::CreateLLMModelFromGGUFFile(path, oriPath);
+        models.locker.unlock();
+        return id;
+    }
+
+    DLL_EXPORT int create_llm_model_from_gguf_with_mtp(
+            char *path, char *oriPath, char *mtpPath) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMModelFromGGUFFile(
+            path, oriPath, mtpPath);
+        models.locker.unlock();
+        return id;
+    }
+
+    DLL_EXPORT int create_llm_model_from_gguf_with_mmproj(
+            char *path, char *oriPath, char *mmprojPath) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMModelFromGGUFFile(
+            path, oriPath, "", mmprojPath);
         models.locker.unlock();
         return id;
     }
@@ -553,12 +668,13 @@ extern "C" {
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
             if (model->model_type == "laguna" ||
-                model->model_type == "kimi_k3") {
+                model->model_type == "kimi_k3" ||
+                model->model_type == "dots3_note") {
                 // Laguna's late-layer activations exceed the finite FP16
-                // range, while Kimi-K3's dedicated CUDA kernels consume
-                // BF16.  Preserve BF16 for both models in auto mode; this
-                // also keeps Kimi-K3's KV capacity accounting consistent
-                // with the cache tensors created by its attention path.
+                // range, while Kimi-K3's dedicated CUDA kernels and the
+                // Dots3-Note reference path consume BF16. Preserve BF16 in
+                // auto mode; this also keeps Kimi-K3's KV accounting
+                // consistent with its attention cache tensors.
                 model->SetDataType(fastllm::DataType::BFLOAT16);
             } else if (model->model_type == "glm_moe_dsa") {
                 model->SetDataType(fastllm::DataType::FLOAT32);
@@ -566,6 +682,7 @@ extern "C" {
                 || model->model_struct == "chatglm" 
                 || model->model_struct == "llama"
                 || model->model_struct == "qwen3_moe"
+                || model->model_type == "qwen4_exp"
                 || model->model_struct == "minimax_m2"
                 // || this->model_struct == "graph" ||
                 // || this->model_struct == "cogvlm" ||
@@ -607,8 +724,10 @@ extern "C" {
             model->SetKVCacheDataType(fastllm::DataType::FLOAT32);
         } else if (dtypeStr == "fp8" || dtypeStr == "float8" || dtypeStr == "fp8_e4m3") {
             model->SetKVCacheDataType(fastllm::DataType::FP8_E4M3);
+        } else if (dtypeStr == "fp4" || dtypeStr == "nvfp4" || dtypeStr == "fp4_e2m1") {
+            model->SetKVCacheDataType(fastllm::DataType::FP4_E2M1);
         } else {
-            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16 or fp8_e4m3.");
+            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1.");
         }
         return;
     }
@@ -922,7 +1041,7 @@ extern "C" {
             fastllm::Data *mmTokenTypeIdsData = new fastllm::Data();
             mmTokenTypeIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, mmTypeShape, mmTokenTypeIds));
             (*multimodalInput)["mm_token_type_ids"].push_back(mmTokenTypeIdsData);
-        } else if (mode == "qwen35") {
+        } else if (mode == "qwen35" || mode == "deepseek_v41") {
             if (multimodal_config["tensors"].is_array()) {
                 for (auto &tensorNode : multimodal_config["tensors"].array_items()) {
                     addTypedPayloadTensor(
@@ -1034,6 +1153,10 @@ extern "C" {
         auto model = models.GetModel(modelId);
         if (length > 0 && length < model->max_positions) {
             model->max_positions = length;
+            if (model->contextPlan.configured) {
+                model->contextPlan.requestedLength = length;
+                model->contextPlan.effectiveLength = std::min(model->contextPlan.effectiveLength, length);
+            }
         }
         return model->max_positions;
     }

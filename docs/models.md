@@ -73,6 +73,7 @@
 | Qwen/Qwen2.5-14B-Instruct  | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen2.5-32B-Instruct  | √ | √ | ✔ |
 | Qwen/Qwen2.5-72B-Instruct  |  | √ | ✔ |
+| [Qwen4-Exp / Qwen3.8-Flash-Next FP8 text](qwen4_exp.md) |  |  | ✔ |
 
 > 注3： ~~需要更新，检查 `tokenizer_config.json` 是否为最新版本~~
 
@@ -84,6 +85,7 @@
 | deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ✔ |
+| deepseek-ai/DeepSeek-V4.1-Flash（[说明](deepseek_v41.md)） | ✔ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-V2-Chat                | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-V2-Lite-Chat           | √ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | ✔ | √ |

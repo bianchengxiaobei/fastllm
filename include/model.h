@@ -14,7 +14,10 @@ namespace fastllm {
 
     std::unique_ptr<basellm> CreateLLMModelFromGGUF(const std::string &modelPath);
 
-    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath);
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
+        const std::string &fileName, const std::string &originalPath,
+        const std::string &externalMtpPath = "",
+        const std::string &mmprojPath = "");
 
     std::unique_ptr<basellm> CreateLLMModelFromFile(const std::string &fileName);
 
@@ -29,7 +32,8 @@ namespace fastllm {
                                                     bool weightOnly = false, 
                                                     bool useMoeDataType = false, 
                                                     DataType moeDataType = DataType::FLOAT32, 
-                                                    int moeGroupCnt = -1, const std::string &dtypeConfigString = "");
+                                                    int moeGroupCnt = -1, const std::string &dtypeConfigString = "",
+                                                    const ContextOptions &contextOptions = {});
     
     void ExportLLMModelFromHF(const std::string &modelPath, 
                             DataType linearDataType, 

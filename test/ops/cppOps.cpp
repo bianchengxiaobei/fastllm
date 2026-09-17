@@ -146,7 +146,10 @@ namespace {
         return result;
     }
 
-    static fastllm::Data MakeTensor(const std::vector<int> &dims, float seed = 0.0f, float scale = 1.0f) {
+    static fastllm::Data MakeTensor(const std::vector<int> &dims,
+                                    float seed = 0.0f,
+                                    float scale = 1.0f,
+                                    float bias = 0.0f) {
         int count = 1;
         for (int dim : dims) {
             count *= dim;
@@ -154,7 +157,7 @@ namespace {
         std::vector<float> data(count);
         for (int i = 0; i < count; i++) {
             float v = std::sin((i + 1) * 0.37f + seed) + std::cos((i + 3) * 0.19f + seed * 0.5f);
-            data[i] = v * scale;
+            data[i] = v * scale + bias;
         }
         return fastllm::Data(fastllm::DataType::FLOAT32, dims, data);
     }
@@ -194,44 +197,29 @@ namespace {
             if (in % groupCnt != 0) {
                 throw std::runtime_error("int4group32 input features must be divisible by 32");
             }
+            std::string sourceType = params.Has("weight_source_type")
+                ? params.GetString("weight_source_type") : "float32";
+            fastllm::DataType sourceDataType = fastllm::DataType::FLOAT32;
+            uint8_t *sourceData = fp32Weight.cpuData;
+            std::vector<uint16_t> bf16Weight;
+            if (sourceType == "bfloat16") {
+                const int elements = out * in;
+                const float *source = (const float*)fp32Weight.cpuData;
+                bf16Weight.resize(elements);
+                for (int i = 0; i < elements; i++) {
+                    bf16Weight[i] = fastllm::Float32ToBFloat16RNEBits(source[i]);
+                }
+                sourceDataType = fastllm::DataType::BFLOAT16;
+                sourceData = (uint8_t*)bf16Weight.data();
+            } else if (sourceType != "float32") {
+                throw std::runtime_error(
+                    "int4group32 weight_source_type must be float32 or bfloat16");
+            }
             weight.dataType = fastllm::DataType::INT4_GROUP32;
             weight.Resize({out, in});
-            weight.Allocate(true);
-            const int groups = in / groupCnt;
-            const size_t rowBytes = fastllm::GetDataBytes(
-                fastllm::DataType::INT4_GROUP32, 1, in);
-            const float *source = (const float*)fp32Weight.cpuData;
-            for (int row = 0; row < out; row++) {
-                uint8_t *rowData = weight.cpuData + (size_t)row * rowBytes;
-                for (int group = 0; group < groups; group++) {
-                    const float *sourceBlock = source +
-                        (size_t)row * in + group * groupCnt;
-                    float absMax = 0.0f;
-                    for (int column = 0; column < groupCnt; column++) {
-                        absMax = std::max(absMax, std::fabs(sourceBlock[column]));
-                    }
-                    uint8_t *block = rowData +
-                        fastllm::GetInt4Group32DataOffset(group, groups);
-                    const uint16_t scaleBits = fastllm::Float32ToBFloat16RNEBits(
-                        absMax == 0.0f ? 0.0f : absMax / 7.0f);
-                    std::memcpy(rowData +
-                                    fastllm::GetInt4Group32ScaleOffset(group, groups),
-                                &scaleBits, sizeof(scaleBits));
-                    const float scale = fastllm::BFloat16BitsToFloat32(scaleBits);
-                    for (int column = 0; column < groupCnt; column += 2) {
-                        auto quantize = [scale](float value) {
-                            if (scale == 0.0f) {
-                                return 8;
-                            }
-                            return std::max(0, std::min(15,
-                                (int)std::lround(value / scale) + 8));
-                        };
-                        const int high = quantize(sourceBlock[column]);
-                        const int low = quantize(sourceBlock[column + 1]);
-                        block[column / 2] = (uint8_t)((high << 4) | low);
-                    }
-                }
-            }
+            weight.CreateFromOriData(
+                fastllm::WeightType::LINEAR, sourceDataType,
+                sourceData, nullptr, nullptr, groupCnt);
             return;
         }
         throw std::runtime_error("unsupported linear weight_type: " + weightType);
@@ -286,8 +274,18 @@ namespace {
     static std::vector<int32_t> ToInt32Vector(fastllm::Data data) {
         data.ToDevice(fastllm::DataDevice::CPU);
         size_t count = data.Count(0);
+        if (data.dataType == fastllm::DataType::INT16) {
+            const int16_t *ptr =
+                reinterpret_cast<const int16_t*>(data.cpuData);
+            std::vector<int32_t> result(count);
+            for (size_t i = 0; i < count; ++i) {
+                result[i] = ptr[i];
+            }
+            return result;
+        }
         if (data.dataType != fastllm::DataType::INT32) {
-            throw std::runtime_error("only INT32 index outputs are supported");
+            throw std::runtime_error(
+                "only INT16/INT32 index outputs are supported");
         }
         const int32_t *ptr = reinterpret_cast<const int32_t*>(data.cpuData);
         return std::vector<int32_t>(ptr, ptr + count);
@@ -639,6 +637,77 @@ namespace {
             },
             [](const OpTestParams &params) {
                 return (double) CountElements(params.GetInts("dims"));
+            }
+        };
+    }
+
+    static fastllm::DataType ParseSigmoidMulToType(
+            const std::string &type) {
+        if (type == "fp32") {
+            return fastllm::DataType::FLOAT32;
+        }
+        if (type == "fp16") {
+            return fastllm::DataType::FLOAT16;
+        }
+        if (type == "bf16") {
+            return fastllm::DataType::BFLOAT16;
+        }
+        throw std::runtime_error(
+            "SigmoidMulTo type must be fp32, fp16 or bf16");
+    }
+
+    static OpCase MakeSigmoidMulToCase() {
+        return {
+            "sigmoid_multo",
+            "multiply by a broadcast sigmoid gate with independent dtypes",
+            []() {
+                OpTestParams params;
+                params.Add("input_dims", "2,3,4", "input tensor shape");
+                params.Add("gate_dims", "2,3,1", "broadcast gate shape");
+                params.Add("input_type", "fp32", "fp32, fp16 or bf16");
+                params.Add("gate_type", "fp32", "fp32, fp16 or bf16");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                fastllm::Data input =
+                    MakeTensor(params.GetInts("input_dims"), 0.37f);
+                fastllm::Data gate =
+                    MakeTensor(params.GetInts("gate_dims"), 0.83f);
+                fastllm::ToDataType(
+                    input, ParseSigmoidMulToType(
+                        params.GetString("input_type")));
+                fastllm::ToDataType(
+                    gate, ParseSigmoidMulToType(
+                        params.GetString("gate_type")));
+                return CanRunOnDevice(
+                    device, "SigmoidMulTo",
+                    {{"input", &input}, {"gate", &gate}}, {}, {});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                fastllm::Data input =
+                    MakeTensor(params.GetInts("input_dims"), 0.37f);
+                fastllm::Data gate =
+                    MakeTensor(params.GetInts("gate_dims"), 0.83f);
+                fastllm::ToDataType(
+                    input, ParseSigmoidMulToType(
+                        params.GetString("input_type")));
+                fastllm::ToDataType(
+                    gate, ParseSigmoidMulToType(
+                        params.GetString("gate_type")));
+                ScopedFirstDevice guard(device);
+                fastllm::SigmoidMulTo(input, gate);
+                fastllm::Data output;
+                fastllm::ToDataType(
+                    input, output, fastllm::DataType::FLOAT32);
+                output.ToDevice(fastllm::DataDevice::CPU);
+                return output;
+            },
+            [](const OpTestParams &params) {
+                return FloatBytes(params.GetInts("input_dims")) * 2.0 +
+                       FloatBytes(params.GetInts("gate_dims"));
+            },
+            [](const OpTestParams &params) {
+                return (double)CountElements(params.GetInts("input_dims"));
             }
         };
     }
@@ -1201,6 +1270,7 @@ namespace {
                 params.Add("in", "8", "input features");
                 params.Add("out", "6", "output features");
                 params.Add("weight_type", "float32", "weight datatype: float32, int4group, or int4group32");
+                params.Add("weight_source_type", "float32", "source datatype for int4group32: float32 or bfloat16");
                 params.Add("group_cnt", "128", "group size used by int4group quantization");
                 return params;
             },
@@ -1319,6 +1389,21 @@ namespace {
         };
     }
 
+    static void PrepareGeluNewInput(const OpTestParams &params,
+                                    const std::string &device,
+                                    fastllm::Data &input) {
+        const std::string inputType = params.GetString("input_type");
+        if (inputType != "fp32" && inputType != "fp16") {
+            throw std::runtime_error(
+                "gelunew input_type must be fp32 or fp16");
+        }
+        if (inputType == "fp16" &&
+            (device.rfind("cuda", 0) == 0 ||
+             device.rfind("multicuda", 0) == 0)) {
+            fastllm::ToDataType(input, fastllm::DataType::FLOAT16);
+        }
+    }
+
     static OpCase MakeGeluNewCase() {
         return {
             "gelunew",
@@ -1326,20 +1411,23 @@ namespace {
             []() {
                 OpTestParams params;
                 params.Add("dims", "4,8", "input tensor shape");
+                params.Add("input_type", "fp32",
+                           "fp32 or fp16 target input; CPU reference is fp32");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
                 fastllm::Data input = MakeTensor(params.GetInts("dims"), 0.5f);
+                PrepareGeluNewInput(params, device, input);
                 fastllm::Data output;
                 return CanRunOnDevice(device, "GeluNew", {{"input", &input}, {"output", &output}}, {}, {});
             },
             [](const OpTestParams &params, const std::string &device) {
                 fastllm::Data input = MakeTensor(params.GetInts("dims"), 0.5f);
+                PrepareGeluNewInput(params, device, input);
                 fastllm::Data output;
                 ScopedFirstDevice guard(device);
                 fastllm::GeluNew(input, output);
-                output.ToDevice(fastllm::DataDevice::CPU);
-                return output;
+                return ConvertToFloat32Data(output);
             },
             [](const OpTestParams &params) {
                 return FloatBytes(params.GetInts("dims")) * 2.0;
@@ -1385,6 +1473,23 @@ namespace {
         };
     }
 
+    static void PrepareAttentionInputs(const OpTestParams &params,
+                                       fastllm::Data &q,
+                                       fastllm::Data &k,
+                                       fastllm::Data &v) {
+        const std::string inputType = params.GetString("input_type");
+        if (inputType == "fp32") {
+            return;
+        }
+        if (inputType != "fp16") {
+            throw std::runtime_error(
+                "attention input_type must be fp32 or fp16");
+        }
+        fastllm::ToDataType(q, fastllm::DataType::FLOAT16);
+        fastllm::ToDataType(k, fastllm::DataType::FLOAT16);
+        fastllm::ToDataType(v, fastllm::DataType::FLOAT16);
+    }
+
     static OpCase MakeAttentionCase() {
         return {
             "attention",
@@ -1396,6 +1501,7 @@ namespace {
                 params.Add("dim", "8", "head dimension total");
                 params.Add("group", "1", "attention group");
                 params.Add("attention_type", "1", "1 normal, 2 no mask");
+                params.Add("input_type", "fp32", "fp32 or fp16");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
@@ -1403,6 +1509,7 @@ namespace {
                 fastllm::Data q = MakeTensor({batch, seq, dim}, 0.1f);
                 fastllm::Data k = MakeTensor({batch, seq, dim}, 0.5f);
                 fastllm::Data v = MakeTensor({batch, seq, dim}, 0.9f);
+                PrepareAttentionInputs(params, q, k, v);
                 fastllm::Data mask;
                 fastllm::Data output;
                 return CanRunOnDevice(device, "Attention", {{"q", &q}, {"k", &k}, {"v", &v}, {"mask", &mask}, {"output", &output}},
@@ -1414,17 +1521,19 @@ namespace {
                 fastllm::Data q = MakeTensor({batch, seq, dim}, 0.1f);
                 fastllm::Data k = MakeTensor({batch, seq, dim}, 0.5f);
                 fastllm::Data v = MakeTensor({batch, seq, dim}, 0.9f);
+                PrepareAttentionInputs(params, q, k, v);
                 fastllm::Data mask;
                 fastllm::Data output;
                 ScopedFirstDevice guard(device);
+                int maskType = params.GetInt("attention_type") == 2 ? 2 : 0;
                 fastllm::Attention(q, k, v, mask, output, params.GetInt("group"),
-                                   1.0f / std::sqrt((float) dim), params.GetInt("attention_type"));
-                output.ToDevice(fastllm::DataDevice::CPU);
-                return output;
+                                   1.0f / std::sqrt((float) dim), maskType);
+                return ConvertToFloat32Data(output);
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), seq = params.GetInt("seq"), dim = params.GetInt("dim");
-                return FloatBytes({batch, seq, dim}) * 4.0;
+                double elementBytes = params.GetString("input_type") == "fp16" ? 2.0 : 4.0;
+                return (double) batch * seq * dim * elementBytes * 4.0;
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), seq = params.GetInt("seq"), dim = params.GetInt("dim");
@@ -3045,6 +3154,7 @@ namespace {
 #ifdef USE_CUDA
     struct FusedRouterTopKBenchState {
         int batch = 1;
+        int experts = 256;
         int topk = 8;
         bool withBias = true;
         bool needNorm = true;
@@ -3119,7 +3229,7 @@ namespace {
                 }
                 os << "] expected_prob=";
                 std::vector<float> referenceProbValues = ToFloatVector(referenceProb);
-                size_t probStart = (mismatch / topk) * 256;
+                size_t probStart = (mismatch / topk) * experts;
                 for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",")
                        << referenceProbValues[probStart + expectedIndex[i]];
@@ -3134,7 +3244,7 @@ namespace {
                 maxAbsDiff = std::max(maxAbsDiff, std::fabs(expectedScore[i] - actualScore[i]));
             }
             const bool selectedLogitFastPath =
-                !sigmoid && !withBias && needNorm;
+                experts == 256 && !sigmoid && !withBias && needNorm;
             const float scoreTolerance = sigmoid ? 1.0e-6f :
                 (selectedLogitFastPath ? 2.0e-6f : 0.0f);
             if (maxAbsDiff > scoreTolerance) {
@@ -3148,8 +3258,12 @@ namespace {
 #ifdef USE_CUDA
             FastllmCudaSetDevice(0);
             batch = params.GetInt("batch");
+            experts = params.GetInt("experts");
             sigmoid = params.GetString("activation") == "sigmoid";
-            topk = sigmoid ? 10 : 8;
+            topk = params.GetInt("topk");
+            if (topk <= 0) {
+                topk = sigmoid ? 10 : 8;
+            }
             withBias = params.GetInt("bias") != 0;
             needNorm = params.GetInt("norm") != 0;
             routeScale = params.GetFloat("route_scale");
@@ -3158,18 +3272,19 @@ namespace {
             std::string pattern = params.GetString("pattern");
             fastllm::Data fp32Logits;
             if (pattern == "unique") {
-                fastllm::Data generated = MakeTensor({batch, 256}, 0.731f, 1.7f);
+                fastllm::Data generated = MakeTensor(
+                    {batch, experts}, 0.731f, 1.7f);
                 fp32Logits.CopyFrom(generated);
             } else if (pattern == "tied") {
-                std::vector<float> values((size_t)batch * 256);
+                std::vector<float> values((size_t)batch * experts);
                 for (int token = 0; token < batch; token++) {
-                    for (int expert = 0; expert < 256; expert++) {
-                        values[(size_t)token * 256 + expert] =
+                    for (int expert = 0; expert < experts; expert++) {
+                        values[(size_t)token * experts + expert] =
                             (float)((expert * 17 + token * 13) & 7) * 0.25f;
                     }
                 }
                 fastllm::Data generated(fastllm::DataType::FLOAT32,
-                                        {batch, 256}, values);
+                                        {batch, experts}, values);
                 fp32Logits.CopyFrom(generated);
             } else {
                 throw std::runtime_error("pattern must be unique or tied");
@@ -3187,15 +3302,16 @@ namespace {
 
             fastllm::Data fp32Bias;
             if (pattern == "unique") {
-                fastllm::Data generated = MakeTensor({256}, 1.217f, 0.015f);
+                fastllm::Data generated = MakeTensor(
+                    {experts}, 1.217f, 0.015f);
                 fp32Bias.CopyFrom(generated);
             } else {
-                std::vector<float> values(256);
-                for (int expert = 0; expert < 256; expert++) {
+                std::vector<float> values(experts);
+                for (int expert = 0; expert < experts; expert++) {
                     values[expert] = (float)(expert & 3) * 0.001f;
                 }
                 fastllm::Data generated(fastllm::DataType::FLOAT32,
-                                        {256}, values);
+                                        {experts}, values);
                 fp32Bias.CopyFrom(generated);
             }
             bias.CopyFrom(fp32Bias);
@@ -3264,10 +3380,13 @@ namespace {
     static OpCase MakeFusedRouterTopKCase() {
         return {
             "fused_router_topk",
-            "benchmark and validate fused softmax/sigmoid + SelectExpert for 256 experts",
+            "benchmark and validate fused softmax/sigmoid + SelectExpert",
             []() {
                 OpTestParams params;
                 params.Add("batch", "1", "token batch size");
+                params.Add("experts", "256", "expert count");
+                params.Add("topk", "0",
+                           "selected experts (0 uses activation default)");
                 params.Add("input_type", "fp16", "fp16, bf16 or fp32");
                 params.Add("bias_type", "fp32", "fp16, bf16 or fp32");
                 params.Add("activation", "softmax", "softmax/top8 or sigmoid/top10");
@@ -3293,11 +3412,1833 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
+    struct Dots3NoteIndexerBenchState {
+        int queryTokens = 1;
+        int totalTokens = 2049;
+        int startPos = 2048;
+        std::string path = "indexer";
+        fastllm::Data indexQ, indexKPe, indexKNope, indexK, indexWeights;
+        fastllm::Data qFp8, foldedWeights, kFp8, kScales, indices;
+        fastllm::Data cachedKFp8{fastllm::DataType::INT8};
+        fastllm::Data cachedKScales{fastllm::DataType::FLOAT32};
+        fastllm::Data mainQ, mainK, mainV;
+        fastllm::Data sparseOutput, sparsePrefillOutput;
+        fastllm::Data slidingPrefillOutput;
+        fastllm::Data sparsePrefillBacking;
+        void *indexerHeadScoreWorkspace = nullptr;
+        size_t indexerHeadScoreWorkspaceBytes = 0;
+        size_t sparseOutputBytes = 0;
+        size_t sparseScratchBytes = 0;
+
+        ~Dots3NoteIndexerBenchState() {
+            if (indexerHeadScoreWorkspace != nullptr) {
+                FastllmCudaDirectFree(indexerHeadScoreWorkspace);
+            }
+        }
+
+        static std::vector<uint8_t> ToBytes(const fastllm::Data &data) {
+            fastllm::Data host;
+            host.CopyFrom(data);
+            host.ToDevice(fastllm::DataDevice::CPU);
+            return std::vector<uint8_t>(host.cpuData,
+                                        host.cpuData + host.GetBytes());
+        }
+
+        void ValidateAttentionKeyPacking() {
+            constexpr int heads = 2;
+            constexpr int tokens = 3;
+            constexpr int capacity = 5;
+            constexpr int nopeDim = 3;
+            constexpr int ropeDim = 2;
+            constexpr int kvDim = 5;
+            constexpr int qkDim = nopeDim + ropeDim;
+
+            fastllm::Data kv = MakeTensor(
+                {heads, tokens, kvDim}, 0.137f, 0.5f);
+            fastllm::Data rope = MakeTensor(
+                {tokens, ropeDim}, 0.823f, 0.5f);
+            fastllm::ToDataType(kv, fastllm::DataType::BFLOAT16);
+            fastllm::ToDataType(rope, fastllm::DataType::BFLOAT16);
+            std::vector<float> kvValues =
+                ToFloatVector(ConvertToFloat32Data(kv));
+            std::vector<float> ropeValues =
+                ToFloatVector(ConvertToFloat32Data(rope));
+            kv.ToDevice(fastllm::DataDevice::CUDA);
+            rope.ToDevice(fastllm::DataDevice::CUDA);
+
+            // Deliberately retain a padded token stride. Fresh Dots KV caches
+            // use the same layout whenever sequence length is not a multiple
+            // of the 128-token cache block.
+            fastllm::Data packed(fastllm::DataType::BFLOAT16);
+            packed.ToDevice(fastllm::DataDevice::CUDA, {0}, false);
+            packed.Expansion({heads, capacity, qkDim});
+            packed.Resize({heads, tokens, qkDim});
+            if (!FastllmCudaDots3NotePackAttentionKey(
+                    kv, rope, nopeDim, packed)) {
+                throw std::runtime_error(
+                    "Dots attention-key packing CUDA launch failed");
+            }
+            ForceDeviceSync();
+            std::vector<uint8_t> packedBytes = ToBytes(packed);
+            for (int head = 0; head < heads; ++head) {
+                for (int token = 0; token < tokens; ++token) {
+                    for (int d = 0; d < qkDim; ++d) {
+                        size_t outputOffset =
+                            ((size_t)head * tokens + token) * qkDim + d;
+                        size_t physicalOffset =
+                            (size_t)head * packed.strides[0] +
+                            (size_t)token * packed.strides[1] + d;
+                        uint16_t actualBits;
+                        std::memcpy(&actualBits,
+                                    packedBytes.data() +
+                                        physicalOffset * sizeof(actualBits),
+                                    sizeof(actualBits));
+                        float actual =
+                            fastllm::BFloat16BitsToFloat32(actualBits);
+                        float expected = d < nopeDim
+                            ? kvValues[((size_t)head * tokens + token) *
+                                       kvDim + d]
+                            : ropeValues[(size_t)token * ropeDim +
+                                         d - nopeDim];
+                        if (actual != expected) {
+                            std::ostringstream os;
+                            os << "Dots attention-key packing mismatch at "
+                               << outputOffset << ": expected=" << expected
+                               << " actual=" << actual;
+                            throw std::runtime_error(os.str());
+                        }
+                    }
+                }
+            }
+        }
+
+        void ValidateAttentionValuePacking() {
+            constexpr int heads = 2;
+            constexpr int tokens = 3;
+            constexpr int capacity = 5;
+            constexpr int nopeDim = 3;
+            constexpr int valueDim = 2;
+            constexpr int kvDim = nopeDim + valueDim;
+
+            fastllm::Data kv = MakeTensor(
+                {heads, tokens, kvDim}, 0.137f, 0.5f);
+            fastllm::ToDataType(kv, fastllm::DataType::BFLOAT16);
+            std::vector<float> kvValues =
+                ToFloatVector(ConvertToFloat32Data(kv));
+            kv.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data packed(fastllm::DataType::BFLOAT16);
+            packed.ToDevice(fastllm::DataDevice::CUDA, {0}, false);
+            packed.Expansion({heads, capacity, valueDim});
+            packed.Resize({heads, tokens, valueDim});
+            if (!FastllmCudaDots3NotePackAttentionValue(
+                    kv, nopeDim, valueDim, packed)) {
+                throw std::runtime_error(
+                    "Dots attention-value packing CUDA launch failed");
+            }
+            ForceDeviceSync();
+            if (packed.strides[0] <= tokens * valueDim) {
+                throw std::runtime_error(
+                    "Dots attention-value test did not create a padded head stride");
+            }
+            std::vector<uint8_t> packedBytes = ToBytes(packed);
+            for (int head = 0; head < heads; ++head) {
+                for (int token = 0; token < tokens; ++token) {
+                    for (int d = 0; d < valueDim; ++d) {
+                        size_t outputOffset =
+                            ((size_t)head * tokens + token) * valueDim + d;
+                        size_t physicalOffset =
+                            (size_t)head * packed.strides[0] +
+                            (size_t)token * packed.strides[1] + d;
+                        uint16_t actualBits;
+                        std::memcpy(&actualBits,
+                                    packedBytes.data() +
+                                        physicalOffset * sizeof(actualBits),
+                                    sizeof(actualBits));
+                        float actual =
+                            fastllm::BFloat16BitsToFloat32(actualBits);
+                        float expected = kvValues[
+                            ((size_t)head * tokens + token) * kvDim +
+                            nopeDim + d];
+                        if (actual != expected) {
+                            std::ostringstream os;
+                            os << "Dots attention-value packing mismatch at "
+                               << outputOffset << ": expected=" << expected
+                               << " actual=" << actual;
+                            throw std::runtime_error(os.str());
+                        }
+                    }
+                }
+            }
+        }
+
+        void ValidateTopK() {
+            const fastllm::FP8E4M3ToFP32Manager fp8;
+            std::vector<uint8_t> qRaw = ToBytes(qFp8);
+            std::vector<uint8_t> kRaw = ToBytes(kFp8);
+            std::vector<float> weights =
+                ToFloatVector(ConvertToFloat32Data(foldedWeights));
+            std::vector<float> scales =
+                ToFloatVector(ConvertToFloat32Data(kScales));
+            std::vector<int32_t> actual = ToInt32Vector(indices);
+
+            std::vector<int> tokensToCheck;
+            auto addToken = [&](int token) {
+                if (token >= 0 && token < queryTokens &&
+                    std::find(tokensToCheck.begin(), tokensToCheck.end(),
+                              token) == tokensToCheck.end()) {
+                    tokensToCheck.push_back(token);
+                }
+            };
+            addToken(0);
+            addToken(queryTokens / 2);
+            addToken(255);
+            addToken(256);
+            addToken(1023);
+            addToken(1024);
+            addToken(queryTokens - 1);
+            for (int token : tokensToCheck) {
+                int rowEnd = std::min(totalTokens, startPos + token + 1);
+                int selectedCount = std::min(2048, rowEnd);
+                std::vector<std::pair<float, int>> scores;
+                scores.reserve(rowEnd);
+                for (int key = 0; key < rowEnd; ++key) {
+                    float score = 0.0f;
+                    for (int head = 0; head < 64; ++head) {
+                        float dot = 0.0f;
+                        size_t qBase =
+                            ((size_t)token * 64 + head) * 128;
+                        size_t kBase = (size_t)key * 128;
+                        for (int d = 0; d < 128; ++d) {
+                            dot += fp8.dict[qRaw[qBase + d]] *
+                                   fp8.dict[kRaw[kBase + d]];
+                        }
+                        score += std::max(dot, 0.0f) *
+                                 weights[(size_t)token * 64 + head];
+                    }
+                    scores.push_back({score * scales[key], key});
+                }
+                std::partial_sort(
+                    scores.begin(), scores.begin() + selectedCount,
+                    scores.end(),
+                    [](const auto &a, const auto &b) {
+                        return a.first > b.first ||
+                               (a.first == b.first && a.second < b.second);
+                    });
+                std::vector<int> expectedSet(selectedCount);
+                std::vector<int> actualSet(selectedCount);
+                for (int i = 0; i < selectedCount; ++i) {
+                    expectedSet[i] = scores[i].second;
+                    actualSet[i] = actual[(size_t)token * 2048 + i];
+                }
+                std::sort(expectedSet.begin(), expectedSet.end());
+                std::sort(actualSet.begin(), actualSet.end());
+                if (expectedSet != actualSet) {
+                    int missing = -1, unexpected = -1;
+                    for (int value : expectedSet) {
+                        if (!std::binary_search(actualSet.begin(),
+                                                actualSet.end(), value)) {
+                            missing = value;
+                            break;
+                        }
+                    }
+                    for (int value : actualSet) {
+                        if (!std::binary_search(expectedSet.begin(),
+                                                expectedSet.end(), value)) {
+                            unexpected = value;
+                            break;
+                        }
+                    }
+                    std::ostringstream os;
+                    os << "Dots indexer Top-2048 mismatch: missing="
+                       << missing << " unexpected=" << unexpected;
+                    throw std::runtime_error(os.str());
+                }
+            }
+        }
+
+        void ValidateIndexerPathAgreement() {
+            if (getCudaInfos()->cudaArch < 750 || queryTokens < 16 ||
+                queryTokens % 16 != 0 || totalTokens < 8192 ||
+                totalTokens % 16 != 0 || startPos % 16 != 0) {
+                return;
+            }
+
+            const char *name =
+                "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE";
+            const char *configured = std::getenv(name);
+            bool hadConfigured = configured != nullptr;
+            std::string original = hadConfigured ? configured : "";
+            fastllm::Data tensorIndices, scalarIndices;
+            bool tensorCorePathUsed = false;
+            bool scalarTensorCorePathUsed = false;
+            setenv(name, "1", 1);
+            bool tensorOk = FastllmCudaDots3NoteIndexerTopKWithPathInfo(
+                qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                startPos, 2048, tensorIndices, nullptr, nullptr,
+                &tensorCorePathUsed);
+            setenv(name, "0", 1);
+            bool scalarOk = FastllmCudaDots3NoteIndexerTopKWithPathInfo(
+                qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                startPos, 2048, scalarIndices, nullptr, nullptr,
+                &scalarTensorCorePathUsed);
+            if (hadConfigured) {
+                setenv(name, original.c_str(), 1);
+            } else {
+                unsetenv(name);
+            }
+            if (!tensorOk || !scalarOk) {
+                throw std::runtime_error(
+                    "Dots indexer path-agreement launch failed");
+            }
+            if (!tensorCorePathUsed) {
+                throw std::runtime_error(
+                    "Dots Tensor Core indexer silently fell back");
+            }
+            if (scalarTensorCorePathUsed) {
+                throw std::runtime_error(
+                    "Dots scalar indexer used the Tensor Core path");
+            }
+            ForceDeviceSync();
+            std::vector<int32_t> tensor = ToInt32Vector(tensorIndices);
+            std::vector<int32_t> scalar = ToInt32Vector(scalarIndices);
+            if (tensor != scalar) {
+                size_t mismatch = 0;
+                while (mismatch < tensor.size() &&
+                       tensor[mismatch] == scalar[mismatch]) {
+                    ++mismatch;
+                }
+                std::ostringstream os;
+                os << "Dots Tensor Core indexer disagrees with scalar path"
+                   << " at output " << mismatch;
+                if (mismatch < tensor.size()) {
+                    os << ": tensor=" << tensor[mismatch]
+                       << " scalar=" << scalar[mismatch];
+                }
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        void ValidateIndexerRadixAgreement() {
+            if (queryTokens <= 0 || totalTokens <= 2048) {
+                return;
+            }
+
+            const char *tensorName =
+                "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE";
+            const char *emitName =
+                "FASTLLM_DOTS3_NOTE_DISABLE_PARALLEL_RADIX_EMIT";
+            const char *compactName =
+                "FASTLLM_DOTS3_NOTE_DISABLE_INDEXER_RADIX_COMPACTION";
+            const char *tensorConfigured = std::getenv(tensorName);
+            const char *emitConfigured = std::getenv(emitName);
+            const char *compactConfigured = std::getenv(compactName);
+            bool hadTensor = tensorConfigured != nullptr;
+            bool hadEmit = emitConfigured != nullptr;
+            bool hadCompact = compactConfigured != nullptr;
+            std::string originalTensor =
+                hadTensor ? tensorConfigured : "";
+            std::string originalEmit = hadEmit ? emitConfigured : "";
+            std::string originalCompact =
+                hadCompact ? compactConfigured : "";
+            auto restoreEnvironment = [&]() {
+                if (hadTensor) {
+                    setenv(tensorName, originalTensor.c_str(), 1);
+                } else {
+                    unsetenv(tensorName);
+                }
+                if (hadEmit) {
+                    setenv(emitName, originalEmit.c_str(), 1);
+                } else {
+                    unsetenv(emitName);
+                }
+                if (hadCompact) {
+                    setenv(compactName, originalCompact.c_str(), 1);
+                } else {
+                    unsetenv(compactName);
+                }
+            };
+
+            auto validateMode = [&](bool tensorCore) {
+                setenv(tensorName, tensorCore ? "1" : "0", 1);
+                unsetenv(emitName);
+                unsetenv(compactName);
+                fastllm::Data optimizedIndices, legacyIndices;
+                bool optimizedTensorCorePathUsed = false;
+                bool legacyTensorCorePathUsed = false;
+                bool optimizedOk =
+                    FastllmCudaDots3NoteIndexerTopKWithPathInfo(
+                        qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                        startPos, 2048, optimizedIndices, nullptr, nullptr,
+                        &optimizedTensorCorePathUsed);
+                setenv(emitName, "1", 1);
+                setenv(compactName, "1", 1);
+                bool legacyOk =
+                    FastllmCudaDots3NoteIndexerTopKWithPathInfo(
+                        qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                        startPos, 2048, legacyIndices, nullptr, nullptr,
+                        &legacyTensorCorePathUsed);
+                if (!optimizedOk || !legacyOk) {
+                    throw std::runtime_error(
+                        std::string("Dots indexer radix-agreement ") +
+                        (tensorCore ? "Tensor Core" : "scalar") +
+                        " launch failed");
+                }
+                if (optimizedTensorCorePathUsed != tensorCore ||
+                    legacyTensorCorePathUsed != tensorCore) {
+                    throw std::runtime_error(
+                        std::string("Dots indexer radix-agreement did not ") +
+                        "use the requested " +
+                        (tensorCore ? "Tensor Core" : "scalar") +
+                        " scoring path");
+                }
+                ForceDeviceSync();
+                std::vector<int32_t> optimized =
+                    ToInt32Vector(optimizedIndices);
+                std::vector<int32_t> legacy =
+                    ToInt32Vector(legacyIndices);
+                if (optimized != legacy) {
+                    size_t mismatch = 0;
+                    while (mismatch < optimized.size() &&
+                           optimized[mismatch] == legacy[mismatch]) {
+                        ++mismatch;
+                    }
+                    std::ostringstream os;
+                    os << "Dots "
+                       << (tensorCore ? "Tensor Core" : "scalar")
+                       << " optimized radix path disagrees with the legacy "
+                          "path at output " << mismatch;
+                    if (mismatch < optimized.size()) {
+                        os << ": optimized=" << optimized[mismatch]
+                           << " legacy=" << legacy[mismatch];
+                    }
+                    throw std::runtime_error(os.str());
+                }
+            };
+
+            try {
+                // Always compare the scalar scorer's parallel emit with the
+                // legacy serial path. On SM75+, additionally cover the FP16
+                // or native-FP8 Tensor Core scorer and its radix-prefix
+                // scratch compaction.
+                validateMode(false);
+                bool tensorCoreEligible =
+                    getCudaInfos()->cudaArch >= 750 && queryTokens >= 16 &&
+                    queryTokens % 16 == 0 && totalTokens >= 8192 &&
+                    totalTokens % 16 == 0 && startPos % 16 == 0;
+                if (tensorCoreEligible) {
+                    validateMode(true);
+                }
+                restoreEnvironment();
+            } catch (...) {
+                restoreEnvironment();
+                throw;
+            }
+        }
+
+        static void CopyCudaTensorToDevice(
+                const fastllm::Data &source, int targetDevice,
+                fastllm::Data &target) {
+            int sourceDevice = GetPointerDeviceId(source.cudaData);
+            if (sourceDevice < 0) {
+                throw std::runtime_error(
+                    "Dots workspace-device test source is not on CUDA");
+            }
+            fastllm::Data host(source.dataType, source.dims);
+            host.Allocate(false);
+            FastllmCudaSetDevice(sourceDevice);
+            FastllmCudaCopyFromDeviceToHost(
+                host.cpuData, source.cudaData, source.GetBytes());
+            target.CopyFrom(host);
+            target.ToDevice(
+                fastllm::DataDevice::CUDA, {targetDevice}, true);
+            if (GetPointerDeviceId(target.cudaData) != targetDevice) {
+                throw std::runtime_error(
+                    "Dots workspace-device test CUDA copy failed");
+            }
+        }
+
+        void ValidateIndexerWorkspaceDeviceSwitch() {
+            if (FastllmCudaGetDeviceCount() < 2) {
+                throw std::runtime_error(
+                    "Dots workspace-device test requires two CUDA devices");
+            }
+            if (queryTokens < 16 || queryTokens % 16 != 0 ||
+                totalTokens < 8192 || totalTokens % 16 != 0 ||
+                startPos % 16 != 0) {
+                throw std::runtime_error(
+                    "Dots workspace-device test requires queries and keys "
+                    "that select the Tensor Core indexer path");
+            }
+
+            const int originalDevice = FastllmCudaGetDevice();
+            void *workspace = nullptr;
+            size_t workspaceBytes = 0;
+            auto releaseWorkspace = [&]() {
+                if (workspace == nullptr) {
+                    return;
+                }
+                int restoreDevice = FastllmCudaGetDevice();
+                int workspaceDevice = GetPointerDeviceId(workspace);
+                if (workspaceDevice >= 0 &&
+                    workspaceDevice != restoreDevice) {
+                    FastllmCudaSetDevice(workspaceDevice);
+                }
+                FastllmCudaDirectFree(workspace);
+                if (workspaceDevice >= 0 && restoreDevice >= 0 &&
+                    workspaceDevice != restoreDevice) {
+                    FastllmCudaSetDevice(restoreDevice);
+                }
+                workspace = nullptr;
+                workspaceBytes = 0;
+            };
+
+            const char *name =
+                "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE";
+            const char *configured = std::getenv(name);
+            bool hadConfigured = configured != nullptr;
+            std::string original = hadConfigured ? configured : "";
+            auto restoreEnvironment = [&]() {
+                if (hadConfigured) {
+                    setenv(name, original.c_str(), 1);
+                } else {
+                    unsetenv(name);
+                }
+            };
+
+            try {
+                FastllmCudaSetDevice(0);
+                if (FastllmCudaRuntimeArch() < 89) {
+                    throw std::runtime_error(
+                        "Dots workspace-device test requires SM89 or newer");
+                }
+                setenv(name, "1", 1);
+                fastllm::Data device0Indices;
+                if (!FastllmCudaDots3NoteIndexerTopK(
+                        qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                        startPos, 2048, device0Indices,
+                        &workspace, &workspaceBytes) ||
+                    workspace == nullptr || workspaceBytes == 0 ||
+                    GetPointerDeviceId(workspace) != 0) {
+                    throw std::runtime_error(
+                        "Dots indexer did not allocate workspace on device 0");
+                }
+                ForceDeviceSync();
+                device0Indices.ToDevice(fastllm::DataDevice::CPU);
+                std::vector<int32_t> expected =
+                    ToInt32Vector(device0Indices);
+                device0Indices.FreeSpace();
+
+                {
+                    fastllm::Data qFp8Device1, foldedWeightsDevice1;
+                    fastllm::Data kFp8Device1, kScalesDevice1;
+                    CopyCudaTensorToDevice(qFp8, 1, qFp8Device1);
+                    CopyCudaTensorToDevice(
+                        foldedWeights, 1, foldedWeightsDevice1);
+                    CopyCudaTensorToDevice(
+                        cachedKFp8, 1, kFp8Device1);
+                    CopyCudaTensorToDevice(
+                        cachedKScales, 1, kScalesDevice1);
+                    FastllmCudaSetDevice(1);
+                    if (FastllmCudaRuntimeArch() < 89) {
+                        throw std::runtime_error(
+                            "Dots workspace-device test requires SM89 or newer");
+                    }
+
+                    fastllm::Data device1Indices;
+                    if (!FastllmCudaDots3NoteIndexerTopK(
+                            qFp8Device1, foldedWeightsDevice1,
+                            kFp8Device1, kScalesDevice1,
+                            startPos, 2048, device1Indices,
+                            &workspace, &workspaceBytes) ||
+                        workspace == nullptr || workspaceBytes == 0 ||
+                        GetPointerDeviceId(workspace) != 1) {
+                        throw std::runtime_error(
+                            "Dots indexer did not migrate workspace to device 1");
+                    }
+                    ForceDeviceSync();
+                    device1Indices.ToDevice(fastllm::DataDevice::CPU);
+                    std::vector<int32_t> actual =
+                        ToInt32Vector(device1Indices);
+                    device1Indices.FreeSpace();
+                    if (actual != expected) {
+                        throw std::runtime_error(
+                            "Dots indexer output changed after workspace "
+                            "migrated from device 0 to device 1");
+                    }
+                    releaseWorkspace();
+                }
+                restoreEnvironment();
+                FastllmCudaSetDevice(originalDevice);
+            } catch (...) {
+                releaseWorkspace();
+                restoreEnvironment();
+                FastllmCudaSetDevice(originalDevice);
+                throw;
+            }
+        }
+
+        void ValidateSparseAttention(const fastllm::Data &output,
+                                     const std::string &name) {
+            std::vector<float> qValues =
+                ToFloatVector(ConvertToFloat32Data(mainQ));
+            std::vector<float> kValues =
+                ToFloatVector(ConvertToFloat32Data(mainK));
+            std::vector<float> vValues =
+                ToFloatVector(ConvertToFloat32Data(mainV));
+            std::vector<int32_t> selected = ToInt32Vector(indices);
+            std::vector<float> actual =
+                ToFloatVector(ConvertToFloat32Data(output));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!std::isfinite(actual[i])) {
+                    std::ostringstream os;
+                    os << name << " produced a non-finite value "
+                       << "at element " << i;
+                    throw std::runtime_error(os.str());
+                }
+            }
+            constexpr float scale = 0.07216878364870322f; // rsqrt(192)
+
+            // One complete head/query is enough to validate indexed gathers,
+            // the BF16 dot boundary, FP32 softmax, and V accumulation.
+            int token = queryTokens - 1;
+            int head = 0;
+            int length = std::min(2048, startPos + token + 1);
+            std::vector<float> scores(length);
+            float maximum = -INFINITY;
+            for (int i = 0; i < length; ++i) {
+                int key = selected[(size_t)token * 2048 + i];
+                float dot = 0.0f;
+                size_t qBase = ((size_t)head * queryTokens + token) * 192;
+                size_t kBase = ((size_t)head * totalTokens + key) * 192;
+                for (int d = 0; d < 192; ++d) {
+                    dot += qValues[qBase + d] * kValues[kBase + d];
+                }
+                uint16_t roundedBits =
+                    fastllm::Float32ToBFloat16RNEBits(dot);
+                scores[i] =
+                    fastllm::BFloat16BitsToFloat32(roundedBits) * scale;
+                maximum = std::max(maximum, scores[i]);
+            }
+            float denominator = 0.0f;
+            for (float &score : scores) {
+                score = std::exp(score - maximum);
+                denominator += score;
+            }
+            float maxAbsDiff = 0.0f;
+            for (int d = 0; d < 128; ++d) {
+                float expected = 0.0f;
+                for (int i = 0; i < length; ++i) {
+                    int key = selected[(size_t)token * 2048 + i];
+                    size_t vOffset =
+                        ((size_t)head * totalTokens + key) * 128 + d;
+                    uint16_t probabilityBits =
+                        fastllm::Float32ToBFloat16RNEBits(
+                            scores[i] / denominator);
+                    float probability =
+                        fastllm::BFloat16BitsToFloat32(probabilityBits);
+                    expected += probability * vValues[vOffset];
+                }
+                size_t outOffset =
+                    ((size_t)head * queryTokens + token) * 128 + d;
+                maxAbsDiff = std::max(
+                    maxAbsDiff, std::fabs(expected - actual[outOffset]));
+            }
+            if (maxAbsDiff > 2.0e-2f) {
+                std::ostringstream os;
+                os << name << " mismatch: max_abs_diff="
+                   << maxAbsDiff;
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        void ValidateSparseAttentionAgreement() {
+            std::vector<float> sparse =
+                ToFloatVector(ConvertToFloat32Data(sparseOutput));
+            std::vector<float> prefill =
+                ToFloatVector(ConvertToFloat32Data(sparsePrefillOutput));
+            if (sparse.size() != prefill.size()) {
+                throw std::runtime_error(
+                    "Dots sparse attention output sizes differ");
+            }
+            float maxAbsDiff = 0.0f;
+            for (size_t i = 0; i < sparse.size(); ++i) {
+                maxAbsDiff = std::max(
+                    maxAbsDiff, std::fabs(sparse[i] - prefill[i]));
+            }
+            if (maxAbsDiff > 1.0e-2f) {
+                std::ostringstream os;
+                os << "Dots sparse prefill disagrees with the row kernel: "
+                   << "max_abs_diff=" << maxAbsDiff;
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        void ValidateSlidingAttention() {
+            std::vector<float> qValues =
+                ToFloatVector(ConvertToFloat32Data(mainQ));
+            std::vector<float> kValues =
+                ToFloatVector(ConvertToFloat32Data(mainK));
+            std::vector<float> vValues =
+                ToFloatVector(ConvertToFloat32Data(mainV));
+            std::vector<float> actual =
+                ToFloatVector(ConvertToFloat32Data(slidingPrefillOutput));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!std::isfinite(actual[i])) {
+                    std::ostringstream os;
+                    os << "Dots sliding prefill produced a non-finite value "
+                       << "at element " << i;
+                    throw std::runtime_error(os.str());
+                }
+            }
+
+            constexpr int windowSize = 513;
+            constexpr float scale = 0.07216878364870322f; // rsqrt(192)
+            std::vector<int> tokensToCheck = {0};
+            if (queryTokens > 2) {
+                tokensToCheck.push_back(queryTokens / 2);
+            }
+            if (queryTokens > 1) {
+                tokensToCheck.push_back(queryTokens - 1);
+            }
+            float maxAbsDiff = 0.0f;
+            for (int token : tokensToCheck) {
+                int queryPosition = startPos + token;
+                int firstKey = std::max(
+                    0, queryPosition - windowSize + 1);
+                int lastKey = std::min(totalTokens, queryPosition + 1);
+                int length = lastKey - firstKey;
+                std::vector<float> scores(length);
+                float maximum = -INFINITY;
+                for (int i = 0; i < length; ++i) {
+                    int key = firstKey + i;
+                    float dot = 0.0f;
+                    size_t qBase = (size_t)token * 192;
+                    size_t kBase = (size_t)key * 192;
+                    for (int d = 0; d < 192; ++d) {
+                        dot += qValues[qBase + d] * kValues[kBase + d];
+                    }
+                    uint16_t roundedBits =
+                        fastllm::Float32ToBFloat16RNEBits(dot);
+                    scores[i] =
+                        fastllm::BFloat16BitsToFloat32(roundedBits) * scale;
+                    maximum = std::max(maximum, scores[i]);
+                }
+                float denominator = 0.0f;
+                for (float &score : scores) {
+                    score = std::exp(score - maximum);
+                    denominator += score;
+                }
+                for (int d = 0; d < 128; ++d) {
+                    float expected = 0.0f;
+                    for (int i = 0; i < length; ++i) {
+                        int key = firstKey + i;
+                        uint16_t probabilityBits =
+                            fastllm::Float32ToBFloat16RNEBits(
+                                scores[i] / denominator);
+                        float probability =
+                            fastllm::BFloat16BitsToFloat32(
+                                probabilityBits);
+                        size_t vOffset = (size_t)key * 128 + d;
+                        expected += probability * vValues[vOffset];
+                    }
+                    size_t outOffset = (size_t)token * 128 + d;
+                    maxAbsDiff = std::max(
+                        maxAbsDiff,
+                        std::fabs(expected - actual[outOffset]));
+                }
+            }
+            if (maxAbsDiff > 2.0e-2f) {
+                std::ostringstream os;
+                os << "Dots sliding prefill mismatch: max_abs_diff="
+                   << maxAbsDiff;
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        void Init(const OpTestParams &params) {
+            FastllmCudaSetDevice(0);
+            ValidateAttentionKeyPacking();
+            ValidateAttentionValuePacking();
+            queryTokens = params.GetInt("queries");
+            totalTokens = params.GetInt("keys");
+            path = params.GetString("path");
+            if (queryTokens <= 0 || totalTokens <= 2048 ||
+                queryTokens > totalTokens) {
+                throw std::runtime_error(
+                    "Dots indexer requires 0 < queries <= keys and keys > 2048");
+            }
+            if (path != "indexer" && path != "sparse" &&
+                path != "sparse_prefill" && path != "sliding_prefill") {
+                throw std::runtime_error(
+                    "Dots benchmark path must be indexer, sparse, "
+                    "sparse_prefill or sliding_prefill");
+            }
+            startPos = totalTokens - queryTokens;
+
+            indexQ.CopyFrom(MakeTensor(
+                {1, queryTokens, 64, 128}, 0.173f, 0.25f));
+            indexKPe.CopyFrom(MakeTensor(
+                {1, totalTokens, 1, 64}, 0.419f, 0.25f));
+            indexKNope.CopyFrom(MakeTensor(
+                {1, totalTokens, 1, 64}, 0.613f, 0.25f));
+            indexWeights.CopyFrom(MakeTensor(
+                {1, queryTokens, 64}, 0.733f, 0.5f));
+            fastllm::ToDataType(indexWeights,
+                                fastllm::DataType::BFLOAT16);
+            indexQ.ToDevice(fastllm::DataDevice::CUDA);
+            indexKPe.ToDevice(fastllm::DataDevice::CUDA);
+            indexKNope.ToDevice(fastllm::DataDevice::CUDA);
+            indexWeights.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data indexQPe, indexQNope;
+            fastllm::Split(indexQ, -1, 0, 64, indexQPe);
+            fastllm::Split(indexQ, -1, 64, 128, indexQNope);
+            if (!FastllmCudaDots3NotePackIndexerKey(
+                    indexKPe, indexKNope, indexK) ||
+                !FastllmCudaDots3NoteQuantizeIndexer(
+                    indexQPe, indexQNope, indexK, indexWeights, qFp8,
+                    foldedWeights, kFp8, kScales)) {
+                throw std::runtime_error("Dots indexer CUDA launch failed");
+            }
+            auto appendCache = [](fastllm::Data &target,
+                                  fastllm::Data &current) {
+                target.ToDevice(current.dataDevice);
+                if (target.dims.empty()) {
+                    std::vector<int> capacity = current.dims;
+                    capacity[1] = 128;
+                    target.Expansion(capacity);
+                }
+                while (!target.dims.empty() &&
+                       target.dims[1] + current.dims[1] >
+                           target.expansionDims[1]) {
+                    std::vector<int> capacity = target.dims;
+                    capacity[1] = target.expansionDims[1] + 128;
+                    target.Expansion(capacity);
+                }
+                fastllm::CatDirect(target, current, 1);
+            };
+            for (int start = 0; start < totalTokens; start += 128) {
+                int end = std::min(totalTokens, start + 128);
+                fastllm::Data keyPart, scalePart;
+                fastllm::Split(kFp8, 1, start, end, keyPart);
+                fastllm::Split(kScales, 1, start, end, scalePart);
+                appendCache(cachedKFp8, keyPart);
+                appendCache(cachedKScales, scalePart);
+            }
+            if (!FastllmCudaDots3NoteIndexerTopK(
+                    qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                    startPos, 2048, indices,
+                    &indexerHeadScoreWorkspace,
+                    &indexerHeadScoreWorkspaceBytes)) {
+                throw std::runtime_error("Dots indexer CUDA launch failed");
+            }
+            ValidateTopK();
+            ValidateIndexerPathAgreement();
+            ValidateIndexerRadixAgreement();
+            if (params.GetInt("workspace_device_switch") != 0) {
+                ValidateIndexerWorkspaceDeviceSwitch();
+            }
+
+            mainQ.CopyFrom(MakeTensor(
+                {128, queryTokens, 192}, 0.291f, 0.125f));
+            mainK.CopyFrom(MakeTensor(
+                {128, totalTokens, 192}, 0.527f, 0.125f));
+            mainV.CopyFrom(MakeTensor(
+                {128, totalTokens, 128}, 0.811f, 0.125f, 1.0f));
+            fastllm::ToDataType(mainQ, fastllm::DataType::BFLOAT16);
+            fastllm::ToDataType(mainK, fastllm::DataType::BFLOAT16);
+            fastllm::ToDataType(mainV, fastllm::DataType::BFLOAT16);
+            mainQ.ToDevice(fastllm::DataDevice::CUDA);
+            mainK.ToDevice(fastllm::DataDevice::CUDA);
+            mainV.ToDevice(fastllm::DataDevice::CUDA);
+            if (!FastllmCudaDots3NoteSparseAttention(
+                    mainQ, mainK, mainV, indices, startPos,
+                    1.0f / std::sqrt(192.0f), sparseOutput)) {
+                throw std::runtime_error(
+                    "Dots sparse attention CUDA launch failed");
+            }
+            sparseOutputBytes =
+                (size_t)128 * queryTokens * 128 * sizeof(uint16_t);
+            size_t bytesPerQuery =
+                (size_t)128 * totalTokens * sizeof(uint16_t);
+            // Fresh Dots prefill borrows the unused half of the KV projection.
+            // Its size matches the attention output (128 value channels), so
+            // mirror that capacity here instead of artificially capping the
+            // 8K benchmark at 128 MiB.
+            size_t scratchLimit = std::max<size_t>(
+                128ULL * 1024ULL * 1024ULL, sparseOutputBytes);
+            int configuredScratchMb = params.GetInt("scratch_mb");
+            if (configuredScratchMb > 0) {
+                scratchLimit =
+                    (size_t)configuredScratchMb * 1024ULL * 1024ULL;
+            }
+            int sparseQueryChunk = std::min(
+                queryTokens,
+                (int)std::max<size_t>(1, scratchLimit / bytesPerQuery));
+            sparseScratchBytes =
+                (size_t)sparseQueryChunk * bytesPerQuery;
+            sparsePrefillBacking.dataType =
+                fastllm::DataType::BFLOAT16;
+            sparsePrefillBacking.Resize(
+                {(int)((sparseOutputBytes + sparseScratchBytes) /
+                       sizeof(uint16_t))});
+            sparsePrefillBacking.ToDevice(
+                fastllm::DataDevice::CUDA, {0}, false);
+            sparsePrefillBacking.Allocate(false);
+            sparsePrefillOutput.FakeFrom(sparsePrefillBacking, 0);
+            sparsePrefillOutput.Resize(
+                {128, queryTokens, 128});
+            if (!FastllmCudaDots3NoteSparseAttentionPrefill(
+                    mainQ, mainK, mainV, indices, startPos,
+                    1.0f / std::sqrt(192.0f), sparsePrefillOutput,
+                    sparsePrefillBacking.cudaData == nullptr
+                        ? nullptr
+                        : (uint8_t *)sparsePrefillBacking.cudaData +
+                              sparseOutputBytes,
+                    sparseScratchBytes)) {
+                throw std::runtime_error(
+                    "Dots sparse prefill CUDA launch failed");
+            }
+            if (!FastllmCudaDots3NoteSlidingAttentionPrefill(
+                    mainQ, mainK, mainV, startPos, 513,
+                    1.0f / std::sqrt(192.0f), slidingPrefillOutput)) {
+                throw std::runtime_error(
+                    "Dots sliding prefill CUDA launch failed");
+            }
+            ForceDeviceSync();
+            ValidateSparseAttention(sparseOutput, "Dots sparse attention");
+            ValidateSparseAttention(sparsePrefillOutput,
+                                    "Dots sparse prefill");
+            ValidateSparseAttentionAgreement();
+            ValidateSlidingAttention();
+        }
+
+        void Run() {
+            bool ok = false;
+            if (path == "indexer") {
+                ok = FastllmCudaDots3NoteIndexerTopK(
+                    qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                    startPos, 2048, indices,
+                    &indexerHeadScoreWorkspace,
+                    &indexerHeadScoreWorkspaceBytes);
+            } else if (path == "sparse") {
+                ok = FastllmCudaDots3NoteSparseAttention(
+                    mainQ, mainK, mainV, indices, startPos,
+                    1.0f / std::sqrt(192.0f), sparseOutput);
+            } else if (path == "sparse_prefill") {
+                ok = FastllmCudaDots3NoteSparseAttentionPrefill(
+                    mainQ, mainK, mainV, indices, startPos,
+                    1.0f / std::sqrt(192.0f), sparsePrefillOutput,
+                    sparsePrefillBacking.cudaData == nullptr
+                        ? nullptr
+                        : (uint8_t *)sparsePrefillBacking.cudaData +
+                              sparseOutputBytes,
+                    sparseScratchBytes);
+            } else {
+                ok = FastllmCudaDots3NoteSlidingAttentionPrefill(
+                    mainQ, mainK, mainV, startPos, 513,
+                    1.0f / std::sqrt(192.0f), slidingPrefillOutput);
+            }
+            if (!ok) {
+                throw std::runtime_error("Dots CUDA replay failed");
+            }
+        }
+    };
+#endif
+
+    static BenchmarkResult BenchmarkDots3NoteIndexerCuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<Dots3NoteIndexerBenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; ++i) state->Run();
+        ForceDeviceSync();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; ++i) state->Run();
+        ForceDeviceSync();
+        auto end = Clock::now();
+        BenchmarkResult result;
+        result.avgMs =
+            std::chrono::duration<double, std::milli>(end - begin).count() /
+            std::max(iters, 1);
+        return result;
+#else
+        (void)params; (void)device; (void)warmup; (void)iters;
+        throw std::runtime_error("Dots indexer requires USE_CUDA");
+#endif
+    }
+
+    static OpCase MakeDots3NoteIndexerCase() {
+        return {
+            "dots3_note_indexer",
+            "validate Dots3-Note E4M3 indexer and bounded attention prefill",
+            []() {
+                OpTestParams params;
+                params.Add("queries", "1", "number of tail query tokens");
+                params.Add("keys", "2049", "total cached key tokens");
+                params.Add("path", "indexer",
+                           "indexer, sparse, sparse_prefill or sliding_prefill");
+                params.Add("scratch_mb", "0",
+                           "borrowed sparse-prefill scratch size in MiB");
+                params.Add("workspace_device_switch", "0",
+                           "validate workspace migration between GPU 0 and 1");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkDots3NoteIndexerCuda,
+            [](const OpTestParams&) { return 0.0; },
+            [](const OpTestParams&) { return 0.0; },
+            true
+        };
+    }
+
+    static OpCase MakeQwen4PLEGateCase() {
+        return {
+            "qwen4_ple_gate",
+            "Qwen4 PLE gate CPU/CUDA agreement",
+            []() {
+                OpTestParams params;
+                params.Add("sequence", "17", "number of input tokens");
+                params.Add("groups", "4", "hyper-connection streams");
+                params.Add("hidden", "160", "channels per stream");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int groups = params.GetInt("groups");
+                const int hidden = params.GetInt("hidden");
+                fastllm::Data key = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.11f, 0.2f);
+                fastllm::Data query = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.37f, 0.2f);
+                fastllm::Data value = MakeTensor(
+                    {1, sequence, hidden}, 0.73f, 0.2f);
+                fastllm::Data output;
+                return CanRunOnDevice(
+                    device, "Qwen4PLEGate",
+                    {{"key", &key}, {"query", &query},
+                     {"value", &value}, {"output", &output}},
+                    {}, {{"groups", groups}});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int groups = params.GetInt("groups");
+                const int hidden = params.GetInt("hidden");
+                fastllm::Data key = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.11f, 0.2f);
+                fastllm::Data query = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.37f, 0.2f);
+                fastllm::Data value = MakeTensor(
+                    {1, sequence, hidden}, 0.73f, 0.2f);
+                fastllm::Data output;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4PLEGate(
+                    key, query, value, groups, output);
+                output.ToDevice(fastllm::DataDevice::CPU);
+                return output;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double groups = params.GetInt("groups");
+                const double hidden = params.GetInt("hidden");
+                return sequence * hidden * (3.0 * groups + 1.0) *
+                       sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double groups = params.GetInt("groups");
+                const double hidden = params.GetInt("hidden");
+                return sequence * groups * hidden * 3.0;
+            }
+        };
+    }
+
+    static OpCase MakeQwen4HyperCombineNormCase() {
+        return {
+            "qwen4_hyper_combine_norm",
+            "fused hyper residual update and grouped RMSNorm versus unfused reference",
+            []() {
+                OpTestParams params;
+                params.Add("sequence", "17", "number of input tokens");
+                params.Add("groups", "4", "hyper-connection streams");
+                params.Add("hidden", "160", "channels per stream");
+                params.Add("dtype", "float16",
+                           "float32, float16 or bfloat16 activation type");
+                params.Add("compare_unfused", "1",
+                           "return fused-minus-unfused outputs when set");
+                params.Add("normalized_storage", "1",
+                           "also return a float16 normalized storage mirror");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int groups = params.GetInt("groups");
+                const int hidden = params.GetInt("hidden");
+                fastllm::Data input = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.11f, 0.2f);
+                fastllm::Data block = MakeTensor(
+                    {1, sequence, hidden}, 0.37f, 0.2f);
+                fastllm::Data injection = MakeTensor(
+                    {1, sequence, groups}, 0.73f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {groups * hidden}, 0.91f, 0.1f, 1.0f);
+                fastllm::DataType type = fastllm::DataType::FLOAT32;
+                if (params.GetString("dtype") == "float16") {
+                    type = fastllm::DataType::FLOAT16;
+                } else if (params.GetString("dtype") == "bfloat16") {
+                    type = fastllm::DataType::BFLOAT16;
+                } else if (params.GetString("dtype") != "float32") {
+                    throw std::runtime_error(
+                        "qwen4_hyper_combine_norm dtype must be float32, float16 or bfloat16");
+                }
+                if (type != fastllm::DataType::FLOAT32) {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(input, type);
+                    fastllm::ToDataType(block, type);
+                    fastllm::ToDataType(injection, type);
+                }
+                fastllm::Data output, normalized, normalizedStorage;
+                fastllm::DataDict datas = {
+                    {"input", &input}, {"blockOutput", &block},
+                    {"injection", &injection}, {"weight", &weight},
+                    {"output", &output}, {"normalized", &normalized}
+                };
+                fastllm::IntDict intParams = {{"groups", groups}};
+                if (params.GetInt("normalized_storage") != 0) {
+                    datas["normalizedStorage"] = &normalizedStorage;
+                    intParams["normalizedStorageType"] =
+                        (int)fastllm::DataType::FLOAT16;
+                }
+                return CanRunOnDevice(
+                    device, "Qwen4HyperCombineRMSNorm",
+                    datas, {{"eps", 1e-6f}}, intParams);
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int groups = params.GetInt("groups");
+                const int hidden = params.GetInt("hidden");
+                fastllm::Data input = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.11f, 0.2f);
+                fastllm::Data block = MakeTensor(
+                    {1, sequence, hidden}, 0.37f, 0.2f);
+                fastllm::Data injection = MakeTensor(
+                    {1, sequence, groups}, 0.73f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {groups * hidden}, 0.91f, 0.1f, 1.0f);
+                fastllm::DataType type = fastllm::DataType::FLOAT32;
+                if (params.GetString("dtype") == "float16") {
+                    type = fastllm::DataType::FLOAT16;
+                } else if (params.GetString("dtype") == "bfloat16") {
+                    type = fastllm::DataType::BFLOAT16;
+                }
+                if (type != fastllm::DataType::FLOAT32) {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(input, type);
+                    fastllm::ToDataType(block, type);
+                    fastllm::ToDataType(injection, type);
+                }
+                fastllm::Data output, normalized, normalizedStorage;
+                fastllm::Data *normalizedStoragePtr =
+                    params.GetInt("normalized_storage") != 0
+                        ? &normalizedStorage : nullptr;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4HyperCombineRMSNorm(
+                    input, block, injection, weight, 1e-6f, groups,
+                    output, normalized, normalizedStoragePtr,
+                    fastllm::DataType::FLOAT16);
+                fastllm::Data storageCheck(fastllm::DataType::FLOAT32);
+                if (normalizedStoragePtr != nullptr) {
+                    fastllm::Data normalizedHost, storageHost;
+                    normalizedHost.CopyFrom(normalized);
+                    fastllm::ToDataType(
+                        normalizedHost, fastllm::DataType::FLOAT32);
+                    normalizedHost.ToDevice(fastllm::DataDevice::CPU);
+                    storageHost.CopyFrom(normalizedStorage);
+                    storageHost.ToDevice(fastllm::DataDevice::CPU);
+                    const int count = normalized.Count(0);
+                    storageCheck.Resize({count});
+                    storageCheck.Allocate(false);
+                    float *mismatch = (float*)storageCheck.cpuData;
+                    const float *normalizedData =
+                        (const float*)normalizedHost.cpuData;
+                    const uint16_t *storageData =
+                        (const uint16_t*)storageHost.cpuData;
+                    for (int i = 0; i < count; i++) {
+                        const float value = normalizedData[i];
+                        uint16_t expected = fastllm::float_to_half(value);
+                        const float rounded =
+                            fastllm::half_to_float(expected);
+                        if (std::isfinite(value) &&
+                            std::fabs(rounded) > std::fabs(value) &&
+                            (expected & 0x7fff) != 0) {
+                            expected--;
+                        }
+                        mismatch[i] = storageData[i] == expected
+                            ? 0.0f : 1.0f;
+                    }
+                }
+                if (params.GetInt("compare_unfused") != 0) {
+                    fastllm::Data referenceOutput, referenceNormalized;
+                    fastllm::Qwen4HyperCombine(
+                        input, block, injection, groups, referenceOutput);
+                    fastllm::Qwen4GroupedRMSNorm(
+                        referenceOutput, weight, 1e-6f, groups,
+                        referenceNormalized);
+                    fastllm::AddTo(output, referenceOutput, -1.0f);
+                    fastllm::AddTo(
+                        normalized, referenceNormalized, -1.0f);
+                }
+                output.Reshape({(int)output.Count(0)});
+                normalized.Reshape({(int)normalized.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(output, normalized, 0, combined);
+                fastllm::ToDataType(
+                    combined, fastllm::DataType::FLOAT32);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                if (normalizedStoragePtr != nullptr) {
+                    fastllm::Data withStorage;
+                    fastllm::Cat(
+                        combined, storageCheck, 0, withStorage);
+                    withStorage.ToDevice(fastllm::DataDevice::CPU);
+                    return withStorage;
+                }
+                return combined;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double groups = params.GetInt("groups");
+                const double hidden = params.GetInt("hidden");
+                return sequence * groups * hidden *
+                       (5.0 * sizeof(float) +
+                        (params.GetInt("normalized_storage") != 0
+                             ? sizeof(uint16_t) : 0));
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double groups = params.GetInt("groups");
+                const double hidden = params.GetInt("hidden");
+                return sequence * groups * hidden * 10.0;
+            }
+        };
+    }
+
+    static OpCase MakeQwen4PLECausalConvCase() {
+        return {
+            "qwen4_ple_conv",
+            "Qwen4 PLE dilated convolution output/history agreement",
+            []() {
+                OpTestParams params;
+                params.Add("sequence", "8", "number of input tokens");
+                params.Add("channels", "64", "depthwise channels");
+                params.Add("kernel", "4", "convolution taps");
+                params.Add("dilation", "3", "causal dilation");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                const int dilation = params.GetInt("dilation");
+                const int historyLength = (kernel - 1) * dilation;
+                fastllm::Data input = MakeTensor(
+                    {1, sequence, channels}, 0.19f, 0.2f);
+                fastllm::Data gated = MakeTensor(
+                    {1, sequence, channels}, 0.43f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.67f, 0.1f);
+                fastllm::Data history = MakeTensor(
+                    {historyLength, channels}, 0.89f, 0.2f);
+                fastllm::Data output, newHistory;
+                return CanRunOnDevice(
+                    device, "Qwen4PLECausalConv",
+                    {{"input", &input}, {"gated", &gated},
+                     {"weight", &weight}, {"history", &history},
+                     {"output", &output}, {"newHistory", &newHistory}},
+                    {}, {{"kernel", kernel}, {"dilation", dilation}});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                const int dilation = params.GetInt("dilation");
+                const int historyLength = (kernel - 1) * dilation;
+                fastllm::Data input = MakeTensor(
+                    {1, sequence, channels}, 0.19f, 0.2f);
+                fastllm::Data gated = MakeTensor(
+                    {1, sequence, channels}, 0.43f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.67f, 0.1f);
+                fastllm::Data history = MakeTensor(
+                    {historyLength, channels}, 0.89f, 0.2f);
+                fastllm::Data output, newHistory;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4PLECausalConv(
+                    input, gated, weight, history, kernel, dilation,
+                    output, newHistory);
+                output.Reshape({(int)output.Count(0)});
+                newHistory.Reshape({(int)newHistory.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(output, newHistory, 0, combined);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double channels = params.GetInt("channels");
+                const double history =
+                    (params.GetInt("kernel") - 1) *
+                    params.GetInt("dilation");
+                return (3.0 * sequence * channels +
+                        2.0 * history * channels +
+                        channels * params.GetInt("kernel")) *
+                       sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("sequence") *
+                       params.GetInt("channels") *
+                       (3.0 * params.GetInt("kernel") + 4.0);
+            }
+        };
+    }
+
+    static OpCase MakeCausalDepthwiseConv1DPrefillCase() {
+        return {
+            "causal_depthwise_conv1d_prefill",
+            "token-major causal depthwise convolution output/state agreement",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "batch size");
+                params.Add("sequence", "3", "number of new tokens");
+                params.Add("channels", "64", "depthwise channels");
+                params.Add("kernel", "4", "convolution taps");
+                params.Add("with_history", "1", "seed a nonzero prior state");
+                params.Add("silu", "1", "apply SiLU to convolution output");
+                params.Add("output_half", "0",
+                           "store output directly as float16");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int batch = params.GetInt("batch");
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                fastllm::Data input = MakeTensor(
+                    {batch, sequence, channels}, 0.23f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.61f, 0.1f);
+                fastllm::Data state = params.GetInt("with_history")
+                    ? MakeTensor({batch, channels, kernel}, 0.97f, 0.2f)
+                    : fastllm::Data(fastllm::DataType::FLOAT32);
+                fastllm::Data output;
+                return CanRunOnDevice(
+                    device, "CausalDepthwiseConv1DPrefill",
+                    {{"input", &input}, {"weight", &weight},
+                     {"state", &state}, {"output", &output}},
+                    {},
+                    {{"kernel", kernel},
+                     {"silu", params.GetInt("silu")},
+                     {"outputType", params.GetInt("output_half")
+                          ? (int)fastllm::DataType::FLOAT16
+                          : (int)fastllm::DataType::FLOAT32}});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int batch = params.GetInt("batch");
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                fastllm::Data input = MakeTensor(
+                    {batch, sequence, channels}, 0.23f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.61f, 0.1f);
+                fastllm::Data state = params.GetInt("with_history")
+                    ? MakeTensor({batch, channels, kernel}, 0.97f, 0.2f)
+                    : fastllm::Data(fastllm::DataType::FLOAT32);
+                fastllm::Data output;
+                ScopedFirstDevice guard(device);
+                fastllm::CausalDepthwiseConv1DPrefill(
+                    input, weight, state, kernel,
+                    params.GetInt("silu") != 0, output,
+                    params.GetInt("output_half")
+                        ? fastllm::DataType::FLOAT16
+                        : fastllm::DataType::FLOAT32);
+                output.Reshape({(int)output.Count(0)});
+                state.Reshape({(int)state.Count(0)});
+                fastllm::Data floatOutput;
+                fastllm::ToDataType(
+                    output, floatOutput, fastllm::DataType::FLOAT32);
+                fastllm::Data combined;
+                fastllm::Cat(floatOutput, state, 0, combined);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params, const std::string &device)
+                    -> std::function<void()> {
+#ifdef USE_CUDA
+                if (device.rfind("cuda", 0) != 0) {
+                    return nullptr;
+                }
+                const int batch = params.GetInt("batch");
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                const bool silu = params.GetInt("silu") != 0;
+                const fastllm::DataType outputType =
+                    params.GetInt("output_half")
+                        ? fastllm::DataType::FLOAT16
+                        : fastllm::DataType::FLOAT32;
+                auto input = std::make_shared<fastllm::Data>(MakeTensor(
+                    {batch, sequence, channels}, 0.23f, 0.2f));
+                auto weight = std::make_shared<fastllm::Data>(MakeTensor(
+                    {channels, 1, kernel}, 0.61f, 0.1f));
+                auto state = std::make_shared<fastllm::Data>(MakeTensor(
+                    {batch, channels, kernel}, 0.97f, 0.2f));
+                auto output = std::make_shared<fastllm::Data>(
+                    outputType,
+                    std::vector<int>({batch, sequence, channels}));
+                input->ToDevice(fastllm::DataDevice::CUDA);
+                weight->ToDevice(fastllm::DataDevice::CUDA);
+                state->ToDevice(fastllm::DataDevice::CUDA);
+                output->ToDevice(fastllm::DataDevice::CUDA);
+                output->Allocate(false);
+                return [input, weight, state, output, kernel, silu]() {
+                    if (!FastllmCudaCausalDepthwiseConv1DPrefill(
+                            *input, *weight, *state, *output,
+                            kernel, silu, false)) {
+                        throw std::runtime_error(
+                            "causal depthwise prefill CUDA replay failed");
+                    }
+                };
+#else
+                (void)params;
+                (void)device;
+                return nullptr;
+#endif
+            },
+            [](const OpTestParams &params) {
+                const double batch = params.GetInt("batch");
+                const double sequence = params.GetInt("sequence");
+                const double channels = params.GetInt("channels");
+                const double kernel = params.GetInt("kernel");
+                const double outputBytes = params.GetInt("output_half")
+                    ? sizeof(uint16_t) : sizeof(float);
+                return batch * channels *
+                       (sequence * (sizeof(float) + outputBytes) +
+                        2.0 * kernel * sizeof(float)) +
+                       channels * kernel * sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("batch") *
+                       params.GetInt("sequence") *
+                       params.GetInt("channels") *
+                       (2.0 * params.GetInt("kernel") + 4.0);
+            }
+        };
+    }
+
+    static OpCase MakeChunkGdnMixedStateCase() {
+        return {
+            "chunk_gdn_mixed_state",
+            "float16 chunk GDN activations with float32 recurrent state",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "batch size");
+                params.Add("heads", "3", "value/key heads");
+                params.Add("chunks", "2", "64-token chunks");
+                params.Add("chunk_size", "64", "tokens per chunk");
+                params.Add("key_dim", "128", "key/query head width");
+                params.Add("value_dim", "128", "value head width");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device == "cpu" || device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int batch = params.GetInt("batch");
+                const int heads = params.GetInt("heads");
+                const int chunks = params.GetInt("chunks");
+                const int chunkSize = params.GetInt("chunk_size");
+                const int keyDim = params.GetInt("key_dim");
+                const int valueDim = params.GetInt("value_dim");
+                const std::vector<int> qShape = {
+                    batch, heads, chunks, chunkSize, keyDim};
+                const std::vector<int> vShape = {
+                    batch, heads, chunks, chunkSize, valueDim};
+                const std::vector<int> gShape = {
+                    batch, heads, chunks, chunkSize};
+                const std::vector<int> attnShape = {
+                    batch, heads, chunks, chunkSize, chunkSize};
+
+                fastllm::Data q = MakeTensor(qShape, 0.11f, 0.01f);
+                fastllm::Data k = MakeTensor(qShape, 0.29f, 0.01f);
+                fastllm::Data v = MakeTensor(vShape, 0.47f, 0.01f);
+                fastllm::Data g = MakeTensor(
+                    gShape, 0.65f, 0.002f, -0.01f);
+                fastllm::Data attn = MakeTensor(
+                    attnShape, 0.83f, 0.001f);
+                fastllm::Data kCum = MakeTensor(
+                    qShape, 1.01f, 0.001f);
+                fastllm::Data state = MakeTensor(
+                    {batch, heads, keyDim, valueDim},
+                    1.19f, 0.01f);
+                {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(q, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(k, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(v, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(g, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(attn, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(kCum, fastllm::DataType::FLOAT16);
+                }
+
+                fastllm::Data output;
+                ScopedFirstDevice guard(device);
+                fastllm::ChunkGatedDeltaRulePrefill(
+                    q, k, v, g, attn, kCum, state, output);
+                fastllm::Data outputFloat;
+                fastllm::ToDataType(
+                    output, outputFloat, fastllm::DataType::FLOAT32);
+                outputFloat.Reshape({(int)outputFloat.Count(0)});
+                state.Reshape({(int)state.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(outputFloat, state, 0, combined);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params) {
+                const double batch = params.GetInt("batch");
+                const double heads = params.GetInt("heads");
+                const double chunks = params.GetInt("chunks");
+                const double chunk = params.GetInt("chunk_size");
+                const double key = params.GetInt("key_dim");
+                const double value = params.GetInt("value_dim");
+                return batch * heads *
+                    (chunks * chunk * (3.0 * key + 2.0 * value +
+                                       chunk + 1.0) * sizeof(uint16_t) +
+                     key * value * sizeof(float));
+            },
+            [](const OpTestParams &params) {
+                const double batch = params.GetInt("batch");
+                const double heads = params.GetInt("heads");
+                const double chunks = params.GetInt("chunks");
+                const double chunk = params.GetInt("chunk_size");
+                const double key = params.GetInt("key_dim");
+                const double value = params.GetInt("value_dim");
+                return batch * heads * chunks *
+                    (4.0 * chunk * key * value +
+                     2.0 * chunk * chunk * value);
+            }
+        };
+    }
+
+    static OpCase MakeQwen4SparseAttentionCase() {
+        return {
+            "qwen4_sparse_attention",
+            "Qwen4 direct-index sparse attention CPU/CUDA agreement",
+            []() {
+                OpTestParams params;
+                params.Add("sequence", "17", "number of query rows");
+                params.Add("query_heads", "24", "number of query heads");
+                params.Add("kv_heads", "2", "number of KV heads");
+                params.Add("key_length", "137", "cached KV length");
+                params.Add("head_dim", "64", "attention head dimension");
+                params.Add("topk", "67", "sparse index width");
+                params.Add("valid", "53", "valid indices per row");
+                params.Add("scale", "0.125", "attention score scale");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device == "cpu" || device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int queryHeads = params.GetInt("query_heads");
+                const int kvHeads = params.GetInt("kv_heads");
+                const int keyLength = params.GetInt("key_length");
+                const int headDim = params.GetInt("head_dim");
+                const int topk = params.GetInt("topk");
+                const int valid = std::min(params.GetInt("valid"), topk);
+                if (sequence <= 0 || queryHeads <= 0 || kvHeads <= 0 ||
+                    queryHeads % kvHeads != 0 || keyLength <= 0 ||
+                    headDim <= 0 || topk <= 0 || valid <= 0 ||
+                    valid > keyLength) {
+                    throw std::runtime_error(
+                        "invalid qwen4_sparse_attention parameters");
+                }
+                fastllm::Data query = MakeTensor(
+                    {queryHeads, sequence, headDim}, 0.31f, 0.08f);
+                fastllm::Data key = MakeTensor(
+                    {kvHeads, keyLength, headDim}, 0.73f, 0.08f);
+                fastllm::Data value = MakeTensor(
+                    {kvHeads, keyLength, headDim}, 1.17f, 0.08f);
+                {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(query, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(key, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(value, fastllm::DataType::FLOAT16);
+                }
+                fastllm::Data indices;
+                indices.dataType = fastllm::DataType::INT32;
+                indices.UpdateUnitSize();
+                indices.Resize({sequence, topk});
+                indices.Allocate(false);
+                int32_t *indexData =
+                    reinterpret_cast<int32_t*>(indices.cpuData);
+                for (int row = 0; row < sequence; row++) {
+                    for (int selected = 0; selected < topk; selected++) {
+                        indexData[(size_t)row * topk + selected] =
+                            selected < valid
+                            ? (row * 29 + selected * 17) % keyLength
+                            : -1;
+                    }
+                }
+                fastllm::Data output;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4SparseAttention(
+                    query, key, value, indices, queryHeads / kvHeads,
+                    params.GetFloat("scale"), output);
+                fastllm::Data result;
+                fastllm::ToDataType(
+                    output, result, fastllm::DataType::FLOAT32);
+                result.ToDevice(fastllm::DataDevice::CPU);
+                return result;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double queryHeads = params.GetInt("query_heads");
+                const double kvHeads = params.GetInt("kv_heads");
+                const double headDim = params.GetInt("head_dim");
+                const double topk = params.GetInt("topk");
+                const double valid = params.GetInt("valid");
+                const double queryAndOutput =
+                    2.0 * queryHeads * sequence * headDim;
+                const double sparseKeyAndValue =
+                    2.0 * kvHeads * sequence * valid * headDim;
+                const double indexReads =
+                    kvHeads * sequence * topk;
+                return 2.0 * (queryAndOutput + sparseKeyAndValue) +
+                       4.0 * indexReads;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double queryHeads = params.GetInt("query_heads");
+                const double headDim = params.GetInt("head_dim");
+                const double valid = params.GetInt("valid");
+                return 4.0 * sequence * queryHeads * valid * headDim;
+            }
+        };
+    }
+
+    static OpCase MakeQwen4QSADenseMaskCase() {
+        return {
+            "qwen4_qsa_dense_mask",
+            "Qwen4 causal QSA selection and dense-mask CPU/CUDA agreement",
+            []() {
+                OpTestParams params;
+                params.Add("rows", "521", "number of causal query rows");
+                params.Add("heads", "4", "indexer query heads");
+                params.Add("head_dim", "128", "indexer head dimension");
+                params.Add("token_budget", "256", "selected token budget");
+                params.Add("compress_ratio", "4", "tokens per index block");
+                params.Add("query_start", "0", "first visible query position");
+                params.Add("key_length", "0", "explicit key length, or zero for causal rows");
+                params.Add("dtype", "float16", "query activation type");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device == "cpu" || device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int rows = params.GetInt("rows");
+                const int heads = params.GetInt("heads");
+                const int headDim = params.GetInt("head_dim");
+                const int tokenBudget = params.GetInt("token_budget");
+                const int compressRatio = params.GetInt("compress_ratio");
+                const int queryStart = params.GetInt("query_start");
+                const int keyLength = params.GetInt("key_length") > 0
+                    ? params.GetInt("key_length") : queryStart + rows;
+                const int blocks = keyLength / compressRatio;
+                fastllm::Data query = MakeTensor(
+                    {rows, heads, headDim}, 0.37f, 0.2f);
+                if (params.GetString("dtype") == "float16") {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(query, fastllm::DataType::FLOAT16);
+                } else if (params.GetString("dtype") != "float32") {
+                    throw std::runtime_error(
+                        "qwen4_qsa_dense_mask dtype must be float16 or float32");
+                }
+                fastllm::Data compressedKeys = MakeTensor(
+                    {blocks, headDim}, 0.83f, 0.2f);
+                fastllm::Data indices, mask;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4QSASelect(
+                    query, compressedKeys, keyLength, heads, headDim,
+                    tokenBudget, compressRatio, indices, queryStart);
+                fastllm::Qwen4QSABuildMask(
+                    indices, query, keyLength, mask);
+                fastllm::Data result;
+                fastllm::ToDataType(
+                    mask, result, fastllm::DataType::FLOAT32);
+                result.ToDevice(fastllm::DataDevice::CPU);
+                return result;
+            },
+            [](const OpTestParams &params) {
+                const double rows = params.GetInt("rows");
+                const double heads = params.GetInt("heads");
+                const double headDim = params.GetInt("head_dim");
+                const double keyLength = params.GetInt("key_length") > 0
+                    ? params.GetInt("key_length")
+                    : params.GetInt("query_start") + rows;
+                return (rows * heads * headDim +
+                        keyLength / params.GetInt("compress_ratio") * headDim +
+                        rows * keyLength) * sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                const double rows = params.GetInt("rows");
+                const double heads = params.GetInt("heads");
+                const double headDim = params.GetInt("head_dim");
+                const double keyLength = params.GetInt("key_length") > 0
+                    ? params.GetInt("key_length")
+                    : params.GetInt("query_start") + rows;
+                const double blocks = keyLength /
+                    params.GetInt("compress_ratio");
+                return rows * blocks * heads * headDim * 2.0;
+            }
+        };
+    }
+
+    static OpCase MakeCausalDepthwiseConv1DPrefillReferenceCase() {
+        return {
+            "causal_depthwise_conv1d_prefill_reference",
+            "fused prefill convolution versus the former standard op chain",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "batch size");
+                params.Add("sequence", "64", "number of new tokens");
+                params.Add("channels", "257", "depthwise channels");
+                params.Add("kernel", "4", "convolution taps");
+                params.Add("with_history", "1", "seed a nonzero prior state");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device == "cpu" || device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int batch = params.GetInt("batch");
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                const int combinedCount =
+                    batch * sequence * channels +
+                    batch * channels * kernel;
+                if (device == "cpu") {
+                    fastllm::Data zeros(
+                        fastllm::DataType::FLOAT32, {combinedCount});
+                    zeros.Allocate(0.0f);
+                    return zeros;
+                }
+
+                fastllm::Data input = MakeTensor(
+                    {batch, sequence, channels}, 0.23f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.61f, 0.1f);
+                fastllm::Data initialState;
+                if (params.GetInt("with_history")) {
+                    initialState.CopyFrom(MakeTensor(
+                        {batch, channels, kernel}, 0.97f, 0.2f));
+                }
+
+                ScopedFirstDevice guard(device);
+                fastllm::Data oldInput;
+                oldInput.CopyFrom(input);
+                fastllm::PermuteSelf(oldInput, {0, 2, 1});
+                const bool hadState = !initialState.dims.empty();
+                fastllm::Data oldState;
+                if (hadState) {
+                    oldState.CopyFrom(initialState);
+                }
+                fastllm::Data convInput;
+                if (hadState) {
+                    fastllm::Cat(oldState, oldInput, -1, convInput);
+                } else {
+                    convInput.CopyFrom(oldInput);
+                }
+                if (convInput.dims.back() >= kernel) {
+                    fastllm::Split(
+                        convInput, -1, convInput.dims.back() - kernel,
+                        convInput.dims.back(), oldState);
+                } else {
+                    fastllm::Data padding(
+                        fastllm::DataType::FLOAT32,
+                        {batch, channels, kernel - convInput.dims.back()});
+                    padding.ToDevice(convInput.dataDevice);
+                    padding.Allocate(0.0f);
+                    fastllm::Cat(padding, convInput, -1, oldState);
+                }
+
+                fastllm::Data oldConvolved, emptyBias;
+                fastllm::Conv1DPerChannel(
+                    convInput, weight, emptyBias, channels, channels,
+                    kernel, 1, hadState ? 0 : kernel - 1, oldConvolved);
+                fastllm::Data oldOutput;
+                if (hadState) {
+                    fastllm::Split(
+                        oldConvolved, -1,
+                        oldConvolved.dims.back() - sequence,
+                        oldConvolved.dims.back(), oldOutput);
+                } else {
+                    fastllm::Split(
+                        oldConvolved, -1, 0, sequence, oldOutput);
+                }
+                fastllm::Silu(oldOutput, oldOutput);
+                fastllm::PermuteSelf(oldOutput, {0, 2, 1});
+
+                fastllm::Data fusedState;
+                if (hadState) {
+                    fusedState.CopyFrom(initialState);
+                }
+                fastllm::Data fusedOutput;
+                fastllm::CausalDepthwiseConv1DPrefill(
+                    input, weight, fusedState, kernel, true, fusedOutput);
+                fastllm::AddTo(fusedOutput, oldOutput, -1.0f);
+                fastllm::AddTo(fusedState, oldState, -1.0f);
+                fusedOutput.Reshape({(int)fusedOutput.Count(0)});
+                fusedState.Reshape({(int)fusedState.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(fusedOutput, fusedState, 0, combined);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("batch") *
+                       params.GetInt("channels") *
+                       (4.0 * params.GetInt("sequence") +
+                        4.0 * params.GetInt("kernel")) * sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("batch") *
+                       params.GetInt("sequence") *
+                       params.GetInt("channels") *
+                       (4.0 * params.GetInt("kernel") + 8.0);
+            }
+        };
+    }
+
     static std::vector<OpCase> BuildRegistry() {
         return {
             MakeAddToCase(),
             MakeCatCase(),
             MakeMulCase(),
+            MakeSigmoidMulToCase(),
             MakePermuteCase(),
             MakeSplitCase(),
             MakeMatMulCase(),
@@ -3315,7 +5256,16 @@ namespace {
             MakeMergeMoeFp8Case(),
             MakeFusedMoeFp8Case(),
             MakeRouterLinearFp16Case(),
-            MakeFusedRouterTopKCase()
+            MakeFusedRouterTopKCase(),
+            MakeQwen4HyperCombineNormCase(),
+            MakeQwen4PLEGateCase(),
+            MakeQwen4PLECausalConvCase(),
+            MakeCausalDepthwiseConv1DPrefillCase(),
+            MakeChunkGdnMixedStateCase(),
+            MakeQwen4SparseAttentionCase(),
+            MakeQwen4QSADenseMaskCase(),
+            MakeCausalDepthwiseConv1DPrefillReferenceCase(),
+            MakeDots3NoteIndexerCase()
         };
     }
 
@@ -3435,6 +5385,7 @@ namespace {
         fastllm::Data baseline = opCase.run(params, "cpu");
         baseline.ToDevice(fastllm::DataDevice::CPU);
         bool ok = true;
+        bool ran = false;
 
         for (const auto &device : devices) {
             if (!DeviceSelected(config.deviceFilters, device)) {
@@ -3444,6 +5395,7 @@ namespace {
                 std::cout << "  [" << device << "] skipped: op not supported on this device\n";
                 continue;
             }
+            ran = true;
 
             fastllm::Data output = opCase.run(params, device);
             output.ToDevice(fastllm::DataDevice::CPU);
@@ -3476,7 +5428,7 @@ namespace {
                 ok = false;
             }
         }
-        return ok;
+        return ran && ok;
     }
 }
 

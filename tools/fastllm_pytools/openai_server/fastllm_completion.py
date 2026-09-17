@@ -13,13 +13,14 @@ import time
 import traceback
 import uuid
 from http import HTTPStatus
-from typing import (Any, AsyncGenerator, AsyncIterator, Awaitable, Dict, Iterable,
-                    List, Optional, Tuple, TypedDict, Union, final)
+from typing import (Any, AsyncGenerator, AsyncIterator, Dict, Iterable, List,
+                    Optional, Tuple, Union)
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 import shortuuid
 from fastapi import Request
+from jinja2.exceptions import TemplateError
 from openai.types.chat import (ChatCompletionContentPartParam,
                                ChatCompletionRole)
 from PIL import Image
@@ -27,6 +28,11 @@ from starlette.background import BackgroundTask
 
 from .protocal.openai_protocol import *
 from .protocal.anthropic_protocol import *
+
+try:
+    from ..generation_errors import PromptTooLongError
+except ImportError:
+    from generation_errors import PromptTooLongError
 
 try:
     from ..gemma4_multimodal import (
@@ -249,6 +255,14 @@ class FastLLmCompletion:
   def _is_deepseek_v4_reasoning_response(self, enable_thinking: bool) -> bool:
       return enable_thinking and self._is_deepseek_v4_model()
 
+  def _is_deepseek_v41_model(self) -> bool:
+      try:
+          is_deepseek_v41 = self.model._is_deepseek_v41()
+      except Exception:
+          is_deepseek_v41 = False
+      return is_deepseek_v41 and not getattr(
+          self.model, "force_chat_template", False)
+
   def _is_poolside_reasoning_response(self, enable_thinking: bool) -> bool:
       if not enable_thinking or getattr(self.model, "force_chat_template", False):
           return False
@@ -270,10 +284,115 @@ class FastLLmCompletion:
   def _is_kimi_k3_reasoning_response(self, enable_thinking: bool) -> bool:
       return enable_thinking and self._is_kimi_k3_model()
 
+  def _is_glm5_next_model(self) -> bool:
+      detector = getattr(self.model, "_is_glm5_next", None)
+      if callable(detector):
+          try:
+              return bool(detector())
+          except Exception:
+              pass
+      try:
+          return self.model.get_type() in {"glm5_next", "glm5_next_text"}
+      except Exception:
+          return False
+
+  def _is_glm5_next_reasoning_response(self) -> bool:
+      # The official GLM-5.3 template always ends the generation prompt inside
+      # <think>; enable_thinking is not a template switch for this model.
+      return (self._is_glm5_next_model()
+              and not getattr(self.model, "force_chat_template", False))
+
+  def _is_qwen3_5_model(self) -> bool:
+      qwen3_5_types = {
+          "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
+      }
+      try:
+          if self.model.get_type() in qwen3_5_types:
+              return True
+      except Exception:
+          pass
+
+      config = getattr(self.model, "config", None)
+      if not isinstance(config, dict):
+          return False
+      architectures = config.get("architectures") or []
+      architecture = architectures[0] if architectures else ""
+      model_type = config.get("model_type", "")
+      text_config = config.get("text_config")
+      text_model_type = (
+          text_config.get("model_type", "")
+          if isinstance(text_config, dict) else "")
+      return (
+          architecture in {
+              "Qwen3_5ForConditionalGeneration",
+              "Qwen3_5MoeForConditionalGeneration",
+          }
+          or model_type in qwen3_5_types
+          or text_model_type in qwen3_5_types
+      )
+
+  def _is_qwen4_exp_model(self) -> bool:
+      qwen4_exp_types = {"qwen4_exp", "qwen4_exp_text"}
+      try:
+          if self.model.get_type() in qwen4_exp_types:
+              return True
+      except Exception:
+          pass
+
+      config = getattr(self.model, "config", None)
+      if not isinstance(config, dict):
+          return False
+      architectures = config.get("architectures") or []
+      architecture = architectures[0] if architectures else ""
+      model_type = config.get("model_type", "")
+      text_config = config.get("text_config")
+      text_model_type = (
+          text_config.get("model_type", "")
+          if isinstance(text_config, dict) else "")
+      return (
+          architecture in {
+              "Qwen4ExpForConditionalGeneration",
+              "Qwen4ExpForCausalLM",
+          }
+          or model_type in qwen4_exp_types
+          or text_model_type in qwen4_exp_types
+      )
+
+  def _is_qwen_reasoning_model(self) -> bool:
+      return self._is_qwen3_5_model() or self._is_qwen4_exp_model()
+
+  def _is_qwen3_5_reasoning_response(self, enable_thinking: bool) -> bool:
+      return (enable_thinking and self._is_qwen_reasoning_model()
+              and not getattr(self.model, "force_chat_template", False))
+
+  def _is_dots3_note_model(self) -> bool:
+      try:
+          if self.model.get_type() == "dots3_note":
+              return True
+      except Exception:
+          pass
+
+      config = getattr(self.model, "config", None)
+      if not isinstance(config, dict):
+          return False
+      architectures = config.get("architectures") or []
+      architecture = architectures[0] if architectures else ""
+      return (architecture == "Dots3NoteForCausalLM"
+              or config.get("model_type") == "dots3_note")
+
+  def _is_dots3_note_reasoning_response(
+      self, enable_thinking: bool
+  ) -> bool:
+      return (enable_thinking and self._is_dots3_note_model()
+              and not getattr(self.model, "force_chat_template", False))
+
   def _uses_tagged_reasoning_response(self, enable_thinking: bool) -> bool:
       return (self._is_deepseek_v4_reasoning_response(enable_thinking)
               or self._is_poolside_reasoning_response(enable_thinking)
-              or self._is_kimi_k3_reasoning_response(enable_thinking))
+              or self._is_kimi_k3_reasoning_response(enable_thinking)
+              or self._is_glm5_next_reasoning_response()
+              or self._is_qwen3_5_reasoning_response(enable_thinking)
+              or self._is_dots3_note_reasoning_response(enable_thinking))
 
   def _resolve_kimi_k3_reasoning_effort(
       self, request: ChatCompletionRequest
@@ -285,12 +404,107 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "thinking_effort", template_kwargs.get("reasoning_effort"))
-      if effort is None:
+      if effort in {None, "none"}:
           effort = "max"
       if effort not in {"low", "high", "max"}:
           raise ValueError(
-              "Kimi K3 reasoning_effort must be one of: low, high, max")
+              "Kimi K3 reasoning_effort must be one of: none, low, high, max")
       return effort
+
+  def _resolve_deepseek_v41_reasoning_effort(
+      self, request: ChatCompletionRequest
+  ) -> Optional[Union[int, str]]:
+      """DeepSeek-V4.1 takes a numeric reasoning budget.
+
+      ``encoding_dsv41.render_reasoning_effort`` accepts an int in [1, 100] or
+      one of the ``low``/``high``/``max`` aliases (50/75/100) and defaults to
+      ``high``.  Returning None keeps that default.
+      """
+      if not self._is_deepseek_v41_model():
+          return None
+      # Reuse the official alias table instead of restating it here.
+      from ftllm.encoding_dsv41 import REASONING_EFFORT_MAPPINGS
+      effort = request.reasoning_effort
+      template_kwargs = request.chat_template_kwargs or {}
+      if effort is None:
+          effort = template_kwargs.get(
+              "reasoning_effort", template_kwargs.get("thinking_effort"))
+      if effort is None or effort == "none":
+          # "none" disables thinking entirely; the effort prefix is then not
+          # rendered at all, so there is nothing left to resolve.
+          return None
+      if isinstance(effort, bool):
+          raise ValueError(
+              "DeepSeek-V4.1 reasoning_effort must be an integer in [1, 100] "
+              "or one of: none, low, high, max")
+      if isinstance(effort, str):
+          stripped = effort.strip()
+          if stripped in REASONING_EFFORT_MAPPINGS:
+              return stripped
+          try:
+              effort = int(stripped, 10)
+          except ValueError:
+              raise ValueError(
+                  "DeepSeek-V4.1 reasoning_effort must be an integer in "
+                  "[1, 100] or one of: none, low, high, max")
+      if not isinstance(effort, int) or not 1 <= effort <= 100:
+          raise ValueError(
+              "DeepSeek-V4.1 reasoning_effort must be an integer in [1, 100] "
+              "or one of: none, low, high, max")
+      return effort
+
+  def _resolve_qwen3_5_reasoning_effort(
+      self, request: ChatCompletionRequest
+  ) -> Optional[str]:
+      if not self._is_qwen_reasoning_model():
+          return None
+      effort = request.reasoning_effort
+      template_kwargs = request.chat_template_kwargs or {}
+      if effort is None:
+          effort = template_kwargs.get(
+              "reasoning_effort", template_kwargs.get("thinking_effort"))
+      if effort in {None, "none"}:
+          effort = "xhigh"
+      if effort not in {"low", "medium", "xhigh"}:
+          raise ValueError(
+              "Qwen reasoning_effort must be one of: none, low, medium, xhigh")
+      return effort
+
+  def _resolve_glm5_next_reasoning_effort(
+      self, request: ChatCompletionRequest
+  ) -> Optional[str]:
+      if not self._is_glm5_next_model():
+          return None
+      effort = request.reasoning_effort
+      template_kwargs = request.chat_template_kwargs or {}
+      if effort is None:
+          effort = template_kwargs.get(
+              "reasoning_effort", template_kwargs.get("thinking_effort"))
+      if effort in {None, "none"}:
+          effort = "max"
+      if effort not in {"low", "high", "max"}:
+          raise ValueError(
+              "GLM-5.3 reasoning_effort must be one of: none, low, high, max")
+      return effort
+
+  def _resolve_chat_template_kwargs(
+      self,
+      request: ChatCompletionRequest,
+      qwen3_5_reasoning_effort: Optional[str],
+      glm5_next_reasoning_effort: Optional[str] = None,
+  ) -> Optional[Dict[str, Any]]:
+      if (request.chat_template_kwargs is None
+              and qwen3_5_reasoning_effort is None
+              and glm5_next_reasoning_effort is None):
+          return None
+      template_kwargs = dict(request.chat_template_kwargs or {})
+      if qwen3_5_reasoning_effort is not None:
+          # Qwen3.5's native template names this variable reasoning_effort;
+          # thinking_effort is retained as a request-side compatibility alias.
+          template_kwargs["reasoning_effort"] = qwen3_5_reasoning_effort
+      if glm5_next_reasoning_effort is not None:
+          template_kwargs["reasoning_effort"] = glm5_next_reasoning_effort
+      return template_kwargs
 
   def _serialize_tool_choice(self, tool_choice: Any) -> Any:
       if hasattr(tool_choice, "model_dump"):
@@ -298,6 +512,18 @@ class FastLLmCompletion:
       if hasattr(tool_choice, "dict"):
           return tool_choice.dict(exclude_none=True)
       return tool_choice
+
+  def _named_tool_choice(self, tool_choice: Any) -> Optional[str]:
+      tool_choice = self._serialize_tool_choice(tool_choice)
+      if not isinstance(tool_choice, dict):
+          return None
+      if tool_choice.get("type") != "function":
+          return None
+      function = tool_choice.get("function")
+      if not isinstance(function, dict):
+          return None
+      name = function.get("name")
+      return name if isinstance(name, str) and name else None
 
   def _with_effective_tool_choice(
       self,
@@ -311,6 +537,115 @@ class FastLLmCompletion:
       if callable(model_copy):
           return model_copy(update={"tool_choice": tool_choice})
       return request.copy(update={"tool_choice": tool_choice})
+
+  def _append_text_to_message(
+      self,
+      message: Dict[str, Any],
+      text: str,
+      separator: str = "\n\n",
+  ) -> Dict[str, Any]:
+      """Copy a message and append text without mutating request content."""
+      updated = dict(message)
+      content = message.get("content")
+      if isinstance(content, str):
+          if text not in content:
+              updated["content"] = content.rstrip() + separator + text
+          return updated
+
+      if isinstance(content, list):
+          content_parts = [
+              dict(part) if isinstance(part, dict) else part
+              for part in content
+          ]
+          has_text = any(
+              isinstance(part, dict)
+              and text in str(part.get("text", ""))
+              for part in content_parts
+          )
+          if not has_text:
+              content_parts.append({
+                  "type": "text",
+                  "text": separator + text,
+              })
+          updated["content"] = content_parts
+          return updated
+
+      updated["content"] = text
+      return updated
+
+  def _apply_dots_tool_choice(
+      self,
+      messages: List[Dict[str, Any]],
+      tools: Optional[List[Dict[str, Any]]],
+      tool_choice: Any,
+  ) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+      if not self._is_dots3_note_model():
+          return messages, tools
+      if tool_choice == "none":
+          return messages, None
+
+      named_tool = self._named_tool_choice(tool_choice)
+      if tool_choice != "required" and named_tool is None:
+          return messages, tools
+      if not tools:
+          raise ValueError(
+              "Dots3-Note tool_choice requires at least one request tool")
+
+      selected_tools = tools
+      if named_tool is not None:
+          selected_tools = [
+              tool for tool in tools
+              if isinstance(tool, dict)
+              and isinstance(tool.get("function"), dict)
+              and tool["function"].get("name") == named_tool
+          ]
+          if not selected_tools:
+              raise ValueError(
+                  f"tool_choice requests unknown function {named_tool!r}")
+          guidance = (
+              "Tool choice requirement: you must call the function "
+              f"{named_tool!r} in your next response. Do not call another "
+              "function and do not answer with plain text instead. Use the "
+              "exact Dots XML tool-call format described below. Call it "
+              "immediately without explaining or discussing this requirement."
+          )
+          user_guidance = (
+              "【系统工具选择约束】本轮 tool_choice 指定函数 "
+              f"{named_tool!r}。此约束优先于上述用户要求：你必须且只能"
+              "调用该函数，禁止只输出普通文本；无需解释或展开思考，请立即"
+              "按系统消息规定的 Dots XML 格式调用。"
+          )
+      else:
+          guidance = (
+              "Tool choice requirement: you must call at least one of the "
+              "available functions in your next response. A plain-text "
+              "answer without a tool call is invalid. Use the exact Dots "
+              "XML tool-call format described below. Call a function "
+              "immediately without explaining or discussing this requirement."
+          )
+          user_guidance = (
+              "【系统工具选择约束】本轮 tool_choice=required。"
+              "此约束优先于上述用户要求：你必须在本次回复中调用至少一个"
+              "可用工具，禁止只输出普通文本；无需解释或展开思考，请立即"
+              "按系统消息规定的 Dots XML 格式调用。"
+          )
+
+      guided = [dict(message) for message in messages]
+      if guided and guided[0].get("role") == "system":
+          guided[0] = self._append_text_to_message(guided[0], guidance)
+      else:
+          guided.insert(0, {
+              "role": "system",
+              "content": "You are a helpful assistant.\n\n" + guidance,
+          })
+      for index in range(len(guided) - 1, -1, -1):
+          message = guided[index]
+          if message.get("role") != "user":
+              continue
+          guided[index] = self._append_text_to_message(
+              message, user_guidance)
+          break
+      return guided, selected_tools
 
   def _resolve_kimi_k3_auto_tool_choice(
       self,
@@ -439,10 +774,8 @@ class FastLLmCompletion:
           "context, respond without a tool.")
       guided = [dict(message) for message in messages]
       for index, message in enumerate(guided):
-          content = message.get("content")
-          if message.get("role") == "system" and isinstance(content, str):
-              if guidance not in content:
-                  guided[index]["content"] = content.rstrip() + "\n\n" + guidance
+          if message.get("role") == "system":
+              guided[index] = self._append_text_to_message(message, guidance)
               return guided
       guided.insert(0, {"role": "system", "content": guidance})
       return guided
@@ -457,7 +790,7 @@ class FastLLmCompletion:
               or tool_choice != "required"):
           return messages
       guidance = (
-          "\n\n系统动作要求：必须立即调用合适的工具完成上述操作；不要只说明"
+          "系统动作要求：必须立即调用合适的工具完成上述操作；不要只说明"
           "将要执行，也不要在信息足够时追问。纯文本回复无效。如果请求是"
           "创建或写入文件，直接调用 write 工具，不要先用 bash 检查目录；"
           "调用 write 时必须同时提供 filePath 和完整 content。")
@@ -466,9 +799,7 @@ class FastLLmCompletion:
           message = guided[index]
           if message.get("role") != "user":
               continue
-          content = message.get("content")
-          if isinstance(content, str) and guidance not in content:
-              guided[index]["content"] = content.rstrip() + guidance
+          guided[index] = self._append_text_to_message(message, guidance)
           break
       return guided
 
@@ -509,6 +840,40 @@ class FastLLmCompletion:
       content = result[think_end_idx + len(think_end):]
       return content, reasoning_content
 
+  def _split_qwen3_5_reasoning(
+      self,
+      result: str,
+      emit_reasoning_content: bool,
+  ) -> Tuple[str, Optional[str]]:
+      if not emit_reasoning_content:
+          return result, None
+      result = self._strip_optional_think_start(result)
+      think_end = "</think>"
+      think_end_idx = result.find(think_end)
+      if think_end_idx < 0:
+          # The Qwen3.5 generation prompt ends inside <think>. A truncated
+          # generation without </think> therefore contains reasoning only.
+          return "", result or None
+      reasoning_content = result[:think_end_idx]
+      content = result[think_end_idx + len(think_end):]
+      return content, reasoning_content or None
+
+  def _split_glm5_next_reasoning(
+      self,
+      result: str,
+      emit_reasoning_content: bool,
+  ) -> Tuple[str, Optional[str]]:
+      if not emit_reasoning_content:
+          return result, None
+      result = self._strip_optional_think_start(result)
+      think_end = "</think>"
+      think_end_idx = result.find(think_end)
+      if think_end_idx < 0:
+          return "", result or None
+      reasoning_content = result[:think_end_idx]
+      content = result[think_end_idx + len(think_end):]
+      return content, reasoning_content or None
+
   def _consume_deepseek_v4_reasoning_delta(
       self,
       delta_text: str,
@@ -520,8 +885,22 @@ class FastLLmCompletion:
       think_end = "</think>"
       state["buffer"] = state.get("buffer", "") + delta_text
       if not state.get("started"):
-          state["buffer"] = self._strip_optional_think_start(state["buffer"])
-          state["started"] = True
+          think_start = "<think>"
+          if state["buffer"].startswith(think_start):
+              state["buffer"] = state["buffer"][len(think_start):]
+              state["started"] = True
+              state["strip_leading_newline"] = True
+          elif think_start.startswith(state["buffer"]):
+              return [], ""
+          else:
+              state["started"] = True
+
+      if state.get("strip_leading_newline"):
+          if not state["buffer"]:
+              return [], ""
+          if state["buffer"].startswith("\n"):
+              state["buffer"] = state["buffer"][1:]
+          state["strip_leading_newline"] = False
 
       think_end_idx = state["buffer"].find(think_end)
       if think_end_idx >= 0:
@@ -1049,6 +1428,9 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
               encode_vision = False,
               encode_fn = self.model.encode,
+              tools = tools,
+              tool_choice = tool_choice,
+              chat_template_kwargs = chat_template_kwargs,
           )
           return len(native_inputs["input_ids"])
       if architecture == "Step3p7ForConditionalGeneration":
@@ -1194,10 +1576,12 @@ class FastLLmCompletion:
       model_type = self.model.get_type()
       chat_template = getattr(tokenizer, "chat_template", None)
       force_type = getattr(self.model, "tool_call_parser", "auto")
+      deepseek_v4_family = {
+          "deepseek_v4", "deepseek_v41", "deepseek_v41_text"}
       allow_without_chat_template = (
-          model_type == "deepseek_v4" or
+          model_type in deepseek_v4_family or
           model_type == "kimi_k3" or
-          force_type in ("deepseek_v4", "kimi_k3")
+          force_type in (*deepseek_v4_family, "kimi_k3")
       )
       if tokenizer is None and allow_without_chat_template:
           tokenizer = _EmptyToolTokenizer()
@@ -1206,11 +1590,32 @@ class FastLLmCompletion:
               "Tool calling requires a Hugging Face tokenizer with chat_template. "
               "Please use an HF model directory or provide the original tokenizer files."
           )
+      return self._resolve_tool_parser_class()(tokenizer)
+
+  def _resolve_tool_parser_class(self):
+      tokenizer = getattr(self.model, "hf_tokenizer", None)
       from .tool_parsers import ToolParserManager
       return ToolParserManager.get_tool_parser_auto(
-          model_type, chat_template,
+          self.model.get_type(), getattr(tokenizer, "chat_template", None),
           force_chat_template = self.model.force_chat_template,
-          force_type = force_type)(tokenizer)
+          force_type = getattr(self.model, "tool_call_parser", "auto"))
+
+  def _apply_qwen4_tool_choice(
+      self, messages, tools, tool_choice, parallel_tool_calls=None,
+  ):
+      if self.model.get_type() != "qwen4_exp" or not tools:
+          return messages, tools
+      if tool_choice != "required" and not isinstance(tool_choice, dict):
+          return messages, tools
+
+      from .tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+      if not issubclass(
+              self._resolve_tool_parser_class(), Qwen3CoderToolParser):
+          return messages, tools
+
+      from .qwen_tool_guidance import apply_qwen_tool_choice_guidance
+      return apply_qwen_tool_choice_guidance(
+          messages, tools, tool_choice, parallel_tool_calls)
 
   def _create_function_call_parser(self, request: ChatCompletionRequest):
       from .toolcall_parser import FunctionCallParser
@@ -1227,6 +1632,9 @@ class FastLLmCompletion:
       force_type = getattr(self.model, "tool_call_parser", "auto")
       model_type = self.model.get_type()
       tool_parser_name = force_type if force_type != "auto" else model_type
+      if (force_type == "auto"
+              and model_type in {"glm5_next", "glm5_next_text"}):
+          tool_parser_name = "glm47"
       return FunctionCallParser.build_constraint_descriptor_from_request(
           request,
           tool_parser_name = tool_parser_name,
@@ -1321,6 +1729,8 @@ class FastLLmCompletion:
       self,
       result: str,
       request: ChatCompletionRequest,
+      *,
+      finish_reason: Optional[str] = None,
   ) -> Union[ErrorResponse, ExtractedToolCallInformation]:
       if not request.tools:
           return ExtractedToolCallInformation(
@@ -1330,7 +1740,7 @@ class FastLLmCompletion:
           )
 
       parser = self._create_function_call_parser(request)
-      parsed = parser.parse_non_stream(result)
+      parsed = parser.parse_non_stream(result, finish_reason=finish_reason)
       if parsed.has_invalid_tool_block:
           diagnostics = self._format_tool_call_diagnostics(parsed.diagnostics)
           logging.warning("Invalid non-stream tool call rejected: %s",
@@ -1345,6 +1755,26 @@ class FastLLmCompletion:
           tool_calls = parsed.valid_tool_calls,
           content = parsed.content,
       )
+
+  def _normalize_system_messages(
+      self, conversation: List[ConversationMessage],
+  ) -> List[ConversationMessage]:
+      # Local model templates commonly require a single leading system message.
+      # Consolidate only explicit system instructions, in their original order;
+      # user messages and tool results keep their roles and relative positions.
+      system_parts: List[Dict[str, Any]] = []
+      messages: List[ConversationMessage] = []
+      for message in conversation:
+          if message.role != "system":
+              messages.append(message)
+          elif isinstance(message.content, str):
+              system_parts.append({"type": "text", "text": message.content})
+          elif message.content:
+              system_parts.extend(message.content)
+      if system_parts:
+          messages.insert(0, ConversationMessage(
+              role = "system", content = self._build_message_content(system_parts)))
+      return messages
 
   def _parse_anthropic_message_content(
       self,
@@ -1659,17 +2089,19 @@ class FastLLmCompletion:
           item_type = item.get("type")
           if item_type == "function_call":
               call_id = item.get("call_id") or item.get("id") or f"call_{shortuuid.random()}"
-              messages.append({
-                  "role": "assistant",
-                  "content": None,
-                  "tool_calls": [{
-                      "id": call_id,
-                      "type": "function",
-                      "function": {
-                          "name": item.get("name", ""),
-                          "arguments": item.get("arguments", "{}"),
-                      },
-                  }],
+              # Responses represents one assistant turn as separate text and
+              # function-call items. Keep them together for chat templates;
+              # splitting them inserts an end-of-turn marker after a progress
+              # note and teaches subsequent generations to stop there too.
+              if not messages or messages[-1].get("role") != "assistant":
+                  messages.append({"role": "assistant", "content": None})
+              messages[-1].setdefault("tool_calls", []).append({
+                  "id": call_id,
+                  "type": "function",
+                  "function": {
+                      "name": item.get("name", ""),
+                      "arguments": item.get("arguments", "{}"),
+                  },
               })
               continue
 
@@ -1699,10 +2131,17 @@ class FastLLmCompletion:
               role = item.get("role", "user")
               if role == "developer":
                   role = "system"
+              content = self._convert_responses_content_to_chat_content(
+                  item.get("content", ""))
+              if (role == "assistant" and messages
+                      and messages[-1].get("role") == "assistant"
+                      and messages[-1].get("content") is None
+                      and messages[-1].get("tool_calls")):
+                  messages[-1]["content"] = content
+                  continue
               messages.append({
                   "role": role,
-                  "content": self._convert_responses_content_to_chat_content(
-                      item.get("content", "")),
+                  "content": content,
               })
               continue
 
@@ -2307,9 +2746,20 @@ class FastLLmCompletion:
               if "error" in data:
                   for event_data in ensure_response_started():
                       yield event_data
-                  yield next_event("error", {
-                      "error": data["error"],
-                  })
+                  # Responses clients (including Codex) need a terminal
+                  # response.failed object; a Chat-style error envelope alone
+                  # is otherwise reported as an unexpectedly closed stream.
+                  response = self._responses_response_object(
+                      request, response_id, created_at, "failed", [], usage,
+                      output_text = output_text or None,
+                  )
+                  error = data["error"]
+                  response.error = {
+                      "code": ("context_length_exceeded" if error.get("type") == "context_length_exceeded"
+                               else "server_error"),
+                      "message": error.get("message", "Generation failed."),
+                  }
+                  yield next_event("response.failed", {"response": response.model_dump()})
                   return
 
               response_id = data.get("id", response_id)
@@ -2470,6 +2920,7 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
+          conversation = self._normalize_system_messages(conversation)
           if len(conversation) == 0:
               raise Exception("Empty msg")
 
@@ -2505,6 +2956,32 @@ class FastLLmCompletion:
       frequency_penalty = default_gen['repetition_penalty']
       max_length = request.max_tokens if request.max_tokens else 32768
 
+      # Claude Code sends effort through Anthropic output_config. Resolve it
+      # with the same model-specific rules as Chat Completions, and use the
+      # same template arguments for token counting and generation.
+      try:
+          reasoning_request = ChatCompletionRequest(
+              model=request.model, messages=[{"role": "user", "content": ""}],
+              reasoning_effort=(request.output_config or {}).get("effort"))
+          thinking_effort = self._resolve_kimi_k3_reasoning_effort(reasoning_request)
+          if thinking_effort is None:
+              thinking_effort = self._resolve_deepseek_v41_reasoning_effort(
+                  reasoning_request)
+          template_kwargs = self._resolve_chat_template_kwargs(
+              reasoning_request, self._resolve_qwen3_5_reasoning_effort(reasoning_request),
+              self._resolve_glm5_next_reasoning_effort(reasoning_request))
+          enable_thinking = self.enable_thinking
+          if reasoning_request.reasoning_effort is not None:
+              enable_thinking = reasoning_request.reasoning_effort != "none"
+          if request.thinking is not None:
+              thinking_type = request.thinking.get("type")
+              if thinking_type not in {"enabled", "adaptive", "disabled"}:
+                  raise ValueError("thinking.type must be enabled, adaptive, or disabled")
+              enable_thinking = thinking_type != "disabled"
+      except ValueError as error:
+          self._cleanup_temp_paths(media.temp_paths)
+          return self.create_error_response(str(error))
+
       if request.stop_sequences:
           logging.warning("Anthropic stop_sequences are not supported yet and will be ignored.")
 
@@ -2516,10 +2993,12 @@ class FastLLmCompletion:
       try:
           input_token_len = self._compute_multimodal_input_token_len(
               messages,
-              enable_thinking = self.enable_thinking,
+              enable_thinking = enable_thinking,
               images = model_images,
               videos = model_videos,
-              tools = model_tools)
+              tools = model_tools,
+              thinking_effort = thinking_effort,
+              chat_template_kwargs = template_kwargs)
           launch_kwargs = {
               "max_length": max_length,
               "min_length": 0,
@@ -2530,15 +3009,28 @@ class FastLLmCompletion:
               "repeat_penalty": frequency_penalty,
               "tools": model_tools,
               "one_by_one": True,
-              "enable_thinking": self.enable_thinking,
+              "enable_thinking": enable_thinking,
               "images": model_images,
               "videos": model_videos,
           }
+          if template_kwargs is not None:
+              launch_kwargs["chat_template_kwargs"] = template_kwargs
+          if self._is_kimi_k3_model():
+              launch_kwargs["thinking_effort"] = thinking_effort
+          elif (self._is_deepseek_v41_model()
+                and thinking_effort is not None):
+              launch_kwargs["thinking_effort"] = thinking_effort
           if parser_request is not None:
               self._attach_tool_call_constraint_if_supported(
                   launch_kwargs, parser_request)
           handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
+      except (ValueError, TemplateError) as error:
+          # Deterministic input/template failures must reach the SDK as a 400.
+          # An uncaught exception becomes a 500, which Claude Code retries.
+          return self.create_error_response(
+              f"Could not prepare model input: {error}",
+              err_type = "invalid_request_error")
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       self.conversation_handles[request_id] = handle
@@ -2558,6 +3050,9 @@ class FastLLmCompletion:
                   request, raw_request, handle, result_generator, request_id,
                   input_token_len, parser_request,
                   response_statistics = response_statistics)
+          except PromptTooLongError as e:
+              self._release_conversation_handle(request_id, handle)
+              return self.create_error_response(str(e))
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -2597,6 +3092,16 @@ class FastLLmCompletion:
 
               conversation.extend(messages)
               media.extend(message_media)
+
+          if self._is_qwen3_5_model() and any(
+                  message.role == "developer" for message in conversation):
+              # Harness/pi-ai sends developer instructions for reasoning models.
+              # Qwen3.5/3.8 templates accept one leading system message instead.
+              # Preserve native developer handling for other model families.
+              for message in conversation:
+                  if message.role == "developer":
+                      message.role = "system"
+              conversation = self._normalize_system_messages(conversation)
 
           if len(conversation) == 0:
             raise Exception("Empty msg")
@@ -2650,13 +3155,25 @@ class FastLLmCompletion:
       stop_token_ids = self._stop_token_ids_from_strings(stop_strings)
 
       enable_thinking = self.enable_thinking
+      if request.reasoning_effort is not None:
+          enable_thinking = request.reasoning_effort != "none"
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
       try:
           thinking_effort = self._resolve_kimi_k3_reasoning_effort(request)
+          if thinking_effort is None:
+              thinking_effort = (
+                  self._resolve_deepseek_v41_reasoning_effort(request))
+          qwen3_5_reasoning_effort = (
+              self._resolve_qwen3_5_reasoning_effort(request))
+          glm5_next_reasoning_effort = (
+              self._resolve_glm5_next_reasoning_effort(request))
       except ValueError as error:
           self._cleanup_temp_paths(media.temp_paths)
           return self.create_error_response(str(error))
+      chat_template_kwargs = self._resolve_chat_template_kwargs(
+          request, qwen3_5_reasoning_effort,
+          glm5_next_reasoning_effort)
       tool_choice = self._serialize_tool_choice(request.tool_choice)
 
       #logging.info(request)
@@ -2674,6 +3191,14 @@ class FastLLmCompletion:
           messages, tools, tool_choice)
       messages = self._apply_kimi_k3_required_tool_guidance(
           messages, tools, tool_choice)
+      try:
+          messages, tools = self._apply_dots_tool_choice(
+              messages, tools, tool_choice)
+          messages, tools = self._apply_qwen4_tool_choice(
+              messages, tools, tool_choice, request.parallel_tool_calls)
+      except ValueError as error:
+          self._cleanup_temp_paths(media.temp_paths)
+          return self.create_error_response(str(error))
       effective_request = self._with_effective_tool_choice(
           request, tool_choice)
 
@@ -2692,12 +3217,17 @@ class FastLLmCompletion:
           "videos": model_videos,
           "stop_token_ids": stop_token_ids,
       }
+      if chat_template_kwargs is not None:
+          launch_kwargs["chat_template_kwargs"] = chat_template_kwargs
       if self._is_kimi_k3_model():
           launch_kwargs.update({
               "thinking_effort": thinking_effort,
               "tool_choice": tool_choice,
-              "chat_template_kwargs": request.chat_template_kwargs,
           })
+      elif self._is_deepseek_v41_model() and thinking_effort is not None:
+          # llm.py forwards this to encoding_dsv41.encode_messages as
+          # reasoning_effort.
+          launch_kwargs["thinking_effort"] = thinking_effort
       self._attach_tool_call_constraint_if_supported(
           launch_kwargs, effective_request)
 
@@ -2714,7 +3244,7 @@ class FastLLmCompletion:
               tools = tools,
               thinking_effort = thinking_effort,
               tool_choice = tool_choice,
-              chat_template_kwargs = request.chat_template_kwargs)
+              chat_template_kwargs = chat_template_kwargs)
           launched_handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
           return input_len, launched_handle
@@ -2728,6 +3258,11 @@ class FastLLmCompletion:
                   prepare_and_launch_text_request)
           else:
               input_token_len, handle = prepare_and_launch_text_request()
+      except (ValueError, TemplateError) as error:
+          # Invalid input must not trigger the client's HTTP 500 retry loop.
+          return self.create_error_response(
+              f"Could not prepare model input: {error}",
+              err_type = "invalid_request_error")
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
@@ -2756,6 +3291,9 @@ class FastLLmCompletion:
                   input_token_len, think = need_think_prefix,
                   emit_reasoning_content = emit_reasoning_content,
                   response_statistics = response_statistics)
+          except PromptTooLongError as e:
+              self._release_conversation_handle(request_id, handle)
+              return self.create_error_response(str(e))
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -2776,8 +3314,8 @@ class FastLLmCompletion:
     return True
 
   async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # Starlette runs a StreamingResponse BackgroundTask after both a normal
-    # completion and a client disconnect.  A naturally exhausted generator
+    # SSEStreamingResponse runs cleanup after completion, disconnects and
+    # response failures.  A naturally exhausted generator
     # releases ownership before its terminal SSE is yielded.  Only an
     # interrupted generator remains active here, so abort it while the
     # request_id still owns the integer handle.
@@ -2809,6 +3347,7 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
+      history_raw = result
       if self._is_kimi_k3_model():
           if emit_reasoning_content:
               result, reasoning_content = self._split_kimi_k3_reasoning(
@@ -2819,6 +3358,13 @@ class FastLLmCompletion:
               reasoning_content = None
               if not request.tools:
                   result = self._strip_kimi_k3_response_wrapper(result)
+      elif (self._is_qwen_reasoning_model()
+            or self._is_dots3_note_model()):
+          result, reasoning_content = self._split_qwen3_5_reasoning(
+              result, emit_reasoning_content)
+      elif self._is_glm5_next_model():
+          result, reasoning_content = self._split_glm5_next_reasoning(
+              result, emit_reasoning_content)
       else:
           result, reasoning_content = self._split_deepseek_v4_reasoning(
               result, emit_reasoning_content)
@@ -2828,13 +3374,21 @@ class FastLLmCompletion:
           handle, response_statistics, input_token_len, completion_tokens)
       output_tokens = usage.completion_tokens or 0
 
-      tool_call_info = self._parse_non_stream_tool_calls(result, request)
+      finish_reason = self._chat_finish_reason(
+          output_tokens, request.max_tokens or 32768, stopped_by_stop_string)
+      tool_call_info = self._parse_non_stream_tool_calls(
+          result, request, finish_reason=finish_reason)
       if isinstance(tool_call_info, ErrorResponse):
           if request_id in self.conversation_handles:
               del self.conversation_handles[request_id]
           return tool_call_info
 
       if tool_call_info.tools_called:
+          remember = getattr(self.model, "remember_deepseek_v41_tool_output", None)
+          if callable(remember):
+              remember(history_raw if emit_reasoning_content else result, tool_call_info.content,
+                       [call.model_dump(exclude_none=True) for call in tool_call_info.tool_calls],
+                       thinking=emit_reasoning_content, reasoning_content=reasoning_content)
           choice_data = ChatCompletionResponseChoice(
               index=0,
               message=ChatMessage(
@@ -2855,9 +3409,7 @@ class FastLLmCompletion:
                   reasoning_content=reasoning_content or None,
               ),
               logprobs=None,
-              finish_reason=self._chat_finish_reason(
-                  output_tokens, request.max_tokens or 32768,
-                  stopped_by_stop_string),
+              finish_reason=finish_reason,
           )
 
       response = ChatCompletionResponse(
@@ -2961,6 +3513,12 @@ class FastLLmCompletion:
         current_token_ids = []
         previous_text = ""
         current_text = ""
+        remember = (getattr(self.model, "remember_deepseek_v41_tool_output", None)
+                    if request.tools and self._is_deepseek_v41_model() else None)
+        history_content = ""
+        history_tool_calls = []
+        history_raw_parts = []
+        history_reasoning_parts = []
         reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
         reasoning_state = {
             "active": emit_reasoning_content,
@@ -2979,11 +3537,15 @@ class FastLLmCompletion:
         async for res in result_generator:
             res = self._normalize_model_delta(res)
             completion_tokens += 1
+            if remember:
+                history_raw_parts.append(res)
             delta_text = res
 
             reasoning_delta_messages, delta_text = self._consume_tagged_reasoning_delta(
                 delta_text, reasoning_state)
             for reasoning_delta_message in reasoning_delta_messages:
+                if remember:
+                    history_reasoning_parts.append(reasoning_delta_message.reasoning_content or "")
                 choice_data = ChatCompletionResponseStreamChoice(
                     index = 0,
                     delta = reasoning_delta_message,
@@ -3027,6 +3589,9 @@ class FastLLmCompletion:
                                 current_token_ids = current_token_ids,
                                 delta_token_ids = now_ids)
 
+                if remember:
+                    history_content += parse_result.content or ""
+                    history_tool_calls.extend(call.model_dump(exclude_none=True) for call in parse_result.valid_tool_calls)
                 previous_text += delta_text
                 previous_token_ids += now_ids
                 if parse_result.has_invalid_tool_block:
@@ -3148,7 +3713,8 @@ class FastLLmCompletion:
             stopped_by_stop_string)
         final_stream_error_data = None
         if request.tools and tool_call_parser:
-            final_diagnostics = tool_call_parser.finalize_stream()
+            final_diagnostics = tool_call_parser.finalize_stream(
+                finish_reason=finish_reason)
             if final_diagnostics:
                 diagnostics = self._format_tool_call_diagnostics(
                     final_diagnostics)
@@ -3167,7 +3733,8 @@ class FastLLmCompletion:
                     f"Invalid tool call: {diagnostics}",
                     err_type = "invalid_tool_call",
                 )
-            elif tool_call_parser.has_valid_streamed_tool_calls:
+            elif (tool_call_parser.has_valid_streamed_tool_calls
+                  and not tool_call_parser.incomplete_tool_call):
                 finish_reason = 'tool_calls'
         if final_stream_error_data is not None:
             data = final_stream_error_data
@@ -3202,8 +3769,14 @@ class FastLLmCompletion:
         if (final_stream_error_data is None and request.tools
                 and tool_call_parser):
             flush_result = tool_call_parser.flush_stream_tool_calls()
-            if flush_result.valid_tool_calls:
+            if remember and finish_reason == 'tool_calls':
+                history_content += flush_result.content or ""
+                history_tool_calls.extend(call.model_dump(exclude_none=True) for call in flush_result.valid_tool_calls)
+                remember("".join(history_raw_parts), history_content, history_tool_calls,
+                         thinking=emit_reasoning_content, reasoning_content="".join(history_reasoning_parts))
+            if flush_result.content or flush_result.valid_tool_calls:
                 delta_message = DeltaMessage(
+                    content = flush_result.content,
                     tool_calls = flush_result.valid_tool_calls,
                 )
                 choice_data = ChatCompletionResponseStreamChoice(
@@ -3222,9 +3795,14 @@ class FastLLmCompletion:
                 yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
-        if self._abort_conversation_handle(request_id, handle):
+        # A native context error is terminal: fetching it already freed the
+        # backend handle, which another request may have reused.
+        if isinstance(e, PromptTooLongError):
+          self._release_conversation_handle(request_id, handle)
+        elif self._abort_conversation_handle(request_id, handle):
           logging.info(f"Abort failed streaming request: {request_id}")
-        data = self.create_streaming_error_response(str(e))
+        data = self.create_streaming_error_response(
+            str(e), err_type = "context_length_exceeded" if isinstance(e, PromptTooLongError) else "BadRequestError")
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
 
@@ -3456,7 +4034,9 @@ class FastLLmCompletion:
               "message_stop",
               MessageStopEvent())
       except ValueError as e:
-          if self._abort_conversation_handle(request_id, handle):
+          if isinstance(e, PromptTooLongError):
+              self._release_conversation_handle(request_id, handle)
+          elif self._abort_conversation_handle(request_id, handle):
               logging.info(f"Abort failed Anthropic streaming request: {request_id}")
           error_data = json.dumps({
               "type": "error",
@@ -3475,12 +4055,10 @@ class FastLLmCompletion:
           message: str,
           err_type: str = "BadRequestError",
           status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> str:
-      json_str = json.dumps({
-          "error":
-          self.create_error_response(message=message,
-                                      err_type=err_type,
-                                      status_code=status_code).model_dump()
-      })
+      error = self.create_error_response(message=message, err_type=err_type,
+                                         status_code=status_code).model_dump()
+      error["type"] = err_type
+      json_str = json.dumps({"error": error})
       return json_str
 
   def abort_conversation(self, conversation_id: str) -> bool:

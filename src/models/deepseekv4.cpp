@@ -39,6 +39,8 @@
 #include <condition_variable>
 #include <functional>
 #include <cstdio>
+#include <optional>
+#include <numeric>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -64,6 +66,10 @@ namespace fastllm {
     namespace {
         static constexpr int DEEPSEEK_V4_DSPARK_LOG_INTERVAL = 64;
         static constexpr int DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS = 7;
+        static constexpr float
+            DEEPSEEK_V4_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
+        static constexpr float
+            DEEPSEEK_V4_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
 
         // A DSpark target verification writes a speculative multi-token suffix
         // into the ordinary decode cache.  Keep the compressor raw rows alive
@@ -209,6 +215,21 @@ namespace fastllm {
 #endif
         }
 
+        static bool DeepSeekV4DeviceMapUsesOnlyNuma(
+                const std::map<std::string, int> &deviceMap) {
+            bool found = false;
+            for (const auto &item : deviceMap) {
+                if (item.second <= 0) {
+                    continue;
+                }
+                found = true;
+                if (!DeepSeekV4DeviceSpecUsesType(item.first, "numa")) {
+                    return false;
+                }
+            }
+            return found;
+        }
+
         static bool DeepSeekV4PreferCuda() {
 #ifdef USE_CUDA
             auto *executor = (Executor*)GetExecutor();
@@ -226,6 +247,12 @@ namespace fastllm {
         static void WriteFloatData(const std::vector<float> &values,
                                    const std::vector<int> &dims,
                                    Data &output, DataType dtype);
+
+        struct DeepSeekV4NumasMoeCpuInputWorkspace {
+            Data input;
+            Data index;
+            Data score;
+        };
 
 #ifdef USE_CUDA
         static int GetTensorCudaDevice(const Data &data) {
@@ -269,47 +296,162 @@ namespace fastllm {
             return GetTensorCudaReplica(const_cast<Data&>(data), device);
         }
 
-        static bool CopyDeepSeekV4CudaTensorToCpu(
-            const Data &source, Data &destination
+        static DeepSeekV4NumasMoeCpuInputWorkspace &
+        GetDeepSeekV4NumasMoeCpuInputWorkspace() {
+            static thread_local DeepSeekV4NumasMoeCpuInputWorkspace
+                workspace;
+            return workspace;
+        }
+
+        static bool CopyDeepSeekV4CudaTensorsToCpu(
+            const std::vector<const Data*> &sources,
+            const std::vector<Data*> &destinations
         ) {
-            int device = GetTensorCudaDevice(source);
-            if (device < 0) {
+            if (sources.empty() || sources.size() != destinations.size()) {
                 return false;
             }
-            const Data *replica =
-                GetTensorCudaReplica(source, device);
-            if (replica == nullptr || replica->cudaData == nullptr ||
-                replica->dataType != source.dataType ||
-                replica->dims != source.dims) {
-                return false;
+
+            int device = -1;
+            std::vector<const Data*> replicas;
+            replicas.reserve(sources.size());
+            for (int i = 0; i < (int)sources.size(); i++) {
+                const Data *source = sources[i];
+                Data *destination = destinations[i];
+                if (source == nullptr || destination == nullptr) {
+                    return false;
+                }
+                int sourceDevice = GetTensorCudaDevice(*source);
+                if (sourceDevice < 0 ||
+                    (device >= 0 && sourceDevice != device)) {
+                    return false;
+                }
+                device = sourceDevice;
+                const Data *replica =
+                    GetTensorCudaReplica(*source, device);
+                if (replica == nullptr || replica->cudaData == nullptr ||
+                    replica->dataType != source->dataType ||
+                    replica->dims != source->dims) {
+                    return false;
+                }
+                destination->dataType = source->dataType;
+                destination->Resize(source->dims);
+                destination->Allocate(false);
+                replicas.push_back(replica);
             }
-            destination.dataType = source.dataType;
-            destination.Resize(source.dims);
-            destination.Allocate(false);
+
             FastllmCudaSetDevice(device);
+            const bool useAsyncPrecopy =
+                !sources[0]->dims.empty() &&
+                sources[0]->Count(0) ==
+                    sources[0]->dims.back() &&
+                std::getenv(
+                    "FASTLLM_DSV4_DISABLE_NUMAS_MOE_ASYNC_PRECOPY") ==
+                    nullptr;
+            if (useAsyncPrecopy) {
+                struct PinnedPrecopyWorkspace {
+                    void *data = nullptr;
+                    size_t bytes = 0;
+
+                    ~PinnedPrecopyWorkspace() {
+                        if (data != nullptr) {
+                            FastllmCudaHostFree(data);
+                        }
+                    }
+
+                    bool Ensure(size_t required) {
+                        if (data != nullptr && bytes >= required) {
+                            return true;
+                        }
+                        if (data != nullptr) {
+                            FastllmCudaHostFree(data);
+                            data = nullptr;
+                            bytes = 0;
+                        }
+                        data = FastllmCudaHostMalloc(required);
+                        if (data == nullptr) {
+                            return false;
+                        }
+                        bytes = required;
+                        return true;
+                    }
+                };
+                static thread_local PinnedPrecopyWorkspace workspace;
+                size_t totalBytes = 0;
+                for (const Data *replica : replicas) {
+                    totalBytes += replica->GetBytes();
+                }
+                if (workspace.Ensure(totalBytes)) {
+                    bool workerOrdered =
+                        MultiCudaCurrentThreadWaitForWorker(device);
+                    if (!workerOrdered) {
+                        FastllmCudaSyncDevice(device);
+                    }
+                    bool queued = true;
+                    size_t offset = 0;
+                    for (const Data *replica : replicas) {
+                        const size_t bytes = replica->GetBytes();
+                        queued &=
+                            FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
+                                (uint8_t*)workspace.data + offset,
+                                replica->cudaData, bytes);
+                        offset += bytes;
+                    }
+                    FastllmCudaSyncCurrentThreadStream();
+                    if (queued) {
+                        offset = 0;
+                        for (int i = 0;
+                             i < (int)replicas.size(); i++) {
+                            const size_t bytes =
+                                replicas[i]->GetBytes();
+                            memcpy(
+                                destinations[i]->cpuData,
+                                (uint8_t*)workspace.data + offset,
+                                bytes);
+                            destinations[i]->cudaData =
+                                replicas[i]->cudaData;
+                            destinations[i]->cudaDataBorrowed = true;
+                            destinations[i]->dataDeviceIds = {device};
+                            offset += bytes;
+                        }
+                        return true;
+                    }
+                }
+            }
             // Persistent tensor-parallel operators publish their results from
             // per-device worker streams.  RunMultiCudaDeviceOps wires those
             // completion events into the caller's per-thread stream, but the
-            // synchronous cudaMemcpy used below runs on CUDA's legacy copy
-            // path and does not reliably observe that stream dependency.
-            // Finish the caller stream explicitly before handing routing data
-            // to the NUMA MoE implementation.
+            // synchronous cudaMemcpy calls below run on CUDA's legacy copy
+            // path and do not reliably observe that stream dependency.
+            // All routing tensors are ordered on the same worker stream, so a
+            // single ready barrier covers the whole group.  This removes two
+            // stream synchronizations per MoE layer without changing the NUMA
+            // allocation or host-copy semantics.
             if (MultiCudaCurrentThreadWaitForWorker(device)) {
                 FastllmCudaSyncCurrentThreadStream();
             } else {
                 FastllmCudaSyncDevice(device);
             }
-            FastllmCudaCopyFromDeviceToHost(
-                destination.cpuData, replica->cudaData,
-                destination.GetBytes());
-            // Keep the source allocation as a non-owning mirror.  NUMA MoE
-            // uses the CPU copy for its local experts, while mixed inference
-            // can still recognize that this tensor genuinely came from CUDA
-            // and reuse the existing replica instead of staging it again.
-            destination.cudaData = replica->cudaData;
-            destination.cudaDataBorrowed = true;
-            destination.dataDeviceIds = {device};
+            for (int i = 0; i < (int)replicas.size(); i++) {
+                Data *destination = destinations[i];
+                const Data *replica = replicas[i];
+                FastllmCudaCopyFromDeviceToHost(
+                    destination->cpuData, replica->cudaData,
+                    destination->GetBytes());
+                // Keep the source allocation as a non-owning mirror.  NUMA
+                // MoE uses the CPU copy for its local experts, while mixed
+                // inference can still reuse the genuine CUDA replica.
+                destination->cudaData = replica->cudaData;
+                destination->cudaDataBorrowed = true;
+                destination->dataDeviceIds = {device};
+            }
             return true;
+        }
+
+        static bool CopyDeepSeekV4CudaTensorToCpu(
+            const Data &source, Data &destination
+        ) {
+            return CopyDeepSeekV4CudaTensorsToCpu(
+                {&source}, {&destination});
         }
 
         static bool DeepSeekV4NumasGpuPrefillEnabled() {
@@ -4279,11 +4421,26 @@ namespace fastllm {
         Data *decodeMeta = nullptr;
     };
 
+    struct DeepSeekV4CudaGraphSegmentState {
+        // A segment owns one graph per TP rank.  The saved host-side shapes
+        // reproduce the metadata mutations that are skipped during replay.
+        std::vector<void*> graphs;
+        std::vector<void*> execs;
+        std::vector<int> ffnDims;
+        std::vector<int> ffnInputDims;
+        std::vector<int> expertIndexDims;
+        std::vector<int> expertScoreDims;
+    };
+
     struct DeepSeekV4CudaGraphState {
         std::mutex mutex;
         bool warmed = false;
         int warmupRounds = 0;
         bool captured = false;
+        bool segmentedCaptured = false;
+        bool segmentedCapture = false;
+        bool segmentedReplay = false;
+        bool segmentedCaptureFailed = false;
         bool disabled = false;
         bool capturing = false;
         bool indexerScorerMode = false;
@@ -4299,11 +4456,31 @@ namespace fastllm {
         std::vector<std::unique_ptr<DeepSeekV4CudaGraphDeviceState> > devices;
         std::map<int, DeepSeekV4CudaGraphDeviceState*> deviceIndex;
         std::vector<int> launchOrder;
+        std::vector<DeepSeekV4CudaGraphSegmentState> segments;
         std::vector<void*> reservedPointers;
 
         DeepSeekV4CudaGraphState() : workspace(new DeepSeekV4DecodeWorkspace()) {}
 
         void DestroyCapturedGraph() {
+            for (auto &segment : segments) {
+                for (int i = 0; i < (int)segment.execs.size() &&
+                                i < (int)devices.size(); i++) {
+                    if (segment.execs[i] != nullptr) {
+                        FastllmCudaSetDevice(devices[i]->device);
+                        FastllmCudaGraphExecDestroy(segment.execs[i]);
+                        segment.execs[i] = nullptr;
+                    }
+                }
+                for (int i = 0; i < (int)segment.graphs.size() &&
+                                i < (int)devices.size(); i++) {
+                    if (segment.graphs[i] != nullptr) {
+                        FastllmCudaSetDevice(devices[i]->device);
+                        FastllmCudaGraphDestroy(segment.graphs[i]);
+                        segment.graphs[i] = nullptr;
+                    }
+                }
+            }
+            segments.clear();
             for (auto &device : devices) {
                 if (device->exec != nullptr) {
                     FastllmCudaSetDevice(device->device);
@@ -4321,6 +4498,10 @@ namespace fastllm {
                 reservedPointers.clear();
             }
             captured = false;
+            segmentedCaptured = false;
+            segmentedCapture = false;
+            segmentedReplay = false;
+            segmentedCaptureFailed = false;
             warmed = false;
             warmupRounds = 0;
             capturing = false;
@@ -4410,6 +4591,189 @@ namespace fastllm {
         }
 
     };
+
+    static bool LaunchDeepSeekV4CudaGraphSegment(
+            DeepSeekV4CudaGraphState &state, int segmentIndex) {
+        if (segmentIndex < 0 || segmentIndex >= (int)state.segments.size() ||
+            state.devices.empty()) {
+            return false;
+        }
+        DeepSeekV4CudaGraphSegmentState &segment =
+            state.segments[segmentIndex];
+        if (segment.execs.size() != state.devices.size()) {
+            return false;
+        }
+        std::vector<int> devices;
+        devices.reserve(state.devices.size());
+        for (const auto &device : state.devices) {
+            devices.push_back(device->device);
+        }
+        std::vector<int> launchOk(devices.size(), 0);
+        std::atomic<int> launchReady{0};
+        const int launchCount = (int)devices.size();
+        std::function<void(int, int)> launchOne =
+            [&](int rank, int device) {
+                bool ready = rank >= 0 && rank < launchCount &&
+                    state.devices[rank]->device == device &&
+                    segment.execs[rank] != nullptr;
+                launchReady.fetch_add(1, std::memory_order_release);
+                while (launchReady.load(std::memory_order_acquire) <
+                       launchCount) {
+                    std::this_thread::yield();
+                }
+                if (ready) {
+                    FastllmCudaSetDevice(device);
+                    launchOk[rank] = FastllmCudaGraphLaunch(
+                        segment.execs[rank]) ? 1 : 0;
+                }
+            };
+        bool previousAsync = MultiCudaSetPersistentAsyncDispatch(true);
+        bool launched = MultiCudaRunDeviceCallbacks(devices, launchOne);
+        MultiCudaSetPersistentAsyncDispatch(previousAsync);
+        return launched && std::all_of(
+            launchOk.begin(), launchOk.end(),
+            [](int value) { return value != 0; });
+    }
+
+    static bool CaptureDeepSeekV4CudaGraphSegment(
+            DeepSeekV4CudaGraphState &state,
+            const std::function<void()> &body,
+            const std::vector<int> &ffnDims,
+            const Data &ffnInput,
+            const Data &expertIndex,
+            const Data &expertScore) {
+        if (state.devices.empty() || state.segmentedCaptureFailed) {
+            return false;
+        }
+        const int originalDevice = FastllmCudaGetDevice();
+        const int deviceCount = (int)state.devices.size();
+        DeepSeekV4CudaGraphSegmentState segment;
+        segment.graphs.assign(deviceCount, nullptr);
+        segment.execs.assign(deviceCount, nullptr);
+
+        int begunCaptures = 0;
+        bool captureOk = true;
+        for (const auto &device : state.devices) {
+            FastllmCudaSetDevice(device->device);
+            if (!FastllmCudaGraphBeginCapture()) {
+                captureOk = false;
+                break;
+            }
+            begunCaptures++;
+        }
+
+        std::vector<int> devices;
+        std::vector<void*> workerStartEvents;
+        std::vector<void*> workerEndEvents;
+        devices.reserve(deviceCount);
+        workerStartEvents.reserve(deviceCount);
+        workerEndEvents.reserve(deviceCount);
+        for (const auto &device : state.devices) {
+            devices.push_back(device->device);
+            workerStartEvents.push_back(device->workerStartEvent);
+            workerEndEvents.push_back(device->workerEndEvent);
+        }
+
+        bool workersJoined = false;
+        if (captureOk) {
+            for (const auto &device : state.devices) {
+                FastllmCudaSetDevice(device->device);
+                FastllmCudaEventRecordCurrentThread(
+                    device->workerStartEvent);
+            }
+            workersJoined = MultiCudaGraphWorkersWaitEvents(
+                devices, workerStartEvents);
+            captureOk = workersJoined;
+        }
+
+        if (captureOk) {
+            state.capturing = true;
+            body();
+            state.capturing = false;
+            captureOk = !FastllmCudaGetThreadError() &&
+                        !FastllmCudaGetGraphError();
+        }
+
+        if (workersJoined) {
+            if (!MultiCudaGraphWorkersRecordEvents(
+                    devices, workerEndEvents)) {
+                captureOk = false;
+            }
+            for (const auto &device : state.devices) {
+                FastllmCudaSetDevice(device->device);
+                FastllmCudaCurrentThreadStreamWaitEvent(
+                    device->workerEndEvent);
+            }
+        }
+
+        if (begunCaptures == deviceCount) {
+            for (const auto &device : state.devices) {
+                FastllmCudaSetDevice(device->device);
+                if (FastllmCudaGraphCaptureInvalidated()) {
+                    captureOk = false;
+                }
+            }
+        } else {
+            captureOk = false;
+        }
+
+        bool endOk = begunCaptures == deviceCount;
+        for (int index = 0; index < begunCaptures; index++) {
+            FastllmCudaSetDevice(state.devices[index]->device);
+            void *graph = nullptr;
+            bool oneEndOk = FastllmCudaGraphEndCapture(&graph) &&
+                            graph != nullptr;
+            if (oneEndOk) {
+                segment.graphs[index] = graph;
+            } else if (graph != nullptr) {
+                FastllmCudaGraphDestroy(graph);
+            }
+            endOk &= oneEndOk;
+        }
+        captureOk &= endOk;
+
+        if (captureOk) {
+            for (int index = 0; index < deviceCount; index++) {
+                FastllmCudaSetDevice(state.devices[index]->device);
+                if (!FastllmCudaGraphInstantiate(
+                        segment.graphs[index], &segment.execs[index]) ||
+                    segment.execs[index] == nullptr) {
+                    captureOk = false;
+                    break;
+                }
+            }
+        }
+
+        segment.ffnDims = ffnDims;
+        segment.ffnInputDims = ffnInput.dims;
+        segment.expertIndexDims = expertIndex.dims;
+        segment.expertScoreDims = expertScore.dims;
+        if (captureOk) {
+            state.segments.push_back(std::move(segment));
+            captureOk = LaunchDeepSeekV4CudaGraphSegment(
+                state, (int)state.segments.size() - 1);
+            if (!captureOk) {
+                segment = std::move(state.segments.back());
+                state.segments.pop_back();
+            }
+        }
+
+        if (!captureOk) {
+            for (int index = 0; index < deviceCount; index++) {
+                FastllmCudaSetDevice(state.devices[index]->device);
+                if (segment.execs[index] != nullptr) {
+                    FastllmCudaGraphExecDestroy(segment.execs[index]);
+                }
+                if (segment.graphs[index] != nullptr) {
+                    FastllmCudaGraphDestroy(segment.graphs[index]);
+                }
+            }
+            state.segmentedCaptureFailed = true;
+        }
+        state.capturing = false;
+        FastllmCudaSetDevice(originalDevice);
+        return captureOk;
+    }
 
     // DSpark's three-layer draft has a fixed seven-row shape, but its anchor,
     // absolute position and 128-row main-model KV window change every round.
@@ -5630,6 +5994,41 @@ namespace fastllm {
                               other.indexerCompressorScoreRaw);
         CopyHistoryTensorData(indexerCompressedKV,
                               other.indexerCompressedKV);
+        return *this;
+    }
+
+    DeepSeekV4HistoryCacheMemory::DeepSeekV4HistoryCacheMemory(
+            const DeepSeekV4HistoryCacheMemory &other) {
+        *this = other;
+    }
+
+    DeepSeekV4HistoryCacheMemory &
+    DeepSeekV4HistoryCacheMemory::operator=(
+            const DeepSeekV4HistoryCacheMemory &other) {
+        if (this == &other) {
+            return *this;
+        }
+        inputToken = other.inputToken;
+        tokens = other.tokens;
+        blockCount = other.blockCount;
+        blockHash = other.blockHash;
+        recordTimes = other.recordTimes;
+        flushTime = other.flushTime;
+        layers = other.layers;
+        dsparkValid = other.dsparkValid;
+        dsparkCommittedTokens = other.dsparkCommittedTokens;
+        dsparkHistoryTokens = other.dsparkHistoryTokens;
+        dsparkMainWindowKV.resize(other.dsparkMainWindowKV.size());
+        for (size_t stage = 0;
+             stage < other.dsparkMainWindowKV.size(); ++stage) {
+            // Data has a deep-copy constructor but no deep-copy assignment.
+            // Prefix-cache replacement and lookup both use assignment, so an
+            // implicit vector<Data> assignment would alias cpuData and later
+            // double-free the DSpark snapshot.
+            CopyHistoryTensorData(
+                dsparkMainWindowKV[stage],
+                other.dsparkMainWindowKV[stage]);
+        }
         return *this;
     }
 
@@ -7107,7 +7506,10 @@ namespace fastllm {
         num_hash_layers = GetIntWithFallback(this->weight, {"num_hash_layers", "n_hash_layers"}, num_hash_layers);
         num_nextn_predict_layers = GetIntWithFallback(this->weight, {"num_nextn_predict_layers", "n_mtp_layers"}, num_nextn_predict_layers);
 
-        dsparkTokens = std::max(0, EnvInt("FASTLLM_DSPARK_TOKENS", 0));
+        // DeepSeek-V4.1 的 mtp.* 与本类的内置 DSpark 同名但结构不同（markov head 是
+        // embed + head、草稿层 128 专家 top-3、目标层取自主干），由子类自行解析与实现。
+        dsparkTokens = UsesEmbeddedV4Dspark() ?
+                       std::max(0, EnvInt("FASTLLM_DSPARK_TOKENS", 0)) : 0;
         dsparkEnabled = dsparkTokens > 0;
         if (dsparkEnabled) {
             // The model-specific scheduler can drain several already-verified
@@ -7609,14 +8011,59 @@ namespace fastllm {
         context.committedTokens += tokens;
     }
 
+    bool DeepSeekV4Model::DsparkSupportsGenerationConfig(
+            const GenerationConfig &generationConfig) const {
+        GenerationConfig effectiveConfig = generationConfig;
+        PrepareDeepSeekV4SamplingConfig(effectiveConfig);
+        const bool simpleGreedy = effectiveConfig.IsSimpleGreedy();
+        const bool mixedCudaNuma =
+            DeepSeekV4DeviceMapUsesSingleCuda(this->deviceMap) &&
+            DeepSeekV4DeviceMapUsesOnlyNuma(this->moeDeviceMap) &&
+            (this->layeredMoeDeviceMap.empty() ||
+             DeepSeekV4DeviceMapUsesOnlyNuma(
+                 this->layeredMoeDeviceMap));
+        const bool samplingSupported =
+            !simpleGreedy && mixedCudaNuma &&
+            effectiveConfig.top_k > 1 &&
+            std::isfinite(effectiveConfig.temperature) &&
+            effectiveConfig.temperature > 0.0f &&
+            std::isfinite(effectiveConfig.top_p) &&
+            effectiveConfig.top_p > 0.0f &&
+            effectiveConfig.top_p <= 1.0f;
+        return dsparkEnabled && (simpleGreedy || samplingSupported) &&
+            !effectiveConfig.output_logits &&
+            effectiveConfig.tool_call_allowed_token_ids.empty() &&
+            std::isfinite(effectiveConfig.repeat_penalty) &&
+            std::fabs(effectiveConfig.repeat_penalty - 1.0f) <= 1.0e-6f &&
+            !effectiveConfig.tool_call_name_constraint_enabled &&
+            !effectiveConfig.tool_call_parameter_name_constraint_enabled &&
+            !effectiveConfig.tool_call_content_sampling_enabled &&
+            // Per-row minimum-length EOS masking needs one full logits tensor;
+            // tensor-parallel verification keeps its logits sharded.
+            (effectiveConfig.output_token_least <= 0 ||
+             DeepSeekV4DeviceMapUsesSingleCuda(this->deviceMap));
+    }
+
     std::vector<int> DeepSeekV4Model::SampleDsparkTargetRows(
             Data &headInput,
+            const GenerationConfig &generationConfig,
+            const std::vector<int> &proposalTokens,
+            std::vector<unsigned char> &verificationAccepted,
             DeepSeekV4DsparkContext *persistentContext) {
         AssertInFastLLM(
             headInput.dims.size() == 3 && headInput.dims[0] == 1 &&
             headInput.dims[1] > 0 && headInput.dims[2] == embed_dim,
             "DSpark target head capture has an invalid shape.");
         const int rows = headInput.dims[1];
+        GenerationConfig effectiveConfig = generationConfig;
+        PrepareDeepSeekV4SamplingConfig(effectiveConfig);
+        const bool sampledVerification =
+            !effectiveConfig.IsSimpleGreedy();
+        AssertInFastLLM(
+            !sampledVerification ||
+                (int)proposalTokens.size() >= rows - 1,
+            "DeepSeek-V4 MTP rejection sampling input is incomplete.");
+        verificationAccepted.clear();
 #ifdef USE_CUDA
         struct ScopedDsparkSamplingAsync {
             bool active = false;
@@ -7639,6 +8086,8 @@ namespace fastllm {
             persistentContext == nullptr ? nullptr :
                 &persistentContext->targetCapture;
         const bool useGraphSampling =
+            !sampledVerification &&
+            effectiveConfig.output_token_least <= 0 &&
             graphCapture != nullptr && graphCapture->samplingReady &&
             graphCapture->samplingLogitsFloat != nullptr &&
             graphCapture->samplingGreedyIds != nullptr &&
@@ -7661,17 +8110,6 @@ namespace fastllm {
             samplingInput.Reshape({rows, 1, embed_dim});
             samplingInputPtr = &samplingInput;
         }
-        GenerationConfig greedy;
-        greedy.do_sample = false;
-        greedy.top_k = 1;
-        greedy.repeat_penalty = 1.0f;
-        greedy.output_token_least = 0;
-        greedy.output_logits = false;
-        std::vector<GenerationConfig> configs(rows, greedy);
-        std::vector<int> seqLens(rows, 1);
-        LastTokensManager emptyLastTokens(rows, greedy.last_n);
-        std::vector<std::pair<Data*, Data*> > emptyPast;
-        std::vector<int> sampled;
         Data *precomputedLogits = useGraphSampling ?
             graphCapture->samplingLogitsFloat : nullptr;
         Data *precomputedGreedyIds = useGraphSampling ?
@@ -7680,24 +8118,162 @@ namespace fastllm {
             graphCapture->samplingGreedyScores : nullptr;
         const std::map<int, void*> *precomputedReadyEvents =
             useGraphSampling ? &graphCapture->samplingReadyEvents : nullptr;
-        if (!useGraphSampling && persistentContext != nullptr) {
+        Data localSamplingLogits;
+        Data localSamplingLogitsFloat;
+        if (!useGraphSampling) {
             RMSNorm(samplingInput, weight["norm.weight"], rms_norm_eps,
                     samplingInput);
+            Data &samplingLogits = persistentContext == nullptr ?
+                localSamplingLogits :
+                persistentContext->targetSamplingLogits;
+            Data &samplingLogitsFloat = persistentContext == nullptr ?
+                localSamplingLogitsFloat :
+                persistentContext->targetSamplingLogitsFloat;
             Linear(samplingInput, weight["head.weight"], *GetEmptyData(),
-                   persistentContext->targetSamplingLogits);
-            ToDataType(persistentContext->targetSamplingLogits,
-                       persistentContext->targetSamplingLogitsFloat,
+                   samplingLogits);
+            ToDataType(samplingLogits, samplingLogitsFloat,
                        DataType::FLOAT32);
-            precomputedLogits =
-                &persistentContext->targetSamplingLogitsFloat;
+            precomputedLogits = &samplingLogitsFloat;
         }
-        LLMSamplingBlock(
-            this, samplingInputPtr, &weight["norm.weight"],
-            &weight["head.weight"], rms_norm_eps, rows, true,
-            seqLens, emptyPast, configs, emptyLastTokens,
-            nullptr, sampled, precomputedLogits,
-            precomputedGreedyIds, precomputedGreedyScores,
-            precomputedReadyEvents);
+
+        if (effectiveConfig.output_token_least > 0) {
+            AssertInFastLLM(
+                precomputedLogits != nullptr &&
+                !precomputedLogits->dims.empty() &&
+                !precomputedLogits->multiDeviceData &&
+                precomputedLogits->Count(0) ==
+                    (uint64_t)rows * precomputedLogits->dims.back(),
+                "DeepSeek-V4 MTP minimum-length masking requires full logits.");
+            std::vector<int> resetLengths(rows, 0);
+            std::vector<int> eosIds = {this->eos_token_id};
+            eosIds.insert(eosIds.end(), this->eos_token_ids.begin(),
+                          this->eos_token_ids.end());
+            eosIds.insert(eosIds.end(),
+                          effectiveConfig.stop_token_ids.begin(),
+                          effectiveConfig.stop_token_ids.end());
+            bool needsReset = false;
+            for (int row = 0; row < rows; ++row) {
+                const int cacheLength =
+                    (persistentContext == nullptr ? 0 :
+                     persistentContext->committedTokens) + row + 1;
+                resetLengths[row] =
+                    effectiveConfig.output_token_least - cacheLength +
+                    effectiveConfig.input_token_length;
+                needsReset |= resetLengths[row] > 0;
+            }
+            if (needsReset) {
+                if (precomputedLogits->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                    std::vector<int> eosCounts(rows, (int)eosIds.size());
+                    std::vector<int> flattenedEosIds;
+                    flattenedEosIds.reserve((size_t)rows * eosIds.size());
+                    for (int row = 0; row < rows; ++row) {
+                        flattenedEosIds.insert(flattenedEosIds.end(),
+                                               eosIds.begin(), eosIds.end());
+                    }
+                    FastllmResetLogitsOfEOS(
+                        rows, precomputedLogits, resetLengths,
+                        eosCounts, flattenedEosIds);
+#endif
+                } else {
+                    precomputedLogits->ToDevice(DataDevice::CPU);
+                    const int vocab = precomputedLogits->dims.back();
+                    float *values = reinterpret_cast<float *>(
+                        precomputedLogits->cpuData);
+                    for (int row = 0; row < rows; ++row) {
+                        if (resetLengths[row] <= 0) {
+                            continue;
+                        }
+                        for (int token : eosIds) {
+                            if (token >= 0 && token < vocab) {
+                                values[(size_t)row * vocab + token] =
+                                    -1.0e30f;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        std::vector<int> sampled;
+        if (sampledVerification) {
+#ifdef USE_CUDA
+            AssertInFastLLM(
+                precomputedLogits != nullptr &&
+                precomputedLogits->dataDevice == DataDevice::CUDA &&
+                precomputedLogits->dataType == DataType::FLOAT32 &&
+                precomputedLogits->cudaData != nullptr &&
+                !precomputedLogits->multiDeviceData &&
+                !precomputedLogits->dims.empty() &&
+                precomputedLogits->Count(0) ==
+                    (uint64_t)rows * precomputedLogits->dims.back(),
+                "DeepSeek-V4 MTP rejection sampling requires full CUDA logits.");
+            const int device = GetPointerDeviceId(
+                precomputedLogits->cudaData);
+            AssertInFastLLM(
+                device >= 0,
+                "DeepSeek-V4 MTP rejection sampling has no CUDA device.");
+            const int previousDevice = FastllmCudaGetDevice();
+            struct ScopedSamplingDeviceRestore {
+                int previousDevice;
+                ~ScopedSamplingDeviceRestore() {
+                    FastllmCudaSetDevice(previousDevice);
+                }
+            } restoreSamplingDevice{previousDevice};
+            FastllmCudaSetDevice(device);
+            std::vector<float> temperatures(
+                rows, std::max(effectiveConfig.temperature, 1.0e-6f));
+            std::vector<int> topKs(
+                rows, std::max(1, effectiveConfig.top_k));
+            std::vector<float> topPs(rows, effectiveConfig.top_p);
+            const int candidateCount = rows - 1;
+            std::vector<int> candidateRows(candidateCount);
+            std::iota(candidateRows.begin(), candidateRows.end(), 0);
+            sampled.assign(rows, -1);
+            verificationAccepted.assign(candidateCount, 0);
+            std::vector<int> recoveredIds(candidateCount, -1);
+            AssertInFastLLM(
+                FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+                    reinterpret_cast<float *>(
+                        precomputedLogits->cudaData),
+                    temperatures.data(), topKs.data(), topPs.data(),
+                    sampled.data(), rows, precomputedLogits->dims.back(),
+                    proposalTokens.data(), candidateRows.data(),
+                    verificationAccepted.data(), recoveredIds.data(),
+                    candidateCount,
+                    DEEPSEEK_V4_MTP_TYPICAL_POSTERIOR_THRESHOLD,
+                    DEEPSEEK_V4_MTP_TYPICAL_POSTERIOR_ALPHA),
+                "DeepSeek-V4 CUDA MTP rejection sampling failed.");
+            // Accepted rows commit their draft token.  On the first rejected
+            // row, recover with the verifier's target argmax; the final row is
+            // an independently sampled bonus token when every draft survives.
+            for (int row = 0; row < candidateCount; ++row) {
+                sampled[row] = recoveredIds[row];
+            }
+#else
+            AssertInFastLLM(
+                false,
+                "DeepSeek-V4 MTP rejection sampling requires CUDA.");
+#endif
+        } else {
+            GenerationConfig greedy = effectiveConfig;
+            greedy.do_sample = false;
+            greedy.top_k = 1;
+            greedy.repeat_penalty = 1.0f;
+            greedy.output_token_least = 0;
+            greedy.output_logits = false;
+            std::vector<GenerationConfig> configs(rows, greedy);
+            std::vector<int> seqLens(rows, 1);
+            LastTokensManager emptyLastTokens(rows, greedy.last_n);
+            std::vector<std::pair<Data*, Data*> > emptyPast;
+            LLMSamplingBlock(
+                this, samplingInputPtr, &weight["norm.weight"],
+                &weight["head.weight"], rms_norm_eps, rows, true,
+                seqLens, emptyPast, configs, emptyLastTokens,
+                nullptr, sampled, precomputedLogits,
+                precomputedGreedyIds, precomputedGreedyScores,
+                precomputedReadyEvents);
+        }
         if (useGraphSampling) {
             // The root gather waits every replay-done event and synchronizes
             // its stream before returning.  All verifier ranks are therefore
@@ -9773,6 +10349,10 @@ namespace fastllm {
 
         const int anchorToken = tokenIds[0];
         const int oldTokens = context.committedTokens;
+        GenerationConfig effectiveSamplingConfig = generationConfig;
+        PrepareDeepSeekV4SamplingConfig(effectiveSamplingConfig);
+        const bool sampledVerification =
+            !effectiveSamplingConfig.IsSimpleGreedy();
         using DsparkProfileClock = std::chrono::steady_clock;
         const int dsparkTargetOnlyCooldownRounds = std::max(
             0, std::min(
@@ -9791,7 +10371,8 @@ namespace fastllm {
         if (!dsparkLogPrinted.exchange(true)) {
             std::printf(
                 "[DeepSeek-V4 DSpark] enabled: layers=%d, "
-                "drafts_per_step=%d, acceptance=exact, "
+                "drafts_per_step=%d, "
+                "acceptance=exact(greedy)/typical(sampling), "
                 "log_interval=%d validations.\n",
                 dsparkLayers, dsparkTokens,
                 DEEPSEEK_V4_DSPARK_LOG_INTERVAL);
@@ -9932,6 +10513,7 @@ namespace fastllm {
             targetSubmitBegin, DsparkProfileClock::now());
         const auto targetFinishBegin = DsparkProfileClock::now();
         std::vector<int> targetRows;
+        std::vector<unsigned char> verificationAccepted;
         DeepSeekV4DsparkProposal pipelinedProposal;
         bool gpuPostprocess = false;
         int gpuAccepted = -1;
@@ -9940,6 +10522,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         const int verifyRows = verifyTokens;
         bool gpuPostprocessEligible =
+            !sampledVerification &&
             verifyDrafts == dsparkTokens && proposal.gpuDeferred &&
             capture.samplingReady &&
             capture.contextReady && capture.contextRows == verifyRows &&
@@ -10194,7 +10777,7 @@ namespace fastllm {
                 proposal.gpuTokens = nullptr;
                 proposal.gpuReadySignal = nullptr;
                 proposal.gpuReadySeen = nullptr;
-                for (int token = 0; token < dsparkTokens; ++token) {
+                for (int token = 0; token < verifyDrafts; ++token) {
                     verifyIds[token + 1] = proposal.tokens[token];
                 }
                 capture.samplingDevicesDrained = true;
@@ -10207,9 +10790,6 @@ namespace fastllm {
             }
         }
 
-        if (!gpuPostprocess) {
-            targetRows = SampleDsparkTargetRows(capture.headInput, &context);
-        }
         if (!gpuPostprocess && proposal.gpuDeferred) {
             AssertInFastLLM(
                 proposal.gpuTokens != nullptr &&
@@ -10224,12 +10804,19 @@ namespace fastllm {
                 proposal.tokens.data(), proposal.gpuTokens->cudaData,
                 proposal.tokens.size() * sizeof(int));
             proposal.gpuDeferred = false;
-            for (int token = 0; token < dsparkTokens; ++token) {
+            for (int token = 0; token < verifyDrafts; ++token) {
                 verifyIds[token + 1] = proposal.tokens[token];
             }
         }
+        if (!gpuPostprocess) {
+            targetRows = SampleDsparkTargetRows(
+                capture.headInput, effectiveSamplingConfig,
+                proposal.tokens, verificationAccepted, &context);
+        }
 #else
-        targetRows = SampleDsparkTargetRows(capture.headInput, &context);
+        targetRows = SampleDsparkTargetRows(
+            capture.headInput, effectiveSamplingConfig,
+            proposal.tokens, verificationAccepted, &context);
 #endif
         dsparkTargetFinishMs = dsparkElapsedMs(
             targetFinishBegin, DsparkProfileClock::now());
@@ -10260,10 +10847,19 @@ namespace fastllm {
         AssertInFastLLM(
             (int)targetRows.size() == verifyTokens,
             "DSpark target verification returned an invalid row count.");
+        AssertInFastLLM(
+            !sampledVerification ||
+                (int)verificationAccepted.size() == verifyDrafts,
+            "DeepSeek-V4 MTP rejection sampling returned an invalid shape.");
 
         int accepted = 0;
-        while (accepted < verifyDrafts &&
-               proposal.tokens[accepted] == targetRows[accepted]) {
+        while (accepted < verifyDrafts) {
+            const bool acceptsCandidate = sampledVerification ?
+                verificationAccepted[accepted] != 0 :
+                proposal.tokens[accepted] == targetRows[accepted];
+            if (!acceptsCandidate) {
+                break;
+            }
             accepted++;
         }
         const int nextToken = targetRows[accepted];
@@ -10445,8 +11041,7 @@ namespace fastllm {
                                  const GenerationConfig &generationConfig,
                                  const LastTokensManager &lastTokens,
                                  std::vector <float> *retLogits) {
-        if (dsparkEnabled && generationConfig.IsSimpleGreedy() &&
-            !generationConfig.output_logits) {
+        if (DsparkSupportsGenerationConfig(generationConfig)) {
             return ForwardDspark(inputIds, pastKeyValues,
                                  generationConfig, lastTokens, retLogits);
         }
@@ -10676,6 +11271,21 @@ namespace fastllm {
         const int graphPlannedMaxTokens = (int)std::max(
             (long long)originalStartPos + seqlen, plannedGraphEnd);
         bool graphRequested = DeepSeekV4DecodeCudaGraphEnabled();
+        bool segmentedGraphRequested = false;
+        // Routed NUMA MoE performs host copies and synchronizations that cannot
+        // live inside a full-model CUDA graph.  TP decode can still capture the
+        // contiguous CUDA portion before each NUMA boundary independently.
+        if (graphRequested && !dsparkGraphVerification && seqlen == 1 &&
+            DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap)) {
+            for (int layer = 0; layer < block_cnt; layer++) {
+                const std::string moeDevice =
+                    this->SelectMoeDeviceForLayer(layer);
+                if (DeepSeekV4DeviceSpecUsesType(moeDevice, "numa")) {
+                    segmentedGraphRequested = true;
+                    break;
+                }
+            }
+        }
         const bool graphSequenceSupported =
             seqlen == 1 || dsparkGraphVerification;
         if (graphRequested && batch == 1 && graphSequenceSupported &&
@@ -10697,13 +11307,16 @@ namespace fastllm {
                 graphPlannedMaxTokens / 4 > 512;
             const bool actualIndexerScorerMode =
                 (originalStartPos + seqlen) / 4 > 512;
-            if (!graphState->captured && !graphState->warmed &&
+            if (!graphState->captured && !graphState->segmentedCaptured &&
+                !graphState->warmed &&
                 graphState->graphMaxTokens == 0) {
                 // Latch the request-wide plan before its first warmup.  A long
                 // request starts with the scorer enabled so it never needs a
                 // mid-generation recapture.
                 graphState->indexerScorerMode = desiredIndexerScorerMode;
-            } else if ((graphState->captured || graphState->warmed) &&
+            } else if ((graphState->captured ||
+                        graphState->segmentedCaptured ||
+                        graphState->warmed) &&
                        !graphState->indexerScorerMode &&
                        actualIndexerScorerMode) {
                 // With no usable output bound, preserve correctness when the
@@ -10718,7 +11331,8 @@ namespace fastllm {
             // costs several milliseconds on the decode critical path.  The
             // captured fast path only stages its fixed-shape mutable inputs. Shape or
             // capacity changes fall through to the complete validation below.
-            bool capturedReplayPrepared = graphState->captured &&
+            bool capturedReplayPrepared =
+                (graphState->captured || graphState->segmentedCaptured) &&
                 graphState->graphMaxTokens >= originalStartPos + seqlen &&
                 graphState->inputDevice >= 0 &&
                 graphState->workspace != nullptr &&
@@ -10735,7 +11349,8 @@ namespace fastllm {
             if (capturedReplayPrepared) {
                 for (const auto &deviceState : graphState->devices) {
                     if (deviceState == nullptr || deviceState->device < 0 ||
-                        deviceState->exec == nullptr ||
+                        (graphState->captured &&
+                         deviceState->exec == nullptr) ||
                         deviceState->decodeMeta == nullptr ||
                         deviceState->decodeMeta->cudaData == nullptr) {
                         capturedReplayPrepared = false;
@@ -10743,6 +11358,22 @@ namespace fastllm {
                         break;
                     }
                     graphDevices.push_back(deviceState->device);
+                }
+                if (capturedReplayPrepared &&
+                    graphState->segmentedCaptured) {
+                    capturedReplayPrepared =
+                        (int)graphState->segments.size() == block_cnt;
+                    for (const auto &segment : graphState->segments) {
+                        if (!capturedReplayPrepared ||
+                            segment.execs.size() !=
+                                graphState->devices.size() ||
+                            std::any_of(
+                                segment.execs.begin(), segment.execs.end(),
+                                [](void *exec) { return exec == nullptr; })) {
+                            capturedReplayPrepared = false;
+                            break;
+                        }
+                    }
                 }
             }
             if (capturedReplayPrepared) {
@@ -11122,15 +11753,25 @@ namespace fastllm {
         bool persistentTpAsync = multiCudaTensorParallel && batch == 1 &&
                                  ((seqlen == 1 && originalStartPos > 0) ||
                                   seqlen > 1);
+        // The direct fused helper launches with raw CUDA pointers on the
+        // executor's current device.  A serial device map can switch that
+        // device between layers while the residual still belongs to the
+        // previous GPU, so let the generic Executor path perform the boundary
+        // transfer.  Single-CUDA tensors and replicated MultiCUDA tensors have
+        // stable placement and can safely retain the fused path.
+        const bool cudaHcFusionPlacementSafe =
+            multiCudaTensorParallel ||
+            DeepSeekV4DeviceMapUsesSingleCuda(this->deviceMap);
         // The decode-only HcPre+RMSNorm kernel preserves the BF16 tensor
         // boundary between both operators while avoiding a second global
         // memory round trip.  Keep prefill and non-CUDA execution on the
         // established generic path, and retain an explicit A/B fallback.
         bool cudaHcPreNormDecode =
-            graphSafeDecode ||
-            (batch == 1 && seqlen == 1 && originalStartPos > 0 &&
-             DeepSeekV4PreferCuda() &&
-             !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_HCPRENORM"));
+            cudaHcFusionPlacementSafe &&
+            (graphSafeDecode ||
+             (batch == 1 && seqlen == 1 && originalStartPos > 0 &&
+              DeepSeekV4PreferCuda() &&
+              !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_HCPRENORM")));
 #else
         bool persistentTpAsync = false;
 #endif
@@ -11244,6 +11885,11 @@ namespace fastllm {
             }
 #endif
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
+            std::vector<int> ffnDims;
+            bool preMoeHealthy = true;
+            // Attention through router is the maximal graph-safe region before
+            // the routed expert output has to cross the CUDA/NUMA boundary.
+            auto runCudaBeforeMoe = [&]() {
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
             bool useCompressRope = compressRatio != 0;
             float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
@@ -11300,6 +11946,7 @@ namespace fastllm {
             kv.Reshape({bsz, seqlen, 1, head_dim_full});
 #ifdef USE_CUDA
             if (!graphCaptureHealthy("qkv", layer)) {
+                preMoeHealthy = false;
                 return;
             }
 #endif
@@ -11688,6 +12335,7 @@ namespace fastllm {
             }
 #ifdef USE_CUDA
             if (!graphCaptureHealthy("kv-cache-compressor", layer)) {
+                preMoeHealthy = false;
                 return;
             }
 #endif
@@ -11715,6 +12363,7 @@ namespace fastllm {
                 }
             }
             if (!graphCaptureHealthy("indexer-topk", layer)) {
+                preMoeHealthy = false;
                 return;
             }
 #endif
@@ -11822,12 +12471,13 @@ namespace fastllm {
             DeepSeekV4Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
 #ifdef USE_CUDA
             if (!graphCaptureHealthy("attention-output", layer)) {
+                preMoeHealthy = false;
                 return;
             }
 #endif
             bool fusedFfnHcPostPreNorm = false;
 #ifdef USE_CUDA
-            if (graphSafeDecode) {
+            if (graphSafeDecode && cudaHcFusionPlacementSafe) {
                 fusedFfnHcPostPreNorm = DeepSeekV4HcPostPreNormMultiCuda(
                     attnOut, *curHiddenStates, attnMix.postData,
                     attnMix.combData, weight[pre + ".hc_ffn_fn"],
@@ -11871,7 +12521,7 @@ namespace fastllm {
                 RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps,
                                  ffnInput, DataType::BFLOAT16);
             }
-            std::vector<int> ffnDims = ffnInput.dims;
+            ffnDims = ffnInput.dims;
             ffnInput.Reshape({bsz * seqlen, dim});
             {
                 BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
@@ -11884,23 +12534,81 @@ namespace fastllm {
             }
 #ifdef USE_CUDA
             if (!graphCaptureHealthy("router", layer)) {
+                preMoeHealthy = false;
                 return;
             }
 #endif
+            };
+#ifdef USE_CUDA
+            if (graphState != nullptr && graphState->segmentedReplay) {
+                if (layer >= (int)graphState->segments.size() ||
+                    !LaunchDeepSeekV4CudaGraphSegment(
+                        *graphState, layer)) {
+                    graphState->segmentedCaptureFailed = true;
+                    preMoeHealthy = false;
+                } else {
+                    const DeepSeekV4CudaGraphSegmentState &segment =
+                        graphState->segments[layer];
+                    ffnDims = segment.ffnDims;
+                    ffnInput.Reshape(segment.ffnInputDims);
+                    expertIndex.Reshape(segment.expertIndexDims);
+                    expertScore.Reshape(segment.expertScoreDims);
+                    std::swap(curHiddenStates, nextHiddenStates);
+                    prefetchedAttnHcPreNorm = false;
+                }
+            } else if (graphState != nullptr &&
+                       graphState->segmentedCapture) {
+                if (!CaptureDeepSeekV4CudaGraphSegment(
+                        *graphState, runCudaBeforeMoe, ffnDims,
+                        ffnInput, expertIndex, expertScore)) {
+                    preMoeHealthy = false;
+                }
+            } else {
+                runCudaBeforeMoe();
+            }
+#else
+            runCudaBeforeMoe();
+#endif
+            if (!preMoeHealthy) {
+                return;
+            }
             {
                 // MOE
                 bool hasSharedExpertOut = false;
                 bool fuseSharedExpert = false;
+                bool parallelNumasSharedExpert = false;
+#ifdef USE_CUDA
+                std::shared_ptr<MultiCudaAsyncMLPHandle>
+                    sharedExpertAsync;
+#endif
                 Data *pairedReduceInput = nullptr;
                 std::vector<Data*> moeWeights = weights[layer];
                 auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
                 auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
-                Data preCopiedMoeInput;
-                Data preCopiedExpertIndex;
-                Data preCopiedExpertScore;
+                std::optional<DeepSeekV4NumasMoeCpuInputWorkspace>
+                    localPreCopyWorkspace;
+                DeepSeekV4NumasMoeCpuInputWorkspace *preCopyWorkspace =
+                    nullptr;
                 Data *routedMoeInput = &ffnInput;
                 Data *routedExpertIndex = &expertIndex;
                 Data *routedExpertScore = &expertScore;
+#ifdef USE_CUDA
+                if (std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_INPUT_WORKSPACE") ==
+                        nullptr &&
+                    !ffnInput.dims.empty() &&
+                    ffnInput.Count(0) == ffnInput.dims.back()) {
+                    preCopyWorkspace =
+                        &GetDeepSeekV4NumasMoeCpuInputWorkspace();
+                }
+#endif
+                if (preCopyWorkspace == nullptr) {
+                    localPreCopyWorkspace.emplace();
+                    preCopyWorkspace = &*localPreCopyWorkspace;
+                }
+                Data *preCopiedMoeInput = &preCopyWorkspace->input;
+                Data *preCopiedExpertIndex = &preCopyWorkspace->index;
+                Data *preCopiedExpertScore = &preCopyWorkspace->score;
 #ifdef USE_CUDA
                 bool preCopiedNumasMoeInputs = false;
                 bool canPreCopyNumasMoeInputs =
@@ -11927,18 +12635,16 @@ namespace fastllm {
                 }
                 if (canPreCopyNumasMoeInputs) {
                     preCopiedNumasMoeInputs =
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            ffnInput, preCopiedMoeInput) &&
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            expertIndex, preCopiedExpertIndex) &&
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            expertScore, preCopiedExpertScore);
+                        CopyDeepSeekV4CudaTensorsToCpu(
+                            {&ffnInput, &expertIndex, &expertScore},
+                            {preCopiedMoeInput, preCopiedExpertIndex,
+                             preCopiedExpertScore});
                     AssertInFastLLM(
                         preCopiedNumasMoeInputs,
                         "DeepSeek-V4 failed to copy tensor-parallel MoE inputs to NUMA.");
-                    routedMoeInput = &preCopiedMoeInput;
-                    routedExpertIndex = &preCopiedExpertIndex;
-                    routedExpertScore = &preCopiedExpertScore;
+                    routedMoeInput = preCopiedMoeInput;
+                    routedExpertIndex = preCopiedExpertIndex;
+                    routedExpertScore = preCopiedExpertScore;
                 }
 #endif
                 const bool routedTensorParallel =
@@ -11972,31 +12678,59 @@ namespace fastllm {
                         fuseSharedExpert =
                             routedExpertParallel && fuseSharedExpertRows;
                         if (!fuseSharedExpert) {
-                            Data sharedInput;
-                            Data *sharedInputPtr = &ffnInput;
-                            if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
-                                IsDeepSeekV4QuantizedLinearWeight(sharedGateupIt->second)) {
-                                DeepSeekV4QuantizeLinearActivationCpu(ffnInput, sharedInput);
-                                sharedInputPtr = &sharedInput;
-                            }
-                            LinearSwigluBlock(sharedInputPtr, &sharedGateupIt->second, GetEmptyData(),
-                                              &sharedW3, &sharedW1);
-                            const bool pairSharedReduction =
-                                routedTensorParallel &&
-                                dsparkGraphVerification &&
-                                DeepSeekV4PairedAllReduceEnabled();
-                            if (pairSharedReduction) {
+#ifdef USE_CUDA
+                            parallelNumasSharedExpert =
+                                !dsparkGraphVerification &&
+                                !EnvFlagEnabled(
+                                    "FASTLLM_DSV4_DISABLE_NUMAS_SHARED_"
+                                    "EXPERT_OVERLAP") &&
+                                preCopiedNumasMoeInputs &&
+                                ffnInput.dims.size() > 0 &&
+                                ffnInput.dims[0] == 1 &&
+                                ffnInput.multiDeviceData &&
+                                ffnInput.IsTensorParallelReplicated() &&
+                                GetReplicatedCudaDevices(ffnInput).size() > 1;
+#endif
+#ifdef USE_CUDA
+                            if (parallelNumasSharedExpert) {
+                                sharedExpertAsync =
+                                    MultiCudaBeginMLPKeepReplicated(
+                                        ffnInput, sharedGateupIt->second,
+                                        sharedDownIt->second, sharedW3,
+                                        sharedW1, sharedExpertOut);
                                 AssertInFastLLM(
-                                    DeepSeekV4LinearColumnLocal(
-                                        sharedW1, sharedDownIt->second,
-                                        *GetEmptyData(), sharedExpertOut),
-                                    "DeepSeek-V4 failed to defer the shared-expert TP reduction.\n");
-                                pairedReduceInput = &sharedExpertOut;
-                            } else {
-                                DeepSeekV4Linear(
-                                    sharedW1, sharedDownIt->second,
-                                    *GetEmptyData(), sharedExpertOut);
+                                    sharedExpertAsync != nullptr,
+                                    "DeepSeek-V4 failed to enqueue its MultiCUDA shared expert before NUMA MoE.\n");
                                 hasSharedExpertOut = true;
+                            } else
+#endif
+                            {
+                                Data sharedInput;
+                                Data *sharedInputPtr = &ffnInput;
+                                if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
+                                    IsDeepSeekV4QuantizedLinearWeight(sharedGateupIt->second)) {
+                                    DeepSeekV4QuantizeLinearActivationCpu(ffnInput, sharedInput);
+                                    sharedInputPtr = &sharedInput;
+                                }
+                                LinearSwigluBlock(sharedInputPtr, &sharedGateupIt->second, GetEmptyData(),
+                                                  &sharedW3, &sharedW1);
+                                const bool pairSharedReduction =
+                                    routedTensorParallel &&
+                                    dsparkGraphVerification &&
+                                    DeepSeekV4PairedAllReduceEnabled();
+                                if (pairSharedReduction) {
+                                    AssertInFastLLM(
+                                        DeepSeekV4LinearColumnLocal(
+                                            sharedW1, sharedDownIt->second,
+                                            *GetEmptyData(), sharedExpertOut),
+                                        "DeepSeek-V4 failed to defer the shared-expert TP reduction.\n");
+                                    pairedReduceInput = &sharedExpertOut;
+                                } else {
+                                    DeepSeekV4Linear(
+                                        sharedW1, sharedDownIt->second,
+                                        *GetEmptyData(), sharedExpertOut);
+                                    hasSharedExpertOut = true;
+                                }
                             }
                             moeWeights[0] = moeWeights[1] = nullptr;
                         }
@@ -12004,38 +12738,49 @@ namespace fastllm {
                 }
                 {
                     this->ApplyMoeDeviceMapForLayer(layer);
-                    DataType effectiveMoeAtype = ffnInput.dataType;
-                    Data moeQuantizedInput;
-                    Data *moeInput = routedMoeInput;
-                    if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
-                        moeWeights.size() > 2 && moeWeights[2] != nullptr &&
-                        IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
+                    auto runRoutedMoe = [&]() {
+                        DataType effectiveMoeAtype = ffnInput.dataType;
+                        Data moeQuantizedInput;
+                        Data *moeInput = routedMoeInput;
+                        if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
+                            moeWeights.size() > 2 && moeWeights[2] != nullptr &&
+                            IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
 #ifdef USE_CUDA
-                        int moeInputCudaDevice = GetTensorCudaDevice(*moeInput);
+                            int moeInputCudaDevice = GetTensorCudaDevice(*moeInput);
 #endif
-                        DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
+                            DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
 #ifdef USE_CUDA
-                        if (moeInputCudaDevice >= 0 &&
-                            moeQuantizedInput.dims.size() > 0 &&
-                            moeQuantizedInput.dims[0] >= 32 &&
-                            DeepSeekV4NumasGpuPrefillEnabled()) {
-                            AssertInFastLLM(
-                                AddDeepSeekV4QuantizedCudaReplica(
-                                    moeQuantizedInput, moeInputCudaDevice),
-                                "DeepSeek-V4 failed to stage its quantized NUMA MoE activation on CUDA.");
+                            if (moeInputCudaDevice >= 0 &&
+                                moeQuantizedInput.dims.size() > 0 &&
+                                moeQuantizedInput.dims[0] >= 32 &&
+                                DeepSeekV4NumasGpuPrefillEnabled()) {
+                                AssertInFastLLM(
+                                    AddDeepSeekV4QuantizedCudaReplica(
+                                        moeQuantizedInput, moeInputCudaDevice),
+                                    "DeepSeek-V4 failed to stage its quantized NUMA MoE activation on CUDA.");
+                            }
+#endif
+                            moeInput = &moeQuantizedInput;
                         }
-#endif
-                        moeInput = &moeQuantizedInput;
+                        MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
+                                      &moeWeights, &biass[layer],
+                                      &w1, &w2, &w3, &tempInput, &tempOutput,
+                                      1.0f, &ffnOut, layer,
+                                      ffnInput.dataType, effectiveMoeAtype,
+                                      &moeInputTemp, &moeOutputTemp,
+                                      MoeGateSwiglu, routedExpertParallel,
+                                      swiglu_limit, true,
+                                      pairedReduceInput);
+                    };
+                    runRoutedMoe();
+#ifdef USE_CUDA
+                    if (sharedExpertAsync != nullptr) {
+                        AssertInFastLLM(
+                            MultiCudaFinishMLPKeepReplicated(
+                                sharedExpertAsync),
+                            "DeepSeek-V4 failed to finish its asynchronous MultiCUDA shared expert.\n");
                     }
-                    MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
-                                  &moeWeights, &biass[layer],
-                                  &w1, &w2, &w3, &tempInput, &tempOutput,
-                                  1.0f, &ffnOut, layer,
-                                  ffnInput.dataType, effectiveMoeAtype,
-                                  &moeInputTemp, &moeOutputTemp,
-                                  MoeGateSwiglu, routedExpertParallel,
-                                  swiglu_limit, true,
-                                  pairedReduceInput);
+#endif
                     ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 }
 #ifdef USE_CUDA
@@ -12045,6 +12790,25 @@ namespace fastllm {
 #endif
                 {
                     if (hasSharedExpertOut) {
+#ifdef USE_CUDA
+                        if (std::getenv(
+                                "FASTLLM_DSV4_DISABLE_NUMAS_MOE_"
+                                "DIRECT_TP_REPLICA") == nullptr &&
+                            ffnOut.dataDevice == DataDevice::CPU &&
+                            ffnOut.cpuData != nullptr &&
+                            !ffnOut.dims.empty() &&
+                            ffnOut.Count(0) == ffnOut.dims.back() &&
+                            sharedExpertOut.multiDeviceData &&
+                            sharedExpertOut.IsTensorParallelReplicated()) {
+                            std::vector<int> replicaDevices =
+                                GetReplicatedCudaDevices(
+                                    sharedExpertOut);
+                            if (replicaDevices.size() > 1) {
+                                PrepareMultiCudaReplicatedData(
+                                    ffnOut, replicaDevices, true);
+                            }
+                        }
+#endif
                         if (!(ffnOut.multiDeviceData && sharedExpertOut.multiDeviceData)) {
                             ffnOut.ToDevice(sharedExpertOut.dataDevice);
                         }
@@ -12061,7 +12825,8 @@ namespace fastllm {
 #endif
                 bool fusedNextAttnHcPreNorm = false;
 #ifdef USE_CUDA
-                if (layer + 1 < block_cnt && graphSafeDecode) {
+                if (layer + 1 < block_cnt && graphSafeDecode &&
+                    cudaHcFusionPlacementSafe) {
                     std::string nextPre =
                         "layers." + std::to_string(layer + 1);
                     fusedNextAttnHcPreNorm =
@@ -12395,6 +13160,138 @@ namespace fastllm {
                 }
                 FastllmCudaSetDevice(oldDevice);
             };
+            if (segmentedGraphRequested) {
+                auto stageSegmentedReplayInputs = [&]() {
+                    if (!graphState->replayInputsPending) {
+                        return true;
+                    }
+                    if (graphGpuReplayInputs ||
+                        graphState->pinnedMeta == nullptr ||
+                        graphState->pinnedInputIds == nullptr) {
+                        return false;
+                    }
+                    FastllmCudaClearThreadError();
+                    for (auto &deviceState : graphState->devices) {
+                        if (deviceState == nullptr ||
+                            deviceState->decodeMeta == nullptr ||
+                            deviceState->decodeMeta->cudaData == nullptr) {
+                            return false;
+                        }
+                        FastllmCudaSetDevice(deviceState->device);
+                        FastllmCudaCopyFromHostToDevice(
+                            deviceState->decodeMeta->cudaData,
+                            graphState->pinnedMeta,
+                            kDeepSeekV4CudaGraphMetaInts *
+                                sizeof(int32_t));
+                    }
+                    FastllmCudaSetDevice(graphState->inputDevice);
+                    FastllmCudaCopyFromHostToDevice(
+                        graphState->inputIds.cudaData,
+                        graphState->pinnedInputIds,
+                        graphState->inputIds.GetBytes());
+                    graphState->replayInputsPending = false;
+                    return !FastllmCudaGetThreadError();
+                };
+                auto disableSegmentedGraph = [&](const char *stage) {
+                    syncGraphDevices();
+                    graphState->DestroyCapturedGraph();
+                    graphState->disabled = true;
+                    std::fprintf(
+                        stderr,
+                        "[Fastllm] DeepSeek-V4 segmented decode CUDA graph "
+                        "disabled at %s: %s\n",
+                        stage, FastllmCudaGraphLastError());
+                    std::fflush(stderr);
+                    FastllmCudaClearThreadError();
+                    FastllmCudaClearGraphError();
+                };
+
+                if (graphState->disabled) {
+                    FastllmCudaClearThreadError();
+                    runModelBody();
+                    modelBodyDone = true;
+                } else if (graphState->segmentedCaptured) {
+                    bool replayOk = stageSegmentedReplayInputs();
+                    graphState->segmentedReplay = replayOk;
+                    if (replayOk) {
+                        runModelBody();
+                        replayOk = !graphState->segmentedCaptureFailed &&
+                            !FastllmCudaGetThreadError() &&
+                            !FastllmCudaGetGraphError();
+                    }
+                    graphState->segmentedReplay = false;
+                    if (!replayOk) {
+                        disableSegmentedGraph("replay");
+                        runModelBody();
+                    }
+                    modelBodyDone = true;
+                } else if (graphState->warmupRounds < 1) {
+                    FastllmCudaClearThreadError();
+                    FastllmCudaClearGraphError();
+                    runModelBody();
+                    modelBodyDone = true;
+                    if (FastllmCudaGetThreadError() ||
+                        FastllmCudaGetGraphError()) {
+                        graphState->disabled = true;
+                    } else {
+                        graphState->warmupRounds = 1;
+                        graphState->warmed = true;
+                    }
+                } else {
+                    syncGraphDevices();
+                    bool captureOk = true;
+                    const char *failureStage = nullptr;
+                    for (auto &deviceState : graphState->devices) {
+                        FastllmCudaSetDevice(deviceState->device);
+                        if (!FastllmCudaGraphPrepareCaptureDevice()) {
+                            captureOk = false;
+                            failureStage = "prepare capture devices";
+                            break;
+                        }
+                    }
+                    if (captureOk && !FastllmCudaGraphMemoryPoolBegin()) {
+                        captureOk = false;
+                        failureStage = "workspace reservation";
+                    }
+                    if (captureOk) {
+                        FastllmCudaClearThreadError();
+                        FastllmCudaClearGraphError();
+                        graphState->segments.clear();
+                        graphState->segmentedCaptureFailed = false;
+                        graphState->segmentedCapture = true;
+                        runModelBody();
+                        graphState->segmentedCapture = false;
+                        captureOk =
+                            !graphState->segmentedCaptureFailed &&
+                            !FastllmCudaGetThreadError() &&
+                            !FastllmCudaGetGraphError() &&
+                            (int)graphState->segments.size() == block_cnt;
+                        if (!captureOk) {
+                            failureStage = "captured CUDA-only segments";
+                        }
+                    }
+                    if (captureOk) {
+                        captureOk = FastllmCudaGraphMemoryPoolEnd(
+                            graphState->reservedPointers);
+                        if (!captureOk) {
+                            failureStage = "pin captured workspaces";
+                        }
+                    } else {
+                        FastllmCudaGraphMemoryPoolAbort();
+                    }
+                    if (captureOk) {
+                        graphState->segmentedCaptured = true;
+                        graphState->warmed = true;
+                        modelBodyDone = true;
+                    } else {
+                        disableSegmentedGraph(
+                            failureStage == nullptr ?
+                                "unknown capture stage" : failureStage);
+                        runModelBody();
+                        modelBodyDone = true;
+                    }
+                }
+            } else {
             auto launchGraphs = [&]() {
                 bool ok = true;
                 auto stageReplayInputs = [&](
@@ -12713,6 +13610,7 @@ namespace fastllm {
                     runModelBody();
                     modelBodyDone = true;
                 }
+            }
             }
 
             for (int layer = 0; layer < (int)activeDecodeLayerCaches.size(); layer++) {
@@ -13380,12 +14278,30 @@ namespace fastllm {
                 std::vector<Data*> moeWeights = weights[layer];
                 auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
                 auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
-                Data preCopiedMoeInput;
-                Data preCopiedExpertIndex;
-                Data preCopiedExpertScore;
+                std::optional<DeepSeekV4NumasMoeCpuInputWorkspace>
+                    localPreCopyWorkspace;
+                DeepSeekV4NumasMoeCpuInputWorkspace *preCopyWorkspace =
+                    nullptr;
                 Data *routedMoeInput = &ffnInput;
                 Data *routedExpertIndex = &expertIndex;
                 Data *routedExpertScore = &expertScore;
+#ifdef USE_CUDA
+                if (std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_INPUT_WORKSPACE") ==
+                        nullptr &&
+                    !ffnInput.dims.empty() &&
+                    ffnInput.Count(0) == ffnInput.dims.back()) {
+                    preCopyWorkspace =
+                        &GetDeepSeekV4NumasMoeCpuInputWorkspace();
+                }
+#endif
+                if (preCopyWorkspace == nullptr) {
+                    localPreCopyWorkspace.emplace();
+                    preCopyWorkspace = &*localPreCopyWorkspace;
+                }
+                Data *preCopiedMoeInput = &preCopyWorkspace->input;
+                Data *preCopiedExpertIndex = &preCopyWorkspace->index;
+                Data *preCopiedExpertScore = &preCopyWorkspace->score;
 #ifdef USE_CUDA
                 bool canPreCopyNumasMoeInputs =
                     std::getenv(
@@ -13399,18 +14315,16 @@ namespace fastllm {
                         this->SelectMoeDeviceForLayer(layer), "numa");
                 if (canPreCopyNumasMoeInputs) {
                     bool copied =
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            ffnInput, preCopiedMoeInput) &&
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            expertIndex, preCopiedExpertIndex) &&
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            expertScore, preCopiedExpertScore);
+                        CopyDeepSeekV4CudaTensorsToCpu(
+                            {&ffnInput, &expertIndex, &expertScore},
+                            {preCopiedMoeInput, preCopiedExpertIndex,
+                             preCopiedExpertScore});
                     AssertInFastLLM(
                         copied,
                         "DeepSeek-V4 failed to copy batched tensor-parallel MoE inputs to NUMA.");
-                    routedMoeInput = &preCopiedMoeInput;
-                    routedExpertIndex = &preCopiedExpertIndex;
-                    routedExpertScore = &preCopiedExpertScore;
+                    routedMoeInput = preCopiedMoeInput;
+                    routedExpertIndex = preCopiedExpertIndex;
+                    routedExpertScore = preCopiedExpertScore;
                 }
 #endif
                 const bool routedTensorParallel =

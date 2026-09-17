@@ -1,7 +1,8 @@
 /*
  * Dense Marlin W8A16 FP8 and W4A16 NVFP4 launchers for FastLLM.
  * Kernel body vendored from vLLM csrc/quantization/marlin (Apache-2.0).
- * SM75 uses a two-stage pipeline; NVFP4 on SM80+ uses four stages, matching
+ * FP8 uses four stages for the SM80/SM86 64x256x64 prefill tile and two
+ * stages otherwise. NVFP4 on SM80+ uses four stages, matching
  * vLLM's ops.marlin_gemm(b_q_type=float4_e2m1f) dispatch.
  */
 
@@ -22,8 +23,9 @@ namespace {
 
 using KernelFn = void (*)(MARLIN_KERNEL_PARAMS);
 
-static bool DeviceOk() {
+static bool DeviceOk(int *deviceArch = nullptr) {
 #ifdef CUDA_NO_TENSOR_CORE
+    if (deviceArch != nullptr) *deviceArch = 0;
     return false;
 #else
     int dev = 0, major = 0, minor = 0;
@@ -32,7 +34,9 @@ static bool DeviceOk() {
         return false;
     if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess)
         return false;
-    return major * 10 + minor >= 75;
+    const int arch = major * 10 + minor;
+    if (deviceArch != nullptr) *deviceArch = arch;
+    return arch >= 75;
 #endif
 }
 
@@ -48,19 +52,33 @@ static int DeviceArch() {
     return major * 10 + minor;
 }
 
-// Explicit FE4M3 group128 (group_blocks=8) + channelwise (-1) SM75 stages=2.
-#define RET_K(THREADS, TM, TN, TK, M8, GB)                                      \
+static bool IsAmpereFp8Device(int deviceArch) {
+    return deviceArch == 80 || deviceArch == 86;
+}
+
+// Explicit FE4M3 group128 (group_blocks=8) + channelwise (-1).
+#define RET_K_STAGES(STAGES, THREADS, TM, TN, TK, M8, GB)                        \
     return MARLIN_NAMESPACE_NAME::Marlin<                                       \
         vllm::kFloat16.id(), vllm::kFE4M3fn.id(), vllm::kFloat16.id(),         \
-        vllm::kFloat16.id(), (THREADS), (TM), (TN), (TK), (M8), 2, (GB), false>
+        vllm::kFloat16.id(), (THREADS), (TM), (TN), (TK), (M8), (STAGES), (GB), false>
+#define RET_K(THREADS, TM, TN, TK, M8, GB)                                      \
+    RET_K_STAGES(2, THREADS, TM, TN, TK, M8, GB)
 
 static KernelFn PickKernel(int sizeM, int threadK, int threadN, int groupBlocks,
-                           bool m8, int &threads) {
+                           bool m8, int deviceArch, int &threads) {
     threads = 0;
     const int tm = (m8 || sizeM <= 8) ? 1 : std::min(4, (sizeM + 15) / 16);
     const bool useM8 = m8 || sizeM <= 8;
 
     if (groupBlocks != 8 && groupBlocks != -1) return nullptr;
+
+    if (!useM8 && sizeM >= 64 && IsAmpereFp8Device(deviceArch) &&
+        threadK == 64 && threadN == 256) {
+        // M64/N256/K64, 256 threads, four asynchronous copy stages.
+        threads = 256;
+        if (groupBlocks == 8) RET_K_STAGES(4, 256, 4, 16, 4, false, 8);
+        RET_K_STAGES(4, 256, 4, 16, 4, false, -1);
+    }
 
     if (useM8) {
         if (threadK == 128 && threadN == 128) {
@@ -131,14 +149,20 @@ static KernelFn PickKernel(int sizeM, int threadK, int threadN, int groupBlocks,
     return nullptr;
 }
 #undef RET_K
+#undef RET_K_STAGES
 
-// Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).  vLLM uses
-// stages=2 on SM75 and stages=4 on every newer architecture.
-#define RET_FP4(STAGES, THREADS, TM, TN, TK, M8)                               \
-    return MARLIN_NAMESPACE_NAME::Marlin<                                     \
-        vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(),        \
-        vllm::kFE4M3fn.id(), (THREADS), (TM), (TN), (TK), (M8),              \
-        (STAGES), 1, false>
+// Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).
+// Only SM75 selects stages=2; newer architectures select stages=4.
+// The SM75 64x256x64 prefill tile specializes the fixed dense reduction
+// flags to remove unused bias/atomic paths and register spills. Bias
+// remains in the outer epilogue. Small-M and SM80+ keep their pipeline.
+#define RET_FP4(STAGES, THREADS, TM, TN, TK, M8)                            \
+    return MARLIN_NAMESPACE_NAME::Marlin<                                   \
+        vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(),       \
+        vllm::kFE4M3fn.id(), (THREADS), (TM), (TN), (TK), (M8),             \
+        (STAGES), 1, false,                                                 \
+        ((STAGES) == 2 && (THREADS) == 256 && (TM) == 4 &&                  \
+         (TN) == 16 && (TK) == 4 && !(M8))>
 #define RET_FP4_FOR_ARCH(THREADS, TM, TN, TK, M8)                             \
     do {                                                                      \
         if (stages == 2) RET_FP4(2, THREADS, TM, TN, TK, M8);                \
@@ -201,10 +225,25 @@ static KernelFn PickFp4Kernel(int sizeM, int threadK, int threadN,
 #undef RET_FP4_FOR_ARCH
 #undef RET_FP4
 
-static bool SelectTile(int sizeM, int sizeN, int sizeK, int &threadK, int &threadN) {
+static bool SelectTile(int sizeM, int sizeN, int sizeK, int deviceArch,
+                       int &threadK, int &threadN) {
+    // Prefer the wider prefill tile on SM75 (two copy stages) and
+    // SM80/SM86 (four stages) only when M/N/K amortize its overhead.
+    if ((deviceArch == 75 || IsAmpereFp8Device(deviceArch)) &&
+        sizeM >= 256 && sizeN >= 4096 && sizeK >= 1024 &&
+        sizeK % 64 == 0 && sizeN % 256 == 0) {
+        threadK = 64;
+        threadN = 256;
+        return true;
+    }
     static const int smallM[][2] = {{64, 128}, {128, 64}, {128, 128}};
+    // On Turing, the 256-thread tile amortizes the fixed M8 reduction cost
+    // better than either 128-thread tile. Keep the established priority on
+    // newer architectures until it is benchmarked there.
+    static const int smallMTuring[][2] = {{128, 128}, {64, 128}, {128, 64}};
     static const int largeM[][2] = {{64, 128}, {128, 64}, {64, 256}, {128, 128}};
-    const int (*cfgs)[2] = sizeM <= 8 ? smallM : largeM;
+    const int (*cfgs)[2] = sizeM <= 8
+        ? (deviceArch == 75 ? smallMTuring : smallM) : largeM;
     int n = sizeM <= 8 ? 3 : 4;
     for (int i = 0; i < n; i++) {
         if (sizeK % cfgs[i][0] == 0 && sizeN % cfgs[i][1] == 0) {
@@ -237,6 +276,7 @@ static bool PrepareKernels(int device) {
     cudaGetDevice(&prev);
     if (prev != device && cudaSetDevice(device) != cudaSuccess) return false;
 
+    const int deviceArch = DeviceArch();
     int maxShared = 0;
     bool ok = cudaDeviceGetAttribute(&maxShared,
                                      cudaDevAttrMaxSharedMemoryPerBlockOptin,
@@ -251,7 +291,8 @@ static bool PrepareKernels(int device) {
             for (auto &t : tiles) {
                 for (int gb : {8, -1}) {
                     int threads = 0;
-                    KernelFn k = PickKernel(m, t[0], t[1], gb, m <= 8, threads);
+                    KernelFn k = PickKernel(m, t[0], t[1], gb, m <= 8,
+                                            deviceArch, threads);
                     if (k == nullptr) continue;
                     if (cudaFuncSetAttribute(
                             k, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -346,6 +387,13 @@ static CTmpBuf &GetCTmp(int device) {
 static bool EnsureCTmp(int device, size_t elems) {
     CTmpBuf &b = GetCTmp(device);
     if (b.device == device && b.ptr != nullptr && b.elems >= elems) return true;
+    // A captured graph keeps this address even when later eager prefills use
+    // larger M tiles. Reserve the largest reduction tile on first use so the
+    // cached buffer never moves underneath an existing FP8/NVFP4 graph.
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) !=
+            cudaSuccess || sms <= 0) return false;
+    elems = std::max(elems, (size_t)sms * 64 * 256);
     int prev = -1;
     cudaGetDevice(&prev);
     if (prev != device) cudaSetDevice(device);
@@ -377,7 +425,10 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
         const void *a, const uint32_t *b_q_weight, const void *b_scales,
         void *c, int size_m, int size_n, int size_k, int group_size,
         int *workspace) {
-    if (!DeviceOk() || size_m <= 0 || size_n <= 0 || size_k <= 0) return false;
+    int deviceArch = 0;
+    if (!DeviceOk(&deviceArch) || size_m <= 0 || size_n <= 0 || size_k <= 0) {
+        return false;
+    }
     if (group_size != 128 && group_size != -1) return false;
     if (size_n % 64 != 0 || size_k % 64 != 0) return false;
     if (group_size == 128 && size_k % 128 != 0) return false;
@@ -411,11 +462,15 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
         }
 
         int threadK = 0, threadN = 0;
-        if (!SelectTile(chunkM, size_n, size_k, threadK, threadN)) return false;
+        if (!SelectTile(chunkM, size_n, size_k, deviceArch,
+                        threadK, threadN)) {
+            return false;
+        }
 
         int threads = 0;
         bool m8 = chunkM <= 8;
-        KernelFn kernel = PickKernel(chunkM, threadK, threadN, groupBlocks, m8, threads);
+        KernelFn kernel = PickKernel(chunkM, threadK, threadN, groupBlocks,
+                                     m8, deviceArch, threads);
         if (kernel == nullptr) return false;
 
         const half *chunkA = reinterpret_cast<const half *>(a) +

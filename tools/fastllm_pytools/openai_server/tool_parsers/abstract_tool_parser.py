@@ -223,8 +223,12 @@ class ToolParserManager:
         if (force_chat_template):
             # 如果指定了强制指定了chat_template，那么尝试检测tool调用类型
             target = ""
-            if ("<｜DSML｜tool_calls>" in chat_template):
+            if ("<｜DSML｜ calls>" in chat_template):
+                target = "deepseek_v41"
+            elif ("<｜DSML｜tool_calls>" in chat_template):
                 target = "deepseek_v4"
+            elif ("<dots_function_call>" in chat_template):
+                target = "dots"
             elif ("<｜tool▁calls▁begin｜>" in chat_template):
                 target = "deepseek_v31"
             elif ("<minimax:tool_call>" in chat_template):
@@ -249,18 +253,26 @@ class ToolParserManager:
             print("Auto tool parse detect type: " + target)
             return cls.get_tool_parser(target)
 
-        if model_type == 'laguna':
+        if "<dots_function_call>" in chat_template:
+            target = 'dots'
+            print("Auto tool parse detect type: " + target)
+            return cls.get_tool_parser(target)
+
+        if model_type == 'dots3_note':
+            target = 'dots'
+        elif model_type == 'laguna':
             target = 'poolside_v1'
         elif (model_type == 'qwen3' or model_type == 'qwen2' or model_type == 'qwen3_moe'
             or model_type == "qwen3_next" or model_type == "qwen3_5"
             or model_type == "qwen3_5_text" or model_type == "qwen3_5_moe"
-            or model_type == "qwen3_5_moe_text"):
+            or model_type == "qwen3_5_moe_text" or model_type == "qwen4_exp"
+            or model_type == "qwen4_exp_text"):
             # 判断是否是coder系列模型（使用xml工具调用）
             if is_qwen_xml_tool_template(chat_template):
                 target = 'qwen3_coder'
             else:
                 target = 'hermes'
-        elif model_type == 'glm_moe_dsa':
+        elif model_type in ('glm_moe_dsa', 'glm5_next', 'glm5_next_text'):
             target = 'glm47'
         elif model_type == 'glm4_moe':
             target = 'glm45'
@@ -272,6 +284,8 @@ class ToolParserManager:
             target = 'kimi_k3'
         elif model_type == 'hy_v3':
             target = 'hy_v3'
+        elif model_type == 'deepseek_v41' or model_type == 'deepseek_v41_text':
+            target = 'deepseek_v41'
         elif model_type == 'deepseek_v4':
             target = 'deepseek_v4'
         elif model_type == 'deepseek_v3' or model_type == 'deepseek_v2':

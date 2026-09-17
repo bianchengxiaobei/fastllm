@@ -17,6 +17,22 @@ namespace fastllm {
         void *C, long ldc, // C[n * k], ldc = bytes for 1 row in C
         int st, int end, // calc C[0 : n, st : end]
         DataType AType, DataType BType, DataType CType);
+
+    bool FastllmGemmBFloat16NVFP4Block32E8M0FullBlocks_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb,
+        void *C, long ldc, int n, int m, int k, int st, int end,
+        bool useScaleLookup, bool allScalesFuseMagic);
+
+    // AVX2+FMA fused NVFP4_BLOCK_32_E8M0 GEMM: decodes the packed FP4 weights
+    // into FP32 inside the registers instead of materialising a temporary
+    // BF16 tile.  Returns false when the build has no AVX2 support.
+    bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
+        const void *A, long lda, const void *B, long ldb,
+        void *C, long ldc, int n, int m, int k, int st, int end);
+
+    // True when this CPU can run the NVFP4 block-32 layout at full speed,
+    // i.e. either the AVX512-BF16 or the AVX2 fused kernel is usable.
+    bool NVFP4Block32E8M0CpuKernelAvailable();
     
     struct MultiThreadGemmOp : MultiThreadBaseOp {
         uint8_t *inputData;   // [n * m]
@@ -270,10 +286,10 @@ namespace fastllm {
 
         MultiThreadLinearBFloat16FP8E4M3Op(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                 int n, int m, int k, int st, int end, 
-                float *scales, int blockK, int blockM) : 
+                float *scales, int blockK, int blockM) :
             inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
             n(n), m(m), k(k), st(st), end(end), 
-            scales(scales), blockK(blockK), blockM(blockM) {}
+            blockK(blockK), blockM(blockM), scales(scales) {}
 
         void Run();
     };

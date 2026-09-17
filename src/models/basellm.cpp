@@ -87,6 +87,21 @@ namespace fastllm {
                    memcmp(text.data(), prefix.data(), prefix.size()) == 0;
         }
 
+        static bool ContainsToolCallPrefix(
+                const std::vector<std::string> &prefixes,
+                const std::string &target) {
+            return std::find(prefixes.begin(), prefixes.end(), target) !=
+                   prefixes.end();
+        }
+
+        static void KeepLaterPosition(std::string::size_type candidate,
+                                      std::string::size_type &position) {
+            if (position == std::string::npos ||
+                (candidate != std::string::npos && candidate > position)) {
+                position = candidate;
+            }
+        }
+
         static bool FindLastPrefix(const std::string &text,
                                    const std::vector<std::string> &prefixes,
                                    std::string::size_type &bestPos,
@@ -167,11 +182,25 @@ namespace fastllm {
                 return false;
             }
 
-            const std::vector<std::string> parameterCloseTags = {
+            static const std::vector<std::string> dsmlParameterCloseTags = {
                     "</｜DSML｜parameter>",
+                    "</｜DSML｜ parameter>",
+                    "</\\DSML\\ parameter>",
                     "</\\DSML\\parameter>",
             };
-            auto closePos = FindLastNeedleBefore(text, parameterCloseTags, parameterPos);
+            auto closePos = FindLastNeedleBefore(
+                text, dsmlParameterCloseTags, parameterPos);
+            if (ContainsToolCallPrefix(
+                    config.tool_call_parameter_name_prefixes,
+                    "<parameter name=\"")) {
+                static const std::vector<std::string> dotsParameterCloseTags = {
+                    "</parameter>",
+                };
+                KeepLaterPosition(
+                    FindLastNeedleBefore(
+                        text, dotsParameterCloseTags, parameterPos),
+                    closePos);
+            }
             if (closePos != std::string::npos && closePos > previousParameterPos) {
                 return false;
             }
@@ -211,8 +240,6 @@ namespace fastllm {
             }
             const std::string terminator =
                     config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
-            const std::string standardClose = "</｜DSML｜invoke>";
-            const std::string alternateClose = "</\\DSML\\invoke>";
             std::string::size_type bestPos = std::string::npos;
             const std::string *bestPrefix = nullptr;
             if (!FindLastPrefix(text, config.tool_call_invoke_name_prefixes,
@@ -224,13 +251,24 @@ namespace fastllm {
             if (terminatorPos == std::string::npos) {
                 return false;
             }
-            auto standardClosePos = text.rfind(standardClose);
-            auto alternateClosePos = text.rfind(alternateClose);
-            auto closePos = standardClosePos;
-            if (closePos == std::string::npos ||
-                (alternateClosePos != std::string::npos &&
-                 alternateClosePos > closePos)) {
-                closePos = alternateClosePos;
+            static const std::vector<std::string> dsmlInvokeCloseTags = {
+                "</｜DSML｜invoke>",
+                "</｜DSML｜ invoke>",
+                "</\\DSML\\ invoke>",
+                "</\\DSML\\invoke>",
+            };
+            auto closePos = FindLastNeedleBefore(
+                text, dsmlInvokeCloseTags, text.size());
+            if (ContainsToolCallPrefix(
+                    config.tool_call_invoke_name_prefixes,
+                    "<invoke name=\"")) {
+                static const std::vector<std::string> dotsInvokeCloseTags = {
+                    "</invoke>",
+                };
+                KeepLaterPosition(
+                    FindLastNeedleBefore(
+                        text, dotsInvokeCloseTags, text.size()),
+                    closePos);
             }
             if (closePos != std::string::npos && closePos > bestPos) {
                 return false;
@@ -484,21 +522,25 @@ namespace fastllm {
     }
 
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
+        generationConfig.tool_call_generated_text = context ? context->toolCallConstraintGeneratedText : "";
+        PrepareToolCallConstraint(generationConfig);
+    }
+
+    void basellm::PrepareToolCallConstraint(GenerationConfig &generationConfig) {
         generationConfig.tool_call_allowed_token_ids.clear();
-        if (context == nullptr ||
-            (!generationConfig.tool_call_name_constraint_enabled &&
-             !generationConfig.tool_call_parameter_name_constraint_enabled)) {
+        if (!generationConfig.tool_call_name_constraint_enabled &&
+            !generationConfig.tool_call_parameter_name_constraint_enabled) {
             return;
         }
         std::string partial;
         std::vector<std::string> allowedValues;
         if (!FindActiveToolCallParameterNamePartial(
-                    context->toolCallConstraintGeneratedText,
+                    generationConfig.tool_call_generated_text,
                     generationConfig,
                     partial,
                     allowedValues)) {
             if (!FindActiveToolCallNamePartial(
-                        context->toolCallConstraintGeneratedText,
+                        generationConfig.tool_call_generated_text,
                         generationConfig,
                         partial)) {
                 return;
@@ -534,12 +576,14 @@ namespace fastllm {
             tokenId < 0) {
             return;
         }
-        context->toolCallConstraintGeneratedText += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
+        AdvanceToolCallConstraintText(context->toolCallConstraintGeneratedText, tokenId);
+    }
+
+    void basellm::AdvanceToolCallConstraintText(std::string &text, int tokenId) {
+        if (tokenId < 0) return;
+        text += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
         const size_t maxTrackedBytes = 8192;
-        if (context->toolCallConstraintGeneratedText.size() > maxTrackedBytes) {
-            context->toolCallConstraintGeneratedText.erase(
-                    0, context->toolCallConstraintGeneratedText.size() - maxTrackedBytes);
-        }
+        if (text.size() > maxTrackedBytes) text.erase(0, text.size() - maxTrackedBytes);
     }
 
     void basellm::RemoveResponseContext(int handleId) {
@@ -3535,6 +3579,7 @@ namespace fastllm {
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next" ||
+                            this->model_struct == "qwen4_exp" ||
                             this->model_struct == "gemma4",
                             this->model_struct + " doesn't support float16");
         } else if (dataType == DataType::BFLOAT16) {
@@ -3545,6 +3590,7 @@ namespace fastllm {
                             this->model_struct == "cogvlm" ||
                             this->model_struct == "deepseek_v2" ||
                             this->model_struct == "deepseek_v4" ||
+                            this->model_struct == "dots3_note" ||
                             this->model_struct == "qwen3_moe" ||
                             this->model_struct == "minimax_m2" ||
                             this->model_struct == "hunyuan" ||
@@ -3552,6 +3598,7 @@ namespace fastllm {
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next" ||
+                            this->model_struct == "qwen4_exp" ||
                             this->model_struct == "kimi_k3" ||
                             this->model_struct == "gemma4",
                             this->model_struct + " doesn't support bfloat16");
@@ -3565,19 +3612,23 @@ namespace fastllm {
     }
 
     void basellm::SetKVCacheDataType(DataType dataType) {
+        if (dataType == DataType::FP4_E2M1 && this->model_type != "qwen3_5" &&
+            this->model_type != "deepseek_v41") {
+            ErrorInFastLLM("FP4 KV cache currently supports the Qwen3.5 CUDA paged attention path and DeepSeek-V4.1 only.");
+        }
 #ifndef USE_CUDA
-        if (dataType == DataType::FP8_E4M3) {
-            ErrorInFastLLM("SetKVCacheDataType Error: fp8_e4m3 kv cache requires CUDA support.");
+        if (dataType == DataType::FP8_E4M3 || dataType == DataType::FP4_E2M1) {
+            ErrorInFastLLM("SetKVCacheDataType Error: FP8/FP4 kv cache requires CUDA support.");
         }
 #endif
         if (dataType == DataType::FLOAT32 ||
             dataType == DataType::FLOAT16 ||
             dataType == DataType::BFLOAT16 ||
-            dataType == DataType::FP8_E4M3) {
+            dataType == DataType::FP8_E4M3 || dataType == DataType::FP4_E2M1) {
             this->kvCacheDataType = dataType;
             this->useCustomKVCacheDataType = true;
         } else {
-            ErrorInFastLLM("SetKVCacheDataType Error: datatype should be float32, float16, bfloat16 or fp8_e4m3");
+            ErrorInFastLLM("SetKVCacheDataType Error: datatype should be float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1");
         }
     }
 
@@ -3905,6 +3956,9 @@ namespace fastllm {
     void basellm::AutoWarmup() {
         ReportModelLoadProgress("warmup", 0, 1);
         if (GetFastllmEnv().skipWarmup) {
+            if (contextPlan.requestedLength > 0) {
+                throw std::runtime_error("Explicit context length requires warmup to validate KV capacity.");
+            }
             ReportModelLoadProgress("warmup", 1, 1);
             return;
         }
@@ -3949,6 +4003,7 @@ namespace fastllm {
                 }
                 finishCudaWarmup();
                 if (!unwinding) {
+                    model->ValidateContextCapacity();
                     ReportModelLoadProgress("warmup", 1, 1);
                 }
             }
@@ -4503,6 +4558,16 @@ namespace fastllm {
                 bytesPerPage += layerBytesPerPage;
             }
 
+            for (int id : deviceIds) {
+                long long extra = std::max(0LL,
+                    this->GetAutoWarmupCudaAdditionalCacheBytesPerToken(id));
+                deviceDelayedCacheBytesPerPage[id] += extra * pageLen;
+                if (extra > 0) {
+                    printf("[Fastllm] AutoWarmup GPU %d: additional model KV pool %.2f KB/token, %.2f MB/page.\n",
+                           id, extra / 1024.0, extra * pageLen / 1e6);
+                }
+            }
+
             bool updatedPages = false;
             int calculatedMaxPages = -1;
             std::string fallbackReason = "";
@@ -5049,6 +5114,34 @@ namespace fastllm {
                         }
                         long long delayedReservePerPage =
                             deviceDelayedCacheBytesPerPage.count(id) ? deviceDelayedCacheBytesPerPage[id] : 0;
+                        if (servingFootprintMaterialized) {
+                            // The provisional estimate allows one late KV layer.
+                            // Release it only after verifying every local K/V
+                            // manager has the full calibrated allocation. Extra
+                            // model-specific caches (e.g. MTP) keep their reserve.
+                            int allocatedLayers = 0;
+                            for (int layer = 0; layer < block_cnt; ++layer) {
+                                if (layerElementsPerToken[layer] <= 0) continue;
+                                bool keyReady = false, valueReady = false;
+                                for (bool isKey : {true, false}) {
+                                    auto managers = this->GetPagedKVCacheManagers(layer, isKey);
+                                    for (auto &entry : managers) {
+                                        auto *manager = entry.second;
+                                        if (entry.first == id && manager != nullptr &&
+                                            manager->cudaData != nullptr &&
+                                            manager->maxPages >= currentPages) {
+                                            (isKey ? keyReady : valueReady) = true;
+                                        }
+                                    }
+                                }
+                                if (keyReady && valueReady) ++allocatedLayers;
+                            }
+                            if (allocatedLayers > 0 &&
+                                allocatedLayers == deviceLayerCount[id]) {
+                                delayedReservePerPage = std::max(0LL,
+                                    this->GetAutoWarmupCudaAdditionalCacheBytesPerToken(id)) * pageLen;
+                            }
+                        }
                         delayedReservePerPage = std::max(0LL, delayedReservePerPage);
                         long long bytesPerFinalPage = bytesPerPageOnDevice + delayedReservePerPage;
                         if (bytesPerFinalPage <= 0) {

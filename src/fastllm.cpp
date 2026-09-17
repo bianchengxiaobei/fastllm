@@ -5,16 +5,20 @@
 #include "utils.h"
 
 #include "fastllm.h"
+#include "contextconfig.h"
+#include "devices/disk/diskdevice.h"
 
 #include "executor.h"
 
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <cmath>
 #include <cfloat>
 #include <climits>
 #include <thread>
 #include <algorithm>
+#include <atomic>
 #include <queue>
 
 #ifdef USE_MMAP
@@ -272,6 +276,7 @@ namespace fastllm {
 
     std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap, defaultLayeredMoeDeviceMap;
     int defaultMoeDeviceLayers = -1;
+    std::string defaultNgramDevice = "cpu";
     Executor defaultExecutor;
     thread_local Executor *curExecutor = &defaultExecutor;
 
@@ -286,6 +291,8 @@ namespace fastllm {
     static bool cudaEmbedding = false;
     static bool cudaSharedExpert = false;
     static int cudaSlabMB = 0;
+    static std::atomic<uint64_t> moeCudaCacheBytes{0};
+    static std::atomic<uint64_t> moeCpuCacheBytes{0};
     static bool enableAMX = false;
     static int maxTokens = -1;
     static int defaultPageLen = 128;
@@ -377,6 +384,10 @@ namespace fastllm {
         return fastllmEnv;
     }
 
+    void SetCudaGraph(bool v) {
+        fastllmEnv.cudaGraph = v;
+    }
+
     void PrintInstructionInfo() {
         std::string avx = "OFF", avx2 = "OFF", aarch64 = "OFF", neonFp16 = "OFF", neonDot = "OFF";
 #ifdef __AVX__
@@ -426,6 +437,24 @@ namespace fastllm {
 
     int GetCudaSlabMB() {
         return cudaSlabMB;
+    }
+
+    void SetMoeCudaCacheBytes(uint64_t bytes) {
+        moeCudaCacheBytes = bytes;
+        TrimDiskMoeCache();
+    }
+
+    uint64_t GetMoeCudaCacheBytes() {
+        return moeCudaCacheBytes;
+    }
+
+    void SetMoeCpuCacheBytes(uint64_t bytes) {
+        moeCpuCacheBytes = bytes;
+        TrimDiskMoeCache();
+    }
+
+    uint64_t GetMoeCpuCacheBytes() {
+        return moeCpuCacheBytes;
     }
 
     void SetCudaSharedExpert(bool v) {
@@ -538,11 +567,14 @@ namespace fastllm {
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
         {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
         {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}}, {DataType::INT32PARAM, {"int32param"}},
+        {DataType::FP4_E2M1, {"fp4_kv"}},
         {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
+        {DataType::NVFP4_BLOCK_16_PLANAR, {"nvfp4_block_16_planar"}},
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
+        {DataType::NVFP4_BLOCK_16_E4M3, {"nvfp4_block_16_e4m3"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
         {DataType::NVFP4_BLOCK_32_E8M0, {"nvfp4_block_32_e8m0"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
@@ -585,8 +617,12 @@ namespace fastllm {
     }
 
     uint8_t *GetNVFP4ScaleData(Data &data) {
-        if (data.dataType != DataType::NVFP4 || data.dims.size() != 2 ||
-            data.blockK <= 0 || data.blockM <= 0 || !data.scales.empty()) {
+        const bool compactE8M0 = data.dataType == DataType::NVFP4 &&
+                                 data.scales.empty();
+        const bool compactE4M3 =
+            data.dataType == DataType::NVFP4_BLOCK_16_E4M3;
+        if ((!compactE8M0 && !compactE4M3) || data.dims.size() != 2 ||
+            data.blockK <= 0 || data.blockM <= 0) {
             return nullptr;
         }
         uint64_t weightBytes = GetNVFP4WeightBytes(data.dims[0], data.dims[1]);
@@ -597,8 +633,12 @@ namespace fastllm {
     }
 
     const uint8_t *GetNVFP4ScaleData(const Data &data) {
-        if (data.dataType != DataType::NVFP4 || data.dims.size() != 2 ||
-            data.blockK <= 0 || data.blockM <= 0 || !data.scales.empty()) {
+        const bool compactE8M0 = data.dataType == DataType::NVFP4 &&
+                                 data.scales.empty();
+        const bool compactE4M3 =
+            data.dataType == DataType::NVFP4_BLOCK_16_E4M3;
+        if ((!compactE8M0 && !compactE4M3) || data.dims.size() != 2 ||
+            data.blockK <= 0 || data.blockM <= 0) {
             return nullptr;
         }
         uint64_t weightBytes = GetNVFP4WeightBytes(data.dims[0], data.dims[1]);
@@ -608,12 +648,121 @@ namespace fastllm {
         return data.cpuData + weightBytes;
     }
 
+    void PackCompactE4M3NVFP4Block16Rows(
+            int rows, int columns, const uint8_t *weights,
+            const uint8_t *scaleBytes,
+            const std::vector<float> &globalScales,
+            int blockK, int blockM, uint8_t *destination,
+            int destinationRowStart, int destinationRows,
+            bool crossSwiglu, bool planar) {
+        AssertInFastLLM(
+            rows > 0 && columns > 0 && weights != nullptr &&
+            scaleBytes != nullptr && !globalScales.empty() &&
+            blockK > 0 && blockM == 16 && destination != nullptr &&
+            destinationRowStart >= 0 && destinationRows >= 0 &&
+            destinationRowStart + destinationRows <= rows &&
+            (!crossSwiglu || (rows & 1) == 0) &&
+            (!planar || destinationRows % NVFP4_PLANAR_TILE_ROWS == 0),
+            "Compact E4M3 NVFP4 block-16 packing received invalid metadata.\n");
+        const int packedBlocks = (columns - 1) / 16 + 1;
+        const int scaleRows = (rows - 1) / blockK + 1;
+        const int scaleColumns = (columns - 1) / blockM + 1;
+        const int globalCount = (int)globalScales.size();
+        const size_t rawBytesPerRow = GetNVFP4WeightBytes(1, columns);
+        const size_t packedBytesPerRow =
+            GetDataBytes(DataType::NVFP4_BLOCK_16, 1, columns);
+        static const FP8E4M3ToFP32Manager fp8ToFloat;
+
+        for (int localRow = 0; localRow < destinationRows; localRow++) {
+            const int destinationRow = destinationRowStart + localRow;
+            const int sourceRow = crossSwiglu
+                ? ((destinationRow & 1)
+                    ? rows / 2 + destinationRow / 2
+                    : destinationRow / 2)
+                : destinationRow;
+            const int scaleRow = sourceRow / blockK;
+            const int globalIndex = std::min(
+                globalCount - 1,
+                (int)((int64_t)scaleRow * globalCount / scaleRows));
+            const float globalScale = globalScales[globalIndex];
+            const uint8_t *source =
+                weights + (size_t)sourceRow * rawBytesPerRow;
+            uint8_t *rowDestination =
+                destination + (size_t)localRow * packedBytesPerRow;
+            for (int block = 0; block < packedBlocks; block++) {
+                const int blockStart = block * 16;
+                const int blockElements =
+                    std::min(16, columns - blockStart);
+                const int blockBytes = (blockElements + 1) / 2;
+                uint8_t *blockDestination = planar
+                    ? destination + NVFP4PlanarWeightOffset(localRow, packedBlocks, block)
+                    : rowDestination;
+                memset(blockDestination, 0, 8);
+                memcpy(blockDestination, source + blockStart / 2, blockBytes);
+
+                const size_t scaleIndex =
+                    (size_t)scaleRow * scaleColumns + block;
+                const float scale =
+                    fp8ToFloat.dict[scaleBytes[scaleIndex]] * globalScale;
+                uint8_t *scaleDestination = planar
+                    ? destination + NVFP4PlanarScaleOffset(localRow, packedBlocks, block)
+                    : blockDestination + 8;
+                memcpy(scaleDestination, &scale, sizeof(scale));
+                rowDestination += 8 + sizeof(scale);
+            }
+        }
+    }
+
+    void ConvertCompactE4M3NVFP4ToBlock16(
+            Data &data, bool crossSwiglu) {
+        if (data.dataType != DataType::NVFP4_BLOCK_16_E4M3) {
+            return;
+        }
+        AssertInFastLLM(
+            data.dataDevice == DataDevice::CPU && data.cpuData != nullptr &&
+            data.dims.size() == 2 && !data.isFake &&
+            !data.multiDeviceData && data.numasData.empty() &&
+            !data.isDiskWeight,
+            "Compact E4M3 NVFP4 conversion requires a resident CPU matrix.\n");
+        const int rows = data.dims[0];
+        const int columns = data.dims[1];
+        const uint8_t *scaleBytes = GetNVFP4ScaleData(data);
+        const size_t packedBytes =
+            GetDataBytes(DataType::NVFP4_BLOCK_16, rows, columns);
+        std::vector<uint8_t> packed(packedBytes);
+        PackCompactE4M3NVFP4Block16Rows(
+            rows, columns, data.cpuData, scaleBytes, data.scales,
+            data.blockK, data.blockM, packed.data(), 0, rows,
+            crossSwiglu);
+
+        data.FreeSpace();
+        // FreeSpace deliberately does not delete an mmap-backed pointer.
+        // The converted allocation is owned storage, so detach the old map
+        // before allocating it or the new buffer would later be treated as a
+        // borrowed mapping and leaked.
+        data.mapFile.reset();
+        data.dataType = DataType::NVFP4_BLOCK_16;
+        data.blockK = 1;
+        data.blockM = 16;
+        data.IsRepacked = false;
+        data.cpuNVFP4Scales.clear();
+        data.UpdateUnitSize();
+        data.Allocate(false);
+        AssertInFastLLM(data.cpuData != nullptr &&
+                        data.GetBytes() == packedBytes,
+                        "Compact E4M3 NVFP4 conversion allocation failed.\n");
+        memcpy(data.cpuData, packed.data(), packedBytes);
+    }
+
     size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
         if (rows == 0 || columns == 0) {
             return 0;
         }
         if (type == DataType::FLOAT32) {
             return rows * columns * sizeof(float);
+        } else if (type == DataType::FP4_E2M1) {
+            AssertInFastLLM(columns % 16 == 0, "FP4 KV cache requires columns divisible by 16.\n");
+            return rows * (columns / 16) * 9;
         } else if (type == DataType::BFLOAT16 || type == DataType::FLOAT16) {
             return rows * columns * sizeof(uint16_t);
         } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP ||
@@ -626,12 +775,14 @@ namespace fastllm {
             return rows * (columns + ((columns - 1) / 128 + 1) * sizeof(float));
         } else if (type == DataType::FP8_E4M3_PERCHANNEL) {
             return rows * (columns + sizeof(float));
-        } else if (type == DataType::NVFP4_BLOCK_16) {
+        } else if (type == DataType::NVFP4_BLOCK_16 || type == DataType::NVFP4_BLOCK_16_PLANAR) {
             int blocks = (columns - 1) / 16 + 1;
             return rows * blocks * (8 + sizeof(float));
         } else if (type == DataType::NVFP4_BLOCK_16_E8M0) {
             int blocks = (columns - 1) / 16 + 1;
             return rows * blocks * (8 + sizeof(uint8_t));
+        } else if (type == DataType::NVFP4_BLOCK_16_E4M3) {
+            return GetNVFP4StorageBytes(rows, columns, 1, 16);
         } else if (type == DataType::NVFP4_BLOCK_32_E8M0) {
             int blocks = (columns - 1) / 32 + 1;
             return rows * blocks * (16 + sizeof(uint8_t));
@@ -985,9 +1136,17 @@ namespace fastllm {
         this->forceGGUFFp32Dequant = ori.forceGGUFFp32Dequant;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
+        bool hasStorage = false;
+        if (this->dataDevice == DataDevice::CPU) {
+            hasStorage = this->cpuData != nullptr;
+        } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            hasStorage = this->cudaData != nullptr;
+#endif
+        }
         if (needRebuildGGUFTensor ||
             ori.expansionDims != this->expansionDims || ori.dims != this->dims ||
-            this->cpuData == nullptr || ori.dataType != this->dataType) {
+            !hasStorage || ori.dataType != this->dataType) {
             if (ori.dims.size() == 0) {
                 this->dataType = ori.dataType;
                 this->UpdateUnitSize();
@@ -1012,12 +1171,12 @@ namespace fastllm {
             if (ori.expansionDims.size() > 0 && ori.expansionDims != ori.dims) {
                 this->Expansion(ori.expansionDims);
                 this->Resize(ori.dims);
-                this->Allocate();
+                this->Allocate(false);
             } else {
                 this->expansionDims.clear();
                 this->Resize(ori.dims);
                 this->FreeSpace();
-                this->MallocSpace(Count(0));
+                this->MallocSpace(Count(0), false);
             }
         }
 
@@ -1318,14 +1477,18 @@ namespace fastllm {
         data.weightType = weightType;
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
+             dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
              dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              dataType == DataType::INT4_GROUP32)) {
             this->blockK = blockK;
             this->blockM = blockM;
             if (dataType == DataType::NVFP4) {
                 this->scales.clear();
-            } else if (dataType == DataType::NVFP4_BLOCK_16) {
+            } else if (dataType == DataType::NVFP4_BLOCK_16 ||
+                       dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                       dataType == DataType::NVFP4_BLOCK_16_E4M3) {
                 // NVFP4_BLOCK_16 keeps its block scales inline.  oriScales, when
                 // present, contains only the tensor-level dequant multiplier
                 // retained by the safetensors loader for Marlin preparation.
@@ -1406,15 +1569,21 @@ namespace fastllm {
             } else if (dataType == DataType::FP8_E4M3 || dataType == DataType::NVFP4) {
                 this->blockK = blockK;
                 this->blockM = blockM;
-                int rows = 1;
-                for (int i = 0; i + 1 < (int)this->dims.size(); i++) {
-                    rows *= this->dims[i];
+                // Some non-linear checkpoint tensors (for example Qwen4-Exp's
+                // sharded PLE lookup table) intentionally keep raw E4M3 bytes
+                // and apply one external scalar after gathering.  They have no
+                // block-scale metadata and must remain valid Data objects.
+                if (!(dataType == DataType::FP8_E4M3 && oriScales == nullptr)) {
+                    int rows = 1;
+                    for (int i = 0; i + 1 < (int)this->dims.size(); i++) {
+                        rows *= this->dims[i];
+                    }
+                    int cols = this->dims.back();
+                    int ks = (rows - 1) / this->blockK + 1;
+                    int ms = (cols - 1) / this->blockM + 1;
+                    data.scales.resize(ks * ms);
+                    memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
                 }
-                int cols = this->dims.back();
-                int ks = (rows - 1) / this->blockK + 1;
-                int ms = (cols - 1) / this->blockM + 1;
-                data.scales.resize(ks * ms);
-                memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
             }
         } else if (oriDataType == DataType::BFLOAT16
                 && dataType == DataType::FLOAT16) {
@@ -1440,6 +1609,68 @@ namespace fastllm {
             for (int i = 0; i < len; i++) {
                 a[i] = ((uint32_t*)&b[i])[0] >> 16;
             }
+        } else if ((oriDataType == DataType::FLOAT32 ||
+                    oriDataType == DataType::BFLOAT16) &&
+                   dataType == DataType::INT4_GROUP32) {
+            AssertInFastLLM(
+                data.dims.size() == 2 && data.dims[0] > 0 &&
+                    data.dims[1] > 0 && data.dims[1] % 32 == 0,
+                "INT4_GROUP32 quantization requires a 2D weight with columns divisible by 32.\n");
+            const int rows = data.dims[0];
+            const int columns = data.dims[1];
+            const int groups = columns / 32;
+            const size_t rowBytes = GetDataBytes(
+                DataType::INT4_GROUP32, 1, columns);
+            const float *floatSource = oriDataType == DataType::FLOAT32
+                ? (const float*)oriData : nullptr;
+            const uint16_t *bf16Source = oriDataType == DataType::BFLOAT16
+                ? (const uint16_t*)oriData : nullptr;
+            auto sourceValue = [&](size_t index) {
+                return floatSource != nullptr
+                    ? floatSource[index]
+                    : bf16tofp32.dict[bf16Source[index]];
+            };
+            auto quantize = [](float value, float scale) {
+                if (scale == 0.0f) {
+                    return 8;
+                }
+                return std::max(
+                    0, std::min(15, (int)std::lround(value / scale) + 8));
+            };
+
+            for (int row = 0; row < rows; row++) {
+                uint8_t *destinationRow =
+                    data.cpuData + (size_t)row * rowBytes;
+                for (int group = 0; group < groups; group++) {
+                    const size_t sourceOffset =
+                        (size_t)row * columns + (size_t)group * 32;
+                    float absMax = 0.0f;
+                    for (int column = 0; column < 32; column++) {
+                        absMax = std::max(
+                            absMax,
+                            std::fabs(sourceValue(sourceOffset + column)));
+                    }
+                    const uint16_t scaleBits = Float32ToBFloat16RNEBits(
+                        absMax == 0.0f ? 0.0f : absMax / 7.0f);
+                    memcpy(destinationRow +
+                               GetInt4Group32ScaleOffset(group, groups),
+                           &scaleBits, sizeof(scaleBits));
+                    const float scale = BFloat16BitsToFloat32(scaleBits);
+                    uint8_t *packed = destinationRow +
+                        GetInt4Group32DataOffset(group, groups);
+                    for (int column = 0; column < 32; column += 2) {
+                        const int high = quantize(
+                            sourceValue(sourceOffset + column), scale);
+                        const int low = quantize(
+                            sourceValue(sourceOffset + column + 1), scale);
+                        packed[column / 2] =
+                            (uint8_t)((high << 4) | low);
+                    }
+                }
+            }
+            data.perChannelAxis = 0;
+            data.groupCnt = 32;
+            data.group = groups;
         } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16)
                 && dataType == DataType::INT4_GROUP) {
             int bit = (dataType == DataType::INT4_GROUP) ? 4 : 8;
@@ -1617,9 +1848,14 @@ namespace fastllm {
         } else if (this->dataType == DataType::NVFP4) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
+        } else if (this->dataType == DataType::FP4_E2M1) {
+            this->unitSize = 9;
+            this->unitSizeDiv = 16;
         } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                    this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    this->dataType == DataType::INT4_GROUP32) {
             this->unitSize = 1;
@@ -1648,7 +1884,9 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1658,7 +1896,8 @@ namespace fastllm {
             this->blockK > 0 && this->blockM > 0 && this->scales.empty()) {
             this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
         } else {
-            this->expansionBytes = (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
+            this->expansionBytes = this->expansionSize == 0 ? 0 :
+                (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
         }
     }
 
@@ -1863,6 +2102,9 @@ namespace fastllm {
     }
 
     uint64_t Data::GetBytes() const {
+        if (this->dims.empty() || this->strides.empty() || this->Count(0) == 0) {
+            return 0;
+        }
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
         }
@@ -1873,7 +2115,9 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1892,7 +2136,9 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1903,7 +2149,8 @@ namespace fastllm {
             size == this->Count(0)) {
             this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
         } else {
-            this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
+            this->expansionBytes = size == 0 ? 0 :
+                (size * this->unitSize - 1) / this->unitSizeDiv + 1;
         }
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = new uint8_t[this->expansionBytes];
@@ -2101,11 +2348,16 @@ namespace fastllm {
     }
 
     Data::~Data() {
+        if (this->isDiskWeight) {
+            ReleaseDiskMoeCache(this);
+        }
 #ifdef USE_CUDA
         // Hash-route tables keep per-device CUDA replicas while the owning
         // Data is alive. Retire them before either this object or its CPU
         // allocation can be reused by a subsequently loaded model.
-        FastllmCudaReleaseDeepSeekV4RouteTableCache(this);
+        if (this->hasDeepSeekV4RouteTableCache) {
+            FastllmCudaReleaseDeepSeekV4RouteTableCache(this);
+        }
 
         // Retire routed-expert caches owned by this Data before its address can
         // be reused by a subsequently loaded model. These calls are no-ops for
@@ -2476,7 +2728,13 @@ namespace fastllm {
             (this->dataDevice == DataDevice::CPU || deviceIds.size() == 0 || this->dataDeviceIds == deviceIds);
 #ifdef USE_CUDA
         if (alreadyOnTarget && this->dataDevice == DataDevice::CUDA &&
-            this->cudaData != nullptr && deviceIds.size() > 0) {
+            this->cudaData != nullptr && deviceIds.size() > 0 &&
+            !FastllmCudaGraphIsCapturingFast()) {
+            // Pointer-attribute queries are useful for detecting stale view
+            // metadata in eager execution, but CUDA forbids them during stream
+            // capture. A graph path must eagerly warm the identical topology
+            // first; once capture starts, placement and allocations are frozen
+            // and exact dataDeviceIds metadata is sufficient.
             int targetDevice = deviceIds.size() == 0 ? FastllmCudaGetDevice() : deviceIds[0];
             int realDevice = GetPointerDeviceId(this->cudaData);
             if (realDevice >= 0 && realDevice != targetDevice) {
@@ -2962,7 +3220,9 @@ namespace fastllm {
             return DataType::FLOAT32;
         } else if (this->dataType == DataType::NVFP4 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                    this->dataType == DataType::NVFP4_BLOCK_32_E8M0) {
             return batchSize > 31 ? DataType::BFLOAT16 : DataType::FLOAT32;
         } else if (this->dataType == DataType::INT4_PERCHANNEL ||
@@ -3907,7 +4167,7 @@ namespace fastllm {
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer, MoeGateType gateType,
                 bool expertParallel, float swigluLimit, bool deepSeekV4Mode,
-                Data *pairedReduceInput) {
+                Data *pairedReduceInput, int activationQuantBlock, bool quantizeSharedExpert) {
         DataDict datas = {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
@@ -3923,7 +4183,9 @@ namespace fastllm {
                                         {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
                                          {"layer", layer}, {"gateType", (int)gateType},
                                          {"expertParallel", expertParallel ? 1 : 0},
-                                         {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0}});
+                                         {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0},
+                                         {"activationQuantBlock", activationQuantBlock},
+                                         {"quantizeSharedExpert", quantizeSharedExpert ? 1 : 0}});
     }
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
@@ -3976,6 +4238,33 @@ namespace fastllm {
                 {"stride", stride}, {"pad", pad}});
     }
 
+    void CausalDepthwiseConv1DDecode(const Data &input, const Data &weight,
+                                     Data &state, int kernel, bool silu,
+                                     Data &output) {
+        curExecutor->Run("CausalDepthwiseConv1DDecode", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"state", &state}, {"output", &output}
+        }, {}, {{"kernel", kernel}, {"silu", silu ? 1 : 0}});
+    }
+
+    void CausalDepthwiseConv1DPrefill(const Data &input, const Data &weight,
+                                      Data &state, int kernel, bool silu,
+                                      Data &output) {
+        CausalDepthwiseConv1DPrefill(
+            input, weight, state, kernel, silu,
+            output, DataType::FLOAT32);
+    }
+
+    void CausalDepthwiseConv1DPrefill(const Data &input, const Data &weight,
+                                      Data &state, int kernel, bool silu,
+                                      Data &output, DataType outputType) {
+        curExecutor->Run("CausalDepthwiseConv1DPrefill", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"state", &state}, {"output", &output}
+        }, {}, {{"kernel", kernel}, {"silu", silu ? 1 : 0},
+                {"outputType", (int)outputType}});
+    }
+
     void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output) {
         curExecutor->Run("Conv2D", {
                 {"input", (Data*)&input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
@@ -4005,6 +4294,208 @@ namespace fastllm {
         curExecutor->Run("RMSNormPart", {
                 {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"output", &output}
         }, {{"eps", eps}}, {{"start", start}, {"end", end}});
+    }
+
+    void Qwen4GroupedRMSNorm(const Data &input, const Data &weight,
+                             float eps, int groups, Data &output) {
+        curExecutor->Run("Qwen4GroupedRMSNorm", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"output", &output}
+        }, {{"eps", eps}}, {{"groups", groups}});
+    }
+
+    void Qwen4PLEGate(const Data &key, const Data &query,
+                      const Data &value, int groups, Data &output) {
+        curExecutor->Run("Qwen4PLEGate", {
+                {"key", (Data*)&key}, {"query", (Data*)&query},
+                {"value", (Data*)&value}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4PLECausalConv(const Data &normalized, const Data &gated,
+                            const Data &weight, const Data &history,
+                            int kernel, int dilation, Data &output,
+                            Data &newHistory) {
+        curExecutor->Run("Qwen4PLECausalConv", {
+                {"input", (Data*)&normalized}, {"gated", (Data*)&gated},
+                {"weight", (Data*)&weight}, {"history", (Data*)&history},
+                {"output", &output}, {"newHistory", &newHistory}
+        }, {}, {{"kernel", kernel}, {"dilation", dilation}});
+    }
+
+    void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
+                       int groups, Data &output) {
+        curExecutor->Run("Qwen4HyperMix", {
+                {"input", (Data*)&normalized},
+                {"mixLogits", (Data*)&mixLogits}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4HyperMixProjected(const Data &normalized,
+                                const Data &lowRank, Data &upWeight,
+                                int groups, Data &output) {
+        curExecutor->Run("Qwen4HyperMix", {
+                {"input", (Data*)&normalized},
+                {"mixLogits", (Data*)&lowRank},
+                {"weight", &upWeight}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4HyperProject(const Data &normalized, Data &downWeight,
+                           Data &injectionWeight, int groups,
+                           Data &activated, Data &injection) {
+        Qwen4HyperProject(
+            normalized, downWeight, injectionWeight, groups,
+            activated, injection, DataType::DATA_AUTO_NONE);
+    }
+
+    void Qwen4HyperProject(const Data &normalized, Data &downWeight,
+                           Data &injectionWeight, int groups,
+                           Data &activated, Data &injection,
+                           DataType outputType) {
+        IntDict intParams = {{"groups", groups}};
+        if (outputType != DataType::DATA_AUTO_NONE) {
+            intParams["outputType"] = (int)outputType;
+        }
+        curExecutor->Run("Qwen4HyperProject", {
+                {"input", (Data*)&normalized},
+                {"downWeight", &downWeight},
+                {"injectionWeight", &injectionWeight},
+                {"output", &activated}, {"injection", &injection}
+        }, {}, intParams);
+    }
+
+    void Qwen4HyperPrepare(const Data &lowRankProjection, int groups,
+                           Data &activated) {
+        curExecutor->Run("Qwen4HyperPrepare", {
+                {"input", (Data*)&lowRankProjection},
+                {"output", &activated}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4HyperInject(const Data &logits, int groups, Data &output) {
+        curExecutor->Run("Qwen4HyperInject", {
+                {"input", (Data*)&logits}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4HyperCombine(const Data &hyperInput, const Data &blockOutput,
+                           const Data &injection, int groups, Data &output) {
+        curExecutor->Run("Qwen4HyperCombine", {
+                {"input", (Data*)&hyperInput},
+                {"blockOutput", (Data*)&blockOutput},
+                {"injection", (Data*)&injection}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4HyperCombineRMSNorm(
+            const Data &hyperInput, const Data &blockOutput,
+            const Data &injection, const Data &normWeight,
+            float eps, int groups, Data &residual, Data &normalized) {
+        Qwen4HyperCombineRMSNorm(
+            hyperInput, blockOutput, injection, normWeight,
+            eps, groups, residual, normalized, nullptr,
+            DataType::FLOAT16);
+    }
+
+    void Qwen4HyperCombineRMSNorm(
+            const Data &hyperInput, const Data &blockOutput,
+            const Data &injection, const Data &normWeight,
+            float eps, int groups, Data &residual, Data &normalized,
+            Data *normalizedStorage, DataType normalizedStorageType) {
+        DataDict datas = {
+                {"input", (Data*)&hyperInput},
+                {"blockOutput", (Data*)&blockOutput},
+                {"injection", (Data*)&injection},
+                {"weight", (Data*)&normWeight},
+                {"output", &residual}, {"normalized", &normalized}
+        };
+        IntDict intParams = {{"groups", groups}};
+        if (normalizedStorage != nullptr) {
+            datas["normalizedStorage"] = normalizedStorage;
+            intParams["normalizedStorageType"] =
+                (int)normalizedStorageType;
+        }
+        curExecutor->Run("Qwen4HyperCombineRMSNorm", datas,
+                         {{"eps", eps}}, intParams);
+    }
+
+    void Qwen4QSASelect(const Data &query, const Data &compressedKeys,
+                        int keyLength, int heads, int headDim,
+                        int tokenBudget, int compressRatio, Data &indices,
+                        int queryStart) {
+        curExecutor->Run("Qwen4QSASelect", {
+                {"query", (Data*)&query},
+                {"compressedKeys", (Data*)&compressedKeys},
+                {"output", &indices}
+        }, {}, {{"keyLength", keyLength}, {"heads", heads},
+                {"headDim", headDim}, {"tokenBudget", tokenBudget},
+                {"compressRatio", compressRatio},
+                {"queryStart", queryStart}});
+    }
+
+    void Qwen4QSABuildMask(const Data &indices, const Data &reference,
+                           int keyLength, Data &mask) {
+        curExecutor->Run("Qwen4QSABuildMask", {
+                {"indices", (Data*)&indices},
+                {"reference", (Data*)&reference}, {"output", &mask}
+        }, {}, {{"keyLength", keyLength}});
+    }
+
+    void Qwen4SparseAttention(const Data &query, const Data &key,
+                              const Data &value, const Data &indices,
+                              int group, float scale, Data &output) {
+        curExecutor->Run("Qwen4SparseAttention", {
+                {"query", (Data*)&query}, {"key", (Data*)&key},
+                {"value", (Data*)&value}, {"indices", (Data*)&indices},
+                {"output", &output}
+        }, {{"scale", scale}}, {{"group", group}});
+    }
+
+    void GatedDeltaRuleDecode(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output) {
+        curExecutor->Run("GatedDeltaRuleDecode", {
+                {"input", (Data*)&qkv},
+                {"alpha", (Data*)&alpha}, {"beta", (Data*)&beta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output}
+        }, {{"recurrentEps", recurrentEps}},
+        {{"keyHeads", keyHeads}, {"valueHeads", valueHeads},
+         {"keyDim", keyDim}, {"valueDim", valueDim}});
+    }
+
+    void GatedDeltaRuleSequence(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output,
+            Data *stateOutput) {
+        DataDict datas = {
+                {"input", (Data*)&qkv},
+                {"alpha", (Data*)&alpha}, {"beta", (Data*)&beta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output}
+        };
+        if (stateOutput != nullptr) {
+            datas["stateOutput"] = stateOutput;
+        }
+        curExecutor->Run("GatedDeltaRuleSequence", datas,
+        {{"recurrentEps", recurrentEps}},
+        {{"keyHeads", keyHeads}, {"valueHeads", valueHeads},
+         {"keyDim", keyDim}, {"valueDim", valueDim}});
+    }
+
+    void Qwen4GatedDeltaRuleDecode(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output) {
+        GatedDeltaRuleDecode(qkv, alpha, beta, aLog, dtBias, state,
+                             keyHeads, valueHeads, keyDim, valueDim,
+                             recurrentEps, output);
     }
 
     void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,
@@ -4065,7 +4556,9 @@ namespace fastllm {
             const Data &q, const Data &k, const Data &v,
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
-            Data &state, Data &output) {
+            Data &state, Data &output,
+            bool normalizeQKInFp32,
+            bool roundBetaToBfloat16) {
         Data unusedDecay, unusedBeta;
         curExecutor->Run("KimiK3RecurrentKDA", {
                 {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
@@ -4075,14 +4568,18 @@ namespace fastllm {
                 {"state", &state}, {"output", &output},
                 {"decay", &unusedDecay}, {"beta", &unusedBeta}
         }, {{"lowerBound", lowerBound}},
-        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 0}});
+        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 0},
+         {"normalizeQKInFp32", normalizeQKInFp32 ? 1 : 0},
+         {"roundBetaToBfloat16", roundBetaToBfloat16 ? 1 : 0}});
     }
 
     void KimiK3RecurrentKDAUpdateState(
             const Data &k, const Data &v,
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
-            int tokens, Data &state) {
+            int tokens, Data &state,
+            bool normalizeKInFp32,
+            bool roundBetaToBfloat16) {
         Data unusedOutput, unusedDecay, unusedBeta;
         curExecutor->Run("KimiK3RecurrentKDA", {
                 // Query contributes only to the emitted attention output; the
@@ -4095,7 +4592,9 @@ namespace fastllm {
                 {"state", &state}, {"output", &unusedOutput},
                 {"decay", &unusedDecay}, {"beta", &unusedBeta}
         }, {{"lowerBound", lowerBound}},
-        {{"tokenLimit", tokens}, {"stateOnly", 1}, {"outputAux", 0}});
+        {{"tokenLimit", tokens}, {"stateOnly", 1}, {"outputAux", 0},
+         {"normalizeQKInFp32", normalizeKInFp32 ? 1 : 0},
+         {"roundBetaToBfloat16", roundBetaToBfloat16 ? 1 : 0}});
     }
 
     void KimiK3RMSNormSigmoidGate(
@@ -4264,6 +4763,14 @@ namespace fastllm {
         curExecutor->Run("Repeat", {
                 {"input", (Data*)&input}, {"output", &output}
         }, {}, {{"axis", axis}, {"repeatTimes", repeatTimes}});
+    }
+
+    void RepeatAddTo(Data &input0, const Data &input1, int axis,
+                     int repeatTimes, float alpha) {
+        curExecutor->Run("RepeatAddTo", {
+                {"input0", &input0}, {"input1", (Data*)&input1}
+        }, {{"alpha", alpha}},
+        {{"axis", axis}, {"repeatTimes", repeatTimes}});
     }
 
     void Copy(const Data &input, Data &output) {
@@ -4468,6 +4975,12 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void SigmoidMulTo(Data &input, const Data &gate) {
+        curExecutor->Run("SigmoidMulTo", {
+                {"input", &input}, {"gate", (Data*)&gate}
+        }, {}, {});
+    }
+
     void Exp(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("Exp", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -4621,6 +5134,20 @@ namespace fastllm {
             {{"topk", topk}, {"needNorm", needNorm ? 1 : 0}});
     };
 
+    void FusedSoftmaxSelectExpert(const Data &logits, Data &index, Data &score,
+                                  int topk, bool needNorm, float routeScale,
+                                  const Data *gateBias) {
+        DataDict datas = {{"logits", (Data*)&logits},
+                          {"index", &index}, {"score", &score}};
+        if (gateBias != nullptr) {
+            datas["gateBias"] = (Data*)gateBias;
+        }
+        curExecutor->Run("FusedSoftmaxSelectExpert", datas,
+                         {{"routeScale", routeScale}},
+                         {{"topk", topk},
+                          {"needNorm", needNorm ? 1 : 0}});
+    };
+
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
         curExecutor->Run("RotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
@@ -4716,7 +5243,7 @@ namespace fastllm {
         Data &insertIndexs, Data &insertPositions,
         int q_heads, int k_heads, int head_dim,
         int rotaryDim, float eps, float ropeTheta, float ropeScale,
-        int pageLen, int batch, bool doQKNorm, Data *lastPageLens) {
+        int pageLen, int batch, bool doQKNorm, Data *lastPageLens, const RopeConfig *ropeConfig) {
         DataDict datas = {
                 {"qkv", &qkv}, {"qNormWeight", &qNormWeight}, {"kNormWeight", &kNormWeight},
                 {"positionIds", (Data*)&positionIds},
@@ -4727,8 +5254,10 @@ namespace fastllm {
         if (lastPageLens != nullptr) {
             datas["lastPageLens"] = lastPageLens;
         }
-        curExecutor->Run("QKVRMSNormRopeSplitAppendPagedCache", datas, {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
-           {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch}, {"doQKNorm", (int)doQKNorm}});
+        FloatDict floats = {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}};
+        IntDict ints = {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch}, {"doQKNorm", (int)doQKNorm}};
+        if (ropeConfig) ropeConfig->AddFusedParams(floats, ints);
+        curExecutor->Run("QKVRMSNormRopeSplitAppendPagedCache", datas, floats, ints);
     }
 
     void Step3p5QKVRMSNormRopeSplitAppendPagedCache(
@@ -4939,6 +5468,16 @@ namespace fastllm {
         int numHeads = cacheData.dims[0];
         int headDim = cacheData.dims.back();
         DataType dataType = cacheData.dataType;
+        if (dataType == DataType::FP4_E2M1) {
+            AssertInFastLLM(headDim == 128 || headDim == 256,
+                            "FP4 KV cache requires head_dim 128 or 256.\n");
+#ifdef USE_CUDA
+            AssertInFastLLM(cacheData.dataDevice == DataDevice::CUDA,
+                            "FP4 KV cache requires CUDA.\n");
+#else
+            ErrorInFastLLM("FP4 KV cache requires CUDA.\n");
+#endif
+        }
 
         // 设置 Data 的基本属性（PagedCacheManager 继承自 Data）
         ((Data*)manager)->dataType = dataType;
@@ -5237,6 +5776,19 @@ namespace fastllm {
 
     int GetMoeDeviceLayers() {
         return defaultMoeDeviceLayers;
+    }
+
+    void SetNgramDevice(const std::string &device) {
+        std::string normalized = device;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        AssertInFastLLM(normalized == "cpu" || normalized == "disk",
+                        "ngram device should be cpu or disk.\n");
+        defaultNgramDevice = normalized;
+    }
+
+    std::string GetNgramDevice() {
+        return defaultNgramDevice;
     }
 
     void PagedCacheManager::SetMaxPages(int maxPages) {
