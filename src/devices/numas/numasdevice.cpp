@@ -6972,8 +6972,25 @@ namespace fastllm {
         offset = 0;
         // Down projection writes plain FLOAT32 with no swiglu/quantization
         // alignment constraints, so always use the wider 128-column chunks to
-        // cut per-task scheduling overhead (grouped-decode already uses 128).
+        // cut per-task scheduling overhead.
         stride = 128;
+        if (useDeepSeekV4GroupedDecodeFast) {
+            // Grouped decode: aim for about eight tasks per worker so the final
+            // wave stays balanced instead of leaving one worker with an
+            // oversized tail chunk.  Chunks stay aligned to the 32-value
+            // activation quantization group.
+            const int groups = std::max(
+                1, (int)groupedGemmExperts.size());
+            const int threadsPerNode = std::max(
+                1, numaConfig->threads / numaConfig->numaCnt);
+            const int targetTasks = threadsPerNode * 8;
+            const int chunksPerExpert = std::max(
+                1, (targetTasks + groups - 1) / groups);
+            const int kPerNode = dim / numaConfig->numaCnt;
+            const int balancedStride =
+                kPerNode / chunksPerExpert / 32 * 32;
+            stride = std::max(64, std::min(512, balancedStride));
+        }
         auto &downTaskStorage =
             fastllmMoeDataManagerNumas.gemmTaskStorage;
         std::vector<std::vector<MultiThreadBaseOp*>> &downOps =
