@@ -195,6 +195,12 @@ namespace fastllm {
             // the host reads only the compact token-id prefix.
             Data sampledTokenIds;
             Data sampledTokenValues;
+            // Actual temperature-scaled draft distribution, as in Qwen3.5.
+            Data proposalLogits;
+            Data proposalLogsumexp;
+            float proposalTemperature = 1.0f;
+            bool sampleProposal = false;
+            int proposalCount = 0;
             std::shared_ptr<MtpDraftCudaGraphState> draftGraphState;
             std::vector<int> proposals;
             std::deque<int> pendingOutputTokens;
@@ -278,8 +284,6 @@ namespace fastllm {
         std::vector<int> visionDeepstackIndexes;
         std::vector<float> visionImageMean = {0.5f, 0.5f, 0.5f};
         std::vector<float> visionImageStd = {0.5f, 0.5f, 0.5f};
-        Data visionSinData;
-        Data visionCosData;
 
         bool preparedWeights = false;
         std::atomic<int> mtpWeightsStatus{-1};
@@ -305,12 +309,7 @@ namespace fastllm {
         // Logical concatenation of the lazy shard metadata used by the
         // standard disk EmbeddingDirect operation.
         Data pleNgramDiskWeight;
-        // QSA cache compression applies RoPE on the host while regular
-        // attention applies it on its execution device. Keep an immutable
-        // host view so cache updates never migrate the shared sinData/cosData
-        // tensors away from CUDA during decode.
-        std::vector<float> qsaSinValues;
-        std::vector<float> qsaCosValues;
+        // Host QSA compression must not move the device normalization weights.
         std::map<int, std::vector<float>> qsaKeyNormValues;
         std::vector<Data *> mtpMoeWeights;
         std::vector<Data *> mtpMoeBiass;

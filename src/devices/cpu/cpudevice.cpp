@@ -54,10 +54,19 @@ namespace fastllm {
     extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end, bool planar);
+    extern bool FastllmGemmBFloat16NVFP4Block16E4M3Packed_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
+    extern bool FastllmGemmBFloat16NVFP4Block16E4M3Packed_AVX2(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
     extern bool FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end);
     extern bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
+    extern bool FastllmGemmBFloat16NVFP4Block16_AVX2(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end);
     extern bool FastllmGemmFloat32NVFP4Block16_AVX512BF16(
@@ -930,19 +939,26 @@ namespace fastllm {
 #endif
 
     static void NVFP4Block16RowsToBFloat16(
-        const void *B, long ldb, uint16_t *bf16B, int m, int st, int end, bool scaleE8M0 = false, bool planar = false
+        const void *B, long ldb, uint16_t *bf16B, int m, int st, int end, bool scaleE8M0 = false, bool planar = false, bool compactScales = false
     ) {
         const int blockSize = 16;
-        const int packedBlockBytes = 8 + (scaleE8M0 ? (int)sizeof(uint8_t) : (int)sizeof(float));
+        const int packedBlockBytes = 8 + ((scaleE8M0 || compactScales) ? (int)sizeof(uint8_t) : (int)sizeof(float));
         const int blocks = (m - 1) / blockSize + 1;
         for (int row = st; row < end; row++) {
             const uint8_t *rowStart = (const uint8_t*)B + (size_t)row * ldb;
+            float globalScale = 1.0f;
+            if (compactScales) {
+                memcpy(&globalScale, rowStart, sizeof(float));
+                rowStart += sizeof(float);
+            }
             uint16_t *dstRow = bf16B + (size_t)(row - st) * m;
             for (int block = 0; block < blocks; block++) {
                 const uint8_t *blockStart = planar ? (const uint8_t*)B + NVFP4PlanarWeightOffset(row, blocks, block)
                     : rowStart + block * packedBlockBytes;
                 float scale = scaleE8M0 ? NVFP4E8M0ScaleToFloat(blockStart[8]) : 0.0f;
-                if (!scaleE8M0) {
+                if (compactScales) {
+                    scale = fp8e4m3tofp32.dict[blockStart[8]] * globalScale;
+                } else if (!scaleE8M0) {
                     memcpy(&scale, planar ? (const uint8_t*)B + NVFP4PlanarScaleOffset(row, blocks, block) : blockStart + 8, sizeof(float));
                 }
                 int l = block * blockSize;
@@ -1024,7 +1040,7 @@ namespace fastllm {
         return value;
     }
 
-    template <int COLS, bool INPUT_BF16, bool SCALE_E8M0, bool PLANAR = false>
+    template <int COLS, bool INPUT_BF16, bool SCALE_E8M0, bool PLANAR = false, bool COMPACT = false>
     static inline void GemmNVFP4Block16Cols_CPU(
         const void *inputBase, const uint8_t *weightBase, long ldb, float *output,
         int outputCol, int m
@@ -1039,14 +1055,18 @@ namespace fastllm {
         const uint8x8_t lowMask = vdup_n_u8(0x0f);
 #endif
 
-        const int packedBlockBytes = 8 + (SCALE_E8M0 ? (int)sizeof(uint8_t) : (int)sizeof(float));
+        const int packedBlockBytes = 8 + ((SCALE_E8M0 || COMPACT) ? (int)sizeof(uint8_t) : (int)sizeof(float));
         for (int block = 0; block < blocks; block++) {
             const uint8_t *blockStart[COLS];
             float scale[COLS];
             for (int c = 0; c < COLS; c++) {
                 blockStart[c] = PLANAR ? weightBase + NVFP4PlanarWeightOffset(outputCol + c, blocks, block)
-                    : weightBase + (size_t)(outputCol + c) * ldb + block * packedBlockBytes;
-                if constexpr (SCALE_E8M0) {
+                    : weightBase + (size_t)(outputCol + c) * ldb + (COMPACT ? sizeof(float) : 0) + block * packedBlockBytes;
+                if constexpr (COMPACT) {
+                    float global;
+                    memcpy(&global, weightBase + (size_t)(outputCol + c) * ldb, sizeof(float));
+                    scale[c] = fp8e4m3tofp32.dict[blockStart[c][8]] * global;
+                } else if constexpr (SCALE_E8M0) {
                     scale[c] = NVFP4E8M0ScaleToFloat(blockStart[c][8]);
                 } else {
                     memcpy(scale + c, PLANAR ? weightBase + NVFP4PlanarScaleOffset(outputCol + c, blocks, block) : blockStart[c] + 8, sizeof(float));
@@ -1143,7 +1163,7 @@ namespace fastllm {
         }
     }
 
-    template <bool INPUT_BF16, bool SCALE_E8M0 = false, bool PLANAR = false>
+    template <bool INPUT_BF16, bool SCALE_E8M0 = false, bool PLANAR = false, bool COMPACT = false>
     static inline void GemmNVFP4Block16_CPU_Run(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int st, int end
@@ -1155,13 +1175,13 @@ namespace fastllm {
             float *output = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(C) + (size_t)i * ldc);
             int j = st;
             for (; j + 3 < end; j += 4) {
-                GemmNVFP4Block16Cols_CPU<4, INPUT_BF16, SCALE_E8M0, PLANAR>(input, weightBase, ldb, output + j, j, m);
+                GemmNVFP4Block16Cols_CPU<4, INPUT_BF16, SCALE_E8M0, PLANAR, COMPACT>(input, weightBase, ldb, output + j, j, m);
             }
             switch (end - j) {
                 case 0: break;
-                case 1: GemmNVFP4Block16Cols_CPU<1, INPUT_BF16, SCALE_E8M0, PLANAR>(input, weightBase, ldb, output + j, j, m); break;
-                case 2: GemmNVFP4Block16Cols_CPU<2, INPUT_BF16, SCALE_E8M0, PLANAR>(input, weightBase, ldb, output + j, j, m); break;
-                case 3: GemmNVFP4Block16Cols_CPU<3, INPUT_BF16, SCALE_E8M0, PLANAR>(input, weightBase, ldb, output + j, j, m); break;
+                case 1: GemmNVFP4Block16Cols_CPU<1, INPUT_BF16, SCALE_E8M0, PLANAR, COMPACT>(input, weightBase, ldb, output + j, j, m); break;
+                case 2: GemmNVFP4Block16Cols_CPU<2, INPUT_BF16, SCALE_E8M0, PLANAR, COMPACT>(input, weightBase, ldb, output + j, j, m); break;
+                case 3: GemmNVFP4Block16Cols_CPU<3, INPUT_BF16, SCALE_E8M0, PLANAR, COMPACT>(input, weightBase, ldb, output + j, j, m); break;
             }
         }
     }
@@ -1197,7 +1217,7 @@ namespace fastllm {
             vst1_f16((float16_t*)float16 + i, output_vec);
         }
 #endif
-#ifdef __AVX__
+#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
         for (; i + 7 < len; i += 8) {
             __m256 input_vec = _mm256_loadu_ps(float32 + i);  // 加载 8 个 float32
             __m128i output_vec = _mm256_cvtps_ph(input_vec, _MM_FROUND_TO_NEAREST_INT);  // 转换为 8 个 float16
@@ -1235,7 +1255,7 @@ namespace fastllm {
         }
 #endif
     
-#ifdef __AVX__
+#ifdef __AVX2__
         for (; i + 7 < len; i += 8) {
             __m256i float_vec = _mm256_loadu_si256((__m256i*)&float32[i]);
             __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(float_vec, 16),
@@ -2631,12 +2651,14 @@ namespace fastllm {
                     finish = true;
                 } else if (BType == DataType::NVFP4_BLOCK_16 ||
                            BType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                           BType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                            BType == DataType::NVFP4_BLOCK_16_E8M0) {
                     bool scaleE8M0 = BType == DataType::NVFP4_BLOCK_16_E8M0;
                     bool planar = BType == DataType::NVFP4_BLOCK_16_PLANAR;
+                    bool compactScales = BType == DataType::NVFP4_BLOCK_16_E4M3_PACKED;
                     if (n > 31) {
                         std::vector<uint16_t> bf16B_temp((size_t)(end - st) * m);
-                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end, scaleE8M0, planar);
+                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end, scaleE8M0, planar, compactScales);
                         std::vector<uint16_t> bf16A_temp((size_t)n * m);
                         for (int i = 0; i < n; i++) {
                             Float32ToBFloat16((float*)((uint8_t*)A + (size_t)i * lda), bf16A_temp.data() + (size_t)i * m, m);
@@ -2645,6 +2667,11 @@ namespace fastllm {
                             bf16A_temp.data(), bf16B_temp.data(), nullptr, ((float*)C) + st,
                             n, m, ldc / sizeof(float), 0, end - st
                         ).Run();
+                        finish = true;
+                        return;
+                    }
+                    if (compactScales) {
+                        GemmNVFP4Block16_CPU_Run<false, false, false, true>(A, lda, B, ldb, C, ldc, n, m, st, end);
                         finish = true;
                         return;
                     }
@@ -2872,16 +2899,31 @@ namespace fastllm {
                     finish = true;
                 } else if (BType == NVFP4_BLOCK_16 ||
                            BType == NVFP4_BLOCK_16_PLANAR ||
+                           BType == NVFP4_BLOCK_16_E4M3_PACKED ||
                            BType == NVFP4_BLOCK_16_E8M0) {
                     bool scaleE8M0 = BType == DataType::NVFP4_BLOCK_16_E8M0;
                     bool planar = BType == DataType::NVFP4_BLOCK_16_PLANAR;
+                    bool compactScales = BType == DataType::NVFP4_BLOCK_16_E4M3_PACKED;
                     if (n > 31) {
                         std::vector<uint16_t> bf16B_temp((size_t)(end - st) * m);
-                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end, scaleE8M0, planar);
+                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end, scaleE8M0, planar, compactScales);
                         MultiThreadLinearBFloat16BFloat16Op(
                             (uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st,
                             n, m, ldc / sizeof(float), 0, end - st
                         ).Run();
+                        finish = true;
+                        return;
+                    }
+                    if (compactScales) {
+                        bool done = cpuInstructInfo.hasAVX512BF16 &&
+                            FastllmGemmBFloat16NVFP4Block16E4M3Packed_AVX512BF16(
+                                A, lda, B, ldb, C, ldc, n, m, k, st, end);
+                        if (!done && cpuInstructInfo.hasAVX2) {
+                            done = FastllmGemmBFloat16NVFP4Block16E4M3Packed_AVX2(
+                                A, lda, B, ldb, C, ldc, n, m, k, st, end);
+                        }
+                        if (!done) GemmNVFP4Block16_CPU_Run<true, false, false, true>(
+                            A, lda, B, ldb, C, ldc, n, m, st, end);
                         finish = true;
                         return;
                     }
@@ -2894,6 +2936,12 @@ namespace fastllm {
                             finish = true;
                             return;
                         }
+                    }
+                    if (cpuInstructInfo.hasAVX2 && !scaleE8M0 && !planar &&
+                        FastllmGemmBFloat16NVFP4Block16_AVX2(
+                            A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
                     }
                     if (scaleE8M0) {
                         GemmNVFP4Block16_CPU_Run<true, true>(A, lda, B, ldb, C, ldc, n, m, st, end);
@@ -3234,14 +3282,29 @@ namespace fastllm {
                     float *weights, float *lastOutput,
                     int *pos, int bsz, int k,
                     int hidden_size, bool preZeroed) {
+        if (bsz <= 0 || hidden_size <= 0) return;
         auto *pool = GetAlivePool();
-        int threadNum = pool->threads.size();
+        const int first = pool->curActivateThreadInterval.first;
+        const int available = pool->curActivateThreadInterval.second - first;
+        const uint64_t elements = (uint64_t)bsz * hidden_size;
+        const uint64_t work = elements * std::max(1, k);
+        constexpr uint64_t elementsPerWorker = 16 * 1024;
+        const int threadNum = (int)std::min<uint64_t>(
+            std::min<uint64_t>(std::max(1, available), elements),
+            std::max<uint64_t>(1, (work + elementsPerWorker - 1) / elementsPerWorker));
+        if (threadNum == 1) {
+            MultiThreadReduceBatchOp op(downOutData, downOutDataType,
+                weights, lastOutput, pos, bsz, k, hidden_size,
+                0, bsz, 0, hidden_size, preZeroed);
+            op.Run();
+            return;
+        }
         
         // 决定如何划分：尝试创建一个接近正方形的网格
         int batch_blocks = 1, hidden_blocks = threadNum;
         
         // 简单的启发式：如果bsz足够大，尝试在两个维度上划分
-        if (bsz >= 4 && threadNum >= 4) {
+        if (bsz > 1 && threadNum > 1) {
             // 找到最佳的2D网格划分
             for (int b = 2; b <= std::min(bsz, threadNum); b++) {
                 if (threadNum % b == 0) {
@@ -3254,37 +3317,42 @@ namespace fastllm {
             }
         }
         
-        std::vector<fastllm::MultiThreadReduceBatchOp*> ops;
+        thread_local std::vector<MultiThreadReduceBatchOp> ops;
+        ops.clear();
         ops.reserve(threadNum);
         
         int batch_per = bsz / batch_blocks;
         int hidden_per = hidden_size / hidden_blocks;
+        const int batch_extra = bsz % batch_blocks;
+        const int hidden_extra = hidden_size % hidden_blocks;
         
-        int op_idx = 0;
         for (int b = 0; b < batch_blocks; b++) {
-            int batch_st = b * batch_per;
-            int batch_end = (b == batch_blocks - 1) ? bsz : (b + 1) * batch_per;
+            // Spread the remainder across workers. Giving it all to the last
+            // worker makes, for example, 64 rows / 40 workers end in 25 rows.
+            int batch_st = b * batch_per + std::min(b, batch_extra);
+            int batch_end = batch_st + batch_per + (b < batch_extra);
             
             for (int h = 0; h < hidden_blocks; h++) {
-                int hidden_st = h * hidden_per;
-                int hidden_end = (h == hidden_blocks - 1) ? hidden_size : (h + 1) * hidden_per;
+                int hidden_st = h * hidden_per + std::min(h, hidden_extra);
+                int hidden_end = hidden_st + hidden_per + (h < hidden_extra);
                 
-                ops.push_back(new MultiThreadReduceBatchOp(
+                ops.emplace_back(
                     downOutData, downOutDataType,
                     weights, lastOutput,
                     pos, bsz, k,
                     hidden_size,
                     batch_st, batch_end,
                     hidden_st, hidden_end,
-                    preZeroed));
-                
-                pool->PushOp(op_idx++, ops.back());
+                    preZeroed);
             }
         }
-        
+        // Publish only after vector growth is finished. Retain each token's
+        // existing expert reduction order and distribute workers over NUMA.
         for (int i = 0; i < threadNum; i++) {
-            pool->Wait(i);
-            delete ops[i];
+            pool->PushOp(first + i * available / threadNum, &ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(first + i * available / threadNum);
         }
     }
 
@@ -8801,7 +8869,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     for (int j = 0; j < k; j++) {
                         float now = 0.0f;
                         int l = 0;
-#if defined(__AVX__)
+#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
                         __m256 vsum = _mm256_set1_ps(0.0f);
                         for (; l + 7 < m; l += 8) {
                             __m256 vx = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (input0Data + i * input0Stride + l)));
@@ -11768,16 +11836,17 @@ ops += (long long)lines * inputDim * interDim * 2;
         float *data, *positionIds;
         int bs, len, n, m, spatial, posDim, rotaryDim;
         float ropeTheta, ropeScale;
+        bool preciseFreq;
         int st, end;
 
         MultiThreadRopeEncodingFloatOp
             (DataType dataType, float *data, float *positionIds,
             int bs, int len, int n, int m, int spatial, int posDim, int rotaryDim,
-            float ropeTheta, float ropeScale,
+            float ropeTheta, float ropeScale, bool preciseFreq,
             int st, int end) :
             dataType(dataType), data(data), positionIds(positionIds),
             bs(bs), len(len), n(n), m(m), spatial(spatial), posDim(posDim), rotaryDim(rotaryDim),
-            ropeTheta(ropeTheta), ropeScale(ropeScale),
+            ropeTheta(ropeTheta), ropeScale(ropeScale), preciseFreq(preciseFreq),
             st(st), end(end) {}
 
         void Run() {
@@ -11791,7 +11860,10 @@ ops += (long long)lines * inputDim * interDim * 2;
                     float *d = (float *) data + (b * len + l) * spatial;
                     for (int i = 0; i < n; i++) {
                         for (int j = 0; j < half; j++) {
-                            float freq = position / pow(ropeTheta, (float)(2 * j) / rotaryDim);
+                            // Match the float inverse-frequency rounding of the original table.
+                            float freq = preciseFreq
+                                ? position * (float)(1.0 / ::pow((double)ropeTheta, (double)((float)(2 * j) / rotaryDim)))
+                                : position / pow(ropeTheta, (float)(2 * j) / rotaryDim);
                             float curSin = sin(freq);
                             float curCos = cos(freq);
                             float a = d[j], b = d[j + half];
@@ -11810,7 +11882,10 @@ ops += (long long)lines * inputDim * interDim * 2;
                     uint16_t *d = (uint16_t *) data + (b * len + l) * spatial;
                     for (int i = 0; i < n; i++) {
                         for (int j = 0; j < half; j++) {
-                            float freq = position / pow(ropeTheta, (float)(2 * j) / rotaryDim);
+                            // Match the float inverse-frequency rounding of the original table.
+                            float freq = preciseFreq
+                                ? position * (float)(1.0 / ::pow((double)ropeTheta, (double)((float)(2 * j) / rotaryDim)))
+                                : position / pow(ropeTheta, (float)(2 * j) / rotaryDim);
                             float curSin = sin(freq);
                             float curCos = cos(freq);
                             float a = fp16tofp32.dict[d[j]], b = fp16tofp32.dict[d[j + half]];
@@ -11826,9 +11901,9 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     static void RunMultiThreadRopeEncodingFloat(DataType dataType, float *data, float *positionIds,
             int bs, int len, int n, int m, int spatial, int posDim, int rotaryDim,
-            float ropeTheta, float ropeScale, AliveThreadPool *pool) {
+            float ropeTheta, float ropeScale, bool preciseFreq, AliveThreadPool *pool) {
         if (bs * len == 1) {
-            (MultiThreadRopeEncodingFloatOp(dataType, data, positionIds, bs, len, n, m, spatial, posDim, rotaryDim, ropeTheta, ropeScale, 0, bs * len)).Run();
+            (MultiThreadRopeEncodingFloatOp(dataType, data, positionIds, bs, len, n, m, spatial, posDim, rotaryDim, ropeTheta, ropeScale, preciseFreq, 0, bs * len)).Run();
             return;
         }
 
@@ -11839,7 +11914,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         for (int i = 0; i < threadNum; i++) {
             int end = (i == threadNum - 1 ? (bs * len) : cur + per + (cur + per * (threadNum - i) < (bs * len)));
             ops.push_back(new MultiThreadRopeEncodingFloatOp(
-                dataType, data, positionIds, bs, len, n, m, spatial, posDim, rotaryDim, ropeTheta, ropeScale, cur, end));
+                dataType, data, positionIds, bs, len, n, m, spatial, posDim, rotaryDim, ropeTheta, ropeScale, preciseFreq, cur, end));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -11859,12 +11934,13 @@ ops += (long long)lines * inputDim * interDim * 2;
         float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
         float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
 
+        const bool preciseFreq = intParams.count("preciseFreq") && intParams.at("preciseFreq");
         int bs = data.dims[0], len = data.dims[1];
         int spatial = data.Count(2);
         int n = data.dims[2], m = data.dims[3];
         RunMultiThreadRopeEncodingFloat(data.dataType, (float*)data.cpuData, (float*)positionIds.cpuData,
             bs, len, n, m, spatial,
-            positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale, GetAlivePool());
+            positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale, preciseFreq, GetAlivePool());
     }
 
     static inline float CpuLlama3InvFreq(float invFreq, float factor, float originalMaxPosition,

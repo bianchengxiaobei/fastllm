@@ -336,6 +336,12 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   int group_size, int *workspace);
 // SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
 // two-stage Turing specialization; SM80+ selects the four-stage kernel.
+// Small-batch residual epilogue: same Marlin FP32 reduction, no temporary output.
+bool FastllmCudaMarlinNVFP4AddSupported(int size_n, int size_k);
+bool FastllmCudaMarlinHalfNVFP4Add(const void *a, const uint32_t *b_q_weight,
+                                const void *b_scales, const float *global_scale,
+                                void *c, int size_m, int size_n, int size_k,
+                                int *workspace, void *c_tmp);
 bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a,
                                     const uint32_t *b_q_weight,
                                     const void *b_scales,
@@ -468,6 +474,7 @@ bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
                              const fastllm::Data &gate);
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
 bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale = 1.0f);
 bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput, fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData);
@@ -669,8 +676,7 @@ bool FastllmCudaQwen4QSAAppendCompress4(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,
         const fastllm::Data &normWeight,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        float ropeTheta,
         int previousLength,
         fastllm::Data &tailKeys,
         fastllm::Data &tailPositions,
@@ -680,8 +686,7 @@ bool FastllmCudaQwen4QSAAppendCompress4Graph(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,
         const fastllm::Data &normWeight,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        float ropeTheta,
         const int32_t *decodeMeta,
         fastllm::Data &tailKeys,
         fastllm::Data &tailPositions,
@@ -696,6 +701,19 @@ bool FastllmCudaQwen4KVAppend(
         const fastllm::Data &key, const fastllm::Data &value,
         int previousLength,
         fastllm::Data &keyCache, fastllm::Data &valueCache);
+// Token-major projections -> normalized/rotated head-major Q and strided KV
+// cache. Preserve the separate RMSNorm and RoPE rounding boundaries.
+bool FastllmCudaQwen4AttentionPrepare(
+        const fastllm::Data &qGate, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &qNorm,
+        const fastllm::Data &kNorm, const fastllm::Data &positions,
+        fastllm::Data &query, fastllm::Data &gate,
+        fastllm::Data &keyCache, fastllm::Data &valueCache,
+        int headDim, int rotaryDim, int sectionH, int sectionW,
+        float eps, float ropeTheta, int previousLength);
+bool FastllmCudaQwen4AttentionOutput(
+        const fastllm::Data &context, const fastllm::Data &gate,
+        fastllm::Data &output);
 bool FastllmCudaQwen4KVAppendGraph(
         const fastllm::Data &key, const fastllm::Data &value,
         const int32_t *decodeMeta,
@@ -1375,7 +1393,7 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim);
 bool FastllmCudaLlamaRotatePosition2DPart(fastllm::Data &data, const fastllm::Data &positionIds,
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim, int part);
-bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale);
+bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale, bool preciseFreq = false);
 bool FastllmCudaLlama3RopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                    float ropeTheta, float factor, float originalMaxPosition,
                                    float lowFreqFactor, float highFreqFactor);
@@ -2192,5 +2210,12 @@ extern __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bi
 #define cudaMalloc(ptr, size) FastllmCudaCheckedMalloc((void **)(ptr), (size), __FILE__, __LINE__)
 #endif
 #endif
+
+// Exact small-batch FP32 activation / FP16 weight shared expert fusion.
+bool FastllmCudaQwen4SharedExpert(
+    const fastllm::Data &input, fastllm::Data &gateUpWeight,
+    fastllm::Data &downWeight, fastllm::Data &gateWeight,
+    fastllm::Data &gateUp, fastllm::Data &hidden,
+    fastllm::Data &gate, fastllm::Data &output);
 
 #endif // FASTLLM_CUDA_CUH

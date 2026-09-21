@@ -1,3 +1,8 @@
+#include "devices/cuda/fastllm-cuda-gdn.h"
+#include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
+#include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
+#include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
+#include "devices/cuda/fastllm-cuda-native-prefill.h"
 //
 // Created by huangyuyang on 6/14/23.
 //
@@ -425,11 +430,8 @@ namespace fastllm {
         int arch, int chunks, int chunkSize, int kDim, int vDim,
         int blockV, int numWarps, int numStages, bool floatState) {
         std::ostringstream os;
-        if (floatState) {
-            os << "chunk_gdn_prefill_v7_fp16_statefp32_sm";
-        } else {
-            os << "chunk_gdn_prefill_v6_fp16_sm";
-        }
+        os << "chunk_gdn_prefill_v8_fp16_state"
+           << (floatState ? "fp32" : "fp16") << "_sm";
         os << arch
            << "_c" << chunks << "_t" << chunkSize
            << "_k" << kDim << "_v" << vDim
@@ -467,12 +469,9 @@ namespace fastllm {
     static std::string CudaTritonQwen4SparseAttentionBaseName(
         const std::string &dtype, int arch, int groupSize, int headDim,
         int topk, int blockN, int numWarps, int numStages) {
-        int blockM = 1;
-        while (blockM < groupSize) {
-            blockM <<= 1;
-        }
+        constexpr int blockM = 16;
         std::ostringstream os;
-        os << "qwen4_sparse_attention_v1_" << dtype << "_sm" << arch
+        os << "qwen4_sparse_attention_v2_" << dtype << "_sm" << arch
            << "_g" << groupSize
            << "_d" << headDim << "_w" << topk
            << "_bm" << blockM << "_bn" << blockN
@@ -1768,10 +1767,7 @@ namespace fastllm {
                 return false;
             }
         }
-        int expectedBlockM = 1;
-        while (expectedBlockM < groupSize) {
-            expectedBlockM <<= 1;
-        }
+        constexpr int expectedBlockM = 16;
         if (loaded.dtype != dtype || loaded.groupSize != groupSize ||
             loaded.headDim != headDim || loaded.topk != topk ||
             loaded.blockM != expectedBlockM || loaded.blockN != blockN ||
@@ -3078,9 +3074,9 @@ namespace fastllm {
         }
         int minBatch = CudaEnvIntRange(
             "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MIN_BATCH", 1, 1, 4096);
-        int maxChunks = CudaEnvIntRange(
-            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MAX_CHUNKS", 64, 1, 256);
-        if (batch < minBatch || chunks > maxChunks) {
+        // The recurrent kernel loops over chunks; 64 is not a kernel limit.
+        // Kernels use 64-bit offsets; grid.y still limits the chunk count.
+        if (batch < minBatch || chunks > 65535) {
             return false;
         }
 
@@ -3176,7 +3172,8 @@ namespace fastllm {
         // Keep the single-chunk path on the native kernels.  It is also used
         // by decode/CUDA-graph warmup, where the Triton prefill scratch and
         // driver launches would prevent the optimized decode graph path.
-        if (batch <= 0 || heads <= 0 || chunks < 2 ||
+        if (batch <= 0 || heads <= 0 ||
+            (int64_t)batch * heads > 65535 || chunks < 2 ||
             chunkSize != 64 || kDim != 128 || vDim != 128 ||
             v.dims != std::vector<int>({batch, heads, chunks,
                                         chunkSize, vDim}) ||
@@ -3604,23 +3601,21 @@ namespace fastllm {
                 "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION", true)) {
             return false;
         }
-        auto isDense = [](const Data &data) {
-            if (data.dims.empty() ||
-                data.strides.size() != data.dims.size()) {
+        // Rows must be contiguous, but reserved cache capacity may pad the
+        // head/row strides independently for Q, K, and V.
+        auto isCudaRowMajor = [](const Data &data) {
+            if (data.dataDevice != DataDevice::CUDA || data.cudaData == nullptr ||
+                data.dims.empty() || data.strides.size() != data.dims.size() ||
+                data.strides.back() != 1) {
                 return false;
             }
-            uint64_t expected = 1;
-            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
-                if (data.strides[i] != expected) {
+            for (int i = (int)data.dims.size() - 1; i >= 0; --i) {
+                if (data.dims[i] <= 0 || (i > 0 && data.strides[i - 1] <
+                        (uint64_t)data.dims[i] * data.strides[i])) {
                     return false;
                 }
-                expected *= (uint64_t)data.dims[i];
             }
             return true;
-        };
-        auto isCudaDense = [&](const Data &data) {
-            return data.dataDevice == DataDevice::CUDA &&
-                   data.cudaData != nullptr && isDense(data);
         };
         if (query.dims.size() != 3 || key.dims.size() != 3 ||
             value.dims != key.dims || indices.dims.size() != 2 ||
@@ -3628,8 +3623,8 @@ namespace fastllm {
             query.dataType != value.dataType ||
             query.dataType != DataType::FLOAT16 ||
             indices.dataType != DataType::INT32 ||
-            !isCudaDense(query) || !isCudaDense(key) ||
-            !isCudaDense(value) || !isCudaDense(indices) ||
+            !isCudaRowMajor(query) || !isCudaRowMajor(key) ||
+            !isCudaRowMajor(value) || !isCudaRowMajor(indices) ||
             group <= 0 || group > 16 ||
             query.dims[0] != key.dims[0] * group ||
             query.dims[1] != indices.dims[0] ||
@@ -4578,6 +4573,8 @@ namespace fastllm {
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
         this->ops["SwigluLinearAdd"] = (BaseOperator*)(new CudaSwigluLinearAddOp());
+        this->ops["RMSNormSmallLinear"] = new CudaRMSNormSmallLinearOp();
+        this->ops["GdnInputConv"] = new CudaGdnInputConvOp();
         this->ops["LinearSwiglu"] = (BaseOperator*)(new CudaLinearSwigluOp());
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
@@ -6197,6 +6194,7 @@ namespace fastllm {
                    weightType == DataType::NVFP4 ||
                    weightType == DataType::NVFP4_BLOCK_16 ||
                    weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                   weightType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                    weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
                    weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    weightType == DataType::DATA_GGUF_FORMAT;
@@ -6216,6 +6214,7 @@ namespace fastllm {
                    weightType == DataType::NVFP4 ||
                    weightType == DataType::NVFP4_BLOCK_16 ||
                    weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                   weightType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                    weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
                    weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    weightType == DataType::DATA_GGUF_FORMAT;
@@ -6231,6 +6230,7 @@ namespace fastllm {
                    weightType == DataType::NVFP4 ||
                    weightType == DataType::NVFP4_BLOCK_16 ||
                    weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                   weightType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                    weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
                    weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    weightType == DataType::DATA_GGUF_FORMAT;
@@ -6239,6 +6239,7 @@ namespace fastllm {
     }
 
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (weight.cudaNativeNvfp4Layout && input.dataType != DataType::FLOAT16) FastllmCudaRestoreNativeNvfp4(weight);
         output.Allocate(false);
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
@@ -6287,7 +6288,8 @@ namespace fastllm {
             } else if (weight.dataType == DataType::NVFP4) {
                 FastllmCudaHalfMatMulFloatNVFP4(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
-                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                 FastllmCudaHalfMatMulFloatNVFP4Block16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
@@ -6325,7 +6327,8 @@ namespace fastllm {
             } else if (weight.dataType == DataType::NVFP4) {
                 FastllmCudaMatMulFloatNVFP4(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
-                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                 FastllmCudaMatMulFloatNVFP4Block16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
@@ -6364,7 +6367,8 @@ namespace fastllm {
             } else if (weight.dataType == DataType::NVFP4) {
                 FastllmCudaBFloat16MatMulNVFP4(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
-                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                 FastllmCudaBFloat16MatMulNVFP4Block16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
@@ -6380,6 +6384,10 @@ namespace fastllm {
     }
 
     bool DoCudaLinearAdd(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (FastllmCudaFP8LinearAddCanRun(input, weight, bias, output)) {
+            FastllmCudaFP8LinearAdd(input, weight, bias, output);
+            return true;
+        }
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
@@ -6454,6 +6462,12 @@ namespace fastllm {
         Data &middle = *(datas.find("middle")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        if (FastllmCudaNativeFp8FusedCanRun(input, weight, bias, output, false) &&
+            FastllmCudaNativeFp8Fused(input, weight, output, false)) return;
+        if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            CudaNvfp4LinearAddBlock(input, weight, bias, middle, output);
+            return;
+        }
         if (DoCudaLinearAdd(input, weight, bias, output)) { 
             return;
         } else {
@@ -6631,6 +6645,12 @@ namespace fastllm {
         Data &middle = *(datas.find("middle")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        if (FastllmCudaNativeFp8FusedCanRun(input, weight, bias, output, true) &&
+            FastllmCudaNativeFp8Fused(input, weight, output, true)) return;
+        if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            CudaNvfp4LinearSwigluBlock(input, weight, bias, middle, output);
+            return;
+        }
         if (DoCudaLinearSwiglu(input, weight, bias, middle, output)) {
             return;
         } else {
@@ -8295,7 +8315,8 @@ namespace fastllm {
         float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
         float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
 
-        FastllmCudaRopeEncoding(data, positionIds, rotaryDim, ropeTheta, ropeScale);
+        const bool preciseFreq = intParams.count("preciseFreq") && intParams.at("preciseFreq");
+        FastllmCudaRopeEncoding(data, positionIds, rotaryDim, ropeTheta, ropeScale, preciseFreq);
     }
 
     void CudaLlama3RopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -8811,6 +8832,7 @@ namespace fastllm {
                weight.dataType == DataType::NVFP4 ||
                weight.dataType == DataType::NVFP4_BLOCK_16 ||
                weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+               weight.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
     }

@@ -358,6 +358,9 @@ namespace fastllm {
         // Internal NUMA layout: each 32-row tile stores packed block-16
         // weights, then FP32 scales, retaining gate/up row interleaving.
         NVFP4_BLOCK_16_PLANAR = 1011,
+        // Internal CPU row layout: one FP32 global multiplier followed by
+        // [8 packed E2M1 bytes, 1 raw E4M3 scale byte] per block of 16.
+        NVFP4_BLOCK_16_E4M3_PACKED = 1012,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -424,7 +427,7 @@ namespace fastllm {
         const std::vector<float> &globalScales,
         int blockK, int blockM, uint8_t *destination,
         int destinationRowStart, int destinationRows,
-        bool crossSwiglu = false, bool planar = false);
+        bool crossSwiglu = false, bool planar = false, bool compactScales = false);
     void ConvertCompactE4M3NVFP4ToBlock16(
         Data &data, bool crossSwiglu = false);
 
@@ -599,6 +602,8 @@ namespace fastllm {
         void *ggmlTensor = nullptr;
         int ggmlType = -1;
         bool IsRepacked = false;
+        // CUDA-only in-place NVFP4 row-major codes + tiled E4M3 scales.
+        bool cudaNativeNvfp4Layout = false;
         bool disableGGUFRepack = false;
         bool forceGGUFFp32Dequant = false;
 
@@ -1385,7 +1390,8 @@ namespace fastllm {
 
     void LlamaRotatePosition2DPart(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int part); // 2D position embedding for llama，前后各一半的维度旋转
 
-    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
+    // preciseFreq matches the inverse-frequency rounding of the former text RoPE tables.
+    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale, bool preciseFreq = false); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
 
     void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
                             float factor, float originalMaxPosition,
