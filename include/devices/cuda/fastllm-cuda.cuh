@@ -161,6 +161,9 @@ bool FastllmCudaGraphIsCapturing();
 // and no capture has been observed on this thread, this avoids a CUDA runtime
 // call. External capturers should call the exact query above once first.
 bool FastllmCudaGraphIsCapturingFast();
+// For owned worker streams whose captures always use FastLLM's begin/end
+// wrappers. Returns the previous mode so callers can restore it on exit.
+bool FastllmCudaGraphSetManagedCaptureOnly(bool enabled);
 bool FastllmCudaGraphCaptureInvalidated();
 // Give pointer-batched kernels a stable, bounded set of device pointer tables
 // while warming/capturing one whole-step graph. Scopes may be nested and must
@@ -239,6 +242,8 @@ bool FastllmCudaGetGraphError();
 int FastllmCudaTryMallocBigBuffers(size_t size, int count);
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
+// Bounded workspace reuse for models that explicitly opt in between forwards.
+void FastllmCudaTrimBigBuffer();
 void FastllmCudaClearBigBufferCurrentDevice();
 void FastllmCudaClearBigBufferAll();
 #ifdef __CUDACC__
@@ -672,6 +677,8 @@ bool FastllmCudaQwen4QSACommitGraph(
         const fastllm::Data &compressedKey, const int32_t *decodeMeta,
         int tokenOffset, int compressRatio,
         fastllm::Data &compressedKeys);
+// Append 1..4 rows to a ratio-4 QSA cache, compressing a completed group
+// with the same FP32 reduction and RoPE order as the separate operators.
 bool FastllmCudaQwen4QSAAppendCompress4(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,
@@ -2189,6 +2196,8 @@ int GetPointerDeviceId(void *ptr);
 bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
                                      int expectedDevice);
 int FastllmCudaGetDeviceCount();
+// Host NUMA node nearest this GPU, or -1 when PCI locality is unavailable.
+int FastllmCudaGetHostNumaNode(int device);
 #ifdef  __cplusplus
 }
 #endif

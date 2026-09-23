@@ -31,6 +31,10 @@
 #include <set>
 #include <numeric>
 #include <fstream>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -549,6 +553,85 @@ namespace fastllm {
         numaConfigLocker.unlock();
         
         return fastllmNumaConfig;
+    }
+
+    std::vector<std::vector<int>> GetNumasCudaWorkerCpuSets(
+            const std::vector<int> &devices) {
+        std::vector<std::vector<int>> result(devices.size());
+        if (devices.empty()) return result;
+#if defined(USE_CUDA) && defined(__linux__)
+        cpu_set_t allowed;
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return result;
+        auto coreOf = [](int cpu, std::pair<int, int> &core) {
+            const auto base = "/sys/devices/system/cpu/cpu" +
+                std::to_string(cpu) + "/topology/";
+            std::ifstream package(base + "physical_package_id");
+            std::ifstream id(base + "core_id");
+            return bool(package >> core.first) && bool(id >> core.second);
+        };
+        std::set<std::pair<int, int>> occupied;
+        auto *pool = GetAlivePool();
+        for (const auto &node : GetNumaConfig()->numaToCpuDict) {
+            for (const auto &worker : node) {
+                cpu_set_t workerCpus;
+                if (worker.first < 0 || worker.first >= (int)pool->threads.size() ||
+                    pthread_getaffinity_np(pool->threads[worker.first]->native_handle(),
+                        sizeof(workerCpus), &workerCpus) != 0) return result;
+                // A restricted container can reject the preferred expert pin.
+                // Use the actual mask, including a NUMA-wide fallback, instead
+                // of assuming that its requested single-core binding worked.
+                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                    if (!CPU_ISSET(cpu, &workerCpus)) continue;
+                    std::pair<int, int> core;
+                    if (!coreOf(cpu, core)) return result;
+                    occupied.insert(core);
+                }
+            }
+        }
+        std::map<int, std::vector<int>> available;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &allowed)) continue;
+            std::pair<int, int> core;
+            if (!coreOf(cpu, core)) return result;
+            // Keep one logical CPU per unused physical core. SMT siblings of
+            // an expert worker must not compete with its vector kernels.
+            if (occupied.insert(core).second) {
+                const int node = numa_node_of_cpu(cpu);
+                if (node >= 0) available[node].push_back(cpu);
+            }
+        }
+        std::vector<int> nodes;
+        std::map<int, int> ranksPerNode;
+        for (int device : devices) {
+            int node = FastllmCudaGetHostNumaNode(device);
+            nodes.push_back(node);
+            ++ranksPerNode[node];
+        }
+        for (size_t rank = 0; rank < devices.size(); ++rank) {
+            const int node = nodes[rank];
+            if (node >= 0 && available[node].size() >= (size_t)ranksPerNode[node]) {
+                result[rank] = available[node];
+            }
+        }
+#endif
+        return result;
+    }
+
+    bool BindNumasWorkerCpuSet(const std::vector<int> &cpus) {
+#ifdef __linux__
+        cpu_set_t allowed, selected;
+        if (cpus.empty() || sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return false;
+        CPU_ZERO(&selected);
+        for (int cpu : cpus) {
+            if (cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed)) {
+                CPU_SET(cpu, &selected);
+            }
+        }
+        return CPU_COUNT(&selected) > 0 &&
+            sched_setaffinity(0, sizeof(selected), &selected) == 0;
+#else
+        return false;
+#endif
     }
 
     NumasDevice::NumasDevice() {
@@ -2047,7 +2130,70 @@ namespace fastllm {
         }
     };
 
+    // Reuse one descriptor per pool worker. Routing and activation pointers
+    // are rebound for each row; workers construct their small GEMM views on
+    // their own stacks instead of building vectors on the submitting thread.
+    struct NumasMoeDecodeContext {
+        Data **weights = nullptr;
+        const std::vector<std::pair<int, float>> *experts = nullptr;
+        uint8_t *input = nullptr, *sharedInput = nullptr, *downInput = nullptr;
+        float *gateUp = nullptr, *swiglu = nullptr, *downOutput = nullptr;
+        DataType inputType = FLOAT32, downType = FLOAT32;
+        int inputDim = 0, interDim = 0, outputDim = 0, numaCnt = 0;
+        int gateUnitRows = 4;
+        size_t downRowBytes = 0;
+        bool gate = true, fuseConvert = false;
+    };
+
+    struct NumasMoeDecodeWorker : MultiThreadBaseOp {
+        NumasMoeDecodeContext *context = nullptr;
+        int node = 0, worker = 0, workers = 1;
+
+        void Run() override {
+            auto &c = *context;
+            const int columns = c.gate ? c.interDim * 2 : c.outputDim;
+            const int perNode = columns / c.numaCnt;
+            const int base = perNode * node;
+            const int unit = c.gate ? c.gateUnitRows : 4;
+            const int units = perNode * (int)c.experts->size() / unit;
+            const int first = unit * (worker * (units / workers) +
+                                      std::min(worker, units % workers));
+            const int last = first + unit * (units / workers +
+                                             (worker < units % workers));
+            for (int row = first; row < last;) {
+                const int slot = row / perNode;
+                const int start = row % perNode;
+                const int end = std::min(perNode, start + last - row);
+                const int expert = (*c.experts)[slot].first;
+                Data &weight = *c.weights[expert * 2 + (c.gate ? 0 : 1)];
+                if (c.gate) {
+                    MultiThreadGemmAndCrossSwigluOp task(
+                        expert == 0 && c.sharedInput ? c.sharedInput : c.input,
+                        c.inputType, weight.numasData[node], weight.GetDataType(),
+                        reinterpret_cast<uint8_t*>(c.gateUp +
+                            (size_t)slot * columns + base), FLOAT32,
+                        c.swiglu + (size_t)slot * c.interDim,
+                        1, c.inputDim, columns, start, end, base,
+                        c.fuseConvert ? c.downInput + slot * c.downRowBytes : nullptr,
+                        c.downType);
+                    task.Run();
+                } else {
+                    MultiThreadGemmOp task(
+                        c.downInput + slot * c.downRowBytes, c.downType,
+                        weight.numasData[node], weight.GetDataType(),
+                        reinterpret_cast<uint8_t*>(c.downOutput +
+                            (size_t)slot * columns + base), FLOAT32,
+                        1, c.interDim, columns, start, end);
+                    task.Run();
+                }
+                row += end - start;
+            }
+        }
+    };
+
     struct FastllmMoeDataManagerNumas {
+            NumasMoeDecodeContext decodeContext;
+            std::vector<NumasMoeDecodeWorker> rowWorkers;
             std::vector<NumasMoeTaskList> decodeWorkers;
             std::vector<std::vector<MultiThreadDeepSeekV41NumasDecodeOp>> fusedDecodeTasks;
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
@@ -2521,7 +2667,7 @@ namespace fastllm {
             inputBytes + indexBytes + scoreBytes);
         void *inputCopyStream = workspace.EnsureInputCopyStream(device);
         void *routeCopyStream = workspace.EnsureRouteCopyStream(device);
-        void *sourceReadyEvent = FastllmCudaEventCreate();
+        void *sourceReadyEvent = workspace.EnsureInputSourceEvent(device);
         FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
         FastllmCudaStreamWaitEvent(inputCopyStream, sourceReadyEvent);
         FastllmCudaStreamWaitEvent(routeCopyStream, sourceReadyEvent);
@@ -2536,7 +2682,6 @@ namespace fastllm {
                 indexHost, index.cudaData, indexBytes, routeCopyStream) &&
             FastllmCudaCopyFromDeviceToPinnedHostAsync(
                 scoreHost, score.cudaData, scoreBytes, routeCopyStream);
-        FastllmCudaEventDestroy(sourceReadyEvent);
         if (!copied) {
             FastllmCudaStreamSynchronize(routeCopyStream);
             FastllmCudaStreamSynchronize(inputCopyStream);
@@ -8432,6 +8577,47 @@ namespace fastllm {
                         downInputDataType == DataType::FLOAT16 ||
                         downInputDataType == DataType::BFLOAT16 ||
                         canFuseGroup32;
+                    auto &decodeContext = fastllmMoeDataManagerNumas.decodeContext;
+                    auto &rowWorkers = fastllmMoeDataManagerNumas.rowWorkers;
+                    if (!useDeepSeekV4MoeFast) {
+                        decodeContext.weights = weights;
+                        decodeContext.experts = &v;
+                        decodeContext.input = realInput.data();
+                        decodeContext.sharedInput = originalSharedInput.empty()
+                            ? nullptr : originalSharedInput.data();
+                        decodeContext.downInput = downInput.data();
+                        decodeContext.gateUp = gateUpOutput.data();
+                        decodeContext.swiglu = swigluOutput.data();
+                        decodeContext.downOutput = downOutput.data();
+                        decodeContext.inputType = startDataType;
+                        decodeContext.downType = downInputDataType;
+                        decodeContext.inputDim = inputDim;
+                        decodeContext.interDim = interDim;
+                        decodeContext.outputDim = outputDim;
+                        decodeContext.numaCnt = numaConfig->numaCnt;
+                        decodeContext.gateUnitRows = canFuseGroup32 ? 64 : 4;
+                        decodeContext.downRowBytes = GetDataBytes(downInputDataType, 1, interDim);
+                        decodeContext.fuseConvert = canFuseDstConvert && !deepSeekV4Mode;
+                        rowWorkers.resize(numaConfig->threads);
+                        for (int nid = 0; nid < numaConfig->numaCnt; ++nid) {
+                            auto &nodeWorkers = numaConfig->numaToCpuDict[nid];
+                            for (int t = 0; t < (int)nodeWorkers.size(); ++t) {
+                                auto &worker = rowWorkers[nodeWorkers[t].first];
+                                worker.context = &decodeContext;
+                                worker.node = nid;
+                                worker.worker = t;
+                                worker.workers = nodeWorkers.size();
+                            }
+                            for (const auto &expert : v) {
+                                for (int phase = 0; phase < 2; ++phase) {
+                                    Data *weight = weights[expert.first * 2 + phase];
+                                    AssertInFastLLM((int)weight->numasData.size() > nid &&
+                                                    weight->numasData[nid] != nullptr,
+                                                    "NUMA decode weight is missing a shard.\n");
+                                }
+                            }
+                        }
+                    }
                     if (useDeepSeekV4MoeFast) {
                         std::vector<int> localExpertOrder;
                         auto &expertOrder = reuseMoeTaskStorage ?
@@ -8570,108 +8756,12 @@ namespace fastllm {
                                 gateTasks, false);
                         }
                     } else {
-                        auto &workers = fastllmMoeDataManagerNumas.decodeWorkers;
-                        auto &taskStorage = fastllmMoeDataManagerNumas.gateSwigluTaskStorage;
-                        workers.resize(numaConfig->threads);
-                        taskStorage.resize(numaConfig->threads);
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            workers[i].tasks.clear();
-                            taskStorage[i].clear();
-                            taskStorage[i].reserve(totalExperts);
-                        }
-                        for (int nid = 0;
-                             nid < numaConfig->numaCnt; nid++) {
-                            int base = kPer * nid;
-                            int threadNum =
-                                numaConfig->numaToCpuDict[nid].size();
-                            int totalRows = kPer * totalExperts;
-                            // A fused group-32 destination must never be
-                            // split between workers because its scale and sum
-                            // are shared by all 32 activation values.
-                            // Larger chunks amortise dispatch + per-column
-                            // HorizontalSum overhead on FP8/BF16 decode GEMMs.
-                            int unitRows = canFuseGroup32 ? 64 : 64;
-                            int rowsPerThread =
-                                (totalRows / unitRows) / threadNum;
-                            int remainingRows =
-                                (totalRows / unitRows) % threadNum;
-                            if (rowsPerThread == 0) {
-                                unitRows = 4;
-                                rowsPerThread =
-                                    (totalRows / unitRows) / threadNum;
-                                remainingRows =
-                                    (totalRows / unitRows) % threadNum;
-                            }
-                            int currentRow = 0;
-
-                            for (int tid = 0; tid < threadNum; tid++) {
-                                int threadRows =
-                                    (rowsPerThread +
-                                     (tid < remainingRows ? 1 : 0)) *
-                                    unitRows;
-                                int endRow = currentRow + threadRows;
-                                int rowStart = currentRow;
-                                while (rowStart < endRow) {
-                                    int expertIdx = rowStart / kPer;
-                                    if (expertIdx >= totalExperts) {
-                                        break;
-                                    }
-                                    int e = v[expertIdx].first;
-                                    int expertStartRow =
-                                        rowStart % kPer;
-                                    int expertEndRow = std::min(
-                                        kPer,
-                                        expertStartRow +
-                                            (endRow - rowStart));
-                                    size_t outputOffset =
-                                        GetDataBytes(
-                                            DataType::FLOAT32,
-                                            expertIdx, k) +
-                                        GetDataBytes(
-                                            DataType::FLOAT32, 1,
-                                            base);
-                                    uint8_t *dstPtr =
-                                        canFuseDstConvert &&
-                                                !deepSeekV4Mode ?
-                                            (uint8_t*)downInput.data() +
-                                                expertIdx *
-                                                    GetDataBytes(
-                                                        downInputDataType,
-                                                        1, interDim) :
-                                            nullptr;
-                                    if ((int)weights[e * 2]->numasData.size() <= nid ||
-                                            weights[e * 2]->numasData[nid] == nullptr) {
-                                        ErrorInFastLLM("NumasMergeMOE small batch gate weight missing NUMA shard: " +
-                                                       weights[e * 2]->name + "\n");
-                                    }
-                                    taskStorage[numaConfig->numaToCpuDict[nid][tid].first].emplace_back(
-                                        (uint8_t*)expertInput(e), startDataType,
-                                        weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
-                                        (uint8_t*)gateUpOutput.data() + outputOffset, DataType::FLOAT32,
-                                        swigluOutput.data() + expertIdx * interDim,
-                                        1, inputDim, k, expertStartRow, expertEndRow, base,
-                                        dstPtr, downInputDataType);
-                                    rowStart +=
-                                        expertEndRow -
-                                        expertStartRow;
-                                    if (expertEndRow == kPer) {
-                                        rowStart =
-                                            (expertIdx + 1) * kPer;
-                                    }
-                                }
-                                currentRow = endRow;
-                            }
-                        }
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            for (auto &task : taskStorage[i]) {
-                                workers[i].tasks.push_back(&task);
-                            }
-                        }
+                        decodeContext.gate = true;
                         profileLap(profileGatePrepMs);
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            pool->PushOp(i, &workers[i]);
+                        for (int i = 0; i < numaConfig->threads; ++i) {
+                            pool->PushOp(i, &rowWorkers[i]);
                         }
-                        for (int i = 0; i < numaConfig->threads; i++) {
+                        for (int i = 0; i < numaConfig->threads; ++i) {
                             pool->Wait(i);
                         }
                     }
@@ -9023,90 +9113,12 @@ namespace fastllm {
                                 downTasks, false);
                         }
                     } else {
-                        auto &workers = fastllmMoeDataManagerNumas.decodeWorkers;
-                        auto &taskStorage = fastllmMoeDataManagerNumas.gemmTaskStorage;
-                        workers.resize(numaConfig->threads);
-                        taskStorage.resize(numaConfig->threads);
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            workers[i].tasks.clear();
-                            taskStorage[i].clear();
-                            taskStorage[i].reserve(totalExperts);
-                        }
-                        for (int nid = 0;
-                             nid < numaConfig->numaCnt; nid++) {
-                            int base = kPer * nid;
-                            int threadNum =
-                                numaConfig->numaToCpuDict[nid].size();
-                            int totalRows = kPer * totalExperts;
-                            int unitRows = 64;
-                            int rowsPerThread =
-                                (totalRows / unitRows) / threadNum;
-                            int extraRows =
-                                (totalRows / unitRows) % threadNum;
-                            if (rowsPerThread == 0) {
-                                unitRows = 4;
-                                rowsPerThread =
-                                    (totalRows / unitRows) / threadNum;
-                                extraRows =
-                                    (totalRows / unitRows) % threadNum;
-                            }
-                            int currentRow = 0;
-                            for (int tid = 0;
-                                 tid < threadNum; tid++) {
-                                int threadRows =
-                                    (rowsPerThread +
-                                     (tid < extraRows ? 1 : 0)) *
-                                    unitRows;
-                                int endRow =
-                                    currentRow + threadRows;
-                                for (int row = currentRow;
-                                     row < endRow;) {
-                                    int expertIdx = row / kPer;
-                                    int rowInExpert = row % kPer;
-                                    int rowsToProcess = std::min(
-                                        kPer - rowInExpert,
-                                        endRow - row);
-                                    if (expertIdx < totalExperts) {
-                                        int e = v[expertIdx].first;
-                                        size_t inputOffset =
-                                            expertIdx *
-                                            GetDataBytes(
-                                                downInputDataType,
-                                                1, interDim);
-                                        size_t outputOffset =
-                                            GetDataBytes(
-                                                DataType::FLOAT32,
-                                                expertIdx, k) +
-                                            GetDataBytes(
-                                                DataType::FLOAT32,
-                                                1, base);
-                                        if ((int)weights[e * 2 + 1]->numasData.size() <= nid ||
-                                                weights[e * 2 + 1]->numasData[nid] == nullptr) {
-                                            ErrorInFastLLM("NumasMergeMOE small batch down weight missing NUMA shard: " +
-                                                           weights[e * 2 + 1]->name + "\n");
-                                        }
-                                        taskStorage[numaConfig->numaToCpuDict[nid][tid].first].emplace_back(
-                                            downInput.data() + inputOffset, downInputDataType,
-                                            weights[e * 2 + 1]->numasData[nid],
-                                            weights[e * 2 + 1]->GetDataType(),
-                                            (uint8_t*)downOutput.data() + outputOffset, DataType::FLOAT32,
-                                            1, interDim, k, rowInExpert, rowInExpert + rowsToProcess);
-                                    }
-                                    row += rowsToProcess;
-                                }
-                                currentRow = endRow;
-                            }
-                        }
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            for (auto &task : taskStorage[i]) {
-                                workers[i].tasks.push_back(&task);
-                            }
-                        }
+                        decodeContext.gate = false;
                         profileLap(profileDownPrepMs);
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            pool->PushOp(i, &workers[i]);
+                        for (int i = 0; i < numaConfig->threads; ++i) {
+                            pool->PushOp(i, &rowWorkers[i]);
                         }
-                        for (int i = 0; i < numaConfig->threads; i++) {
+                        for (int i = 0; i < numaConfig->threads; ++i) {
                             pool->Wait(i);
                         }
                     }

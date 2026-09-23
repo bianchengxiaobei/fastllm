@@ -1118,6 +1118,7 @@ namespace fastllm {
         this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
+        this->dataDeviceIds = ori.dataDeviceIds;
         this->ClearTensorParallelLayout();
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = ori.cpuData + offset;
@@ -2384,7 +2385,10 @@ namespace fastllm {
                 if (!oldBorrowed) {
                     CudaFreeForData(*this, old);
                 }
-                FastllmCudaClearBigBuffer();
+                // Growing one tensor must not discard the workspaces needed
+                // by the next operators. Bound idle storage; allocation
+                // pressure can still reclaim it through the pool's OOM retry.
+                FastllmCudaTrimBigBuffer();
 #else
                 ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif

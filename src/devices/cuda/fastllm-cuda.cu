@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -731,10 +732,17 @@ static thread_local std::string fastllmCudaGraphLastError;
 // on a negative query: tensor-parallel code can temporarily inspect a different
 // device's per-thread stream while the original stream is active.
 static thread_local bool fastllmCudaGraphCaptureMayBeActive = false;
+static thread_local bool fastllmCudaGraphManagedCaptureOnly = false;
+
+bool FastllmCudaGraphSetManagedCaptureOnly(bool enabled) {
+    const bool previous = fastllmCudaGraphManagedCaptureOnly;
+    fastllmCudaGraphManagedCaptureOnly = enabled;
+    return previous;
+}
 
 static bool FastllmCudaGraphCaptureQueryRequired() {
     return fastllmCudaGraphCaptureMayBeActive ||
-           fastllm::GetFastllmEnv().cudaGraph;
+           (!fastllmCudaGraphManagedCaptureOnly && fastllm::GetFastllmEnv().cudaGraph);
 }
 
 static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
@@ -4467,7 +4475,9 @@ static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMem
         cudaDeviceSynchronize();
     }
     for (auto &buffer : bigBuffers) {
-        if (buffer.busy || !FastllmCudaBufferReadyForReuseLocked(buffer)) {
+        if (buffer.busy || buffer.graphPins > 0 ||
+            !FastllmCudaBufferReadyForReuseLocked(buffer) ||
+            FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
             keep.push_back(buffer);
             continue;
         }
@@ -5397,6 +5407,7 @@ static void *FastllmCudaMallocImpl(
         return allocationSucceeded(ret);
     }
     auto &cudaBuffers = *view.smallBuffers;
+    int selectedSmall = -1;
     for (int i = *view.minId; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy &&
             cudaBuffers[i].graphPins == 0 &&
@@ -5404,20 +5415,28 @@ static void *FastllmCudaMallocImpl(
                 cudaBuffers[i], captureIdentity.valid) &&
             FastllmCudaGraphPoolPointerReusableLocked(
                 cudaBuffers[i].data, captureIdentity)) {
-            cudaBuffers[i].busy = true;
-            FastllmCudaGraphPoolAfterAllocLocked(
-                cudaBuffers[i].data, captureIdentity);
-            *view.noBusy -= cudaBuffers[i].size;
-            while (*view.minId < cudaBuffers.size() &&
-                   (cudaBuffers[*view.minId].busy ||
-                    cudaBuffers[*view.minId].graphPins > 0)) {
-                (*view.minId)++;
+            if (selectedSmall < 0 || cudaBuffers[i].size < cudaBuffers[selectedSmall].size) {
+                selectedSmall = i;
             }
-#ifdef CUDA_MEM_DEBUG
-            CudaMemDebugRecord(cudaBuffers[i].data, size);
-#endif
-            return allocationSucceeded(cudaBuffers[i].data);
+            // Capture cannot allocate a new block. Preserve larger idle
+            // blocks for later temporaries instead of consuming the first fit.
+            // Keep eager allocation/reuse order unchanged.
+            if (!capturePoolOnly || cudaBuffers[i].size == size) break;
         }
+    }
+    if (selectedSmall >= 0) {
+        auto &buffer = cudaBuffers[selectedSmall];
+        buffer.busy = true;
+        FastllmCudaGraphPoolAfterAllocLocked(buffer.data, captureIdentity);
+        *view.noBusy -= buffer.size;
+        while (*view.minId < cudaBuffers.size() &&
+               (cudaBuffers[*view.minId].busy || cudaBuffers[*view.minId].graphPins > 0)) {
+            (*view.minId)++;
+        }
+#ifdef CUDA_MEM_DEBUG
+        CudaMemDebugRecord(buffer.data, size);
+#endif
+        return allocationSucceeded(buffer.data);
     }
     if (useAnyFittingPooledBuffer) {
         auto &bigBuffers = *view.bigBuffers;
@@ -5883,7 +5902,8 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
-static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool currentDeviceOnly) {
+static void FastllmCudaClearBigBufferWithRetain(
+        size_t retainBytes, bool currentDeviceOnly, bool boundedRetain = false) {
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return;
     }
@@ -5910,12 +5930,31 @@ static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool current
         std::vector <CudaMemoryBuffer> temp;
         size_t littleMemSum = 0;
         size_t littleMemSumLimit = retainBytes; // 留一小部分复用
+        size_t idleBytes = 0;
         std::vector <std::pair <std::size_t, int > > v;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
                 FastllmCudaBufferReadyForReuseLocked(bigBuffers[i])) {
                 v.push_back(std::make_pair(bigBuffers[i].size, i));
+                idleBytes += bigBuffers[i].size;
             }
+        }
+        if (boundedRetain) {
+            // Device capacity is constant; keep this cache local to callers
+            // that opt into reuse, without extending every pool view.
+            static thread_local std::map<int, size_t> capacities;
+            size_t &capacity = capacities[view.device];
+            if (capacity == 0) {
+                cudaDeviceProp prop;
+                state = cudaGetDeviceProperties(&prop, view.device);
+                checkCudaErrors("Error: CUDA error when reading workspace capacity!", state);
+                capacity = prop.totalGlobalMem;
+            }
+            // Retain reusable workspaces within a device-relative budget. Do not
+            // query free memory on every forward: that may wait for queued GPU
+            // work. Allocation pressure is handled by the idle-pool OOM retry.
+            littleMemSumLimit = capacity / 4;
+            if (idleBytes <= littleMemSumLimit) continue;
         }
         std::sort(v.begin(), v.end());
         std::set <int> littleMemIds;
@@ -5950,6 +5989,10 @@ static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool current
 
 void FastllmCudaClearBigBuffer() {
     FastllmCudaClearBigBufferWithRetain(300ULL * 1024ULL * 1024ULL, false);
+}
+
+void FastllmCudaTrimBigBuffer() {
+    FastllmCudaClearBigBufferWithRetain(0, false, true);
 }
 
 void FastllmCudaClearBigBufferCurrentDevice() {
@@ -6365,6 +6408,10 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
 
     cudaError_t state = cudaSuccess;
     if (FastllmCudaGraphIsCapturingFast()) {
+        // A failed managed capture can carry undersized allocation-failure
+        // placeholders until every TP rank reaches the common abort barrier.
+        // Do not submit a copy against those addresses; the graph is discarded.
+        if (FastllmCudaGetThreadError()) return;
         state = cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height,
                                   cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         checkCudaErrors("Error: CUDA error when async 2D copy on GPU!", state);
@@ -19212,6 +19259,27 @@ int GetPointerDeviceId(void *ptr) {
         cudaGetLastError();
         return -1;
     }
+}
+
+int FastllmCudaGetHostNumaNode(int device) {
+#if defined(__linux__) && !defined(USE_ROCM)
+    char busId[32];
+    if (cudaDeviceGetPCIBusId(busId, sizeof(busId), device) != cudaSuccess) {
+        return -1;
+    }
+    unsigned domain, bus, slot, function;
+    if (std::sscanf(busId, "%x:%x:%x.%x", &domain, &bus, &slot, &function) != 4) {
+        return -1;
+    }
+    char path[128];
+    std::snprintf(path, sizeof(path),
+        "/sys/bus/pci/devices/%04x:%02x:%02x.%x/numa_node",
+        domain, bus, slot, function);
+    int node = -1;
+    std::ifstream file(path);
+    if (file >> node) return node;
+#endif
+    return -1;
 }
 
 int FastllmCudaGetDeviceCount() {
