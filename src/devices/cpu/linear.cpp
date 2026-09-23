@@ -2225,6 +2225,46 @@ namespace fastllm {
         */
     }
 
+    void RunLinearFloat32Int8Perchannel(float *inputData, Data &weight, float *outputData, float *biasData,
+                                int n, int m, int k,
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        // The weight keeps its per-channel scale inline, so only the activation
+        // has to be quantized. INF_INT8_PERCHANNEL stores one symmetric int8
+        // row per token plus the row scale and the row sum used by the kernels.
+        static thread_local std::vector<uint8_t> quantizedInput;
+        const size_t inputBytes = GetDataBytes(DataType::INF_INT8_PERCHANNEL, n, m);
+        if (quantizedInput.size() < inputBytes) {
+            quantizedInput.resize(inputBytes);
+        }
+        RunMultiThreadConvertFromFloat32(quantizedInput.data(), DataType::INF_INT8_PERCHANNEL,
+                                         inputData, n, m, pool);
+
+        uint8_t *weightData = (uint8_t*)weight.cpuData;
+
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearInt8PerchannelOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            // 核函数用绝对列下标 j 索引权重行（j 属于 [st, end)），
+            // 因此 weightData 必须保持指向第 0 行。
+            ops.push_back(new MultiThreadLinearInt8PerchannelOp(
+                quantizedInput.data(), weightData,
+                biasData, outputData, n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
+
     void RunLinearFloat32FP8E4M3(float *inputData, Data &weight, float *outputData, float *biasData, 
                     int n, int m, int k, 
                     AliveThreadPool *pool, int startTid, int threadNum) {

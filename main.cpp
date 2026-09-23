@@ -1,6 +1,10 @@
 #include "model.h"
+#include <chrono>
 #ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 #include <stdlib.h>
+#include <windows.h>
 #endif
 
 std::map <std::string, fastllm::DataType> dataTypeDict = {
@@ -110,9 +114,34 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
     }
 }
 
+#ifdef _WIN32
+// 控制台读到的字节按当前输入代码页(中文系统为GBK)编码，需要转成UTF-8再交给模型
+static std::string ConsoleInputToUtf8(const std::string &text) {
+    if (text.empty()) {
+        return text;
+    }
+    UINT codePage = GetConsoleCP();
+    int wideLen = MultiByteToWideChar(codePage, 0, text.c_str(), (int)text.size(), NULL, 0);
+    if (wideLen <= 0) {
+        return text;
+    }
+    std::wstring wide(wideLen, L'\0');
+    MultiByteToWideChar(codePage, 0, text.c_str(), (int)text.size(), &wide[0], wideLen);
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wideLen, NULL, 0, NULL, NULL);
+    if (utf8Len <= 0) {
+        return text;
+    }
+    std::string utf8(utf8Len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wideLen, &utf8[0], utf8Len, NULL, NULL);
+    return utf8;
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
-    system("chcp 65001");
+    // 只把输出代码页切到UTF-8，不能再用 chcp 连输入代码页一起切，
+    // 否则控制台输入会卡住或丢失多字节字符
+    SetConsoleOutputCP(CP_UTF8);
 #endif
     RunConfig config;
     fastllm::GenerationConfig generationConfig;
@@ -146,8 +175,16 @@ int main(int argc, char **argv) {
 
     while (true) {
         printf(u8"用户: ");
+        fflush(stdout);
         std::string input;
-        std::getline(std::cin, input);
+        if (!std::getline(std::cin, input)) {
+            // 输入流结束或出错，直接退出，避免用空输入反复触发模型
+            printf("\n");
+            break;
+        }
+#ifdef _WIN32
+        input = ConsoleInputToUtf8(input);
+#endif
         if (input == "reset") {
             messages = config.systemPrompt.empty() ? fastllm::ChatMessages() : fastllm::ChatMessages({{"system", config.systemPrompt}});
             continue;
@@ -155,7 +192,12 @@ int main(int argc, char **argv) {
         if (input == "stop") {
             break;
         }
+        if (input.empty()) {
+            continue;
+        }
         messages.push_back(std::make_pair("user", input));
+        fastllm::ClearProfileSummary();
+        auto profileStartTime = std::chrono::steady_clock::now();
         std::string ret = model->Response(model->ApplyChatTemplate(messages), [](int index, const char* content) {
             if (index == 0) {
                 printf("%s:%s", modelType.c_str(), content);
@@ -169,6 +211,14 @@ int main(int argc, char **argv) {
                 printf("\n");
             }
         }, generationConfig);
+        double profileSpend = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - profileStartTime).count();
+        int outputTokens = model->weight.tokenizer.Encode(ret).Count(0);
+        printf("[fastllm-profile] output tokens = %d, spend = %f s, tokens / s = %f\n",
+               outputTokens, profileSpend,
+               profileSpend > 0.0 ? (double)outputTokens / profileSpend : 0.0);
+        fflush(stdout);
+        fastllm::PrintProfileSummary();
         messages.push_back(std::make_pair("assistant", ret));
     }
 

@@ -2,6 +2,8 @@
 // Created by huangyuyang on 5/11/23.
 //
 
+#define _USE_MATH_DEFINES
+
 #include "utils.h"
 
 #include "fastllm.h"
@@ -1206,10 +1208,14 @@ namespace fastllm {
         }
 
         if (this->dataDevice == DataDevice::CPU) {
-            std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
+            if (ori.cpuData != nullptr) {
+                std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
+            }
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
+            if (ori.cudaData != nullptr) {
+                FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
+            }
 #endif
         }
         this->cudaNativeNvfp4Layout = ori.cudaNativeNvfp4Layout;
@@ -1872,7 +1878,8 @@ namespace fastllm {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
-                   this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                   this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                   this->dataType == DataType::INT8_PERCHANNEL) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::NVFP4) {
@@ -1914,6 +1921,7 @@ namespace fastllm {
 
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+             this->dataType == DataType::INT8_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
              this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
@@ -2152,6 +2160,7 @@ namespace fastllm {
         }
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+             this->dataType == DataType::INT8_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
              this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
@@ -2174,6 +2183,7 @@ namespace fastllm {
         this->expansionSize = size;
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+             this->dataType == DataType::INT8_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
              this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||

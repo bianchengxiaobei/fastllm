@@ -2,6 +2,8 @@
 // Created by huangyuyang on 5/11/24.
 //
 
+#define _USE_MATH_DEFINES
+
 #include "glm5_moe_dsa.h"
 
 #include "executor.h"

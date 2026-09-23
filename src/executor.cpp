@@ -9,6 +9,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/disk/diskdevice.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -36,6 +37,56 @@
 #endif
 
 namespace fastllm {
+    // 逐次打印的阈值，默认 0.05 s；调小才能看到细碎算子
+    static float GetProfileSlowOpThreshold() {
+        static const float threshold = []() {
+            const char *env = std::getenv("FASTLLM_PROFILE_SLOW_OPS_S");
+            if (env == nullptr) {
+                return 0.05f;
+            }
+            float value = (float)atof(env);
+            return value < 0.0f ? 0.0f : value;
+        }();
+        return threshold;
+    }
+
+    static std::string GetProfileWeightName(const fastllm::DataDict &datas) {
+        auto it = datas.find("weight");
+        if (it == datas.end() || it->second == nullptr) {
+            return "";
+        }
+        return it->second->name;
+    }
+
+    // 按线程汇总所有算子的累计耗时。算子始终在调用线程上派发，
+    // 因此嵌套 Executor（MoE 层的 thread_local Executor 等）也能被统计到。
+    static std::map <std::string, float> &GetThreadProfileSummary() {
+        static thread_local std::map <std::string, float> summary;
+        return summary;
+    }
+
+    void ClearProfileSummary() {
+        GetThreadProfileSummary().clear();
+    }
+
+    void PrintProfileSummary() {
+        auto &summary = GetThreadProfileSummary();
+        std::vector <std::pair <std::string, float> > items(summary.begin(), summary.end());
+        summary.clear();
+        std::sort(items.begin(), items.end(),
+                  [](const std::pair <std::string, float> &a,
+                     const std::pair <std::string, float> &b) {
+                      return a.second > b.second;
+                  });
+        float sum = 0.0f;
+        for (auto &it : items) {
+            printf("%s spend %f\n", it.first.c_str(), it.second);
+            sum += it.second;
+        }
+        printf("total spend %f\n", sum);
+        fflush(stdout);
+    }
+
 #ifdef USE_CUDA
     static bool KeepKimiK3NumaTensorOnSource(
             const std::string &opType, const std::string &name,
@@ -403,9 +454,12 @@ namespace fastllm {
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
         profiler[opType] += spend;
+        GetThreadProfileSummary()[opType] += spend;
         static const bool profileSlowOps = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
-        if (profileSlowOps && spend > 0.05f) {
-            printf("[fastllm-slow-op] %s spend=%.6f s\n", opType.c_str(), spend);
+        if (profileSlowOps && spend > GetProfileSlowOpThreshold()) {
+            const std::string weightName = GetProfileWeightName(datas);
+            printf("[fastllm-slow-op] %s spend=%.6f s%s%s\n", opType.c_str(), spend,
+                   weightName.empty() ? "" : " weight=", weightName.c_str());
             fflush(stdout);
         }
     }
@@ -489,10 +543,13 @@ namespace fastllm {
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
         profiler[opType] += spend;
+        GetThreadProfileSummary()[opType] += spend;
         static const bool profileSlowOps = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
-        if (profileSlowOps && spend > 0.05f) {
-            printf("[fastllm-slow-op] %s (device=%s) spend=%.6f s\n",
-                   opType.c_str(), deviceType.c_str(), spend);
+        if (profileSlowOps && spend > GetProfileSlowOpThreshold()) {
+            const std::string weightName = GetProfileWeightName(datas);
+            printf("[fastllm-slow-op] %s (device=%s) spend=%.6f s%s%s\n",
+                   opType.c_str(), deviceType.c_str(), spend,
+                   weightName.empty() ? "" : " weight=", weightName.c_str());
             fflush(stdout);
         }
     }

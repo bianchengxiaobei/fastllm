@@ -1210,59 +1210,247 @@ namespace fastllm {
 #endif
     }
 
+    // INT8_PERCHANNEL 权重每行是 [columns uint8][float min][float scale]，字节按 (q + 128)
+    // 存放，正好可以作为 pmaddubsw 的无符号操作数，激活保持有符号。
+    // 一次算 AROW 行输入 × BROW 行权重，权重面板在寄存器内被多行输入复用。
+    template <int BROW, int AROW>
+    static void mul_mat_int8_int8_perchannel_avx2(
+        int m,
+        const uint8_t *A, size_t stride_a,
+        const uint8_t *B, size_t stride_b,
+        float *C, size_t stride_c,
+        const float *biasRow
+    ) {
+#ifdef __AVX2__
+        constexpr int SIMD_WIDTH = 32;
+        __m256i acc[AROW * BROW];
+        for (int i = 0; i < AROW * BROW; ++i) {
+            acc[i] = _mm256_setzero_si256();
+        }
+        const __m256i ones = _mm256_set1_epi16(1);
+        const int nb = m / SIMD_WIDTH;
+        for (int block = 0; block < nb; ++block) {
+            const int off = block * SIMD_WIDTH;
+            for (int ia = 0; ia < AROW; ++ia) {
+                const uint8_t *a_row = A + (size_t)ia * stride_a;
+                const __m256i ay = _mm256_loadu_si256((const __m256i*)(a_row + off));
+                for (int ib = 0; ib < BROW; ++ib) {
+                    const uint8_t *b_row = B + (size_t)ib * stride_b;
+                    _mm_prefetch((const char*)(b_row + off + 256), _MM_HINT_T0);
+                    const __m256i bx = _mm256_loadu_si256((const __m256i*)(b_row + off));
+                    const int idx = ia * BROW + ib;
+                    acc[idx] = _mm256_add_epi32(
+                        acc[idx], _mm256_madd_epi16(_mm256_maddubs_epi16(bx, ay), ones));
+                }
+            }
+        }
+
+        int remainderSums[AROW * BROW] = {0};
+        const int remainder = m % SIMD_WIDTH;
+        if (remainder > 0) {
+            for (int ia = 0; ia < AROW; ++ia) {
+                const int8_t *a_row = (const int8_t*)(A + (size_t)ia * stride_a);
+                for (int ib = 0; ib < BROW; ++ib) {
+                    const uint8_t *b_row = B + (size_t)ib * stride_b;
+                    int sum = 0;
+                    for (int p = nb * SIMD_WIDTH; p < m; p++) {
+                        sum += a_row[p] * b_row[p];
+                    }
+                    remainderSums[ia * BROW + ib] = sum;
+                }
+            }
+        }
+
+        for (int ia = 0; ia < AROW; ++ia) {
+            const uint8_t *a_row = A + (size_t)ia * stride_a;
+            const float scaleA = *(const float*)(a_row + m);
+            const int sumA = *(const int*)(a_row + m + sizeof(float));
+            float *c_ptr = (float*)((char*)C + (size_t)ia * stride_c);
+            for (int ib = 0; ib < BROW; ++ib) {
+                const uint8_t *b_row = B + (size_t)ib * stride_b;
+                const float minB = *(const float*)(b_row + m);
+                const float scaleB = *(const float*)(b_row + m + sizeof(float));
+                const int idx = ia * BROW + ib;
+                int sum = I32sum(acc[idx]) + remainderSums[idx];
+                float value = sum * scaleA * scaleB + minB * scaleA * sumA;
+                if (biasRow != nullptr) {
+                    value += biasRow[ib];
+                }
+                c_ptr[ib] = value;
+            }
+        }
+#endif
+    }
+
+    // 4 行权重 x 2 行输入的显式寄存器版本：累加器全部留在 YMM，
+    // 避免运行期下标使 MSVC 把 acc[] 放进栈（模板版会掉 1.5x 以上）。
+    static void mul_mat_int8_int8_perchannel_avx2_4x2(
+        int m, int nb32,
+        const uint8_t *a0, size_t stride_a,
+        const uint8_t *b0, size_t stride_b,
+        float *c0, size_t stride_c,
+        const float *biasRow) {
+#ifdef __AVX2__
+        const __m256i ones = _mm256_set1_epi16(1);
+        const uint8_t *a1 = a0 + stride_a;
+        const uint8_t *b1 = b0 + stride_b;
+        const uint8_t *b2 = b1 + stride_b;
+        const uint8_t *b3 = b2 + stride_b;
+        float *c1 = (float*)((char*)c0 + stride_c);
+        __m256i c00 = _mm256_setzero_si256(), c01 = c00, c02 = c00, c03 = c00;
+        __m256i c10 = c00, c11 = c00, c12 = c00, c13 = c00;
+        for (int p = 0; p < nb32; p += 32) {
+            const __m256i va0 = _mm256_loadu_si256((const __m256i*)(a0 + p));
+            const __m256i va1 = _mm256_loadu_si256((const __m256i*)(a1 + p));
+            __m256i vb = _mm256_loadu_si256((const __m256i*)(b0 + p));
+            c00 = _mm256_add_epi32(c00, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va0), ones));
+            c10 = _mm256_add_epi32(c10, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va1), ones));
+            vb = _mm256_loadu_si256((const __m256i*)(b1 + p));
+            c01 = _mm256_add_epi32(c01, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va0), ones));
+            c11 = _mm256_add_epi32(c11, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va1), ones));
+            vb = _mm256_loadu_si256((const __m256i*)(b2 + p));
+            c02 = _mm256_add_epi32(c02, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va0), ones));
+            c12 = _mm256_add_epi32(c12, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va1), ones));
+            vb = _mm256_loadu_si256((const __m256i*)(b3 + p));
+            c03 = _mm256_add_epi32(c03, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va0), ones));
+            c13 = _mm256_add_epi32(c13, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va1), ones));
+        }
+        int rem[8] = {0};
+        for (int p = nb32; p < m; p++) {
+            const int q0 = (int)(int8_t)a0[p];
+            const int q1 = (int)(int8_t)a1[p];
+            rem[0] += q0 * b0[p]; rem[1] += q0 * b1[p]; rem[2] += q0 * b2[p]; rem[3] += q0 * b3[p];
+            rem[4] += q1 * b0[p]; rem[5] += q1 * b1[p]; rem[6] += q1 * b2[p]; rem[7] += q1 * b3[p];
+        }
+        const float sa0 = *(const float*)(a0 + m);
+        const float sa1 = *(const float*)(a1 + m);
+        const int qa0 = *(const int*)(a0 + m + sizeof(float));
+        const int qa1 = *(const int*)(a1 + m + sizeof(float));
+        const int s[8] = {I32sum(c00), I32sum(c01), I32sum(c02), I32sum(c03),
+                          I32sum(c10), I32sum(c11), I32sum(c12), I32sum(c13)};
+        const uint8_t *brows[4] = {b0, b1, b2, b3};
+        for (int ib = 0; ib < 4; ib++) {
+            const uint8_t *br = brows[ib];
+            const float minB = *(const float*)(br + m);
+            const float scaleB = *(const float*)(br + m + sizeof(float));
+            float v0 = (s[ib] + rem[ib]) * sa0 * scaleB + minB * sa0 * qa0;
+            float v1 = (s[4 + ib] + rem[4 + ib]) * sa1 * scaleB + minB * sa1 * qa1;
+            if (biasRow != nullptr) {
+                v0 += biasRow[ib];
+                v1 += biasRow[ib];
+            }
+            c0[ib] = v0;
+            c1[ib] = v1;
+        }
+#endif
+    }
+
+    // 4 行权重 x 1 行输入（decode 主路径）的显式寄存器版本。
+    static void mul_mat_int8_int8_perchannel_avx2_4x1(
+        int m, int nb32,
+        const uint8_t *a0,
+        const uint8_t *b0, size_t stride_b,
+        float *c0,
+        const float *biasRow) {
+#ifdef __AVX2__
+        const __m256i ones = _mm256_set1_epi16(1);
+        const uint8_t *b1 = b0 + stride_b;
+        const uint8_t *b2 = b1 + stride_b;
+        const uint8_t *b3 = b2 + stride_b;
+        __m256i c0a = _mm256_setzero_si256(), c1a = c0a, c2a = c0a, c3a = c0a;
+        for (int p = 0; p < nb32; p += 32) {
+            const __m256i va = _mm256_loadu_si256((const __m256i*)(a0 + p));
+            __m256i vb = _mm256_loadu_si256((const __m256i*)(b0 + p));
+            c0a = _mm256_add_epi32(c0a, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va), ones));
+            vb = _mm256_loadu_si256((const __m256i*)(b1 + p));
+            c1a = _mm256_add_epi32(c1a, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va), ones));
+            vb = _mm256_loadu_si256((const __m256i*)(b2 + p));
+            c2a = _mm256_add_epi32(c2a, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va), ones));
+            vb = _mm256_loadu_si256((const __m256i*)(b3 + p));
+            c3a = _mm256_add_epi32(c3a, _mm256_madd_epi16(_mm256_maddubs_epi16(vb, va), ones));
+        }
+        int rem[4] = {0};
+        for (int p = nb32; p < m; p++) {
+            const int q = (int)(int8_t)a0[p];
+            rem[0] += q * b0[p]; rem[1] += q * b1[p];
+            rem[2] += q * b2[p]; rem[3] += q * b3[p];
+        }
+        const float sa = *(const float*)(a0 + m);
+        const int qa = *(const int*)(a0 + m + sizeof(float));
+        const int s[4] = {I32sum(c0a), I32sum(c1a), I32sum(c2a), I32sum(c3a)};
+        const uint8_t *brows[4] = {b0, b1, b2, b3};
+        for (int ib = 0; ib < 4; ib++) {
+            const uint8_t *br = brows[ib];
+            const float minB = *(const float*)(br + m);
+            const float scaleB = *(const float*)(br + m + sizeof(float));
+            float value = (s[ib] + rem[ib]) * sa * scaleB + minB * sa * qa;
+            if (biasRow != nullptr) {
+                value += biasRow[ib];
+            }
+            c0[ib] = value;
+        }
+#endif
+    }
+
     bool LinearINT8PERCHANNEL_INT8PERCHANNEL_AVX2_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX2__
         size_t lda = GetDataBytes(DataType::INF_INT8_PERCHANNEL, 1, m);
         size_t ldb = GetDataBytes(DataType::INT8_PERCHANNEL, 1, m);
         size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+        const int nb32 = (m / 32) * 32;
 
         // 2D 分块：superBlock 行输入在外层，j 面板在内层，面板权重驻留 L2
-        // 被 superBlock 行复用，避免 n 次 DRAM 重读；stream 预取权重行。
+        // 被 superBlock 行复用，避免 n 次 DRAM 重读；内层两行输入共用一次权重装载。
         constexpr int superBlock = 128;
         const int panelCols = std::max(1, (int)((128 * 1024) / std::max<size_t>(1, ldb)));
         for (int iSuper = 0; iSuper < n; iSuper += superBlock) {
             const int superRows = std::min(superBlock, n - iSuper);
             for (int jPanel = st; jPanel < end; jPanel += panelCols) {
                 const int panelEnd = std::min(jPanel + panelCols, end);
-                for (int r = 0; r < superRows; r++) {
+                int r = 0;
+                for (; r + 1 < superRows; r += 2) {
                     const int i = iSuper + r;
-                    uint8_t *infInt8A = (uint8_t*)inputData + (size_t)i * lda;
-                    int8_t *quantizedA = (int8_t*)infInt8A;
-                    float scaleA = *(float*)(infInt8A + m);
-                    int sumA = *(int*)(infInt8A + m + sizeof(float));
-
-                    float *floatC = (float*)((uint8_t*)outputData + (size_t)i * ldc);
-
-                    for (int j = jPanel; j < panelEnd; j++) {
-                        uint8_t *int8B = (uint8_t*)weightData + (size_t)j * ldb;
-                        float minB = *(float*)(int8B + m);
-                        float scaleB = *(float*)(int8B + m + sizeof(float));
-
-                        int sum = 0;
-                        int p = 0;
-
-                        __m256i acc = _mm256_setzero_si256();
-                        const __m256i ones = _mm256_set1_epi16(1);
-
-                        for (; p + 31 < m; p += 32) {
-                            _mm_prefetch((const char*)(int8B + p + 192), _MM_HINT_T0);
-                            __m256i bx = _mm256_loadu_si256((const __m256i *) (int8B + p));
-                            __m256i by = _mm256_loadu_si256((const __m256i *) (quantizedA + p));
-                            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, by), ones));
-                        }
-                        sum = I32sum(acc);
-                        for (; p < m; p++) {
-                            sum += quantizedA[p] * int8B[p];
-                        }
-
-                        floatC[j] = sum * scaleA * scaleB + minB * scaleA * sumA;
+                    float *cRow = (float*)((uint8_t*)outputData + (size_t)i * ldc);
+                    const uint8_t *aRow = inputData + (size_t)i * lda;
+                    int j = jPanel;
+                    for (; j + 3 < panelEnd; j += 4) {
+                        mul_mat_int8_int8_perchannel_avx2_4x2(
+                            m, nb32, aRow, lda,
+                            weightData + (size_t)j * ldb, ldb,
+                            cRow + j, ldc,
+                            biasData == nullptr ? nullptr : biasData + j);
+                    }
+                    for (; j < panelEnd; j++) {
+                        mul_mat_int8_int8_perchannel_avx2<1, 2>(
+                            m, aRow, lda,
+                            weightData + (size_t)j * ldb, ldb,
+                            cRow + j, ldc,
+                            biasData == nullptr ? nullptr : biasData + j);
+                    }
+                }
+                if (r < superRows) {
+                    const int i = iSuper + r;
+                    float *cRow = (float*)((uint8_t*)outputData + (size_t)i * ldc);
+                    int j = jPanel;
+                    for (; j + 3 < panelEnd; j += 4) {
+                        mul_mat_int8_int8_perchannel_avx2_4x1(
+                            m, nb32, inputData + (size_t)i * lda,
+                            weightData + (size_t)j * ldb, ldb,
+                            cRow + j,
+                            biasData == nullptr ? nullptr : biasData + j);
+                    }
+                    for (; j < panelEnd; j++) {
+                        mul_mat_int8_int8_perchannel_avx2<1, 1>(
+                            m, inputData + (size_t)i * lda, lda,
+                            weightData + (size_t)j * ldb, ldb,
+                            cRow + j, ldc,
+                            biasData == nullptr ? nullptr : biasData + j);
                     }
                 }
             }
         }
-
-        AddBiasAVX2(outputData, biasData, n, k, st, end);
+        // bias 已在 epilogue 中累加，这里不再整趟回写输出。
         return true;
 #else
         return false;

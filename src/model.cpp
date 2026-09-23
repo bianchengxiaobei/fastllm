@@ -1595,6 +1595,42 @@ namespace fastllm {
             }
         }
 
+        // Convert an msmodelslim-style per-channel int8 weight into FastLLM's
+        // portable INT8_PERCHANNEL layout, one row of
+        // [columns uint8 values][float min][float scale].  The source uses
+        // symmetric quantization (value = q * scale), while the layout stores
+        // the raw int8 value biased by 128 so the CPU kernels can consume it as
+        // unsigned bytes:
+        //   value = (stored - 128) * scale + min
+        // With min kept at -128 * scale both forms agree exactly, and a
+        // non-zero additive offset is folded into min.
+        void CreateBufferWithInt8PerChannel(const SafeTensorItem &scale,
+                                            const SafeTensorItem *offset) {
+            AssertInFastLLM(this->dtype == "I8" && this->shape.size() == 2 &&
+                            scale.buffer != nullptr &&
+                            scale.len == this->shape[0] &&
+                            (offset == nullptr || offset->buffer != nullptr) &&
+                            (offset == nullptr || offset->len == this->shape[0]),
+                            "CreateBufferWithInt8PerChannel error: invalid weight or scale tensor.");
+            const size_t rows = (size_t)this->shape[0];
+            const size_t columns = (size_t)this->shape[1];
+            ClearBuffer();
+            buffer = new uint8_t[rows * (columns + 2 * sizeof(float))];
+            for (size_t row = 0; row < rows; row++) {
+                uint8_t *dst = buffer + row * (columns + 2 * sizeof(float));
+                ReadRawAt(this->data_offsets[0] + row * columns, dst, columns);
+                for (size_t i = 0; i < columns; i++) {
+                    dst[i] ^= 0x80;
+                }
+                const float scaleValue = ((const float*)scale.buffer)[row];
+                const float offsetValue =
+                    offset == nullptr ? 0.0f : ((const float*)offset->buffer)[row];
+                const float minValue = offsetValue - 128.0f * scaleValue;
+                memcpy(dst + columns, &minValue, sizeof(float));
+                memcpy(dst + columns + sizeof(float), &scaleValue, sizeof(float));
+            }
+        }
+
         void CreateBuffer(DataType dstType) {
             //printf("read %s from %s [%llu %llu] (%f M)\n", this->tensorName.c_str(), this->fileName.c_str(), this->data_offsets[0], this->data_offsets[0] + this->bytes, (float)this->bytes / 1e6);
             DataType srcType;
@@ -2046,6 +2082,14 @@ namespace fastllm {
             std::string prefix = name.substr(0, name.size() - strlen(".weight_scale_2"));
             return isQuantTensor(prefix + ".weight") || isQuantTensor(prefix + ".weight_packed");
         }
+        // msmodelslim saves the additive offset of a per-channel int8 weight next
+        // to the weight itself.  It must be skipped like the scale, otherwise the
+        // loader would register and later free it while the int8 weight is still
+        // reading it.
+        if (StringEndWith(name, ".weight_offset")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_offset"));
+            return isQuantTensor(prefix + ".weight");
+        }
         if (StringEndWith(name, ".weight_global_scale")) {
             std::string prefix = name.substr(0, name.size() - strlen(".weight_global_scale"));
             return isQuantTensor(prefix + ".weight_packed");
@@ -2127,6 +2171,58 @@ namespace fastllm {
             }
         }
         return "";
+    }
+
+    // msmodelslim-style W8A8 checkpoints store a per-channel int8 weight next to
+    // a per-channel float scale and an optional additive offset.  Keep the
+    // detection strictly pattern based: only a 2D I8 ".weight" whose scale holds
+    // exactly one value per output row is treated as a linear int8 weight.
+    struct Int8PerChannelInfo {
+        std::string scaleTensorName;
+        std::string offsetTensorName;
+    };
+
+    static bool TryGetInt8PerChannelInfo(const SafeTensors &safeTensors,
+                                         const std::string &tensorName,
+                                         Int8PerChannelInfo &info) {
+        info = Int8PerChannelInfo();
+        if (!StringEndWith(tensorName, ".weight")) {
+            return false;
+        }
+        auto tensorIt = safeTensors.itmeDict.find(tensorName);
+        if (tensorIt == safeTensors.itmeDict.end() || tensorIt->second.dtype != "I8" ||
+            tensorIt->second.shape.size() != 2) {
+            return false;
+        }
+        // Packed FP4 checkpoints also serialize into an I8 container; those are
+        // handled by the NVFP4 paths instead.
+        DataType packedFp4DataType;
+        if (TryGetPackedFP4DataType(safeTensors, tensorName, packedFp4DataType)) {
+            return false;
+        }
+        auto isPerChannelFloat = [&](const std::string &name) {
+            auto it = safeTensors.itmeDict.find(name);
+            if (it == safeTensors.itmeDict.end() ||
+                (it->second.dtype != "F32" && it->second.dtype != "BF16")) {
+                return false;
+            }
+            const auto &shape = it->second.shape;
+            if (shape.empty() || shape.size() > 2 ||
+                (shape.size() == 2 && shape[1] != 1)) {
+                return false;
+            }
+            return it->second.len == tensorIt->second.shape[0];
+        };
+        const std::string prefix =
+            tensorName.substr(0, tensorName.size() - strlen(".weight"));
+        if (!isPerChannelFloat(prefix + ".weight_scale")) {
+            return false;
+        }
+        info.scaleTensorName = prefix + ".weight_scale";
+        if (isPerChannelFloat(prefix + ".weight_offset")) {
+            info.offsetTensorName = prefix + ".weight_offset";
+        }
+        return true;
     }
 
     static DataType ResolveSafeTensorAutoDataType(const SafeTensors &safeTensors,
@@ -4041,6 +4137,9 @@ namespace fastllm {
         std::set <std::string> allWeightNames; // 所有创建了的weight name
         std::set <std::string> allFinishNames; // 转换好的weight name
 
+        // 已被合并认领的输入权重名，防止并行加载线程双重合并。
+        std::set <std::string> mergedInputsClaimed;
+
         ReportModelLoadProgress("weights_prepare", 0, 1);
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
@@ -4186,6 +4285,26 @@ namespace fastllm {
             AssertInFastLLM(!dflashReadTaskDict.empty(),
                             "No DFlash tensors were mapped for the GGUF target.");
         }
+        // 预创建合并输出，加载期并行合并时不插入 unordered_map（避免 rehash 竞争）。
+        for (auto &rule : model->weightMergeRules) {
+            for (auto &r : rule.rules) {
+                bool allInputsPresent = !r.inputs.empty();
+                for (auto &input : r.inputs) {
+                    if (allWeightNames.find(input) == allWeightNames.end()) {
+                        allInputsPresent = false;
+                        break;
+                    }
+                }
+                if (!allInputsPresent) {
+                    continue;
+                }
+                if (allWeightNames.find(r.output) != allWeightNames.end()) {
+                    continue;
+                }
+                model->weight.AddEmptyWeight(r.output, {1}, DataType::FLOAT32);
+                allWeightNames.insert(r.output);
+            }
+        }
         model->OnWeightsCreated(allWeightNames);
         ReportModelLoadProgress("weights_prepare", 1, 1);
         std::stable_sort(tensors.begin(), tensors.end(),
@@ -4320,6 +4439,27 @@ namespace fastllm {
                                 }
                                 if (!canMerge) {
                                     continue;
+                                }
+                                // 认领合并输入，防止双重合并
+                                bool allUnclaimed = true;
+                                for (auto &it : rule.rules) {
+                                    for (auto input : it.inputs) {
+                                        if (mergedInputsClaimed.find(input) != mergedInputsClaimed.end()) {
+                                            allUnclaimed = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!allUnclaimed) {
+                                        break;
+                                    }
+                                }
+                                if (!allUnclaimed) {
+                                    continue;
+                                }
+                                for (auto &it : rule.rules) {
+                                    for (auto input : it.inputs) {
+                                        mergedInputsClaimed.insert(input);
+                                    }
                                 }
 
                                 locker.unlock();
@@ -4971,6 +5111,13 @@ namespace fastllm {
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
                 }
+                Int8PerChannelInfo int8PerChannelInfo;
+                const bool isInt8PerChannel =
+                    it.second != DATA_AUTO_CONV &&
+                    TryGetInt8PerChannelInfo(safeTensors, tensorName, int8PerChannelInfo);
+                if (isInt8PerChannel) {
+                    dataType = DataType::INT8_PERCHANNEL;
+                }
                 if (it.second == DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
@@ -5005,6 +5152,42 @@ namespace fastllm {
         }
         if (tensors.empty()) {
             ReportModelLoadProgress("weights_prepare", 1, 1);
+        }
+        // 预创建合并输出。加载阶段 16 线程并行，合并输出名不在预创建列表里，
+        // 若等加载时才插入 unordered_map，会与其他线程的无锁 find/erase 并发：
+        // 既可能双重合并（对同一 Data 双重 RegisterNumas），也可能因 rehash
+        // 使引用失效导致崩溃。这里对每个合并规则，若其全部输入均已排队加载，
+        // 则先用 AddEmptyWeight 占位分配。
+        for (auto &rule : model->weightMergeRules) {
+            for (auto &r : rule.rules) {
+                bool allInputsPresent = !r.inputs.empty();
+                for (auto &input : r.inputs) {
+                    if (allWeightNames.find(input) == allWeightNames.end()) {
+                        allInputsPresent = false;
+                        break;
+                    }
+                }
+                if (!allInputsPresent) {
+                    continue;
+                }
+                if (allWeightNames.find(r.output) != allWeightNames.end()) {
+                    continue;
+                }
+                int dim0 = 0, dim1 = 1;
+                for (auto &input : r.inputs) {
+                    auto it = safeTensors.itmeDict.find(input);
+                    if (it == safeTensors.itmeDict.end()) {
+                        dim0 = 0;
+                        break;
+                    }
+                    dim0 += it->second.intShape[0];
+                    dim1 = it->second.intShape.size() > 1 ? it->second.intShape[1] : 0;
+                }
+                if (dim0 > 0) {
+                    model->weight.AddEmptyWeight(r.output, {dim0, dim1}, DataType::FLOAT32);
+                    allWeightNames.insert(r.output);
+                }
+            }
         }
         model->OnWeightsCreated(allWeightNames);
         std::stable_sort(tensors.begin(), tensors.end(),
@@ -5082,6 +5265,11 @@ namespace fastllm {
         }
 
         std::vector <std::string> *activeTensors = &tensors;
+
+        // 已被合并认领的输入权重名。多个加载线程可能同时判定某合并规则
+        // 的全部输入已就绪，导致双重合并（重复 RegisterNumas/重复释放）。
+        // 认领在 locker 内原子完成：先抢到输入集合所有权者执行合并，其余跳过。
+        std::set <std::string> mergedInputsClaimed;
         auto buildSafeTensorParts = [&](const std::vector<std::string> &names,
                                         int rangeStart, int rangeEnd, int partNum) {
             std::vector <std::pair <int, int> > ret;
@@ -5220,6 +5408,18 @@ namespace fastllm {
                                 }
                             }
 
+                            Int8PerChannelInfo int8PerChannelInfo;
+                            std::string int8OffsetTensorName = "";
+                            const bool isInt8PerChannel =
+                                it.second != DATA_AUTO_CONV &&
+                                TryGetInt8PerChannelInfo(safeTensors, tensorName, int8PerChannelInfo);
+                            if (isInt8PerChannel) {
+                                dataType = DataType::INT8_PERCHANNEL;
+                                oriDataType = DataType::INT8_PERCHANNEL;
+                                scaleTensorName = int8PerChannelInfo.scaleTensorName;
+                                int8OffsetTensorName = int8PerChannelInfo.offsetTensorName;
+                            }
+
                             WeightType diskLazyWeightType = GetDiskLazyWeightType(
                                 model, weightName, tensor.bytes);
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
@@ -5267,7 +5467,22 @@ namespace fastllm {
                                     }
                                 }
                             } else {
-                                if (packedInt4Info.isAffine) {
+                                if (isInt8PerChannel) {
+                                    auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
+                                    scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                    SafeTensorItem *offsetTensor = nullptr;
+                                    if (int8OffsetTensorName != "") {
+                                        offsetTensor =
+                                            &safeTensors.itmeDict[int8OffsetTensorName];
+                                        offsetTensor->CreateBuffer(DataType::FLOAT32);
+                                    }
+                                    tensor.CreateBufferWithInt8PerChannel(
+                                        scaleTensor, offsetTensor);
+                                    scaleTensor.ClearBuffer();
+                                    if (offsetTensor != nullptr) {
+                                        offsetTensor->ClearBuffer();
+                                    }
+                                } else if (packedInt4Info.isAffine) {
                                     auto &scaleTensor = safeTensors.itmeDict[
                                         packedInt4Info.scaleTensorName];
                                     auto &qzeroTensor = safeTensors.itmeDict[
@@ -5460,6 +5675,27 @@ namespace fastllm {
                                 }
                                 if (!canMerge) {
                                     continue;
+                                }
+                                // 认领合并输入，防止双重合并
+                                bool allUnclaimed = true;
+                                for (auto &it : rule.rules) {
+                                    for (auto input : it.inputs) {
+                                        if (mergedInputsClaimed.find(input) != mergedInputsClaimed.end()) {
+                                            allUnclaimed = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!allUnclaimed) {
+                                        break;
+                                    }
+                                }
+                                if (!allUnclaimed) {
+                                    continue;
+                                }
+                                for (auto &it : rule.rules) {
+                                    for (auto input : it.inputs) {
+                                        mergedInputsClaimed.insert(input);
+                                    }
                                 }
 
                                 locker.unlock();

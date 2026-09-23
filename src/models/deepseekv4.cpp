@@ -14,6 +14,8 @@
 // 这些算子在 fastllm 中尚无对应实现，将会作为后续 PR 单独提交。
 //
 
+#define _USE_MATH_DEFINES
+
 #include "deepseekv4.h"
 
 #include "baseblock.h"

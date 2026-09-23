@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES
+
 #include "laguna.h"
 
 #include "json11.hpp"

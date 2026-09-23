@@ -953,6 +953,10 @@ namespace fastllm {
 
     void PrintProfiler();
 
+    void ClearProfileSummary();
+
+    void PrintProfileSummary();
+
     void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total); // 执行到了current, 一共total，使用deviceMap切换设备
 
     int LLMSamplingOnly(Data &logits, int outerOffset, const GenerationConfig &config);

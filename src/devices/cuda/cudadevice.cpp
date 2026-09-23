@@ -8962,7 +8962,6 @@ namespace fastllm {
             return hasGpuExpert;
         }();
 
-// ForceDeviceSync(); timeCnt["get experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         auto ensureBuf = [](void *&buf, size_t &cap, size_t need) -> void* {
             if (cap < need) {
                 if (buf != nullptr) {
@@ -8973,63 +8972,6 @@ namespace fastllm {
             }
             return buf;
         };
-        int *cudaIndex = (int*)ensureBuf(
-            workspace.cudaIndex, workspace.cudaIndexBytes,
-            indexVec.size() * sizeof(int));
-        float *cudaScales = (float*)ensureBuf(
-            workspace.cudaScales, workspace.cudaScalesBytes,
-            scales.size() * sizeof(float));
-        float *cudaUnitScales = nullptr;
-// ForceDeviceSync(); timeCnt["malloc index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-        FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
-        FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
-        if (deepSeekV4Mode) {
-            AssertInFastLLM(
-                isCrossSwiglu && gateType == MoeGateSwiglu,
-                "DeepSeek-V4 CUDA NUMA MoE requires cross-SwiGLU weights.");
-            std::vector<float> unitScales(scales.size(), 1.0f);
-            cudaUnitScales = (float*)ensureBuf(
-                workspace.cudaUnitScales, workspace.cudaUnitScalesBytes,
-                unitScales.size() * sizeof(float));
-            FastllmCudaCopyFromHostToDevice(
-                cudaUnitScales, unitScales.data(),
-                unitScales.size() * sizeof(float));
-        }
-// ForceDeviceSync(); timeCnt["copy index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-        tempInput.Resize(input.dims);
-        tempInput.dataType = input.dataType;
-        tempInput.ToDevice(
-            input.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempInput.Allocate();
-
-        tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
-        tempMiddle.dataType = input.dataType;
-        tempMiddle.ToDevice(
-            input.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempMiddle.Allocate();
-
-        tempSwiglu.Resize({input.dims[0], weights[2]->dims[0] / 2});
-        tempSwiglu.dataType = input.dataType;
-        tempSwiglu.ToDevice(
-            input.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempSwiglu.Allocate();
-
-        tempOutput.Resize(output.dims);
-        tempOutput.dataType = input.dataType;
-        tempOutput.ToDevice(
-            output.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempOutput.Allocate();
-// ForceDeviceSync(); timeCnt["alloc data"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-float total = 0.0f;
-std::map <int, int> eeCnt;
-for (int e = 0; e < expertTasks.size(); e++) {
-    if (weights[e * 2] != nullptr) {
-        eeCnt[expertTasks[e].size()]++;
-    }
-}
-for (auto &it : eeCnt) {
-    // printf("%d: %d\n", it.first, it.second);
-}
         auto isValidExpert = [&](int idx) {
             return idx >= 0 && idx < (int)expertTasks.size() &&
                    expertTasks[idx].size() > 0 &&
@@ -9068,8 +9010,12 @@ for (auto &it : eeCnt) {
             }
         }
 
-        int *cudaIndex = (int*)FastllmCudaMalloc(indexVec.size() * sizeof(int));
-        float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
+        int *cudaIndex = (int*)ensureBuf(
+            workspace.cudaIndex, workspace.cudaIndexBytes,
+            indexVec.size() * sizeof(int));
+        float *cudaScales = (float*)ensureBuf(
+            workspace.cudaScales, workspace.cudaScalesBytes,
+            scales.size() * sizeof(float));
         float *cudaUnitScales = nullptr;
         FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
         FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
@@ -9078,7 +9024,8 @@ for (auto &it : eeCnt) {
                 isCrossSwiglu && gateType == MoeGateSwiglu,
                 "DeepSeek-V4 CUDA NUMA MoE requires cross-SwiGLU weights.");
             std::vector<float> unitScales(scales.size(), 1.0f);
-            cudaUnitScales = (float*)FastllmCudaMalloc(
+            cudaUnitScales = (float*)ensureBuf(
+                workspace.cudaUnitScales, workspace.cudaUnitScalesBytes,
                 unitScales.size() * sizeof(float));
             FastllmCudaCopyFromHostToDevice(
                 cudaUnitScales, unitScales.data(),
@@ -9317,8 +9264,6 @@ for (auto &it : eeCnt) {
         }
         FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);
-
-// printf("copy weight %f G.\n", total / 1e9);
 
         input.FreeCudaTemporary({}, false);
     }

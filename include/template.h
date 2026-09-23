@@ -60,7 +60,8 @@ namespace fastllm {
         JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenLess, JinjaTokenLessEqual, JinjaTokenMore, JinjaTokenMoreEqual,
         JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv, JinjaTokenMod,
         JinjaTokenNot, JinjaTokenAnd, JinjaTokenOr,
-        JinjaTokenFilter, JinjaTokenNamespace, JinjaTokenSlice
+        JinjaTokenFilter, JinjaTokenNamespace, JinjaTokenSlice,
+        JinjaTokenIfSep, JinjaTokenIfExpr
         };
 
         JinjaToKenType type;

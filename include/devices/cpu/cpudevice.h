@@ -156,6 +156,21 @@ namespace fastllm {
         void Run();
     };
 
+    // INT8_PERCHANNEL weights keep [columns int8][float min][float scale] per row
+    // and are consumed together with an INF_INT8_PERCHANNEL activation.
+    struct MultiThreadLinearInt8PerchannelOp : MultiThreadBaseOp {
+        uint8_t *inputData, *weightData;
+        float *biasData, *outputData;
+        int n, m, k, st, end;
+
+        MultiThreadLinearInt8PerchannelOp(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                                int n, int m, int k, int st, int end) :
+            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
+            n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run();
+    };
+
     struct MultiThreadInt4GroupLinearOp : MultiThreadBaseOp {
         float *inputData;
         uint8_t *weightData;

@@ -445,6 +445,9 @@ namespace fastllm {
     void RunLinearFloat32Int8(float *inputData, Data &weight, float *outputData, float *biasData, 
                             int n, int m, int k, 
                             AliveThreadPool *pool, int startTid, int threadNum);
+    void RunLinearFloat32Int8Perchannel(float *inputData, Data &weight, float *outputData, float *biasData,
+                            int n, int m, int k,
+                            AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearFloat32FP8E4M3(float *inputData, Data &weight, float *outputData, float *biasData, 
                             int n, int m, int k, 
                             AliveThreadPool *pool, int startTid, int threadNum);

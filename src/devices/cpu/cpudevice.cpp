@@ -7286,6 +7286,11 @@ ops += (long long)lines * inputDim * interDim * 2;
         DoCpuLinearReshape(input, weight, output);
     }
 
+    void MultiThreadLinearInt8PerchannelOp::Run() {
+        LinearINT8PERCHANNEL_INT8PERCHANNEL_Kernel(inputData, weightData, biasData, outputData,
+                                                   n, m, k, st, end);
+    }
+
     void MultiThreadInt4GroupLinearOp::Run() {
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {
@@ -8015,6 +8020,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             } else if (weight.dataType == DataType::INT8) {
                 RunLinearFloat32Int8((float*)input.cpuData, weight, (float*)output.cpuData, 
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::INT8_PERCHANNEL) {
+                RunLinearFloat32Int8Perchannel((float*)input.cpuData, weight, (float*)output.cpuData,
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::INT4_GROUP || weight.dataType == DataType::INT4_NOZERO) {
                 int group = weight.group, groupCnt = weight.groupCnt;
                 if (weight.dataType == DataType::INT4_NOZERO) {
@@ -8121,6 +8129,12 @@ ops += (long long)lines * inputDim * interDim * 2;
                        weight.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
                 RunLinearBFloat16NVFP4((uint16_t*)input.cpuData, weight, (float*)output.cpuData,
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::INT8_PERCHANNEL) {
+                std::vector<float> floatInput;
+                floatInput.resize((size_t)n * m);
+                BFloat16ToFloat32((uint16_t*)input.cpuData, floatInput.data(), n * m);
+                RunLinearFloat32Int8Perchannel(floatInput.data(), weight, (float*)output.cpuData,
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else {
                 linearTypeError();
             }
@@ -8157,6 +8171,12 @@ ops += (long long)lines * inputDim * interDim * 2;
                        weight.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
                 RunLinearBFloat16NVFP4((uint16_t*)input.cpuData, weight, floatOutput.data(),
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::INT8_PERCHANNEL) {
+                std::vector<float> floatInput;
+                floatInput.resize((size_t)n * m);
+                BFloat16ToFloat32((uint16_t*)input.cpuData, floatInput.data(), n * m);
+                RunLinearFloat32Int8Perchannel(floatInput.data(), weight, floatOutput.data(),
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else {
                 linearTypeError();
             }
@@ -8171,6 +8191,15 @@ ops += (long long)lines * inputDim * interDim * 2;
             } else if (weight.dataType == DataType::INT8) {
                 RunLinearFloat16Int8((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData, 
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::INT8_PERCHANNEL) {
+                std::vector<float> floatInput;
+                floatInput.resize((size_t)n * m);
+                Float16ToFloat32((uint16_t*)input.cpuData, floatInput.data(), n * m);
+                std::vector<float> floatOutput;
+                floatOutput.resize((size_t)n * k);
+                RunLinearFloat32Int8Perchannel(floatInput.data(), weight, floatOutput.data(),
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+                Float32ToFloat16(floatOutput.data(), (uint16_t*)output.cpuData, n * k);
             } else if (weight.dataType == DataType::INT4_GROUP || weight.dataType == DataType::INT4_NOZERO) {
                 int group = weight.group, groupCnt = weight.groupCnt;
                 if (weight.dataType == DataType::INT4_NOZERO) {
