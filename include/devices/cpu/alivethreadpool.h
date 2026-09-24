@@ -18,8 +18,24 @@
 #endif
 #include <chrono>
 #include <cstring>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 
 namespace fastllm {
+    // 自旋时插 PAUSE。多路多核机器上（例如双 22 核）线程池有几十个线程，
+    // 其中空闲线程和 PushOp/Wait 的调用方都在轮询同一行，全速 load 会和
+    // 正在跑 GEMV 的线程抢 L2 端口和流水线资源，PAUSE 让出这部分。
+    static inline void CPUPause() {
+#if defined(__aarch64__)
+        asm volatile("yield");
+#elif defined(_MSC_VER)
+        _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    }
+
     static void barrier() {
 #ifdef __aarch64__
         asm volatile("dmb ish");
@@ -72,6 +88,7 @@ namespace fastllm {
                     task->doneId.store(currentId, std::memory_order_release);
                     lastRunTime = std::chrono::system_clock::now();
                 }
+                CPUPause();
 
                 cnt = (cnt + 1) & ((1 << 16) - 1);
                 if (cnt == 0) {
@@ -88,6 +105,7 @@ namespace fastllm {
             std::lock_guard<std::mutex> guard(pushMutex);
             while (this->task->doneId.load(std::memory_order_acquire) !=
                    this->task->publishId.load(std::memory_order_acquire)) {
+                CPUPause();
             }
             this->task->op = op;
             uint64_t nextId = this->task->publishId.load(std::memory_order_relaxed) + 1;
@@ -101,6 +119,7 @@ namespace fastllm {
                 if (doneId == targetId) {
                     break;
                 }
+                CPUPause();
             }
         }
 

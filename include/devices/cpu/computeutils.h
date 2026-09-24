@@ -396,7 +396,8 @@ namespace fastllm {
     void LaunchLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
         int *weightSums, int *weightZeros, float *scales, float *bias,
         float *inputSums, float *iscales, float *izeros,
-        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum);
+        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum,
+        int kStride = -1);
     void LaunchLinearBFloat16FP8E4M3(uint16_t *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum);
@@ -419,9 +420,13 @@ namespace fastllm {
     void RunLinearFloat16Float32(uint16_t *inputData, float *weightData, uint16_t *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);
+    // 后四个参数用于 NUMA 按输出列分片：本段只算 [0, cols) 列，权重指针指向
+    // 本段分片首行，按行辅助数组整体前移 weightRow，输出按 kStride 行走
+    // （仍写进整行）。取默认值时与整池调用完全等价。
     void RunLinearFloat32Float16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
-                                AliveThreadPool *pool, int startTid, int threadNum);
+                                AliveThreadPool *pool, int startTid, int threadNum,
+                                int cols = -1, int kStride = -1, const uint16_t *weightShard = nullptr);
     void RunLinearFloat32BFloat16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);
@@ -437,17 +442,21 @@ namespace fastllm {
     void RunLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
                             int *weightSums, int *weightZeros, float *scales, float *bias,
                             float *inputSums, float *iscales, float *izeros,
-                            AliveThreadPool *pool, int startTid, int threadNum);
+                            AliveThreadPool *pool, int startTid, int threadNum, int kStride = -1);
     void RunLinearInt8Int4Group(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, int group, int groupCnt,
                                 int *weightSums, float *weightMins, float *scales, float *bias,
                                 float *inputSums, float *iscales, float *izeros,
                                 AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearFloat32Int8(float *inputData, Data &weight, float *outputData, float *biasData, 
                             int n, int m, int k, 
-                            AliveThreadPool *pool, int startTid, int threadNum);
+                            AliveThreadPool *pool, int startTid, int threadNum,
+                            int weightRow = 0, int cols = -1, int kStride = -1,
+                            const uint8_t *weightShard = nullptr);
     void RunLinearFloat32Int8Perchannel(float *inputData, Data &weight, float *outputData, float *biasData,
                             int n, int m, int k,
-                            AliveThreadPool *pool, int startTid, int threadNum);
+                            AliveThreadPool *pool, int startTid, int threadNum,
+                            int cols = -1, int kStride = -1,
+                            const uint8_t *weightShard = nullptr);
     void RunLinearFloat32FP8E4M3(float *inputData, Data &weight, float *outputData, float *biasData, 
                             int n, int m, int k, 
                             AliveThreadPool *pool, int startTid, int threadNum);

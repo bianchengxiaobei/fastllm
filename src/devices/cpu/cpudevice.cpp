@@ -37,6 +37,8 @@
 
 #ifdef USE_NUMAS
 #include "numas.h"
+// 定义在 numasdevice.cpp。CPU 侧按 NUMA 列分片时需要节点与线程映射。
+namespace fastllm { NumaConfig *GetNumaConfig(); }
 #elif defined(USE_CPU_NUMA)
 #include <numa.h>
 #include <numaif.h>
@@ -7988,6 +7990,88 @@ ops += (long long)lines * inputDim * interDim * 2;
         return true;
     }
 
+    // NUMA 列分片：把 Linear 的输出列按 NUMA 节点切成若干段，每段只由本节点的
+    // 线程组执行，并且只读本节点本地的权重分片，单 token 解码时权重不再跨 QPI。
+    // 未分片（numasData 为空 / 没开 NUMA / 形状不满足）时退化成单段，
+    // 各项参数与原来的整池调用完全一致。
+    struct LinearColumnShard {
+        const uint8_t *weightShard; // 本段权重首行，nullptr 表示用 weight.cpuData
+        int rowBase;                // 本段首行的全局行号
+        int cols;                   // 本段列数
+        int firstThread;
+        int threadNum;
+    };
+
+    static std::vector <LinearColumnShard> BuildLinearColumnShards(
+            Data &weight, int k, size_t rowBytes,
+            AliveThreadPool *pool, int firstThread, int threadNum) {
+        std::vector <LinearColumnShard> shards;
+        auto singleShard = [&]() {
+            shards.clear();
+            shards.push_back({nullptr, 0, k, firstThread, threadNum});
+            return shards;
+        };
+        if (weight.cpuData == nullptr) {
+            return singleShard();
+        }
+        // INT8 按行辅助数组必须覆盖全部行，否则不能按行分片
+        if (weight.dataType == DataType::INT8) {
+            weight.CalcWeightSum();
+            if (weight.weightSum.size() < (size_t)k || weight.zeros.size() < (size_t)k ||
+                weight.scales.size() < (size_t)k) {
+                return singleShard();
+            }
+        }
+
+        // 对比开关：把同一份权重按行切成 N 段交给 N 组线程，用来在单节点机器上
+        // 验证切分逻辑的正确性。不改变数据布局，只改任务的列范围归属。
+        // 每段列数必须是偶数：fp16/bf16 内核按相邻两列配对做微内核，段起点为
+        // 奇数会把配对关系挪位、落到单列回退路径，结果差 1 个 ULP。
+        const char *forceGroups = std::getenv("FASTLLM_LINEAR_COLUMN_GROUPS");
+        if (forceGroups != nullptr) {
+            int value = atoi(forceGroups);
+            if (value > 1 && value <= threadNum && k % value == 0 && (k / value) % 2 == 0 &&
+                threadNum % value == 0) {
+                const int per = k / value;
+                const int threadsPerShard = threadNum / value;
+                for (int g = 0; g < value; g++) {
+                    shards.push_back({(const uint8_t*)weight.cpuData + (size_t)(g * per) * rowBytes,
+                                      g * per, per,
+                                      firstThread + g * threadsPerShard, threadsPerShard});
+                }
+                return shards;
+            }
+        }
+
+#if defined(USE_NUMAS)
+        // 权重已按行分片到各 NUMA 节点；每段只由本节点的线程执行。
+        if (weight.numasData.size() >= 2) {
+            NumaConfig *numaConfig = GetNumaConfig();
+            const int numaCnt = (int)weight.numasData.size();
+            if (numaConfig != nullptr && numaConfig->numaCnt == numaCnt &&
+                k % numaCnt == 0 && (k / numaCnt) % 2 == 0) {
+                const int per = k / numaCnt;
+                bool ok = true;
+                for (int node = 0; node < numaCnt; node++) {
+                    const auto &nodeThreads = numaConfig->numaToCpuDict[node];
+                    if (weight.numasData[node] == nullptr || nodeThreads.empty()) {
+                        ok = false;
+                        break;
+                    }
+                    shards.push_back({weight.numasData[node], node * per, per,
+                                      nodeThreads[0].first,
+                                      std::min((int)nodeThreads.size(), per)});
+                }
+                if (ok && !shards.empty()) {
+                    return shards;
+                }
+            }
+        }
+#endif
+
+        return singleShard();
+    }
+
     void DoCpuLinear(Data &input, Data &weight, const Data &bias, Data &output) {
 //auto st = std::chrono::system_clock::now();
         output.Allocate();
@@ -8015,14 +8099,34 @@ ops += (long long)lines * inputDim * interDim * 2;
                 RunLinearFloat32BFloat16((float*)input.cpuData, (uint16_t*)weight.cpuData, (float*)output.cpuData, 
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::FLOAT16) {
-                RunLinearFloat32Float16((float*)input.cpuData, (uint16_t*)weight.cpuData, (float*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                const size_t rowBytes = GetDataBytes(DataType::FLOAT16, 1, m);
+                for (const auto &shard : BuildLinearColumnShards(weight, k, rowBytes, GetAlivePool(), threadSt, threadLen)) {
+                    RunLinearFloat32Float16((float*)input.cpuData, (uint16_t*)weight.cpuData,
+                        (float*)output.cpuData + shard.rowBase,
+                        biasData == nullptr ? nullptr : biasData + shard.rowBase,
+                        n, m, k, GetAlivePool(), shard.firstThread, shard.threadNum,
+                        shard.cols, k, (const uint16_t*)shard.weightShard);
+                }
             } else if (weight.dataType == DataType::INT8) {
-                RunLinearFloat32Int8((float*)input.cpuData, weight, (float*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                for (const auto &shard : BuildLinearColumnShards(weight, k, m, GetAlivePool(), threadSt, threadLen)) {
+                    RunLinearFloat32Int8((float*)input.cpuData, weight,
+                        (float*)output.cpuData + shard.rowBase,
+                        biasData == nullptr ? nullptr : biasData + shard.rowBase,
+                        n, m, k, GetAlivePool(), shard.firstThread, shard.threadNum,
+                        shard.rowBase, shard.cols, k, shard.weightShard);
+                }
             } else if (weight.dataType == DataType::INT8_PERCHANNEL) {
-                RunLinearFloat32Int8Perchannel((float*)input.cpuData, weight, (float*)output.cpuData,
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                const size_t rowBytes = GetDataBytes(DataType::INT8_PERCHANNEL, 1, m);
+                for (const auto &shard : BuildLinearColumnShards(weight, k, rowBytes, GetAlivePool(), threadSt, threadLen)) {
+                    RunLinearFloat32Int8Perchannel((float*)input.cpuData, weight,
+                        (float*)output.cpuData + shard.rowBase,
+                        biasData == nullptr ? nullptr : biasData + shard.rowBase,
+                        n, m, k, GetAlivePool(), shard.firstThread, shard.threadNum,
+                        shard.cols, k, shard.weightShard);
+                }
             } else if (weight.dataType == DataType::INT4_GROUP || weight.dataType == DataType::INT4_NOZERO) {
                 int group = weight.group, groupCnt = weight.groupCnt;
                 if (weight.dataType == DataType::INT4_NOZERO) {

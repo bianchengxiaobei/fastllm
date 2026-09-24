@@ -1890,17 +1890,61 @@ namespace fastllm {
         Float32ToFloat16(floatOutput.data(), outputData, n * k);
     }
 
+    // 把一组 op 交给同一个池线程顺序执行。NUMA 列分片时每段只能用自己的线程组，
+    // 不能走整池的 DynamicScheduleTasks。
+    struct RunOpListOp : MultiThreadBaseOp {
+        std::vector<MultiThreadBaseOp*> ops;
+        RunOpListOp(std::vector<MultiThreadBaseOp*>::iterator begin,
+                    std::vector<MultiThreadBaseOp*>::iterator end) : ops(begin, end) {}
+        void Run() override {
+            for (auto *op : ops) {
+                op->Run();
+            }
+        }
+    };
+
+    // cols/kStride/weightShard 见 RunLinearFloat32Int8 的说明。weightShard 指向
+    // 本段权重分片首行, 段内列号从 0 起算, 输出按 kStride 行走。
     void RunLinearFloat32Float16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
-                                AliveThreadPool *pool, int startTid, int threadNum) {
+                                AliveThreadPool *pool, int startTid, int threadNum,
+                                int cols, int kStride, const uint16_t *weightShard) {
+        const int outCols = cols > 0 ? cols : k;
+        const int outputStride = kStride > 0 ? kStride : k;
+        uint16_t *weightBase = weightShard != nullptr ? const_cast<uint16_t*>(weightShard) : weightData;
         int stride = 64;
         std::vector<MultiThreadBaseOp*> ops;
-        for (int st = 0; st < k; st += stride) {
-            int end = std::min(st + stride, k);
-            ops.push_back(new MultiThreadLinearFloat32Float16Op(inputData, weightData, biasData, outputData,
-                                                n, m, k, st, end));
+        for (int st = 0; st < outCols; st += stride) {
+            int end = std::min(st + stride, outCols);
+            ops.push_back(new MultiThreadLinearFloat32Float16Op(inputData, weightBase, biasData, outputData,
+                                                n, m, outputStride, st, end));
         }
-        DynamicScheduleTasks(ops);
+        // 分片时只用本段的线程区间; 单组 (整池) 时保持原来的动态调度。
+        if (startTid == 0 && threadNum == (int)pool->threads.size()) {
+            DynamicScheduleTasks(ops);
+            return;
+        }
+        const int total = (int)ops.size();
+        std::vector<RunOpListOp*> groups(threadNum, nullptr);
+        for (int i = 0; i < threadNum; i++) {
+            int begin = (int)((int64_t)total * i / threadNum);
+            int end = (int)((int64_t)total * (i + 1) / threadNum);
+            if (begin >= end) {
+                continue;
+            }
+            groups[i] = new RunOpListOp(ops.begin() + begin, ops.begin() + end);
+            pool->PushOp(startTid + i, groups[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            if (groups[i] == nullptr) {
+                continue;
+            }
+            pool->Wait(startTid + i);
+            delete groups[i];
+        }
+        for (auto *op : ops) {
+            delete op;
+        }
     }
 
     struct FastllmBF16Manager {
@@ -2120,7 +2164,9 @@ namespace fastllm {
     void LaunchLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
         int *weightSums, int *weightZeros, float *scales, float *bias,
         float *inputSums, float *iscales, float *izeros,
-        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum,
+        int kStride) {
+        const int outputStride = kStride > 0 ? kStride : k;
         int per = k / threadNum;
         int cur = 0;
         for (int i = 0; i < threadNum; i++) {
@@ -2128,7 +2174,7 @@ namespace fastllm {
             if (i == threadNum - 1) {
                 end = k;
             }
-            ops[startTid + i] = new MultiThreadLinearInt8Int8Op(a, b + cur * m, (int32_t*)c + cur, n, m, end - cur, k, 
+            ops[startTid + i] = new MultiThreadLinearInt8Int8Op(a, b + cur * m, (int32_t*)c + cur, n, m, end - cur, outputStride, 
                                                         weightSums + cur, weightZeros + cur, scales + cur, 
                                                         (bias == nullptr ? (float *) nullptr : bias + cur), 
                                                         iscales, izeros, inputSums);
@@ -2140,10 +2186,13 @@ namespace fastllm {
     }
 
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
+    // k 是本段要算的列数, kStride 是输出矩阵每行的步长。NUMA 按列分片时
+    // 两者不再相等: 本段只算 [0, k) 列, 但要写进整行 [0, kStride) 的输出里。
     void RunLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
                             int *weightSums, int *weightZeros, float *scales, float *bias,
                             float *inputSums, float *iscales, float *izeros,
-                            AliveThreadPool *pool, int startTid, int threadNum) {
+                            AliveThreadPool *pool, int startTid, int threadNum,
+                            int kStride) {
         int per = k / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadLinearInt8Int8Op*> ops;
@@ -2152,7 +2201,7 @@ namespace fastllm {
             if (i == threadNum - 1) {
                 end = k;
             }
-            ops.push_back(new MultiThreadLinearInt8Int8Op(a, b + cur * m, (int32_t*)c + cur, n, m, end - cur, k, 
+            ops.push_back(new MultiThreadLinearInt8Int8Op(a, b + cur * m, (int32_t*)c + cur, n, m, end - cur, kStride, 
                                                         weightSums + cur, weightZeros + cur, scales + cur, 
                                                         (bias == nullptr ? (float *) nullptr : bias + cur), 
                                                         iscales, izeros, inputSums));
@@ -2192,19 +2241,29 @@ namespace fastllm {
         }
     }
 
+    // weightRow/cols/kStride/weightShard 用于 NUMA 按输出列分片: 本段只算
+    // [0, cols) 列, 权重指针指向本段分片的首行, 按行辅助数组整体前移
+    // weightRow, 输出按 outputStride 行走 (仍写进整行)。默认值等价于原来的
+    // 整体调用。
     void RunLinearFloat32Int8(float *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, 
-                                AliveThreadPool *pool, int startTid, int threadNum) {
+                                AliveThreadPool *pool, int startTid, int threadNum,
+                                int weightRow, int cols, int kStride,
+                                const uint8_t *weightShard) {
         weight.CalcWeightSum();
+        const int outCols = cols > 0 ? cols : k;
+        const int outputStride = kStride > 0 ? kStride : k;
+        const uint8_t *weightBase = weightShard != nullptr ? weightShard : (const uint8_t*)weight.cpuData;
         std::vector<LowBitConfig> inputConfigs;
         std::vector<uint8_t> uinput;
         std::vector <float> inputSums, iscales, izeros;
         OnlineQuantization(inputData, uinput, inputConfigs, n, m, 1, m, inputSums, iscales, izeros, 0);
 
-        RunLinearInt8Int8(uinput.data(), (uint8_t*)weight.cpuData, outputData, n, m, k, 
-                weight.weightSum.data(), weight.zeros.data(), weight.scales.data(), biasData, 
+        RunLinearInt8Int8(uinput.data(), (uint8_t*)weightBase, outputData, n, m, outCols, 
+                weight.weightSum.data() + weightRow, weight.zeros.data() + weightRow,
+                weight.scales.data() + weightRow, biasData, 
                 inputSums.data(), iscales.data(), izeros.data(),
-                pool, startTid, threadNum);
+                pool, startTid, threadNum, outputStride);
         /*
         这部分是float输入，float输出
         int threadNum = threads;
@@ -2227,7 +2286,11 @@ namespace fastllm {
 
     void RunLinearFloat32Int8Perchannel(float *inputData, Data &weight, float *outputData, float *biasData,
                                 int n, int m, int k,
-                                AliveThreadPool *pool, int startTid, int threadNum) {
+                                AliveThreadPool *pool, int startTid, int threadNum,
+                                int cols, int kStride,
+                                const uint8_t *weightShard) {
+        const int outCols = cols > 0 ? cols : k;
+        const int outputStride = kStride > 0 ? kStride : k;
         // The weight keeps its per-channel scale inline, so only the activation
         // has to be quantized. INF_INT8_PERCHANNEL stores one symmetric int8
         // row per token plus the row scale and the row sum used by the kernels.
@@ -2239,21 +2302,22 @@ namespace fastllm {
         RunMultiThreadConvertFromFloat32(quantizedInput.data(), DataType::INF_INT8_PERCHANNEL,
                                          inputData, n, m, pool);
 
-        uint8_t *weightData = (uint8_t*)weight.cpuData;
+        uint8_t *weightData = weightShard != nullptr ? const_cast<uint8_t*>(weightShard)
+                                                     : (uint8_t*)weight.cpuData;
 
-        int per = k / threadNum;
+        int per = outCols / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadLinearInt8PerchannelOp*> ops;
         for (int i = 0; i < threadNum; i++) {
-            int end = cur + per + (cur + per * (threadNum - i) < k);
+            int end = cur + per + (cur + per * (threadNum - i) < outCols);
             if (i == threadNum - 1) {
-                end = k;
+                end = outCols;
             }
-            // 核函数用绝对列下标 j 索引权重行（j 属于 [st, end)），
-            // 因此 weightData 必须保持指向第 0 行。
+            // 核函数用段内列下标 j 索引权重行（j 属于 [st, end)），
+            // 因此分片时 weightData 指向本段首行、st/end 用段内相对列号。
             ops.push_back(new MultiThreadLinearInt8PerchannelOp(
                 quantizedInput.data(), weightData,
-                biasData, outputData, n, m, k, cur, end));
+                biasData, outputData, n, m, outputStride, cur, end));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
