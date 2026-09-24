@@ -412,7 +412,7 @@ namespace fastllm {
 
         const uint16_t* a0 = A;
         for (int i = 0; i < nb; ++i) {
-            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 256), _MM_HINT_T0);
             __m256 w0 = bf16_to_fp32_avx2(
                 _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
             for (int r = 0; r < BROW; ++r) {
@@ -471,8 +471,8 @@ namespace fastllm {
         const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
 
         for (int i = 0; i < nb; ++i) {
-            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
-            _mm_prefetch((const char*)(a1 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 256), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a1 + i * SIMD_WIDTH + 256), _MM_HINT_T0);
             __m256 w0 = bf16_to_fp32_avx2(
                 _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
             __m256 w1 = bf16_to_fp32_avx2(
@@ -1617,7 +1617,7 @@ namespace fastllm {
                 const uint16_t* a_row = (const uint16_t*)((const char*)A + ix * stride_a);
                 
                 // 从 f16 转换到 f32 (F16C)
-                _mm_prefetch((const char*)(a_row + i * SIMD_WIDTH + 64), _MM_HINT_T0);
+                _mm_prefetch((const char*)(a_row + i * SIMD_WIDTH + 256), _MM_HINT_T0);
                 __m128i a_f16 = _mm_loadu_si128((const __m128i*)(a_row + i * SIMD_WIDTH));
                 __m256 a_vec = _mm256_cvtph_ps(a_f16);
                 
@@ -1698,8 +1698,8 @@ namespace fastllm {
         const uint16_t* a1 = (const uint16_t*)((const char*)A + stride_a);
 
         for (int i = 0; i < nb; ++i) {
-            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
-            _mm_prefetch((const char*)(a1 + i * SIMD_WIDTH + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a0 + i * SIMD_WIDTH + 256), _MM_HINT_T0);
+            _mm_prefetch((const char*)(a1 + i * SIMD_WIDTH + 256), _MM_HINT_T0);
             __m256 w0 = _mm256_cvtph_ps(
                 _mm_loadu_si128((const __m128i*)(a0 + i * SIMD_WIDTH)));
             __m256 w1 = _mm256_cvtph_ps(

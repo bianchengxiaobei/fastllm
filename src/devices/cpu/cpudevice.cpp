@@ -7043,6 +7043,180 @@ ops += (long long)lines * inputDim * interDim * 2;
         output.Resize(dims);
     }
 
+    // 一次性打印某个算子首次执行时的实际形状/分支, 由 FASTLLM_PROFILE_OP_PARAMS 打开.
+    // 用来确认某条优化路径是否真的被走到, 以及 build 是否包含改动.
+    static void ReportOpParamsOnce(const std::string &tag, const std::string &info) {
+        static const bool enabled =
+            std::getenv("FASTLLM_PROFILE_OP_PARAMS") != nullptr;
+        if (!enabled) {
+            return;
+        }
+        static std::vector<std::string> reported;
+        for (auto &it : reported) {
+            if (it == tag) {
+                return;
+            }
+        }
+        reported.push_back(tag);
+        printf("[fastllm-op-params] %s %s\n", tag.c_str(), info.c_str());
+        fflush(stdout);
+    }
+
+    // 每个 (算子, 形状) 只跑一次的一次性标记, 用于在算子里做一次性变体对比.
+    static bool OpBenchOnce(const std::string &key) {
+        static std::vector<std::string> done;
+        for (auto &it : done) {
+            if (it == key) {
+                return false;
+            }
+        }
+        done.push_back(key);
+        return true;
+    }
+
+    template <class F>
+    static double TimeFunction(int reps, F &&f) {
+        auto t0 = std::chrono::system_clock::now();
+        for (int i = 0; i < reps; i++) {
+            f();
+        }
+        return GetSpan(t0, std::chrono::system_clock::now()) / (double)reps;
+    }
+
+    // 已知周期数的定标探针: n 次依赖链加法, 每次 4 周期.
+    // 用它换算当前线程的等效主频, 用来区分 "内核慢" 和 "进程/线程被拖慢".
+    static double ProbeDependentAddChain(int n) {
+        double s = 0.0;
+        for (int i = 0; i < n; i++) {
+            s += 1.0000001;
+        }
+        // volatile 落盘, 防止整个循环被优化掉.
+        volatile double sink = s;
+        (void)sink;
+        return s;
+    }
+
+    // 返回本次测量换算出的等效主频 (GHz). 若明显低于标称睿频, 说明是环境问题.
+    static double MeasureEffectiveGHz(int n) {
+        double best = 1e30;
+        for (int r = 0; r < 3; r++) {
+            double t = TimeFunction(1, [&]() { ProbeDependentAddChain(n); });
+            if (t > 0 && t < best) {
+                best = t;
+            }
+        }
+        return best > 0 ? (double)n * 4.0 / best / 1e9 : 0.0;
+    }
+
+    // 算子内部的分段自计时, 由 FASTLLM_PROFILE_OP_INTERNAL 打开.
+    // t0 = 输出分配+参数解析, t1 = 主体计算(含池化派发), t2 = 收尾转换.
+    struct OpSelfTiming {
+        std::string key;
+        double count = 0.0, t0 = 0.0, t1 = 0.0, t2 = 0.0;
+    };
+
+    static void OpSelfTimingAdd(const std::string &key, double t0, double t1, double t2) {
+        static std::vector<OpSelfTiming> all;
+        OpSelfTiming *stat = nullptr;
+        for (auto &it : all) {
+            if (it.key == key) {
+                stat = &it;
+                break;
+            }
+        }
+        if (stat == nullptr) {
+            all.push_back(OpSelfTiming());
+            all.back().key = key;
+            stat = &all.back();
+        }
+        stat->count += 1.0;
+        stat->t0 += t0;
+        stat->t1 += t1;
+        stat->t2 += t2;
+        if (stat->count == 1.0 || ((long long)stat->count % 128) == 0) {
+            double c = stat->count;
+            printf("[fastllm-op-internal] %s count=%.0f alloc=%.1fus compute=%.1fus tail=%.1fus total=%.1fus\n",
+                   key.c_str(), c, stat->t0 / c * 1e6, stat->t1 / c * 1e6,
+                   stat->t2 / c * 1e6,
+                   (stat->t0 + stat->t1 + stat->t2) / c * 1e6);
+            fflush(stdout);
+        }
+    }
+
+    // 通用分组卷积内核.
+    static void GenericConv1DPerChannelKernel(
+            float *floatInput, float *floatOutput, float *floatWeight, float *floatBias,
+            int batchSize, int inputLength, int outputLength,
+            int inputChannels, int outputChannels, int kernelSize, int padding, int stride,
+            int groups, int channelsPerGroup, int outputChannelsPerGroup, int st, int end) {
+        for (int b = 0; b < batchSize; b++) {
+            float *batchInput = floatInput + (long long)b * (inputChannels * inputLength);
+            float *batchOutput = floatOutput + (long long)b * (outputChannels * outputLength);
+
+            for (int g = st; g < end; g++) {
+                for (int oc = 0; oc < outputChannelsPerGroup; oc++) {
+                    int globalOc = g * outputChannelsPerGroup + oc;
+                    float *curWeight = floatWeight + globalOc * (channelsPerGroup * kernelSize);
+                    float *curOutput = batchOutput + (long long)globalOc * outputLength;
+
+                    for (int ol = 0; ol < outputLength; ol++) {
+                        int il = ol * stride - padding;
+                        float value = floatBias ? floatBias[globalOc] : 0.0f;
+
+                        for (int ic = 0; ic < channelsPerGroup; ic++) {
+                            int globalIc = g * channelsPerGroup + ic;
+                            float *curInput = batchInput + (long long)globalIc * inputLength;
+
+                            for (int k = 0; k < kernelSize; k++) {
+                                float inputValue = 0;
+                                int inputPos = il + k;
+
+                                if (inputPos >= 0 && inputPos < inputLength) {
+                                    inputValue = curInput[inputPos];
+                                }
+
+                                value += inputValue * curWeight[ic * kernelSize + k];
+                            }
+                        }
+
+                        curOutput[ol] = value;
+                    }
+                }
+            }
+        }
+    }
+
+    // 逐通道卷积内核 (channelsPerGroup == 1 && outputChannelsPerGroup == 1):
+    // 每个输出通道只依赖同组唯一的输入通道, k 的合法区间与 bias 都与内层无关, 可提前算出.
+    static void DepthwiseConv1DPerChannelKernel(
+            float *floatInput, float *floatOutput, float *floatWeight, float *floatBias,
+            int batchSize, int inputLength, int outputLength,
+            int inputChannels, int outputChannels, int kernelSize, int padding, int stride,
+            int groups, int st, int end) {
+        for (int b = 0; b < batchSize; b++) {
+            float *batchInput = floatInput + (long long)b * (inputChannels * inputLength);
+            float *batchOutput = floatOutput + (long long)b * (outputChannels * outputLength);
+
+            for (int g = st; g < end; g++) {
+                const float *curWeight = floatWeight + (long long)g * kernelSize;
+                const float *curInput = batchInput + (long long)g * inputLength;
+                float *curOutput = batchOutput + (long long)g * outputLength;
+                const float biasValue = floatBias ? floatBias[g] : 0.0f;
+
+                for (int ol = 0; ol < outputLength; ol++) {
+                    int il = ol * stride - padding;
+                    int kBegin = std::max(0, -il);
+                    int kEnd = std::min(kernelSize, inputLength - il);
+                    float value = biasValue;
+                    for (int k = kBegin; k < kEnd; k++) {
+                        value += curInput[il + k] * curWeight[k];
+                    }
+                    curOutput[ol] = value;
+                }
+            }
+        }
+    }
+
     struct MultiThreadConv1DPerChannelOp : MultiThreadBaseOp {
         float *floatInput, *floatOutput, *floatWeight, *floatBias;
         int batchSize, inputLength, outputLength;
@@ -7062,41 +7236,16 @@ ops += (long long)lines * inputDim * interDim * 2;
             outputChannelsPerGroup(outputChannelsPerGroup), st(st), end(end) {}
 
         void Run() {
-            for (int b = 0; b < batchSize; b++) {
-                float *batchInput = floatInput + (long long)b * (inputChannels * inputLength);
-                float *batchOutput = floatOutput + (long long)b * (outputChannels * outputLength);
-
-                for (int g = st; g < end; g++) {
-                    for (int oc = 0; oc < outputChannelsPerGroup; oc++) {
-                        int globalOc = g * outputChannelsPerGroup + oc;
-                        float *curWeight = floatWeight + globalOc * (channelsPerGroup * kernelSize);
-                        float *curOutput = batchOutput + (long long)globalOc * outputLength;
-
-                        for (int ol = 0; ol < outputLength; ol++) {
-                            int il = ol * stride - padding;
-                            float value = floatBias ? floatBias[globalOc] : 0.0f;
-
-                            for (int ic = 0; ic < channelsPerGroup; ic++) {
-                                int globalIc = g * channelsPerGroup + ic;
-                                float *curInput = batchInput + (long long)globalIc * inputLength;
-
-                                for (int k = 0; k < kernelSize; k++) {
-                                    float inputValue = 0;
-                                    int inputPos = il + k;
-
-                                    if (inputPos >= 0 && inputPos < inputLength) {
-                                        inputValue = curInput[inputPos];
-                                    }
-
-                                    value += inputValue * curWeight[ic * kernelSize + k];
-                                }
-                            }
-
-                            curOutput[ol] = value;
-                        }
-                    }
-                }
+            if (channelsPerGroup == 1 && outputChannelsPerGroup == 1) {
+                DepthwiseConv1DPerChannelKernel(floatInput, floatOutput, floatWeight, floatBias,
+                    batchSize, inputLength, outputLength, inputChannels, outputChannels,
+                    kernelSize, padding, stride, groups, st, end);
+                return;
             }
+            GenericConv1DPerChannelKernel(floatInput, floatOutput, floatWeight, floatBias,
+                batchSize, inputLength, outputLength, inputChannels, outputChannels,
+                kernelSize, padding, stride, groups, channelsPerGroup,
+                outputChannelsPerGroup, st, end);
         }
     };
 
@@ -7106,6 +7255,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
+        static const bool profileInternal =
+            std::getenv("FASTLLM_PROFILE_OP_INTERNAL") != nullptr;
+        auto selfSt0 = std::chrono::system_clock::now();
         output.Allocate(false);
         int inputChannels = intParams.find("inputChannels")->second;    
         int outputChannels = intParams.find("outputChannels")->second; 
@@ -7141,6 +7293,27 @@ ops += (long long)lines * inputDim * interDim * 2;
         int channelsPerGroup = inputChannels / groups;   // 对于逐通道卷积，这是1
         int outputChannelsPerGroup = outputChannels / groups;  // 对于逐通道卷积，这也是1
 
+        ReportOpParamsOnce("Conv1DPerChannel",
+            std::string("build=silu-avx2+conv1d-fastpath") +
+            " inType=" + std::to_string((int)input.dataType) +
+            " wType=" + std::to_string((int)weight.dataType) +
+            " biasDims=" + std::to_string((int)bias.dims.size()) +
+            " batch=" + std::to_string(batchSize) +
+            " inCh=" + std::to_string(inputChannels) +
+            " outCh=" + std::to_string(outputChannels) +
+            " inLen=" + std::to_string(inputLength) +
+            " outLen=" + std::to_string(outputLength) +
+            " K=" + std::to_string(kernelSize) +
+            " pad=" + std::to_string(padding) +
+            " stride=" + std::to_string(stride) +
+            " groups=" + std::to_string(groups) +
+            " chPerGrp=" + std::to_string(channelsPerGroup) +
+            " outChPerGrp=" + std::to_string(outputChannelsPerGroup) +
+            " work=" + std::to_string((long long)batchSize * groups * outputLength * kernelSize * channelsPerGroup) +
+            ((channelsPerGroup == 1 && outputChannelsPerGroup == 1) ? " fastpath=1" : " fastpath=0"));
+
+        auto selfSt1 = std::chrono::system_clock::now();
+
         if ((long long)batchSize * groups * outputLength * kernelSize * channelsPerGroup < 65536 ||
             groups <= 1) {
             MultiThreadConv1DPerChannelOp(floatInput, floatOutput, floatWeight, floatBias,
@@ -7171,8 +7344,43 @@ ops += (long long)lines * inputDim * interDim * 2;
             }
         }
 
+        auto selfSt2 = std::chrono::system_clock::now();
+
         if (input.dataType == DataType::FLOAT16) {
             Float32ToFloat16(floatOutput, (uint16_t*)output.cpuData, (int)floatOutputVector.size());
+        }
+
+        auto selfSt3 = std::chrono::system_clock::now();
+        if (profileInternal) {
+            OpSelfTimingAdd(
+                "Conv1DPerChannel inLen=" + std::to_string(inputLength) +
+                    " outLen=" + std::to_string(outputLength) +
+                    " groups=" + std::to_string(groups),
+                GetSpan(selfSt0, selfSt1), GetSpan(selfSt1, selfSt2), GetSpan(selfSt2, selfSt3));
+        }
+        if (profileInternal && channelsPerGroup == 1 &&
+            outputChannelsPerGroup == 1 &&
+            OpBenchOnce("conv1d-single inLen=" + std::to_string(inputLength) +
+                        " outLen=" + std::to_string(outputLength))) {
+            // 同上: 只能写临时缓冲, 避免原地操作时污染 output.
+            std::vector<float> scratch((size_t)outputChannels * outputLength);
+            double tGeneric = TimeFunction(5, [&]() {
+                GenericConv1DPerChannelKernel(floatInput, scratch.data(), floatWeight, floatBias,
+                    batchSize, inputLength, outputLength, inputChannels, outputChannels,
+                    kernelSize, padding, stride, groups, channelsPerGroup,
+                    outputChannelsPerGroup, 0, groups);
+            });
+            double tDepthwise = TimeFunction(5, [&]() {
+                DepthwiseConv1DPerChannelKernel(floatInput, scratch.data(), floatWeight, floatBias,
+                    batchSize, inputLength, outputLength, inputChannels, outputChannels,
+                    kernelSize, padding, stride, groups, 0, groups);
+            });
+            printf("[fastllm-conv1d-bench] 1thread inLen=%d outLen=%d groups=%d K=%d work=%lld generic=%.1fus depthwise=%.1fus speedup=%.2fx\n",
+                   inputLength, outputLength, groups, kernelSize,
+                   (long long)batchSize * groups * outputLength * kernelSize,
+                   tGeneric * 1e6, tDepthwise * 1e6,
+                   tDepthwise > 0 ? tGeneric / tDepthwise : 0.0);
+            fflush(stdout);
         }
     }
 
@@ -8096,8 +8304,40 @@ ops += (long long)lines * inputDim * interDim * 2;
                 RunLinearFloat32Float32((float*)input.cpuData, (float*)weight.cpuData, (float*)output.cpuData, 
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::BFLOAT16) {
+                // 一次性诊断 (FASTLLM_PROFILE_F32BF16): 报告真实命中的分支、形状、
+                // 本 op 读了多少权重字节 / 花了多少 ms / 等效带宽。
+                // 只对 >=16MB 权重的形状、且每种 (m,k) 只打一次，避免刷屏。
+                static const bool profilePath = std::getenv("FASTLLM_PROFILE_F32BF16") != nullptr;
+                static std::vector<std::string> reportedShapes;
+                const size_t weightBytes = (size_t)m * (size_t)k * 2;
+                bool logThisShape = false;
+                if (profilePath && weightBytes >= (16u << 20)) {
+                    std::string shapeKey = std::to_string(m) + "x" + std::to_string(k);
+                    bool seen = false;
+                    for (auto &it : reportedShapes) {
+                        if (it == shapeKey) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) {
+                        reportedShapes.push_back(shapeKey);
+                        logThisShape = true;
+                    }
+                }
+                auto linearSt = std::chrono::steady_clock::now();
                 RunLinearFloat32BFloat16((float*)input.cpuData, (uint16_t*)weight.cpuData, (float*)output.cpuData, 
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+                if (logThisShape) {
+                    double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - linearSt).count();
+                    printf("[fastllm-linear-real] input=%s weight=%s n=%d m=%d k=%d threads=%d weightMB=%.0f ms=%.3f GBps=%.2f\n",
+                           GetDataTypeName(input.dataType).c_str(),
+                           GetDataTypeName(weight.dataType).c_str(),
+                           n, m, k, threadLen, weightBytes / 1048576.0, ms,
+                           ms > 0 ? (double)weightBytes / (ms * 1e6) : 0.0);
+                    fflush(stdout);
+                }
             } else if (weight.dataType == DataType::FLOAT16) {
                 float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
                 const size_t rowBytes = GetDataBytes(DataType::FLOAT16, 1, m);
@@ -9582,16 +9822,62 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     } fp16SigmoidManager;
 
+    static void SiluFloat32ScalarKernel(float *inputData, float *outputData, int len) {
+        for (int i = 0; i < len; i++) {
+            float x = inputData[i];
+            outputData[i] = x / (1.0 + expf(-x));
+        }
+    }
+
+    static void SiluFloat32VectorKernel(float *inputData, float *outputData, int len) {
+        int i = 0;
+#ifdef __aarch64__
+        float32x4_t c1 = vdupq_n_f32(1.0f);
+        for (; i + 3 < len; i += 4) {
+            float32x4_t vx = vld1q_f32(inputData + i);
+            float32x4_t vdiv = vaddq_f32(c1, exp_ps(vnegq_f32(vx)));
+            vx = vdivq_f32(vx, vdiv);
+            vst1q_f32(outputData + i, vx);
+        }
+#endif
+#ifdef __AVX2__
+        {
+            const __m256 one = _mm256_set1_ps(1.0f);
+            const __m256 zero = _mm256_setzero_ps();
+            for (; i + 7 < len; i += 8) {
+                __m256 vx = _mm256_loadu_ps(inputData + i);
+                __m256 vdiv = _mm256_add_ps(one,
+                    exp256_ps(_mm256_sub_ps(zero, vx)));
+                _mm256_storeu_ps(outputData + i, _mm256_div_ps(vx, vdiv));
+            }
+        }
+#endif
+        for (; i < len; i++) {
+            float x = inputData[i];
+            outputData[i] = x / (1.0 + expf(-x));
+        }
+    }
+
     void CpuSiluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
+        static const bool profileInternal =
+            std::getenv("FASTLLM_PROFILE_OP_INTERNAL") != nullptr;
+        auto selfSt0 = std::chrono::system_clock::now();
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16 ||
                         input.dataType == DataType::BFLOAT16,
                         "Silu error: Data's type should be float32, float16 or bfloat16.\n");
         int len = input.Count(0);
+        auto selfSt1 = std::chrono::system_clock::now();
+
+        ReportOpParamsOnce("Silu",
+            std::string("build=silu-avx2+conv1d-fastpath") +
+            " type=" + std::to_string((int)input.dataType) +
+            " len=" + std::to_string(len) +
+            " smallpath=" + std::to_string(len < 65536 ? 1 : 0));
 
         if (input.dataType == DataType::FLOAT16) {
             uint16_t *inputData = (uint16_t*)input.cpuData;
@@ -9608,22 +9894,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     value / (1.0f + std::exp(-value)));
             }
         } else if (len < 65536) {
-            float *inputData = (float*)input.cpuData;
-            float *outputData = (float*)output.cpuData;
-            int i = 0;
-    #ifdef __aarch64__
-            float32x4_t c1 = vdupq_n_f32(1.0f);
-            for (; i + 3 < len; i += 4) {
-                float32x4_t vx = vld1q_f32(inputData + i);
-                float32x4_t vdiv = vaddq_f32(c1, exp_ps(vnegq_f32(vx)));
-                vx = vdivq_f32(vx, vdiv);
-                vst1q_f32(outputData + i, vx);
-            }
-    #endif
-            for (; i < len; i++) {
-                float x = inputData[i];
-                outputData[i] = x / (1.0 + expf(-x));
-            }
+            SiluFloat32VectorKernel((float*)input.cpuData, (float*)output.cpuData, len);
         } else {
             auto *pool = GetAlivePool();
             int threadNum = pool->threads.size();
@@ -9643,6 +9914,43 @@ ops += (long long)lines * inputDim * interDim * 2;
                 pool->Wait(i);
                 delete ops[i];
             }
+        }
+
+        auto selfSt2 = std::chrono::system_clock::now();
+        if (profileInternal) {
+            OpSelfTimingAdd(
+                "Silu type=" + std::to_string((int)input.dataType) +
+                    " len=" + std::to_string(len),
+                GetSpan(selfSt0, selfSt1), GetSpan(selfSt1, selfSt2), 0.0);
+        }
+        if (profileInternal && input.dataType == DataType::FLOAT32 &&
+            OpBenchOnce("silu-vector-vs-scalar len=" + std::to_string(len))) {
+            // 注意: 只能写进临时缓冲. 该 op 可能是原地操作 (input 与 output 同一块内存),
+            // 往 output 里重复写会把结果叠加/污染.
+            float *inData = (float*)input.cpuData;
+            std::vector<float> scratch((size_t)len);
+            // freshIn 是刚分配的独立缓冲, 用来对比 "现成激活缓冲" 与 "外来缓冲" 的差别,
+            // 用于判断慢是因为内核本身还是因为内存/环境.
+            std::vector<float> freshIn((size_t)len);
+            for (int i = 0; i < len; i++) {
+                freshIn[i] = inData[i];
+            }
+            double tScalar = TimeFunction(10, [&]() {
+                SiluFloat32ScalarKernel(inData, scratch.data(), len);
+            });
+            double tVector = TimeFunction(10, [&]() {
+                SiluFloat32VectorKernel(inData, scratch.data(), len);
+            });
+            double tVectorFresh = TimeFunction(10, [&]() {
+                SiluFloat32VectorKernel(freshIn.data(), scratch.data(), len);
+            });
+            // 定标: 依赖链加法每次 4 周期, 用来换算当前线程的等效主频.
+            double effGHz = MeasureEffectiveGHz(500000);
+            printf("[fastllm-silu-bench] len=%d scalar=%.1fus vector=%.1fus (%.2fx) vector-freshbuf=%.1fus effGHz=%.2f (in-model path=%s)\n",
+                   len, tScalar * 1e6, tVector * 1e6,
+                   tVector > 0 ? tScalar / tVector : 0.0, tVectorFresh * 1e6, effGHz,
+                   (len < 65536) ? "vector" : "pool");
+            fflush(stdout);
         }
     }
 
@@ -13298,6 +13606,32 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    // 向量化 softmax 的 exp 与求和: sRow[jj] = exp(sRow[jj] - mNew), 返回该行之和.
+    // 传进来的参数恒 <= 0（mNew 是本行最大值）, 落在 exp256_ps 的精确区间内,
+    // 相对误差约 7e-8, 对 fp32/bf16/fp16 输出均可忽略.
+    static float SoftmaxExpRowAVX2(float *sRow, int blockLen, float mNew) {
+        float lt = 0.0f;
+        int jj = 0;
+#ifdef __AVX2__
+        {
+            const __m256 vsub = _mm256_set1_ps(mNew);
+            __m256 vsum = _mm256_setzero_ps();
+            for (; jj + 7 < blockLen; jj += 8) {
+                __m256 e = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(sRow + jj), vsub));
+                _mm256_storeu_ps(sRow + jj, e);
+                vsum = _mm256_add_ps(vsum, e);
+            }
+            lt = Floatsum(vsum);
+        }
+#endif
+        for (; jj < blockLen; jj++) {
+            float e = expf(sRow[jj] - mNew);
+            sRow[jj] = e;
+            lt += e;
+        }
+        return lt;
+    }
+
     struct MultiThreadPagedAttentionFloat32Op : MultiThreadBaseOp {
         float *qHead, *oHead, *maskHead;
         float scale;
@@ -13438,12 +13772,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         continue; // 到目前为止整行仍无可见 token
                     }
                     float correction = (mVal[t] <= -1e29f) ? 0.0f : expf(mVal[t] - mNew);
-                    float lt = 0.0f;
-                    for (int jj = 0; jj < blockLen; jj++) {
-                        float e = expf(sRow[jj] - mNew);
-                        sRow[jj] = e;
-                        lt += e;
-                    }
+                    float lt = SoftmaxExpRowAVX2(sRow, blockLen, mNew);
                     lVal[t] = lVal[t] * correction + lt;
                     float *accRow = acc + (size_t)t * v2;
                     if (correction != 1.0f) {
@@ -13542,6 +13871,78 @@ ops += (long long)lines * inputDim * interDim * 2;
     // 旧实现每个 q 头独立流式读一遍完整 K/V（12MB/头），group=8 即 8× 冗余
     // DRAM 流量。这里把 kv block 提到最外层，8 个 q 头轮流消费同一块，K/V
     // 流量降为 1/group。
+    // 合并同一 (q 头组 × query 行块) 上按 kv 区间切开的多个部分注意力结果：
+    // 取全局 max M，每段按 exp(m_i - M) 缩放后相加（online-softmax 的合并公式），
+    // 最后除以权重和写出。每段布局 [m][l][acc]。
+    struct MultiThreadPagedAttentionMergeOp : MultiThreadBaseOp {
+        const float *pieces; // chunkCount 段, 每段 chunkStride 个 float
+        int chunkCount, chunkStride;
+        float *oHeadBase;
+        int oStride, qHeadLo, qHeadHi, qLo, qHi, v2;
+
+        MultiThreadPagedAttentionMergeOp(
+            const float *pieces, int chunkCount, int chunkStride,
+            float *oHeadBase, int oStride,
+            int qHeadLo, int qHeadHi, int qLo, int qHi, int v2) :
+            pieces(pieces), chunkCount(chunkCount), chunkStride(chunkStride),
+            oHeadBase(oHeadBase), oStride(oStride),
+            qHeadLo(qHeadLo), qHeadHi(qHeadHi), qLo(qLo), qHi(qHi), v2(v2) {}
+
+        void Run() {
+            const int rows = qHi - qLo;
+            const int nHead = qHeadHi - qHeadLo;
+            const int lOff = nHead * rows;
+            const int accOff = 2 * nHead * rows;
+            for (int ho = 0; ho < nHead; ho++) {
+                float *oHead = oHeadBase + (size_t)(qHeadLo + ho) * oStride;
+                for (int t = 0; t < rows; t++) {
+                    const int idx = ho * rows + t;
+                    float M = -1e30f;
+                    for (int c = 0; c < chunkCount; c++) {
+                        M = std::max(M, pieces[(size_t)c * chunkStride + idx]);
+                    }
+                    float *outRow = oHead + (size_t)(qLo + t) * v2;
+                    std::fill(outRow, outRow + v2, 0.0f);
+                    float lSum = 0.0f;
+                    for (int c = 0; c < chunkCount; c++) {
+                        const float *base = pieces + (size_t)c * chunkStride;
+                        const float mc = base[idx];
+                        if (mc <= -1e29f) {
+                            continue; // 该段对整行都不可见
+                        }
+                        const float w = expf(mc - M);
+                        lSum += base[lOff + idx] * w;
+                        const float *acc = base + accOff + (size_t)idx * v2;
+                        int d = 0;
+#ifdef __AVX__
+                        __m256 wv = _mm256_set1_ps(w);
+                        for (; d + 7 < v2; d += 8) {
+                            _mm256_storeu_ps(outRow + d,
+                                _mm256_fmadd_ps(wv, _mm256_loadu_ps(acc + d),
+                                                _mm256_loadu_ps(outRow + d)));
+                        }
+#endif
+                        for (; d < v2; d++) {
+                            outRow[d] += w * acc[d];
+                        }
+                    }
+                    const float inv = 1.0f / std::max(lSum, 0.1f);
+                    int d = 0;
+#ifdef __AVX__
+                    __m256 iv = _mm256_set1_ps(inv);
+                    for (; d + 7 < v2; d += 8) {
+                        _mm256_storeu_ps(outRow + d,
+                            _mm256_mul_ps(iv, _mm256_loadu_ps(outRow + d)));
+                    }
+#endif
+                    for (; d < v2; d++) {
+                        outRow[d] *= inv;
+                    }
+                }
+            }
+        }
+    };
+
     struct MultiThreadPagedAttentionGqaFloat32Op : MultiThreadBaseOp {
         float *qHeadBase, *oHeadBase, *maskHeadBase;
         int qStride, oStride, maskStride;
@@ -13551,8 +13952,21 @@ ops += (long long)lines * inputDim * interDim * 2;
         int kHeadDim, vHeadDim;
         int qHeadLo, qHeadHi; // 本 task 负责的 q 头区间（共享同一 kv 头）
         int qLo, qHi;         // query 行区间
+        // 直接从分页 KV 缓存取 token（layout [page][offset][head][dim]），不再把整条
+        // cache 物化成连续 fp32，省掉 conv 阶段和它那次 O(k1) 分配。
+        const uint8_t *kPagedData, *vPagedData;
+        const std::vector<int> *kPageIndex, *vPageIndex;
+        int kPageLen, vPageLen, kNumHeads, vNumHeads, kUnitSize, vUnitSize;
+        // 缓存本身不是 fp32 时仍需一次物化（要顺带做 fp16/bf16 -> fp32 转换），
+        // 此时这两个指针非空，KTokenPtr/VTokenPtr 退回读连续缓冲。
         const float *kF32Base, *vF32Base;
         int kvHeadIdx;
+        // 按 kv 区间切分时本任务只算 [kvLo, kvHi) 这一段 kv（只有 decode 分支
+        // 支持），部分结果写进 partialOut，布局
+        // [m: nHead*rows][l: nHead*rows][acc: nHead*rows*v2]，
+        // 由 MultiThreadPagedAttentionMergeOp 合并。partialOut 为空=直接写出。
+        int kvLo, kvHi;
+        float *partialOut;
 
         MultiThreadPagedAttentionGqaFloat32Op(
             float *qHeadBase, float *oHeadBase, float *maskHeadBase,
@@ -13560,21 +13974,57 @@ ops += (long long)lines * inputDim * interDim * 2;
             float scale, int q1, int q2, int k1, int v2, int group,
             int kHeadDim, int vHeadDim,
             int qHeadLo, int qHeadHi, int qLo, int qHi,
-            const float *kF32Base, const float *vF32Base, int kvHeadIdx) :
+            const uint8_t *kPagedData, const uint8_t *vPagedData,
+            const std::vector<int> *kPageIndex, const std::vector<int> *vPageIndex,
+            int kPageLen, int vPageLen, int kNumHeads, int vNumHeads,
+            int kUnitSize, int vUnitSize,
+            const float *kF32Base, const float *vF32Base, int kvHeadIdx,
+            int kvLo, int kvHi, float *partialOut) :
             qHeadBase(qHeadBase), oHeadBase(oHeadBase), maskHeadBase(maskHeadBase),
             qStride(qStride), oStride(oStride), maskStride(maskStride),
             maskHeadDenom(maskHeadDenom),
             scale(scale), q1(q1), q2(q2), k1(k1), v2(v2), group(group),
             kHeadDim(kHeadDim), vHeadDim(vHeadDim),
             qHeadLo(qHeadLo), qHeadHi(qHeadHi), qLo(qLo), qHi(qHi),
-            kF32Base(kF32Base), vF32Base(vF32Base), kvHeadIdx(kvHeadIdx) {}
+            kPagedData(kPagedData), vPagedData(vPagedData),
+            kPageIndex(kPageIndex), vPageIndex(vPageIndex),
+            kPageLen(kPageLen), vPageLen(vPageLen),
+            kNumHeads(kNumHeads), vNumHeads(vNumHeads),
+            kUnitSize(kUnitSize), vUnitSize(vUnitSize),
+            kF32Base(kF32Base), vF32Base(vF32Base), kvHeadIdx(kvHeadIdx),
+            kvLo(kvLo), kvHi(kvHi), partialOut(partialOut) {}
+
+        // 第 tokenIdx 个 token 在本任务所属 kv 头上是连续的 headDim 个 fp32。
+        // 只有最后一页可能不满, 而 k1 = (页数-1)*pageLen + lastPageLen, 所以
+        // tokenIdx -> (tokenIdx/pageLen, tokenIdx%pageLen) 对全部 tokenIdx < k1 都成立。
+        const float *KTokenPtr(int tokenIdx) const {
+            if (kF32Base != nullptr) {
+                return kF32Base + ((size_t)kvHeadIdx * k1 + (size_t)tokenIdx) * kHeadDim;
+            }
+            int pageIdx = (*kPageIndex)[tokenIdx / kPageLen];
+            int off = tokenIdx % kPageLen;
+            return (const float*)(kPagedData +
+                ((size_t)pageIdx * kPageLen * kNumHeads * kHeadDim +
+                 (size_t)off * kNumHeads * kHeadDim +
+                 (size_t)kvHeadIdx * kHeadDim) * kUnitSize);
+        }
+
+        const float *VTokenPtr(int tokenIdx) const {
+            if (vF32Base != nullptr) {
+                return vF32Base + ((size_t)kvHeadIdx * k1 + (size_t)tokenIdx) * vHeadDim;
+            }
+            int pageIdx = (*vPageIndex)[tokenIdx / vPageLen];
+            int off = tokenIdx % vPageLen;
+            return (const float*)(vPagedData +
+                ((size_t)pageIdx * vPageLen * vNumHeads * vHeadDim +
+                 (size_t)off * vNumHeads * vHeadDim +
+                 (size_t)kvHeadIdx * vHeadDim) * vUnitSize);
+        }
 
         void Run() {
             const int rows = qHi - qLo;
             const int base = k1 - q1;
             const int nHead = qHeadHi - qHeadLo;
-            const float *kF32 = kF32Base + (size_t)kvHeadIdx * k1 * kHeadDim;
-            const float *vF32 = vF32Base + (size_t)kvHeadIdx * k1 * vHeadDim;
 
             // decode / 小 batch（rows<=8）：token 外层复用 K/V，K/V DRAM 只读 1×；
             // prefill 走下方 else 的 head 外层路径，s 缓冲保持 rows×kvBlock，
@@ -13597,8 +14047,8 @@ ops += (long long)lines * inputDim * interDim * 2;
             // token 外层、head 内层：每个 K/V token 只从内存流经一次，
             // 组内全部 q 头复用。decode(q1=1) 时 K/V DRAM 流量从 nHead×
             // 降为 1×，是关键提速点；prefill 亦减少 K 的重复加载。
-            for (int jb = 0; jb < k1; jb += kvBlock) {
-                const int jEnd = std::min(jb + kvBlock, k1);
+            for (int jb = kvLo; jb < kvHi; jb += kvBlock) {
+                const int jEnd = std::min(jb + kvBlock, kvHi);
                 const int blockLen = jEnd - jb;
                 const bool blockFullyVisible = !maskHeadBase && (jEnd - 1) <= base + qLo;
                 const bool blockFullyInvisible = !maskHeadBase && jb > base + qHi - 1;
@@ -13608,7 +14058,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
                 // A: 本块 scores（token 外层，head 内层，复用 kToken）
                 for (int j = jb; j < jEnd; j++) {
-                    const float *kToken = kF32 + (size_t)j * kHeadDim;
+                    const float *kToken = KTokenPtr(j);
                     for (int ho = 0; ho < nHead; ho++) {
                         const int o = qHeadLo + ho;
                         const float *qHead = qHeadBase + (size_t)o * qStride;
@@ -13726,12 +14176,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                             continue;
                         }
                         float correction = (mValLocal[t] <= -1e29f) ? 0.0f : expf(mValLocal[t] - mNew);
-                        float lt = 0.0f;
-                        for (int jj = 0; jj < blockLen; jj++) {
-                            float e = expf(sRow[jj] - mNew);
-                            sRow[jj] = e;
-                            lt += e;
-                        }
+                        float lt = SoftmaxExpRowAVX2(sRow, blockLen, mNew);
                         lValLocal[t] = lValLocal[t] * correction + lt;
                         float *accRow = accLocal + (size_t)t * v2;
                         if (correction != 1.0f) {
@@ -13752,7 +14197,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
                 // C: V 块累加（token 外层，head 内层，复用 vToken）
                 for (int j = jb; j < jEnd; j++) {
-                    const float *vToken = vF32 + (size_t)j * vHeadDim;
+                    const float *vToken = VTokenPtr(j);
                     for (int ho = 0; ho < nHead; ho++) {
                         float *accLocal = accH + (size_t)ho * rows * v2;
                         float *sHead = s + (size_t)ho * rows * blockLen;
@@ -13785,6 +14230,23 @@ ops += (long long)lines * inputDim * interDim * 2;
                             }
                         }
                     }
+                }
+
+                // D: 切分模式下把未归一化的部分结果交给 merge 任务（不在这里写出）。
+                if (partialOut != nullptr) {
+                    float *mOut = partialOut;
+                    float *lOut = partialOut + (size_t)nHead * rows;
+                    float *accOut = partialOut + (size_t)2 * nHead * rows;
+                    for (int ho = 0; ho < nHead; ho++) {
+                        for (int t = 0; t < rows; t++) {
+                            const int idx = ho * rows + t;
+                            mOut[idx] = mValH[idx];
+                            lOut[idx] = lValH[idx];
+                            memcpy(accOut + (size_t)idx * v2,
+                                   accH + (size_t)idx * v2, (size_t)v2 * sizeof(float));
+                        }
+                    }
+                    return;
                 }
 
                 // D: 最终归一化并写出
@@ -13852,7 +14314,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
                         // A: 本块 scores
                         for (int j = jb; j < jEnd; j++) {
-                            const float *kToken = kF32 + (size_t)j * kHeadDim;
+                            const float *kToken = KTokenPtr(j);
                             int t = 0;
                             for (; t + 1 < rows; t += 2) {
                                 const int i0 = qLo + t;
@@ -13961,12 +14423,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                                 continue;
                             }
                             float correction = (mValLocal[t] <= -1e29f) ? 0.0f : expf(mValLocal[t] - mNew);
-                            float lt = 0.0f;
-                            for (int jj = 0; jj < blockLen; jj++) {
-                                float e = expf(sRow[jj] - mNew);
-                                sRow[jj] = e;
-                                lt += e;
-                            }
+                            float lt = SoftmaxExpRowAVX2(sRow, blockLen, mNew);
                             lValLocal[t] = lValLocal[t] * correction + lt;
                             float *accRow = accLocal + (size_t)t * v2;
                             if (correction != 1.0f) {
@@ -13986,7 +14443,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
                         // C: V 块累加
                         for (int j = jb; j < jEnd; j++) {
-                            const float *vToken = vF32 + (size_t)j * vHeadDim;
+                            const float *vToken = VTokenPtr(j);
                             for (int t = 0; t < rows; t++) {
                                 float w = s[(size_t)t * blockLen + (j - jb)];
                                 if (w == 0.0f) {
@@ -14273,12 +14730,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         continue; // 到目前为止整行仍无可见 token
                     }
                     float correction = (mVal[t] <= -1e29f) ? 0.0f : expf(mVal[t] - mNew);
-                    float lt = 0.0f;
-                    for (int jj = 0; jj < blockLen; jj++) {
-                        float e = expf(sRow[jj] - mNew);
-                        sRow[jj] = e;
-                        lt += e;
-                    }
+                    float lt = SoftmaxExpRowAVX2(sRow, blockLen, mNew);
                     lVal[t] = lVal[t] * correction + lt;
                     float *accRow = acc + (size_t)t * v2;
                     if (correction != 1.0f) {
@@ -14523,12 +14975,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         continue; // 到目前为止整行仍无可见 token
                     }
                     float correction = (mVal[t] <= -1e29f) ? 0.0f : expf(mVal[t] - mNew);
-                    float lt = 0.0f;
-                    for (int jj = 0; jj < blockLen; jj++) {
-                        float e = expf(sRow[jj] - mNew);
-                        sRow[jj] = e;
-                        lt += e;
-                    }
+                    float lt = SoftmaxExpRowAVX2(sRow, blockLen, mNew);
                     lVal[t] = lVal[t] * correction + lt;
                     float *accRow = acc + (size_t)t * v2;
                     if (correction != 1.0f) {
@@ -14677,6 +15124,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             static const bool pagedAttnProf = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
             float pagedAttnConvSpend = -1.0f;
             float pagedAttnComputeSpend = -1.0f;
+            int pagedAttnKvChunks = 1;
             auto pagedAttnTotalSt = std::chrono::system_clock::now();
 
             if (q.dataType == DataType::FLOAT32) {
@@ -14696,12 +15144,17 @@ ops += (long long)lines * inputDim * interDim * 2;
                 auto *pool = GetAlivePool();
                 int threads = pool->threads.size();
 
-                // 先把本次请求用到的 K/V 各 kv 头一次性整理为连续 fp32
-                // （布局 [head][token][dim]），供同 group 的 q 头共享。
+                // 缓存本身是 fp32 时内核直接读分页内存（零拷贝、无转换），省掉整条
+                // cache 的物化与其 O(k1) 分配，K/V 的 DRAM 读取也从
+                // (读分页 + 写fp32 + 读fp32) 降到只读分页一次。
+                // 缓存是 fp16/bf16 时仍要物化一次，因为要顺带做精度转换。
                 auto convSt = std::chrono::system_clock::now();
-                std::vector<float> kF32((size_t)k1 * kNumHeads * kHeadDim);
-                std::vector<float> vF32((size_t)k1 * vNumHeads * vHeadDim);
-                {
+                const bool directKV = (k.pagedKVCacheData->dataType == DataType::FLOAT32 &&
+                                       v.pagedKVCacheData->dataType == DataType::FLOAT32);
+                std::vector<float> kF32, vF32;
+                if (!directKV) {
+                    kF32.resize((size_t)k1 * kNumHeads * kHeadDim);
+                    vF32.resize((size_t)k1 * vNumHeads * vHeadDim);
                     std::vector<MultiThreadPagedAttentionConvertKVOp*> convOps;
                     // decode 时 kvHeads 仅 2，conv 若按头分只有 2 路并行；
                     // 这里再按 token 区间切分，让全部线程参与转换。
@@ -14738,25 +15191,71 @@ ops += (long long)lines * inputDim * interDim * 2;
                 }
                 pagedAttnConvSpend = GetSpan(convSt, std::chrono::system_clock::now());
 
-                std::vector<MultiThreadPagedAttentionGqaFloat32Op*> ops;
-                // 任务粒度 = (同一 kv 头的 8 个 q 头) × 64 行 query 块：
-                // K/V 块在外层仅流经内存一次，组内 q 头复用，group=8 时
-                // K/V DRAM 流量降为旧实现的 1/8。
+                // 任务粒度 = (同一 kv 头的 group 个 q 头) × 64 行 query 块：
+                // K/V 块在外层仅流经内存一次，组内 q 头复用，K/V 读取量降为
+                // 逐 q 头各读一遍的 1/group。
                 const int qTileRows = 64;
                 int qBlocks = (q1 + qTileRows - 1) / qTileRows;
+
+                // decode 时任务数只有 q0/group（本模型 8/4=2），8 线程大半空转；
+                // 再按 kv 区间切一刀，每个任务只算一段 kv，部分结果随后合并。
+                // 只用在 decode 分支（nHead>1 && rows<=8）上，且要求 q0 能整除
+                // group，这样每个任务的 nHead 都等于 group、必定走 decode 分支。
+                // k1/32 保证每段至少 ~32 个 token：每段的固定开销只有一次
+                // nHead*rows*(v2+2) 的部分结果拷贝，远小于 32×nHead×2×kHeadDim 的计算量。
+                int kvChunks = 1;
+                if (q1 <= 8 && qBlocks == 1 && group > 1 && q0 % group == 0) {
+                    int numGroups = q0 / group;
+                    int want = std::max(1, threads / std::max(1, numGroups));
+                    kvChunks = std::max(1, std::min(want, k1 / 32));
+                }
+                const int partialStride = (kvChunks > 1)
+                    ? group * std::min(q1, qTileRows) * (v2 + 2) : 0;
+                pagedAttnKvChunks = kvChunks;
+                std::vector<float> partialBuf;
+                if (kvChunks > 1) {
+                    partialBuf.assign((size_t)(q0 / group) * qBlocks * kvChunks * partialStride, 0.0f);
+                }
+
+                std::vector<MultiThreadPagedAttentionGqaFloat32Op*> ops;
+                std::vector<MultiThreadPagedAttentionMergeOp*> mergeOps;
                 for (int c = 0; c < q0; c += group) {
                     int qHeadHi = std::min(c + group, q0);
                     for (int b = 0; b < qBlocks; b++) {
                         int qLo = b * qTileRows;
                         int qHi = std::min(qLo + qTileRows, q1);
-                        ops.push_back(new MultiThreadPagedAttentionGqaFloat32Op(
-                            qd, od, maskd,
-                            q.strides[0], output.strides[0], maskStride,
-                            q0 / batch,
-                            scale, q1, q2, k1, v2, group,
-                            kHeadDim, vHeadDim,
-                            c, qHeadHi, qLo, qHi,
-                            kF32.data(), vF32.data(), c / group));
+                        for (int cc = 0; cc < kvChunks; cc++) {
+                            int kvLo = (int)((size_t)cc * k1 / kvChunks);
+                            int kvHi = (int)((size_t)(cc + 1) * k1 / kvChunks);
+                            float *partialOut = nullptr;
+                            if (kvChunks > 1) {
+                                size_t taskIdx = ((size_t)((c / group) * qBlocks + b)) * kvChunks + cc;
+                                partialOut = partialBuf.data() + taskIdx * partialStride;
+                            }
+                            ops.push_back(new MultiThreadPagedAttentionGqaFloat32Op(
+                                qd, od, maskd,
+                                q.strides[0], output.strides[0], maskStride,
+                                q0 / batch,
+                                scale, q1, q2, k1, v2, group,
+                                kHeadDim, vHeadDim,
+                                c, qHeadHi, qLo, qHi,
+                                kPagedData, vPagedData,
+                                &k.pageIndex, &v.pageIndex,
+                                pageLen, vPageLen,
+                                kNumHeads, vNumHeads,
+                                kUnitSize, vUnitSize,
+                                directKV ? nullptr : kF32.data(),
+                                directKV ? nullptr : vF32.data(), c / group,
+                                kvLo, kvHi, partialOut));
+                        }
+                        if (kvChunks > 1) {
+                            size_t taskIdx0 = ((size_t)((c / group) * qBlocks + b)) * kvChunks;
+                            mergeOps.push_back(new MultiThreadPagedAttentionMergeOp(
+                                partialBuf.data() + taskIdx0 * partialStride,
+                                kvChunks, partialStride,
+                                od, output.strides[0],
+                                c, qHeadHi, qLo, qHi, v2));
+                        }
                     }
                 }
                 auto computeSt = std::chrono::system_clock::now();
@@ -14769,8 +15268,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                         pool->Wait(i - st);
                     }
                 }
-                pagedAttnComputeSpend = GetSpan(computeSt, std::chrono::system_clock::now());
                 for (auto *op : ops) delete op;
+                // 部分结果必须全部落盘后才能合并，所以合并单独一轮派发。
+                for (int st = 0; st < (int)mergeOps.size(); st += threads) {
+                    int end = std::min(st + threads, (int)mergeOps.size());
+                    for (int i = st; i < end; i++) {
+                        pool->PushOp(i - st, mergeOps[i]);
+                    }
+                    for (int i = st; i < end; i++) {
+                        pool->Wait(i - st);
+                    }
+                }
+                for (auto *op : mergeOps) delete op;
+                pagedAttnComputeSpend = GetSpan(computeSt, std::chrono::system_clock::now());
             } else if (q.dataType == DataType::FLOAT16) {
                 uint16_t *qd = (uint16_t*)q.cpuData;
                 uint16_t *od = (uint16_t*)output.cpuData;
@@ -14956,11 +15466,11 @@ ops += (long long)lines * inputDim * interDim * 2;
                 static int pagedAttnLogCnt = 0;
                 int cnt = pagedAttnLogCnt++;
                 float totalSpend = GetSpan(pagedAttnTotalSt, std::chrono::system_clock::now());
-                printf("[fastllm-paged-attn] #%d dtype=%s cache=%s q0=%d q1=%d q2=%d k1=%d v2=%d group=%d kvHeads=%d threads=%d conv=%.4f compute=%.4f total=%.4f s\n",
+                printf("[fastllm-paged-attn] #%d dtype=%s cache=%s q0=%d q1=%d q2=%d k1=%d v2=%d group=%d kvHeads=%d threads=%d kvChunks=%d conv=%.4f compute=%.4f total=%.4f s\n",
                        cnt, GetDataTypeName(q.dataType).c_str(),
                        GetDataTypeName(k.pagedKVCacheData->dataType).c_str(),
                        q0, q1, q2, k1, v2, group, kNumHeads,
-                       (int)GetAlivePool()->threads.size(), pagedAttnConvSpend,
+                       (int)GetAlivePool()->threads.size(), pagedAttnKvChunks, pagedAttnConvSpend,
                        pagedAttnComputeSpend, totalSpend);
                 fflush(stdout);
             }

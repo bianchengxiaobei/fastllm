@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <map>
+#include <string>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -65,8 +68,76 @@ namespace fastllm {
         return summary;
     }
 
+    // Executor::Run 的按 op 分阶段耗时, 由 FASTLLM_PROFILE_EXEC_PHASES 打开.
+    // 用来区分一个 op 的墙钟时间花在算子本身, 还是花在算子外围的调度代码上.
+    struct ExecPhaseStat {
+        double count = 0.0;
+        double prologue = 0.0;
+        double canRun = 0.0;
+        double toDevice = 0.0;
+        double reshape = 0.0;
+        double run = 0.0;
+        double total = 0.0;
+    };
+
+    static std::map<std::string, ExecPhaseStat> execPhaseProfile;
+
+    struct ExecPhaseTimer {
+        ExecPhaseStat *stat;
+        std::chrono::system_clock::time_point last;
+        explicit ExecPhaseTimer(ExecPhaseStat *s) : stat(s) {
+            if (stat != nullptr) {
+                last = std::chrono::system_clock::now();
+            }
+        }
+        void Split(double ExecPhaseStat::*field) {
+            if (stat == nullptr) {
+                return;
+            }
+            auto now = std::chrono::system_clock::now();
+            (stat->*field) += GetSpan(last, now);
+            last = now;
+        }
+    };
+
+    static void PrintExecPhaseProfile() {
+        if (execPhaseProfile.empty()) {
+            return;
+        }
+        printf("--- Executor::Run phases (FASTLLM_PROFILE_EXEC_PHASES) ---\n");
+        printf("%-24s %7s %9s %9s %9s %9s %9s %9s %9s\n",
+               "opType", "count", "prologue", "canRun", "toDevice",
+               "reshape", "run", "total", "other");
+        double sumTotal = 0.0, sumOther = 0.0;
+        double sumPrologue = 0.0, sumCanRun = 0.0, sumToDevice = 0.0;
+        double sumReshape = 0.0, sumRun = 0.0;
+        unsigned long long totalCount = 0;
+        for (auto &it : execPhaseProfile) {
+            const ExecPhaseStat &s = it.second;
+            double other = s.total - s.prologue - s.canRun - s.toDevice -
+                           s.reshape - s.run;
+            printf("%-24s %7.0f %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f\n",
+                   it.first.c_str(), s.count, s.prologue, s.canRun,
+                   s.toDevice, s.reshape, s.run, s.total, other);
+            sumTotal += s.total;
+            sumOther += other;
+            sumPrologue += s.prologue;
+            sumCanRun += s.canRun;
+            sumToDevice += s.toDevice;
+            sumReshape += s.reshape;
+            sumRun += s.run;
+            totalCount += (unsigned long long)s.count;
+        }
+        printf("%-24s %7llu %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f\n",
+               "SUM", totalCount, sumPrologue, sumCanRun, sumToDevice,
+               sumReshape, sumRun, sumTotal, sumOther);
+        printf("op count = %llu, sum(op total) = %.4f s\n", totalCount, sumTotal);
+        fflush(stdout);
+    }
+
     void ClearProfileSummary() {
         GetThreadProfileSummary().clear();
+        execPhaseProfile.clear();
     }
 
     void PrintProfileSummary() {
@@ -84,6 +155,7 @@ namespace fastllm {
             sum += it.second;
         }
         printf("total spend %f\n", sum);
+        PrintExecPhaseProfile();
         fflush(stdout);
     }
 
@@ -343,6 +415,14 @@ namespace fastllm {
             }
         }
 
+        static const bool profileExecPhases =
+            std::getenv("FASTLLM_PROFILE_EXEC_PHASES") != nullptr;
+        ExecPhaseStat *phaseStat = nullptr;
+        if (profileExecPhases) {
+            phaseStat = &execPhaseProfile[opType];
+            phaseStat->count += 1.0;
+            phaseStat->prologue += GetSpan(st, std::chrono::system_clock::now());
+        }
         bool run = false;
         for (auto device: devices) {
             if (lockInCPU && device->deviceType != "cpu") {
@@ -351,7 +431,9 @@ namespace fastllm {
 #ifdef USE_CUDA
             SelectCudaDeviceForCandidate(device);
 #endif
+            ExecPhaseTimer phaseTimer(phaseStat);
             if (device->CanRun(opType, datas, floatParams, intParams)) {
+                phaseTimer.Split(&ExecPhaseStat::canRun);
                 bool intParamsSize = intParams.size();
                 for (auto &it: datas) {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
@@ -440,8 +522,11 @@ namespace fastllm {
                             device->deviceType.c_str(), wName);
                     fflush(stderr);
                 }
+                phaseTimer.Split(&ExecPhaseStat::toDevice);
                 device->Reshape(opType, datas, floatParams, intParams);
+                phaseTimer.Split(&ExecPhaseStat::reshape);
                 device->Run(opType, datas, floatParams, intParams);
+                phaseTimer.Split(&ExecPhaseStat::run);
 #ifdef USE_CUDA
                 SyncCudaDeviceForProfiler(device);
 #endif
@@ -453,6 +538,9 @@ namespace fastllm {
             ErrorInFastLLM("Can't run " + opType + " in any device.");
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
+        if (phaseStat != nullptr) {
+            phaseStat->total += spend;
+        }
         profiler[opType] += spend;
         GetThreadProfileSummary()[opType] += spend;
         static const bool profileSlowOps = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
@@ -470,6 +558,14 @@ namespace fastllm {
                                const fastllm::FloatDict &floatParams,
                                const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
+        static const bool profileExecPhases =
+            std::getenv("FASTLLM_PROFILE_EXEC_PHASES") != nullptr;
+        ExecPhaseStat *phaseStat = nullptr;
+        if (profileExecPhases) {
+            phaseStat = &execPhaseProfile[opType];
+            phaseStat->count += 1.0;
+            phaseStat->prologue += GetSpan(st, std::chrono::system_clock::now());
+        }
         bool run = false;
         for (auto device: devices) {
             if (device->deviceType != deviceType) {
@@ -478,9 +574,12 @@ namespace fastllm {
 #ifdef USE_CUDA
             SelectCudaDeviceForCandidate(device);
 #endif
+            ExecPhaseTimer phaseTimer(phaseStat);
             if (!device->CanRun(opType, datas, floatParams, intParams)) {
+                phaseTimer.Split(&ExecPhaseStat::canRun);
                 continue;
             }
+            phaseTimer.Split(&ExecPhaseStat::canRun);
             bool intParamsSize = intParams.size();
             for (auto &it: datas) {
                 if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
@@ -530,8 +629,11 @@ namespace fastllm {
                     }
                 }
             }
+            phaseTimer.Split(&ExecPhaseStat::toDevice);
             device->Reshape(opType, datas, floatParams, intParams);
+            phaseTimer.Split(&ExecPhaseStat::reshape);
             device->Run(opType, datas, floatParams, intParams);
+            phaseTimer.Split(&ExecPhaseStat::run);
 #ifdef USE_CUDA
             SyncCudaDeviceForProfiler(device);
 #endif
@@ -542,6 +644,9 @@ namespace fastllm {
             ErrorInFastLLM("Can't run " + opType + " on device " + deviceType + ".");
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
+        if (phaseStat != nullptr) {
+            phaseStat->total += spend;
+        }
         profiler[opType] += spend;
         GetThreadProfileSummary()[opType] += spend;
         static const bool profileSlowOps = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
@@ -577,6 +682,7 @@ namespace fastllm {
             sum += it.second;
         }
         printf("total spend %f\n", sum);
+        PrintExecPhaseProfile();
 #ifdef __ANDROID__
         __android_log_print(ANDROID_LOG_INFO, "FastllmProfiler", "===== Profiler Results =====");
         for (auto &it : profiler) {
