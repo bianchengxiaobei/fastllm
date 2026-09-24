@@ -32998,13 +32998,30 @@ namespace fastllm {
                     }
                     #endif
 
+                    // 纯 CPU 下 ChunkGatedDeltaRulePrefill 同样有实现(注册在
+                    // cpu device 上), 张量不在 CUDA 时也走融合算子。
+                    // 仅 float32/float16 激活 (state 可为 float32) 有 CPU 实现。
+                    if (!useFusedChunkPrefill &&
+                        (qq.dataType == DataType::FLOAT32 ||
+                         qq.dataType == DataType::FLOAT16) &&
+                        (last_recurrent_state.dataType == qq.dataType ||
+                         (qq.dataType == DataType::FLOAT16 &&
+                          last_recurrent_state.dataType == DataType::FLOAT32)) &&
+                        qq.dataDevice == DataDevice::CPU &&
+                        pkk->dataDevice == DataDevice::CPU &&
+                        vv_pad.dataDevice == DataDevice::CPU &&
+                        pgg->dataDevice == DataDevice::CPU &&
+                        attn.dataDevice == DataDevice::CPU &&
+                        k_cumdecay.dataDevice == DataDevice::CPU &&
+                        last_recurrent_state.dataDevice == DataDevice::CPU) {
+                        useFusedChunkPrefill = GetFastllmEnv().useFusedGdnPrefill;
+                    }
+
                     if (useFusedChunkPrefill) {
-#ifdef USE_CUDA
                         ChunkGatedDeltaRulePrefill(
                             qq, *pkk, vv_pad, *pgg, attn, k_cumdecay,
                             last_recurrent_state, core_attn_out
                         );
-#endif
                     } else {
                         PermuteSelf(qq, {2, 0, 1, 3, 4});
                         PermuteSelf(*pkk, {2, 0, 1, 3, 4});
@@ -34866,13 +34883,30 @@ namespace fastllm {
                     }
 #endif
 
+                    // 纯 CPU 下 ChunkGatedDeltaRulePrefill 同样有实现(注册在
+                    // cpu device 上), 张量不在 CUDA 时也走融合算子。
+                    // 仅 float32/float16 激活 (state 可为 float32) 有 CPU 实现。
+                    if (!useFusedChunkPrefill &&
+                        (qq.dataType == DataType::FLOAT32 ||
+                         qq.dataType == DataType::FLOAT16) &&
+                        (last_recurrent_state.dataType == qq.dataType ||
+                         (qq.dataType == DataType::FLOAT16 &&
+                          last_recurrent_state.dataType == DataType::FLOAT32)) &&
+                        qq.dataDevice == DataDevice::CPU &&
+                        pkk->dataDevice == DataDevice::CPU &&
+                        vv.dataDevice == DataDevice::CPU &&
+                        pgg->dataDevice == DataDevice::CPU &&
+                        attn.dataDevice == DataDevice::CPU &&
+                        k_cumdecay.dataDevice == DataDevice::CPU &&
+                        last_recurrent_state.dataDevice == DataDevice::CPU) {
+                        useFusedChunkPrefill = GetFastllmEnv().useFusedGdnPrefill;
+                    }
+
                     if (useFusedChunkPrefill) {
-#ifdef USE_CUDA
                         ChunkGatedDeltaRulePrefill(
                             qq, *pkk, vv, *pgg, attn, k_cumdecay,
                             last_recurrent_state, core_attn_out
                         );
-#endif
                     } else {
                         PermuteSelf(qq, {2, 0, 1, 3, 4});
                         PermuteSelf(*pkk, {2, 0, 1, 3, 4});

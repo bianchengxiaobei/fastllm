@@ -8734,6 +8734,53 @@ ops += (long long)lines * inputDim * interDim * 2;
         DoCpuCatDirect(input0, input1, axis);
     }
 
+    // output[i][l] += alpha * input0[i][j] * input1[j][l]
+    // input0 按 input0Stride 取行, input1 连续 (行长为 k), 输出行连续 (行长为 k)
+    static void MatMulFloatAccumulate(const float *input0Data, int input0Stride,
+                                      const float *input1Data, float *outputData,
+                                      int n, int m, int k, float alpha) {
+        for (int i = 0; i < n; i++) {
+            const float *input0Row = input0Data + i * input0Stride;
+            float *outputRow = outputData + i * k;
+            int j = 0;
+#ifdef __AVX2__
+            for (; j + 1 < m; j += 2) {
+                __m256 vnow0 = _mm256_set1_ps(input0Row[j] * alpha);
+                __m256 vnow1 = _mm256_set1_ps(input0Row[j + 1] * alpha);
+                const float *input1Row0 = input1Data + j * k;
+                const float *input1Row1 = input1Row0 + k;
+                int l = 0;
+                for (; l + 7 < k; l += 8) {
+                    __m256 vac = _mm256_loadu_ps(outputRow + l);
+                    vac = _mm256_fmadd_ps(vnow0, _mm256_loadu_ps(input1Row0 + l), vac);
+                    vac = _mm256_fmadd_ps(vnow1, _mm256_loadu_ps(input1Row1 + l), vac);
+                    _mm256_storeu_ps(outputRow + l, vac);
+                }
+                for (; l < k; l++) {
+                    outputRow[l] += (input0Row[j] * input1Row0[l] +
+                                     input0Row[j + 1] * input1Row1[l]) * alpha;
+                }
+            }
+#endif
+            for (; j < m; j++) {
+                float now = input0Row[j] * alpha;
+                const float *input1Row = input1Data + j * k;
+                int l = 0;
+#ifdef __AVX2__
+                __m256 vnow = _mm256_set1_ps(now);
+                for (; l + 7 < k; l += 8) {
+                    __m256 vac = _mm256_loadu_ps(outputRow + l);
+                    vac = _mm256_fmadd_ps(vnow, _mm256_loadu_ps(input1Row + l), vac);
+                    _mm256_storeu_ps(outputRow + l, vac);
+                }
+#endif
+                for (; l < k; l++) {
+                    outputRow[l] += now * input1Row[l];
+                }
+            }
+        }
+    }
+
     struct MultiThreadMatMulSingleOp : MultiThreadBaseOp {
         float *input0Base, *input1Base, *outputBase;
         int input0Spatial, input1Spatial, outputSpatial;
@@ -8756,14 +8803,8 @@ ops += (long long)lines * inputDim * interDim * 2;
                 float *input1Data = input1Base + b * input1Spatial;
                 float *outputData = outputBase + b * outputSpatial;
                 std::fill(outputData, outputData + n * k, 0.0f);
-                for (int i = 0; i < n; i++) {
-                    for (int j = 0; j < m; j++) {
-                        float now = input0Data[i * input0Stride + j] * alpha;
-                        for (int l = 0; l < k; l++) {
-                            outputData[i * k + l] += (now * input1Data[j * k + l]);
-                        }
-                    }
-                }
+                MatMulFloatAccumulate(input0Data, input0Stride, input1Data, outputData,
+                                      n, m, k, alpha);
             }
         }
     };
@@ -8785,43 +8826,92 @@ ops += (long long)lines * inputDim * interDim * 2;
                       n(n), m(m), k(k), alpha(alpha), st(st), end(end) {}
 
         void Run() {
-            float *input0 = new float[n * m];
-            float *input1 = new float[m * k];
-            float *output = new float[n * k];
+            std::vector <float> input0Buffer, input1Buffer, outputBuffer;
+            input0Buffer.resize((size_t)n * m);
+            input1Buffer.resize((size_t)m * k);
+            outputBuffer.resize((size_t)n * k);
+            float *input0 = input0Buffer.data();
+            float *input1 = input1Buffer.data();
+            float *output = outputBuffer.data();
 
             for (int b = st; b < end; b++) {
                 uint16_t *input0Data = input0Base + b * input0Spatial;
                 uint16_t *input1Data = input1Base + b * input1Spatial;
                 uint16_t *outputData = outputBase + b * outputSpatial;
                 for (int i = 0; i < n; i++) {
-                    for (int j = 0; j < m; j++) {
-                        input0[i * m + j] = fp16tofp32.dict[input0Data[i * input0Stride + j]];
-                    }
+                    Float16ToFloat32(input0Data + i * input0Stride, input0 + i * m, m);
                 }
-                for (int j = 0; j < m; j++) {
-                    for (int l = 0; l < k; l++) {
-                        input1[j * k + l] = fp16tofp32.dict[input1Data[j * k + l]];
-                    }
-                }
+                Float16ToFloat32(input1Data, input1, m * k);
                 std::fill(output, output + n * k, 0.0f);
-                for (int i = 0; i < n; i++) {
-                    for (int j = 0; j < m; j++) {
-                        float now = input0[i * m + j] * alpha;
-                        for (int l = 0; l < k; l++) {
-                            output[i * k + l] += (now * input1[j * k + l]);
-                        }
-                    }
-                }
-                for (int i = 0; i < n * k; i++) {
-                    outputData[i] = float_to_half(output[i]);
-                }
+                MatMulFloatAccumulate(input0, m, input1, output, n, m, k, alpha);
+                Float32ToFloat16(output, outputData, n * k);
             }
-
-            delete[] input0;
-            delete[] input1;
-            delete[] output;
         }
     };
+
+    // sum_l input0Row[l] * input1Row[l]
+    static float DotProductFloat(const float *input0Row, const float *input1Row, int m) {
+        float now = 0.0f;
+        int l = 0;
+#ifdef __aarch64__
+        float32x4_t sum = {0, 0, 0, 0};
+        for (; l + 3 < m; l += 4) {
+            sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(input0Row + l), vld1q_f32(input1Row + l)));
+        }
+        now += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX2__)
+        __m256 vsum0 = _mm256_setzero_ps(), vsum1 = _mm256_setzero_ps();
+        __m256 vsum2 = _mm256_setzero_ps(), vsum3 = _mm256_setzero_ps();
+        for (; l + 31 < m; l += 32) {
+            vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps(input0Row + l), _mm256_loadu_ps(input1Row + l), vsum0);
+            vsum1 = _mm256_fmadd_ps(_mm256_loadu_ps(input0Row + l + 8), _mm256_loadu_ps(input1Row + l + 8), vsum1);
+            vsum2 = _mm256_fmadd_ps(_mm256_loadu_ps(input0Row + l + 16), _mm256_loadu_ps(input1Row + l + 16), vsum2);
+            vsum3 = _mm256_fmadd_ps(_mm256_loadu_ps(input0Row + l + 24), _mm256_loadu_ps(input1Row + l + 24), vsum3);
+        }
+        for (; l + 7 < m; l += 8) {
+            vsum0 = _mm256_fmadd_ps(_mm256_loadu_ps(input0Row + l), _mm256_loadu_ps(input1Row + l), vsum0);
+        }
+        now += Floatsum(_mm256_add_ps(_mm256_add_ps(vsum0, vsum1), _mm256_add_ps(vsum2, vsum3)));
+#elif defined(__AVX__)
+        __m256 vsum = _mm256_setzero_ps();
+        for (; l + 7 < m; l += 8) {
+            vsum = _mm256_add_ps(vsum, _mm256_mul_ps(_mm256_loadu_ps(input0Row + l),
+                                                      _mm256_loadu_ps(input1Row + l)));
+        }
+        now += Floatsum(vsum);
+#endif
+        for (; l < m; l++) {
+            now += input0Row[l] * input1Row[l];
+        }
+        return now;
+    }
+
+    // sum_l input0Row[l] * input1Row[l]，float16 输入
+    static float DotProductFloat16(const uint16_t *input0Row, const uint16_t *input1Row, int m) {
+        float now = 0.0f;
+        int l = 0;
+#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
+        __m256 vsum0 = _mm256_setzero_ps(), vsum1 = _mm256_setzero_ps();
+        for (; l + 15 < m; l += 16) {
+            vsum0 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (input0Row + l))),
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (input1Row + l))), vsum0);
+            vsum1 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (input0Row + l + 8))),
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (input1Row + l + 8))), vsum1);
+        }
+        for (; l + 7 < m; l += 8) {
+            vsum0 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (input0Row + l))),
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (input1Row + l))), vsum0);
+        }
+        now += Floatsum(_mm256_add_ps(vsum0, vsum1));
+#endif
+        for (; l < m; l++) {
+            now += fp16tofp32.dict[input0Row[l]] * fp16tofp32.dict[input1Row[l]];
+        }
+        return now;
+    }
 
     struct MultiThreadMatMulTransBSingleOp : MultiThreadBaseOp {
         float *input0Base, *input1Base, *outputBase;
@@ -8845,29 +8935,10 @@ ops += (long long)lines * inputDim * interDim * 2;
                 float *input1Data = input1Base + b * input1Spatial;
                 float *outputData = outputBase + b * outputSpatial;
                 for (int i = 0; i < n; i++) {
+                    const float *input0Row = input0Data + i * input0Stride;
+                    float *outputRow = outputData + i * k;
                     for (int j = 0; j < k; j++) {
-                        float now = 0.0f;
-                        int l = 0;
-#ifdef __aarch64__
-                        float32x4_t sum = {0, 0, 0, 0};
-                        for (; l + 3 < m; l += 4) {
-                            sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(input0Data + i * input0Stride + l),
-                                                        vld1q_f32(input1Data + j * input1Stride + l)));
-                        }
-                        now += sum[0] + sum[1] + sum[2] + sum[3];
-#elif defined(__AVX__)
-                        __m256 vsum = _mm256_set1_ps(0.0f);
-                        for (; l + 7 < m; l += 8) {
-                            __m256 vx = _mm256_loadu_ps((const float *) (input0Data + i * input0Stride + l));
-                            __m256 vy = _mm256_loadu_ps((const float *) (input1Data + j * input1Stride + l));
-                            vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
-                        }
-                        now += Floatsum(vsum);
-#endif
-                        for (; l < m; l++) {
-                            now += input0Data[i * input0Stride + l] * input1Data[j * input1Stride + l];
-                        }
-                        outputData[i * k + j] = now * alpha;
+                        outputRow[j] = DotProductFloat(input0Row, input1Data + j * input1Stride, m) * alpha;
                     }
                 }
             }
@@ -8895,23 +8966,11 @@ ops += (long long)lines * inputDim * interDim * 2;
                 uint16_t *input1Data = input1Base + b * input1Spatial;
                 uint16_t *outputData = outputBase + b * outputSpatial;
                 for (int i = 0; i < n; i++) {
+                    const uint16_t *input0Row = input0Data + i * input0Stride;
+                    uint16_t *outputRow = outputData + i * k;
                     for (int j = 0; j < k; j++) {
-                        float now = 0.0f;
-                        int l = 0;
-#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
-                        __m256 vsum = _mm256_set1_ps(0.0f);
-                        for (; l + 7 < m; l += 8) {
-                            __m256 vx = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (input0Data + i * input0Stride + l)));
-                            __m256 vy = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (input1Data + j * input1Stride + l)));
-                            vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
-                        }
-                        now += Floatsum(vsum);
-#endif
-                        for (; l < m; l++) {
-                            now += fp16tofp32.dict[input0Data[i * input0Stride + l]] *
-                                    fp16tofp32.dict[input1Data[j * input1Stride + l]];
-                        }
-                        outputData[i * k + j] = float_to_half(now * alpha);
+                        outputRow[j] = float_to_half(
+                            DotProductFloat16(input0Row, input1Data + j * input1Stride, m) * alpha);
                     }
                 }
             }
@@ -10437,33 +10496,58 @@ ops += (long long)lines * inputDim * interDim * 2;
             temp.resize(n3);
             for (int i = st; i < end; i++) {
                 float v = exp(fgt[i]);
-                for (int j = 0; j < n2 * n3; j++) {
-                    flast[i * n2 * n3 + j] *= v;
-                }
+                float *stateData = flast + (size_t)i * n2 * n3;
+                const float *curfktRow = fkt + (size_t)(i / group) * n2;
+                const float *curfqtRow = fqt + (size_t)(i / group) * n2;
+                const float *curfvtRow = fvt + (size_t)i * n3;
+                float *curfatvRow = fatv + (size_t)i * n3;
+                float *kvData = fkv_mem.data();
+                float *tempData = temp.data();
 
+                // kv_mem[k] = sum_j (state[j][k] * v) * key[j]，把衰减并进这一遍
                 std::fill(fkv_mem.begin(), fkv_mem.end(), 0.0f);
                 for (int j = 0; j < n2; j++) {
-                    float curfkt = fkt[i / group * n2 + j];
-                    for (int k = 0; k < n3; k++) {
-                        fkv_mem[k] += flast[i * n2 * n3 + j * n3 + k] * curfkt;
+                    float curfkt = curfktRow[j] * v;
+                    const float *stateRow = stateData + (size_t)j * n3;
+                    int k = 0;
+#ifdef __AVX2__
+                    __m256 vk = _mm256_set1_ps(curfkt);
+                    for (; k + 7 < n3; k += 8) {
+                        _mm256_storeu_ps(kvData + k,
+                            _mm256_fmadd_ps(_mm256_loadu_ps(stateRow + k), vk,
+                                            _mm256_loadu_ps(kvData + k)));
+                    }
+#endif
+                    for (; k < n3; k++) {
+                        kvData[k] += stateRow[k] * curfkt;
                     }
                 }
 
                 float curfbt = fbt[i];
                 for (int k = 0; k < n3; k++) {
-                    temp[k] = ((fvt[i * n3 + k] - fkv_mem[k]) * curfbt);
+                    tempData[k] = ((curfvtRow[k] - kvData[k]) * curfbt);
                 }
 
+                // state = state * v + key x temp，同时累计 output，两遍合一
                 for (int j = 0; j < n2; j++) {
-                    for (int k = 0; k < n3; k++) {
-                        flast[i * n2 * n3 + j * n3 + k] += fkt[i / group * n2 + j] * temp[k];
+                    float curfkt = curfktRow[j], curfqt = curfqtRow[j];
+                    float *stateRow = stateData + (size_t)j * n3;
+                    int k = 0;
+#ifdef __AVX2__
+                    __m256 vv = _mm256_set1_ps(v);
+                    __m256 vk = _mm256_set1_ps(curfkt);
+                    __m256 vq = _mm256_set1_ps(curfqt);
+                    for (; k + 7 < n3; k += 8) {
+                        __m256 vs = _mm256_mul_ps(_mm256_loadu_ps(stateRow + k), vv);
+                        vs = _mm256_fmadd_ps(vk, _mm256_loadu_ps(tempData + k), vs);
+                        _mm256_storeu_ps(stateRow + k, vs);
+                        _mm256_storeu_ps(curfatvRow + k,
+                            _mm256_fmadd_ps(vq, vs, _mm256_loadu_ps(curfatvRow + k)));
                     }
-                }
-
-                for (int j = 0; j < n2; j++) {
-                    float curfqt = fqt[i / group * n2 + j];
-                    for (int k = 0; k < n3; k++) {
-                        fatv[i * n3 + k] += flast[i * n2 * n3 + j * n3 + k] * curfqt;
+#endif
+                    for (; k < n3; k++) {
+                        stateRow[k] = stateRow[k] * v + curfkt * tempData[k];
+                        curfatvRow[k] += stateRow[k] * curfqt;
                     }
                 }
             }
@@ -10671,21 +10755,16 @@ ops += (long long)lines * inputDim * interDim * 2;
 
         // The chunk formula is composed from standard CPU matmul/elementwise
         // operators.  Reorder only private copies so the public operation does
-        // not mutate q/k/v/g/attn/kCumDecay.
+        // not mutate q/k/v/g/attn/kCumDecay.  直接用 out-of-place Permute 一趟
+        // 完成 (clone + in-place transpose 要三趟)，5 维 permute 走按行转置快路径。
         Data qByChunk, kByChunk, vByChunk, gByChunk;
         Data attnByChunk, kCumByChunk;
-        Mul(q, 1.0f, qByChunk);
-        Mul(k, 1.0f, kByChunk);
-        Mul(v, 1.0f, vByChunk);
-        Mul(g, 1.0f, gByChunk);
-        Mul(attn, 1.0f, attnByChunk);
-        Mul(kCumDecay, 1.0f, kCumByChunk);
-        PermuteSelf(qByChunk, {2, 0, 1, 3, 4});
-        PermuteSelf(kByChunk, {2, 0, 1, 3, 4});
-        PermuteSelf(vByChunk, {2, 0, 1, 3, 4});
-        PermuteSelf(gByChunk, {2, 0, 1, 3});
-        PermuteSelf(attnByChunk, {2, 0, 1, 3, 4});
-        PermuteSelf(kCumByChunk, {2, 0, 1, 3, 4});
+        Permute(q, {2, 0, 1, 3, 4}, qByChunk);
+        Permute(k, {2, 0, 1, 3, 4}, kByChunk);
+        Permute(v, {2, 0, 1, 3, 4}, vByChunk);
+        Permute(g, {2, 0, 1, 3}, gByChunk);
+        Permute(attn, {2, 0, 1, 3, 4}, attnByChunk);
+        Permute(kCumDecay, {2, 0, 1, 3, 4}, kCumByChunk);
 
         auto makeChunk4D = [](Data &src, int index, Data &dst) {
             dst.dims = {src.dims[1], src.dims[2], src.dims[3], src.dims[4]};
@@ -11368,6 +11447,12 @@ ops += (long long)lines * inputDim * interDim * 2;
                 tmpData += output.Count(1) * unitSize;
                 curData += input.Count(1) * unitSize;
             }
+        } else if (axis == std::vector <int> {2, 0, 1, 3, 4}) {
+            int n = input.dims[0] * input.dims[1];
+            int m = input.dims[2];
+            int k = input.dims[3] * input.dims[4];
+            int unitSize = input.unitSize;
+            RunMultiThreadTransposeByLine(tmpData, curData, n, m, k * unitSize, GetAlivePool());
         } else {
             std::vector<int> oldSteps;
             std::vector<int> newSteps;
@@ -11527,6 +11612,15 @@ ops += (long long)lines * inputDim * interDim * 2;
             int k = input.dims[2];
             int unitSize = input.unitSize;
             RunMultiThreadTransposeByLine(newData, oldData, n, m, k * unitSize, GetAlivePool());
+            input.Resize(new_dims);
+        } else if (axis == std::vector <int> {2, 0, 1, 3, 4}) {
+            if (vold.size() < input.GetBytes()) {
+                vold.resize(input.GetBytes());
+            }
+            RunMultiThreadMemcpy(vold.data(), input.cpuData, input.GetBytes(), GetAlivePool());
+            RunMultiThreadTransposeByLine((uint8_t *) input.cpuData, vold.data(),
+                input.dims[0] * input.dims[1], input.dims[2],
+                input.dims[3] * input.dims[4] * input.unitSize, GetAlivePool());
             input.Resize(new_dims);
         } else {
             auto tmp = new Data();

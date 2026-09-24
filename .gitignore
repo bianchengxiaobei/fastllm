@@ -38,3 +38,32 @@ CLAUDE.md
 /vllm/
 /test/multimodal/*_probe*.png
 /test/multimodal/*_probe*.gif
+
+# Visual Studio CMake 集成的本机状态/配置（个人环境，不入库）
+/.vs/
+/out/
+/CMakeSettings.json
+/CMakeUserPresets.json
+/.cache/
+
+# 源码内构建（in-source build）产物兜底
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/CTestTestfile.cmake
+/compile_commands.json
+/Makefile
+/Testing/
+/install_manifest.txt
+/build_info.json
+/*.exe
+/*.dll
+/*.so
+/*.lib
+/*.pdb
+/*.ilk
+/*.exp
+/*.obj
+/*.sln
+/*.vcxproj
+/*.vcxproj.filters
