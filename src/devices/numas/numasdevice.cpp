@@ -7142,14 +7142,6 @@ namespace fastllm {
                 }
             }
             ScheduleNumasMoeGemmQueue(contexts);
-        } else if (useGroupedScratch) {
-            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
-                ops[nid].reserve(gateUpTaskStorage[nid].size());
-                for (auto &task : gateUpTaskStorage[nid]) {
-                    ops[nid].push_back(&task);
-                }
-            }
-            DynamicScheduleTasks(ops, false);
         } else {
             DynamicScheduleTasks(ops, false);
         }
@@ -7359,14 +7351,6 @@ namespace fastllm {
                             numaConfig->numaToCpuDict[nid].size()) : stride);
             }
             ScheduleNumasMoeGemmQueue(contexts);
-        } else if (useGroupedScratch) {
-            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
-                downOps[nid].reserve(downTaskStorage[nid].size());
-                for (auto &task : downTaskStorage[nid]) {
-                    downOps[nid].push_back(&task);
-                }
-            }
-            DynamicScheduleTasks(downOps, false);
         } else {
             DynamicScheduleTasks(downOps, false);
         }
