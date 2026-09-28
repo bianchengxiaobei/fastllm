@@ -1421,6 +1421,9 @@ namespace fastllm {
         std::vector<std::vector<int>> workerCpus;
         bool hostMoe = false;
         std::vector<bool> hostMoeLayers;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        std::shared_ptr<FastllmCudaMoeExpertParallel> expertParallel;
+#endif
         std::vector<int> votes;
         int vocabSize = 0;
         std::vector<std::vector<std::pair<int, float>>> topCandidates;
@@ -1523,9 +1526,8 @@ namespace fastllm {
         AssertInFastLLM(std::set<int>(devices.begin(), devices.end()).size() == devices.size(),
                         "Qwen4 TP device IDs must be unique.");
         if (devices.size() <= 1) return;
-        AssertInFastLLM(Qwen4CudaOnlyDeviceMap(deviceMap) &&
-                        GetMoeCudaCacheBytes() == 0,
-                        "Qwen4 TP requires CUDA dense weights without --moe_cuda_cache.");
+        AssertInFastLLM(Qwen4CudaOnlyDeviceMap(deviceMap),
+                        "Qwen4 TP requires CUDA dense weights.");
         std::vector<bool> hostMoeLayers(block_cnt, false);
         for (int layer = 0; layer < block_cnt; ++layer) {
             const std::string device = SelectMoeDeviceForLayer(layer);
@@ -1547,6 +1549,11 @@ namespace fastllm {
         threadTpState->hostMoe = std::any_of(hostMoeLayers.begin(), hostMoeLayers.end(),
                                           [](bool host) { return host; });
         threadTpState->hostMoeLayers = std::move(hostMoeLayers);
+#ifndef USE_ROCM
+        if (threadTpState->hostMoe && MoeCudaCacheRequested()) {
+            threadTpState->expertParallel = FastllmCudaCreateMoeExpertParallel(count);
+        }
+#endif
 #endif
     }
 
@@ -1629,7 +1636,7 @@ namespace fastllm {
             for (int layer = 0; layer < block_cnt; ++layer) {
                 if (tp.hostMoeLayers[layer]) {
                     // The parent outlives its ranks and owns NUMA registration.
-                    // Only rank zero executes these shared, unsplit experts.
+                    // EP shares the unsplit tables; its NUMA subset runs once.
                     model->weights[layer] = weights[layer];
                     model->biass[layer] = biass[layer];
                     continue;
@@ -6161,6 +6168,7 @@ namespace fastllm {
 
         const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoeLayers[deviceLayer];
         const bool runRoutedExperts = !hostMoe || threadTpRank == 0;
+        const std::string moeDevice = SelectMoeDeviceForLayer(deviceLayer);
         Data routerLogits, expertIndex, expertScore, sharedOutput;
         if (runRoutedExperts) {
             Linear(flattened, this->weight[mlp + "gate.weight"],
@@ -6170,7 +6178,9 @@ namespace fastllm {
         // SelectExpert contract requires it). Keep only the narrow router
         // tensor in float32 while larger activations retain their dtype.
         if (runRoutedExperts) ToDataType(routerLogits, DataType::FLOAT32);
+        bool expertsSelected = false;
         auto selectExperts = [&]() {
+            if (!runRoutedExperts || expertsSelected) return;
             bool fusedRouterSelection = false;
 #ifdef USE_CUDA
             if (routerLogits.dataDevice == DataDevice::CUDA &&
@@ -6192,19 +6202,18 @@ namespace fastllm {
                              this->norm_topk_prob,
                              this->routed_scaling_factor, nullptr);
             }
+            expertsSelected = true;
         };
-        bool selectedBeforeShared = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        const std::string moeDevice = SelectMoeDeviceForLayer(deviceLayer);
+        const bool numaMoe = moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0;
         if (runRoutedExperts && batch * sequence <= kNumasMoePrefetchMaxRows &&
             flattened.dataDevice == DataDevice::CUDA &&
-            (moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0) &&
+            numaMoe &&
             !FastllmCudaMoeCacheRequested() &&
             !FastllmCudaGraphIsCapturing()) {
             selectExperts();
             PrefetchNumasMoeDecodeInput(
                 flattened, expertIndex, expertScore, deviceLayer);
-            selectedBeforeShared = true;
         }
 #endif
 #ifdef USE_CUDA
@@ -6221,11 +6230,10 @@ namespace fastllm {
         // recycle a shared intermediate into routed-MoE workspace would turn
         // an otherwise valid dependency rewrite into a data race.
         Data sharedGateUp, sharedHidden, sharedGate;
-        auto runSharedExpert = [&](Data &sharedInput,
-                                   Data &sharedResult) {
+        auto runSharedExpert = [&](Data &sharedResult) {
 #ifdef USE_CUDA
             if (FastllmCudaQwen4SharedExpert(
-                    sharedInput,
+                    flattened,
                     this->weight[mlp + "shared_expert.gateup_proj.weight"],
                     this->weight[mlp + "shared_expert.down_proj.weight"],
                     this->weight[mlp + "shared_expert_gate.weight"],
@@ -6233,7 +6241,7 @@ namespace fastllm {
                 return;
             }
 #endif
-            Linear(sharedInput,
+            Linear(flattened,
                    this->weight[mlp +
                                 "shared_expert.gateup_proj.weight"],
                    Data(), sharedGateUp);
@@ -6242,12 +6250,46 @@ namespace fastllm {
                    this->weight[mlp +
                                 "shared_expert.down_proj.weight"],
                    Data(), sharedResult);
-            Linear(sharedInput,
+            Linear(flattened,
                    this->weight[mlp + "shared_expert_gate.weight"],
                    Data(), sharedGate);
             SigmoidMulTo(sharedResult, sharedGate);
         };
-        runSharedExpert(flattened, runRoutedExperts ? sharedOutput : output);
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (hostMoe && &moeWeights != &this->mtpMoeWeights && threadTpOwner->expertParallel &&
+            batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
+            MoeCudaCacheRequested()) {
+            selectExperts();
+            if (FastllmCudaMergeMOEExpertParallel(*threadTpOwner->expertParallel,
+                    threadTpRank, flattened, expertIndex, expertScore, output,
+                    moeWeights.data(), moeWeights.size(), deviceLayer,
+                    [&] { runSharedExpert(sharedOutput); })) {
+                FastllmCudaGraphMarkParallelJoin(deviceLayer);
+                output.Reshape(input.dims);
+                sharedOutput.Reshape(input.dims);
+                ApplyDeviceMap(this->deviceMap, deviceLayer + 1, this->block_cnt);
+                Qwen4CastLike(sharedOutput, output);
+                AddTo(output, sharedOutput);
+                if (reduceOutput) ThreadTpAllReduce(output);
+                return;
+            }
+        }
+#endif
+        runSharedExpert(runRoutedExperts ? sharedOutput : output);
+
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (hostMoe && numaMoe && batch * sequence >= kNumasMoeGpuPrefillMinRows) {
+            selectExperts();
+            // NUMA prefill launches expert workers on both TP devices. Their
+            // streams share the temporary pool with the rank streams, whose
+            // released intermediates may still be in use by queued kernels.
+            // Drain both producers before either device's worker can reuse
+            // those buffers. Single-row decode and MTP verification stay on
+            // their existing stream-local paths.
+            FastllmCudaSyncCurrentThreadStream();
+            threadTpOwner->Barrier();
+        }
+#endif
 
 #ifdef USE_CUDA
         FastllmCudaGraphMarkParallelFirstDone(deviceLayer);
@@ -6256,7 +6298,7 @@ namespace fastllm {
             moeWeights[2] != nullptr && moeWeights[3] != nullptr &&
             moeWeights[2]->dims == std::vector<int>({0, input.dims.back()}) &&
             moeWeights[3]->dims == std::vector<int>({input.dims.back(), 0}))) {
-            // Host experts contribute once on rank zero; other ranks retain
+            // Host experts contribute once on their owner; other ranks retain
             // their shared-expert slice and join the same final reduction.
             // Empty CUDA routed slices use the same additive identity.
             FastllmCudaGraphMarkParallelJoin(deviceLayer);
@@ -6266,9 +6308,7 @@ namespace fastllm {
             return;
         }
 #endif
-        if (!selectedBeforeShared) {
-            selectExperts();
-        }
+        selectExperts();
         const std::string outputDevice = SelectDeviceFromMap(
             this->deviceMap, deviceLayer + 1, this->block_cnt);
         bool hybridMoe = false;
@@ -6285,7 +6325,7 @@ namespace fastllm {
         // Host TP ranks own the result before reduction. Preserve the existing
         // output transfer and ownership for serial layer transitions.
         const bool writeRoutedDirectly = hostMoe || useMoeCudaCache ||
-            this->SelectMoeDeviceForLayer(deviceLayer) == outputDevice;
+            moeDevice == outputDevice;
         if (!useMoeCudaCache) {
             this->ApplyMoeDeviceMapForLayer(deviceLayer);
         }
@@ -8238,14 +8278,18 @@ namespace fastllm {
         // Check the supported cache shape before querying availability,
         // which lazily allocates the device cache. Cached verifier rows run
         // entirely on CUDA, so their configured NUMA fallback is graph-safe.
-        const bool moeCudaCache =
+        // TP host experts run outside the dense graph. Cache availability
+        // must not change graph eligibility between ranks with different
+        // per-device budgets; expert dispatch handles their cache fallback.
+        const bool tpHostMoe = threadTpRank >= 0 &&
+            threadTpOwner != nullptr && threadTpOwner->hostMoe;
+        const bool moeCudaCache = !tpHostMoe &&
             hiddenStates.dims.size() == 3 && hiddenStates.dims[1] > 0 &&
             hiddenStates.dims[1] <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             (hiddenStates.dims[1] == 1 || mtpTargetGraph) &&
             !this->weights.empty() && !this->weights[0].empty() &&
             MoeCudaCacheAvailable(this->weights[0]);
-        const bool hybridDenseGraph = threadTpRank >= 0 &&
-            threadTpOwner != nullptr && threadTpOwner->hostMoe &&
+        const bool hybridDenseGraph = tpHostMoe &&
             hiddenStates.dims.size() == 3 && hiddenStates.dims[1] == 1 &&
             verificationCapture == nullptr && Qwen4MtpDraftsPerStep() == 0;
         const bool moeDeviceMapGraphCompatible =
@@ -8257,7 +8301,7 @@ namespace fastllm {
             hybridDenseGraph;
         // Host decisions and NUMA execution cannot be captured in the full
         // backbone graph. MTP and prefill retain their existing paths.
-        const bool hybridMoe = Qwen4MtpDraftsPerStep() == 0 &&
+        const bool hybridMoe = !tpHostMoe && Qwen4MtpDraftsPerStep() == 0 &&
             !this->weights.empty() && !this->weights[0].empty() &&
             FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
         if (!GetFastllmEnv().cudaGraph ||
@@ -9751,7 +9795,8 @@ namespace fastllm {
     bool Qwen4ExpModel::ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             const RequestState &state, int &cachedLen) const {
-        if (autoWarmupRunning.load() || threadTpRank >= 0 || !Qwen4PrefixCacheEnabled() ||
+        if (state.hasMultimodalInput || autoWarmupRunning.load() ||
+            threadTpRank >= 0 || !Qwen4PrefixCacheEnabled() ||
             (int)pastKeyValues.size() < this->block_cnt) {
             return false;
         }
@@ -10195,7 +10240,8 @@ namespace fastllm {
     bool Qwen4ExpModel::RestorePrefixSnapshot(
             ResponseContext *context,
             const std::shared_ptr<PrefixSnapshot> &snapshot) {
-        if (context == nullptr || snapshot == nullptr ||
+        if (context == nullptr || !context->multimodalInput.empty() ||
+            snapshot == nullptr || snapshot->state.hasMultimodalInput ||
             snapshot->cachedLen <= 0 ||
             snapshot->cachedLen != context->cacheLen ||
             (int)snapshot->layers.size() < this->block_cnt ||
@@ -10410,6 +10456,14 @@ namespace fastllm {
         AssertInFastLLM(
             (int)pastKeyValues.size() >= this->block_cnt,
             "Qwen4-Exp multimodal inference received too few cache slots.");
+
+        // Independent prefix snapshots are also recorded inside ForwardTarget,
+        // after the first visual prefill. Mark the whole request, including
+        // callers that use ForwardMultimodal without a ResponseContext.
+        {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            this->requestStates[&pastKeyValues[0].first].hasMultimodalInput = true;
+        }
 
         // The payload remains attached to the response context during decode.
         // Only the first call has an empty target cache and needs the visual
@@ -11883,8 +11937,9 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
             if (!context->pastKeyValues.empty()) {
-                this->requestStates[&context->pastKeyValues[0].first] =
-                    RequestState();
+                auto &state = this->requestStates[&context->pastKeyValues[0].first];
+                state = RequestState();
+                state.hasMultimodalInput = !context->multimodalInput.empty();
             }
         }
     }
