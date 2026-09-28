@@ -3496,7 +3496,7 @@ namespace fastllm {
         float psum = 0.0, maxValue = base[candidateOffsets[0] * 2 + 1];
         std::vector <float> ps;
         for (int i = 0; i < topk; i++) {
-            ps.push_back(expf(base[candidateOffsets[i] * 2 + 1] - maxValue));
+            ps.push_back(expf((base[candidateOffsets[i] * 2 + 1] - maxValue) * invTemp));
             psum += ps.back();
         }
         float curSum = 0.0;
@@ -3898,34 +3898,84 @@ namespace fastllm {
         this->peftDict[name][key] = value;
     }
 
+    // linearNames 只支持 '*' 通配。把 pattern 按 '*' 切成字面量段后，首段必须是
+    // key 的前缀、尾段必须是 key 的后缀、中间段必须在两者之间按序出现，这是匹配的
+    // 必要条件；不满足就能直接跳过下面的 DP。MoE 这种几万个张量名的 checkpoint 上
+    // 绝大多数 pattern 都在这里被排除掉。key 自身含 '*' 时 DP 语义更宽松，不做判断。
+    static bool WildcardPatternCannotMatch(const std::string &pattern, const std::string &key) {
+        if (key.find('*') != std::string::npos) {
+            return false;
+        }
+        size_t patternLen = pattern.size();
+        size_t firstStar = pattern.find('*');
+        if (firstStar == std::string::npos) {
+            return key.size() != patternLen || key.compare(pattern) != 0;
+        }
+        if (key.compare(0, firstStar, pattern, 0, firstStar) != 0) {
+            return true;
+        }
+        size_t tailStart = pattern.rfind('*') + 1;
+        size_t tailLen = patternLen - tailStart;
+        if (key.size() < firstStar + tailLen ||
+            key.compare(key.size() - tailLen, tailLen, pattern, tailStart, tailLen) != 0) {
+            return true;
+        }
+        size_t tailBegin = key.size() - tailLen;
+        size_t pos = firstStar;
+        size_t literalStart = firstStar + 1;
+        while (literalStart < tailStart) {
+            size_t literalEnd = pattern.find('*', literalStart);
+            size_t literalLen = literalEnd - literalStart;
+            if (literalLen > 0) {
+                size_t found = key.find(pattern.c_str() + literalStart, pos, literalLen);
+                if (found == std::string::npos || found + literalLen > tailBegin) {
+                    return true;
+                }
+                pos = found + literalLen;
+            }
+            literalStart = literalEnd + 1;
+        }
+        return false;
+    }
+
     WeightType WeightMap::GetWeightType(const std::string &key) {
         if (this->embeddingNames.find(key) != this->embeddingNames.end()) {
             return WeightType::EMBEDDING;
         }
+        // DP 表按 key/pattern 尺寸复用一块扁平缓冲：Debug 构建下 vector<bool>
+        // 的代理引用会把这段匹配放大上百倍。
+        static thread_local std::vector <uint8_t> matchTable;
         for (auto &linearName : this->linearNames) {
+            if (WildcardPatternCannotMatch(linearName, key)) {
+                continue;
+            }
             int n = key.size(), m = linearName.size();
-            std::vector <std::vector <bool> > f = std::vector <std::vector <bool> > (n + 1, std::vector <bool>(m + 1, 0));
-            f[0][0] = 1;
+            size_t rowSize = (size_t)m + 1;
+            matchTable.assign(((size_t)n + 1) * rowSize, 0);
+            auto dp = [&](int i, int j) -> uint8_t& {
+                return matchTable[(size_t)i * rowSize + j];
+            };
+            dp(0, 0) = 1;
             for (int i = 0; i <= n; i++) {
                 for (int j = 0; j <= m; j++) {
-                    if (f[i][j]) {
+                    if (dp(i, j)) {
                         if (i + 1 <= n && key[i] == '*') {
                             for (int l = j; l <= m; l++) {
-                                f[i + 1][l] = 1;
+                                dp(i + 1, l) = 1;
                             }
                         }
                         if (j + 1 <= m && linearName[j] == '*') {
                             for (int l = i; l <= n; l++) {
-                                f[l][j + 1] = 1;
+                                dp(l, j + 1) = 1;
                             }
                         }
                         if (i + 1 <= n && j + 1 <= m && key[i] == linearName[j]) {
-                            f[i + 1][j + 1] = 1;
+                            dp(i + 1, j + 1) = 1;
                         }
                     }
                 }
             }
-            if (f[n][m]) {
+            if (dp(n, m)) {
                 return WeightType::LINEAR;
             }
         }

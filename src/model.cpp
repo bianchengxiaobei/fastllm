@@ -1171,7 +1171,8 @@ namespace fastllm {
             if (dstType == DataType::FP8_E4M3 || dstType == DataType::NVFP4 ||
                 dstType == DataType::NVFP4_BLOCK_16 ||
                 dstType == DataType::NVFP4_BLOCK_16_E8M0 ||
-                dstType == DataType::NVFP4_BLOCK_16_E4M3) {
+                dstType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                dstType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                 if (dstType == DataType::FP8_E4M3 && !isFp8) {
                     ErrorInFastLLM("CreateBufferWithScale error: packed FP4 cannot be loaded as FP8_E4M3.");
                 }
@@ -1186,7 +1187,8 @@ namespace fastllm {
                 }
                 if ((dstType == DataType::NVFP4_BLOCK_16 ||
                      dstType == DataType::NVFP4_BLOCK_16_E8M0 ||
-                     dstType == DataType::NVFP4_BLOCK_16_E4M3) && !isPackedFp4) {
+                     dstType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                     dstType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) && !isPackedFp4) {
                     ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8/U8 can be loaded as NVFP4_BLOCK_16.");
                 }
                 if (isScalarScale && dstType != DataType::FP8_E4M3) {
@@ -1196,13 +1198,15 @@ namespace fastllm {
                 this->blockM = blockM;
                 if (dstType == DataType::NVFP4_BLOCK_16 ||
                     dstType == DataType::NVFP4_BLOCK_16_E8M0 ||
-                    dstType == DataType::NVFP4_BLOCK_16_E4M3) {
+                    dstType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                    dstType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                     AssertInFastLLM(blockM == 16,
                                     "CreateBufferWithScale error: NVFP4_BLOCK_16 requires blockM = 16.");
                     AssertInFastLLM(scale.bytes == (size_t)ns * ms,
                                     "CreateBufferWithScale error: NVFP4_BLOCK_16 scale bytes mismatch.");
                     if ((dstType == DataType::NVFP4_BLOCK_16 ||
-                         dstType == DataType::NVFP4_BLOCK_16_E4M3) && scale.dtype != "F8_E4M3") {
+                         dstType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                         dstType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) && scale.dtype != "F8_E4M3") {
                         ErrorInFastLLM("CreateBufferWithScale error: NVFP4_BLOCK_16 scale should be F8_E4M3.");
                     }
                     if (dstType == DataType::NVFP4_BLOCK_16_E8M0 && scale.dtype != "F8_E8M0") {
@@ -1230,7 +1234,8 @@ namespace fastllm {
                     // append this vector, allowing the Marlin preparation path
                     // to choose a common multiplier for all merged partitions.
                     if (dstType == DataType::NVFP4_BLOCK_16 ||
-                        dstType == DataType::NVFP4_BLOCK_16_E4M3) {
+                        dstType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                        dstType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                         scalesBuffer = new float[1];
                         scalesBuffer[0] = scale2Value;
                     }
@@ -1270,8 +1275,39 @@ namespace fastllm {
                         return;
                     }
 
+                    const size_t scaleCols = (m - 1) / 16 + 1;
+                    if (dstType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
+                        // Keep the raw FP8 block-scale bytes next to the packed
+                        // nibbles instead of expanding them into an inline FP32.
+                        // Four bytes fewer per block is a quarter of the weight
+                        // traffic a decode step streams, and the values are
+                        // identical: fp8(byte) * scale2Value.
+                        const size_t packedRowBytes = GetDataBytes(dstType, 1, m);
+                        const size_t packedBytes = packedRowBytes * (size_t)n;
+                        std::vector<uint8_t> packed(this->bytes);
+                        std::vector<uint8_t> scaleBytes(scale.bytes);
+                        ReadRaw(packed.data(), this->bytes);
+                        scale.ReadRaw(scaleBytes.data(), scale.bytes);
+
+                        buffer = new uint8_t[packedBytes];
+                        memset(buffer, 0, packedBytes);
+                        for (int i = 0; i < n; i++) {
+                            uint8_t *dstRow = buffer + (size_t)i * packedRowBytes;
+                            memcpy(dstRow, &scale2Value, sizeof(float));
+                            const uint8_t *srcRow = packed.data() + (size_t)i * packedM;
+                            for (size_t bj = 0; bj < scaleCols; bj++) {
+                                uint8_t *dstBlock = dstRow + sizeof(float) +
+                                    bj * (8 + sizeof(uint8_t));
+                                const size_t srcOffset = bj * 8;
+                                memcpy(dstBlock, srcRow + srcOffset,
+                                       std::min((size_t)8, (size_t)packedM - srcOffset));
+                                dstBlock[8] = scaleBytes[(size_t)i * ms + bj];
+                            }
+                        }
+                        return;
+                    }
+
                     size_t blockBytes = dstType == DataType::NVFP4_BLOCK_16 ? 8 + sizeof(float) : 9;
-                    size_t scaleCols = (m - 1) / 16 + 1;
                     size_t outputBytes = GetDataBytes(dstType, n, m);
                     std::vector<uint8_t> packed(this->bytes);
                     std::vector<uint8_t> scaleBytes(scale.bytes);
@@ -1884,7 +1920,15 @@ namespace fastllm {
             return true;
         }
         if (scaleIt->second.dtype == "F8_E4M3") {
+#if !defined(USE_CUDA) && !defined(USE_ROCM) && !defined(USE_NUMAS)
+            // A CPU-only build can keep the checkpoint's raw FP8 block scales
+            // instead of expanding them into an inline FP32 multiplier. The
+            // values are identical, and the compact row is a quarter smaller,
+            // which is a quarter less weight traffic per decode step.
+            dataType = DataType::NVFP4_BLOCK_16_E4M3_PACKED;
+#else
             dataType = DataType::NVFP4_BLOCK_16;
+#endif
             return true;
         }
         return false;
@@ -5459,7 +5503,9 @@ namespace fastllm {
                                                  diskLazyWeightType == WeightType::EMBEDDING)) &&
                                                (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) ||
                                               ((diskDataType == DataType::NVFP4_BLOCK_16 ||
-                                                diskDataType == DataType::NVFP4_BLOCK_16_E4M3) && scaleTensor->dtype == "F8_E4M3"))) {
+                                                diskDataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                                                diskDataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
+                                               scaleTensor->dtype == "F8_E4M3"))) {
                                             scaleTensor->CreateBuffer(DataType::FLOAT32);
                                         }
                                     }
@@ -5511,7 +5557,8 @@ namespace fastllm {
                                     bool keepScalePacked = (oriDataType == DataType::NVFP4 &&
                                                             (scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8")) ||
                                                            ((oriDataType == DataType::NVFP4_BLOCK_16 ||
-                                                             oriDataType == DataType::NVFP4_BLOCK_16_E4M3) &&
+                                                             oriDataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                                                             oriDataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
                                                             scaleTensor.dtype == "F8_E4M3") ||
                                                            packedInt4Info.dataType == DataType::INT4_GROUP32;
                                     if (!keepScalePacked) {
@@ -5522,7 +5569,9 @@ namespace fastllm {
                                     SafeTensorItem *scale2Tensor = nullptr;
                                     std::string scale2TensorName = FindSafeTensorScale2TensorName(safeTensors, tensorName);
                                     if ((oriDataType == DataType::NVFP4_BLOCK_16 ||
-                                         oriDataType == DataType::NVFP4_BLOCK_16_E4M3) && scale2TensorName != "") {
+                                         oriDataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                                         oriDataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
+                                        scale2TensorName != "") {
                                         scale2Tensor = &safeTensors.itmeDict[scale2TensorName];
                                     }
                                     if (isPackedInt4Group) {

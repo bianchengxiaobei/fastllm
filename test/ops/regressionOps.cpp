@@ -4207,6 +4207,8 @@ namespace {
         }
     }
 
+#endif
+
     void RunQwen4HyperPrepareRegressionCase(
             fastllm::DataType type, int rows, int lowRank, int groups,
             const std::string &deviceName) {
@@ -4274,6 +4276,7 @@ namespace {
         }
     }
 
+#ifdef USE_CUDA
     void RunCudaLocalExpertRangeMaskRegression() {
         const std::vector<int32_t> routeIndices = {
             -1, 0, 31, 32, 47, 63, 64, 255

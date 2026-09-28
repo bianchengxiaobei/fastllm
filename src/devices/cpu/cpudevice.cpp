@@ -3003,8 +3003,18 @@ namespace fastllm {
         return (ggml_type)weight.ggmlType;
     }
 
+    // NVFP4 block-16 布局把每个 block 的 scale 内联在权重里，CPU 上没有对应的
+    // 专用内核，统一走通用 BF16 GEMM（FastllmGemm 已支持这几种布局）。
+    static bool IsNativeGemmNVFP4Block16WeightType(DataType type) {
+        return type == DataType::NVFP4_BLOCK_16 ||
+               type == DataType::NVFP4_BLOCK_16_PLANAR ||
+               type == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
+               type == DataType::NVFP4_BLOCK_16_E8M0;
+    }
+
     static bool CanRunBFloat16NativeLinearWeight(const Data &weight) {
-        if (weight.dataType == DataType::FLOAT32) {
+        if (weight.dataType == DataType::FLOAT32 ||
+            IsNativeGemmNVFP4Block16WeightType(weight.dataType)) {
             return true;
         }
         if (weight.dataType != DataType::DATA_GGUF_FORMAT) {
@@ -3064,6 +3074,91 @@ namespace fastllm {
             delete ops[i];
         }
         AddBiasToFloatOutput(outputData, biasData, n, k);
+    }
+
+    static uint16_t *GetNVFP4Block16Bf16InputBuffer(size_t count) {
+        static thread_local std::vector<uint16_t> buffer;
+        if (buffer.size() < count) {
+            buffer.resize(count);
+        }
+        return buffer.data();
+    }
+
+    static void ConvertFloat32ToBFloat16ForGemm(float *inputData, uint16_t *outputData, int count,
+                                               AliveThreadPool *pool, int startTid, int threadNum) {
+        if (cpuInstructInfo.hasAVX512BF16 &&
+            Float32ToBFloat16_AVX512BF16_RNE(inputData, outputData, count)) {
+            return;
+        }
+        if (count <= 4 || threadNum <= 1) {
+            Float32ToBFloat16(inputData, outputData, count);
+            return;
+        }
+        std::vector<fastllm::MultiThreadFloat32ToBFloat16Op*> ops;
+        int per = count / threadNum;
+        int cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < count);
+            if (i == threadNum - 1) {
+                end = count;
+            }
+            ops.push_back(new MultiThreadFloat32ToBFloat16Op(inputData + cur, outputData + cur, end - cur));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
+
+    static void RunLinearFloat32NVFP4Block16ToFloat32(float *inputData, Data &weight, float *outputData,
+                                                     float *biasData, int n, int m, int k,
+                                                     AliveThreadPool *pool, int startTid, int threadNum) {
+        uint16_t *bf16Input = GetNVFP4Block16Bf16InputBuffer((size_t)n * m);
+        ConvertFloat32ToBFloat16ForGemm(inputData, bf16Input, n * m, pool, startTid, threadNum);
+        RunLinearBFloat16NativeToFloat32(bf16Input, weight, outputData, biasData, n, m, k,
+                                        pool, startTid, threadNum);
+    }
+
+    static void RunLinearFloat16NVFP4Block16ToFloat16(uint16_t *inputData, Data &weight, uint16_t *outputData,
+                                                     float *biasData, int n, int m, int k,
+                                                     AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector<float> floatInput((size_t)n * m);
+        Float16ToFloat32(inputData, floatInput.data(), n * m);
+        uint16_t *bf16Input = GetNVFP4Block16Bf16InputBuffer((size_t)n * m);
+        ConvertFloat32ToBFloat16ForGemm(floatInput.data(), bf16Input, n * m, pool, startTid, threadNum);
+        std::vector<float> floatOutput((size_t)n * k);
+        RunLinearBFloat16NativeToFloat32(bf16Input, weight, floatOutput.data(), biasData, n, m, k,
+                                        pool, startTid, threadNum);
+        Float32ToFloat16(floatOutput.data(), outputData, n * k);
+    }
+
+    // 融合 MoE 里按专家并行的 gate / down 投影，与 LaunchLinearBFloat16NVFP4 等价，
+    // 只是权重换成内联 scale 的 block-16 布局。
+    static void LaunchLinearBFloat16NVFP4Block16(uint16_t *inputData, Data &weight, float *outputData,
+                                                int n, int m, int k,
+                                                std::vector<fastllm::MultiThreadBaseOp*> &ops,
+                                                AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops[startTid + i] = new MultiThreadGemmOp(
+                (uint8_t*)inputData, DataType::BFLOAT16,
+                (uint8_t*)weight.cpuData, weight.dataType,
+                (uint8_t*)outputData, DataType::FLOAT32,
+                n, m, k, cur, end);
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[startTid + i]);
+        }
     }
 
     void MultiThreadGemmOp::Run() {
@@ -4713,6 +4808,7 @@ namespace fastllm {
                 (weights[2]->dataType == DataType::FP8_E4M3 ||
                  weights[2]->dataType == DataType::NVFP4 ||
                  weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                 IsNativeGemmNVFP4Block16WeightType(weights[2]->dataType) ||
                  weights[2]->dataType == DataType::BFLOAT16) &&
                 (input.dims[0] < 32 || (deepSeekV4Mode && activationQuantBlock == 32))) {
             int outer = n;
@@ -5148,6 +5244,9 @@ namespace fastllm {
                             }
                         } else if (weight->dataType == DataType::BFLOAT16) {
                             LaunchLinearBFloat16BFloat16(expertBf16Input(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                        } else if (IsNativeGemmNVFP4Block16WeightType(weight->dataType)) {
+                            LaunchLinearBFloat16NVFP4Block16(expertBf16Input(idx), *weight, outputData,
+                                                             1, m, curK, ops, pool, threadSt, curThread);
                         } else if (weight->dataType == DataType::FLOAT16) {
                             LaunchLinearFloat32Float16(expertFloatInput(idx), *weight, outputData, biasData,
                                                        1, m, curK, ops, pool, threadSt, curThread);
@@ -5203,6 +5302,7 @@ namespace fastllm {
                             if (weightDown->dataType == DataType::FP8_E4M3 ||
                                 (weightDown->dataType == DataType::NVFP4 && cpuInstructInfo.hasAVX512BF16) ||
                                 (weightDown->dataType == DataType::NVFP4_BLOCK_16_E4M3 && cpuInstructInfo.hasAVX512BF16) ||
+                                IsNativeGemmNVFP4Block16WeightType(weightDown->dataType) ||
                                 weightDown->dataType == DataType::BFLOAT16) {
                                 Float32ToBFloat16(swigluData, (uint16_t*)middles[l].data(), mid);
                             }
@@ -5232,6 +5332,7 @@ namespace fastllm {
                         if (weightDown->dataType == DataType::FP8_E4M3 ||
                             (weightDown->dataType == DataType::NVFP4 && cpuInstructInfo.hasAVX512BF16) ||
                             (weightDown->dataType == DataType::NVFP4_BLOCK_16_E4M3 && cpuInstructInfo.hasAVX512BF16) ||
+                            IsNativeGemmNVFP4Block16WeightType(weightDown->dataType) ||
                             weightDown->dataType == DataType::BFLOAT16) {
                             ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(swigluData, (uint16_t*)middles[l].data(), mid));
                         }
@@ -5268,6 +5369,9 @@ namespace fastllm {
                             }
                         } else if (weightDown->dataType == DataType::BFLOAT16) {
                             LaunchLinearBFloat16BFloat16((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                        } else if (IsNativeGemmNVFP4Block16WeightType(weightDown->dataType)) {
+                            LaunchLinearBFloat16NVFP4Block16((uint16_t*)middles[l].data(), *weightDown, results[l].data(),
+                                                             1, mid, m, ops, pool, threadSt, curThread);
                         } else if (weightDown->dataType == DataType::FLOAT16) {
                             LaunchLinearFloat32Float16(swigluResults[l].data(), *weightDown, results[l].data(), nullptr,
                                                        1, mid, m, ops, pool, threadSt, curThread);
@@ -8436,6 +8540,9 @@ ops += (long long)lines * inputDim * interDim * 2;
                        weight.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
                 RunLinearFloat32NVFP4((float*)input.cpuData, weight, (float*)output.cpuData,
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (IsNativeGemmNVFP4Block16WeightType(weight.dataType)) {
+                RunLinearFloat32NVFP4Block16ToFloat32((float*)input.cpuData, weight, (float*)output.cpuData,
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
                 RunLinearFloat32GGUF((float*)input.cpuData, (uint8_t*)weight.cpuData, (float*)output.cpuData, bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, 
                     &weight, n, m, k, GetAlivePool(), threadSt, threadLen);
@@ -8558,6 +8665,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             } else if (weight.dataType == DataType::NVFP4 ||
                        weight.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
                 RunLinearFloat16NVFP4((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData,
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (IsNativeGemmNVFP4Block16WeightType(weight.dataType)) {
+                RunLinearFloat16NVFP4Block16ToFloat16((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData,
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
                 RunLinearFloat16GGUF((uint16_t*)input.cpuData, (uint8_t*)weight.cpuData, (uint16_t*)output.cpuData, bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, 

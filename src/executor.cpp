@@ -383,10 +383,19 @@ namespace fastllm {
 
     bool Executor::CanRunOnFirstDevice(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
+        // DiskDevice 排在 devices 里只是为了 Executor::Run 的派发顺序：它只服务
+        // isDiskWeight 的权重。这里探测的是算力设备能否执行某个融合算子，跳过
+        // disk 才不会把内存权重的融合路径（MergeMOE / LinearAdd / MLP ...）误判关掉。
+        for (auto &device : this->devices) {
+            if (device == nullptr || device->deviceType == "disk") {
+                continue;
+            }
 #ifdef USE_CUDA
-        SelectCudaDeviceForCandidate(this->devices[0]);
+            SelectCudaDeviceForCandidate(device);
 #endif
-        return this->devices[0]->CanRun(opType, datas, floatParams, intParams);
+            return device->CanRun(opType, datas, floatParams, intParams);
+        }
+        return false;
     }
 
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,

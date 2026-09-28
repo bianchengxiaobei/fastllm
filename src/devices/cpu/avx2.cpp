@@ -2505,34 +2505,37 @@ namespace fastllm {
         }
     }
 
-    // Compact block-16 keeps eight FP4 bytes and the original E4M3 scale.
-    // Expand bytes directly to dwords: VPERMPS selects the magnitude from
-    // the low three bits, then XOR restores the sign (including negative zero).
-    // Keeping even/odd elements separate avoids the BF16 byte-table unpacking.
-    template <int ROWS>
+    // Compact and legacy block-16 rows hold the same eight packed nibble bytes
+    // and differ only in where the per-block scale lives (a raw FP8 byte plus a
+    // row-global multiplier, or an inline FP32). Decode both from a one-pass
+    // FP32 input tile that keeps even elements in the low half of each block and
+    // odd elements in the high half. VPERMPS then selects the magnitude from the
+    // low three bits and an XOR restores the sign, including negative zero.
+    template <int ROWS, bool COMPACT>
     static
 #ifdef _MSC_VER
     __declspec(noinline)
 #else
     __attribute__((noinline))
 #endif
-    void NVFP4Block16CompactGemmPacked_AVX2(
+    void NVFP4Block16GemmPacked_AVX2(
         const float *input, const uint8_t *weights, long ldb,
         float *output, long ldc, int m, int st, int end
     ) {
         const __m256 lookup = _mm256_setr_ps(0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f);
         const __m256i signMask = _mm256_set1_epi32(0x80000000u);
         static constexpr FP8E4M3ToFP32Manager fp8ToFloat;
+        constexpr size_t blockStride = COMPACT ? 9 : 12;
+        constexpr size_t blockBase = COMPACT ? sizeof(float) : 0;
         for (int j = st; j < end; j++) {
             const uint8_t *weightRow = weights + (size_t)j * ldb;
-            float global;
-            memcpy(&global, weightRow, sizeof(global));
+            const float global = COMPACT ? *(const float*)weightRow : 0.0f;
             __m256 even[ROWS], odd[ROWS];
             for (int r = 0; r < ROWS; r++) {
                 even[r] = odd[r] = _mm256_setzero_ps();
             }
             auto accumulateBlock = [&](int block) {
-                const uint8_t *packed = weightRow + sizeof(float) + (size_t)block * 9;
+                const uint8_t *packed = weightRow + blockBase + (size_t)block * blockStride;
                 const __m256i codes = _mm256_cvtepu8_epi32(
                     _mm_loadl_epi64((const __m128i*)packed));
                 const __m256 weightEven = _mm256_xor_ps(
@@ -2543,17 +2546,22 @@ namespace fastllm {
                     _mm256_permutevar8x32_ps(lookup, _mm256_srli_epi32(codes, 4)),
                     _mm256_castsi256_ps(_mm256_and_si256(
                         _mm256_slli_epi32(codes, 24), signMask)));
-                const __m256 scale = _mm256_set1_ps(fp8ToFloat.dict[packed[8]] * global);
+                float scale;
+                if constexpr (COMPACT) {
+                    scale = fp8ToFloat.dict[packed[8]] * global;
+                } else {
+                    memcpy(&scale, packed + 8, sizeof(scale));
+                }
+                const __m256 scaleVec = _mm256_set1_ps(scale);
                 for (int r = 0; r < ROWS; r++) {
                     const float *src = input + (size_t)r * m + block * 16;
                     even[r] = _mm256_fmadd_ps(
-                        _mm256_mul_ps(_mm256_load_ps(src), scale), weightEven, even[r]);
+                        _mm256_mul_ps(_mm256_load_ps(src), scaleVec), weightEven, even[r]);
                     odd[r] = _mm256_fmadd_ps(
-                        _mm256_mul_ps(_mm256_load_ps(src + 8), scale), weightOdd, odd[r]);
+                        _mm256_mul_ps(_mm256_load_ps(src + 8), scaleVec), weightOdd, odd[r]);
                 }
             };
-            // A one-row tile leaves enough registers to unroll the block
-            // loop. Apply this to tail tiles too, without a separate kernel.
+            // A one-row tile leaves enough registers to unroll the block loop.
             if constexpr (ROWS == 1) {
 #if defined(__clang__)
 #pragma clang loop unroll_count(4)
@@ -2577,7 +2585,12 @@ namespace fastllm {
         }
     }
 
-    static void NVFP4Block16CompactGemmPackInput_AVX2(
+    // Converts a BF16 activation tile to the FP32 even/odd layout the kernel
+    // above consumes, then streams one weight row at a time. Four token rows
+    // share its decode; larger tiles spill accumulators on AVX2's sixteen
+    // vector registers.
+    template <bool COMPACT>
+    static void NVFP4Block16GemmPackInput_AVX2(
         const void *A, long lda, const void *B, long ldb,
         void *C, long ldc, int n, int m, int st, int end
     ) {
@@ -2595,16 +2608,14 @@ namespace fastllm {
                 _mm256_store_ps(dst + 8, _mm256_castsi256_ps(_mm256_and_si256(values, highMask)));
             }
         }
-        // Stream one weight row at a time. Four token rows share its decode;
-        // larger tiles spill accumulators on AVX2's sixteen vector registers.
         for (int row = 0; row < n; row += 4) {
             const float *src = input.data() + (size_t)row * m;
             float *dst = (float*)((uint8_t*)C + (size_t)row * ldc);
             switch (std::min(4, n - row)) {
-                case 1: NVFP4Block16CompactGemmPacked_AVX2<1>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
-                case 2: NVFP4Block16CompactGemmPacked_AVX2<2>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
-                case 3: NVFP4Block16CompactGemmPacked_AVX2<3>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
-                case 4: NVFP4Block16CompactGemmPacked_AVX2<4>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
+                case 1: NVFP4Block16GemmPacked_AVX2<1, COMPACT>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
+                case 2: NVFP4Block16GemmPacked_AVX2<2, COMPACT>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
+                case 3: NVFP4Block16GemmPacked_AVX2<3, COMPACT>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
+                case 4: NVFP4Block16GemmPacked_AVX2<4, COMPACT>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
             }
         }
     }
@@ -2771,11 +2782,11 @@ namespace fastllm {
         }
         const int fullBlocks = m >> 4;
         const int tail = m & 15;
-        if constexpr (COMPACT) {
-            if (tail == 0) {
-                NVFP4Block16CompactGemmPackInput_AVX2(A, lda, B, ldb, C, ldc, n, m, st, end);
-                return true;
-            }
+        // Whole blocks let both layouts share the one-pass FP32 input tile.
+        // Partial blocks keep the row-tiled path, which handles them inline.
+        if (tail == 0) {
+            NVFP4Block16GemmPackInput_AVX2<COMPACT>(A, lda, B, ldb, C, ldc, n, m, st, end);
+            return true;
         }
         // Bound register use independently of matrix width and batch size.
         // The same row tiles handle legacy scales and partial FP4 blocks.

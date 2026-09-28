@@ -8,6 +8,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -20,6 +21,9 @@
 #include <cstring>
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>
 #endif
 
 namespace fastllm {
@@ -49,6 +53,69 @@ namespace fastllm {
         virtual void Run() = 0;
         virtual ~MultiThreadBaseOp() = default;
     };
+
+    // Logical processors sharing one physical core, or 0 when the platform
+    // cannot report it. CPUID leaf 0x0B marks the SMT level with EAX[4:0] == 1
+    // and returns the thread count per core in EBX.
+    static inline int GetThreadsPerCore() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        int threadsPerCore = 0;
+    #if defined(_MSC_VER)
+        int regs[4];
+        __cpuid(regs, 0);
+        const int maxLeaf = regs[0];
+        if (maxLeaf >= 0x0B) {
+            __cpuidex(regs, 0x0B, 0);
+            if ((regs[0] & 0x1F) == 1) {
+                threadsPerCore = regs[1] & 0xFFFF;
+            }
+        }
+    #elif defined(__GNUC__) || defined(__clang__)
+        unsigned int eax, ebx, ecx, edx;
+        const unsigned int maxLeaf = __get_cpuid_max(0, nullptr);
+        if (maxLeaf >= 0x0B) {
+            __get_cpuid_count(0x0B, 0, &eax, &ebx, &ecx, &edx);
+            if ((eax & 0x1F) == 1) {
+                threadsPerCore = (int)(ebx & 0xFFFF);
+            }
+        }
+    #endif
+        const int logical = (int)std::thread::hardware_concurrency();
+        if (threadsPerCore > 1 && threadsPerCore <= logical &&
+            logical % threadsPerCore == 0) {
+            return threadsPerCore;
+        }
+#endif
+        return 0;
+    }
+
+    // The pool's ops are full barriers: the caller cannot continue until every
+    // worker has finished its slice, so the slowest worker sets the op time.
+    // Giving the pool more workers than physical cores only makes the OS
+    // time-slice them against each other, and one logical processor has to
+    // stay free for the calling thread. On an 8-core / 16-thread CPU an
+    // oversubscribed pool is 20x slower than a correctly sized one, so clamp.
+    static inline int GetMaxAliveThreads() {
+        const int logical = (int)std::thread::hardware_concurrency();
+        if (logical <= 1) {
+            return 1;
+        }
+        const int threadsPerCore = GetThreadsPerCore();
+        const int physical = threadsPerCore > 0 ? logical / threadsPerCore : logical;
+        return std::max(1, std::min(physical, logical - 1));
+    }
+
+    static inline int ClampAliveThreads(int threadNum) {
+        const int limit = GetMaxAliveThreads();
+        if (threadNum > limit) {
+            printf("[Fastllm] Threads capped at %d (requested %d): this CPU thread "
+                   "pool synchronizes with a barrier per op, so more workers than "
+                   "cores is slower.\n", limit, threadNum);
+            fflush(stdout);
+            return limit;
+        }
+        return std::max(1, threadNum);
+    }
 
     struct AliveThreadTask {
         std::atomic<uint64_t> publishId;
@@ -136,6 +203,7 @@ namespace fastllm {
         std::vector <std::thread*> threads;
         
         AliveThreadPool (int threadNum) {
+            threadNum = ClampAliveThreads(threadNum);
             for (int i = 0; i < threadNum; i++) {
                 this->loops.push_back(new AliveThreadLoop(i));
                 this->threads.push_back(new std::thread([loop = this->loops[i]]() { (*loop)(); }));
@@ -160,6 +228,7 @@ namespace fastllm {
         }
 
         void ResizeThreads(int threadNum) {
+            threadNum = ClampAliveThreads(threadNum);
             for (int i = this->threads.size(); i < threadNum; i++) {
                 this->loops.push_back(new AliveThreadLoop(i));
                 this->threads.push_back(new std::thread([loop = this->loops[i]]() { (*loop)(); }));
