@@ -78,6 +78,13 @@ scripts\windows\build_tools.bat cpu     :: USE_CUDA=OFF
 CUDA 构建的额外产物是 `tools\ftllm\nccl.dll`（CMake 的后置步骤从 `NCCL::nccl` 拷过来），
 缺了它加载 DLL 会报 `找不到指定的模块 (or one of its dependencies)`。
 
+两个容易踩的点：
+
+- `gpu` 后端依赖第一步的 NCCL，没做第一步就直接 configure 会报找不到 NCCL。
+- 构建前要停掉正在运行的 `ftllm` 服务。它加载着 `build-vs-gpu\tools\ftllm\fastllm_tools.dll`，
+  后置的拷贝步骤会以 `Error copying file "...\Release\fastllm_tools.dll" to "...\tools\ftllm\.": Permission denied`
+  报错退出（MSB3073），此时 DLL 已经编译出来但没同步到运行目录。
+
 只编译命令行的 `main` 示例时可以直接用 MSBuild：
 
 ```bat
