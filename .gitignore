@@ -10,6 +10,7 @@ token
 /pyfastllm/dist/
 /.idea/
 /.vscode/
+/.venv/
 /example/Win32Demo/bin/*.*
 /example/Win32Demo/Win32
 /example/Win32Demo/x64

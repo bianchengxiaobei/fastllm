@@ -3,17 +3,17 @@
 本文说明在 Windows 上用 MSVC + CUDA 编译 FastLLM，以及用本地构建出的 `fastllm_tools.dll` 跑推理服务。
 Linux 构建见仓库根目录 `README.md`，本文只覆盖 Windows 专有的步骤与差异。
 
-## 目录约定
+## 脚本位置
 
-脚本放在工作区根目录（仓库的上一级），不在 git 仓库内：
+Windows 辅助脚本随仓库一起维护，位于 `scripts\windows\`，命令统一在**仓库根目录**下执行：
 
-```
-<工作区>\
-├── build_tools.bat        # 编译 fastllm_tools.dll
-├── run_ftllm.bat          # 建 venv 并运行 ftllm（server / chat / webui ...）
-├── ftllm_deps.txt         # 运行期 Python 依赖
-└── fastllm\               # git 仓库
-```
+| 文件 | 用途 |
+| --- | --- |
+| `scripts\windows\build_tools.bat` | 编译 `fastllm_tools.dll`（`cpu` / `gpu` 两个后端） |
+| `scripts\windows\run_ftllm.bat` | 建 venv 并运行 `ftllm`（`server` / `chat` / `webui` ...） |
+| `scripts\windows\ftllm_deps.txt` | `run_ftllm.bat` 安装的运行期 Python 依赖 |
+
+脚本用自身路径上溯两级定位仓库，所以在哪里调用都不影响行为，但下文示例均以仓库根目录为当前目录。
 
 ## 前置依赖
 
@@ -23,7 +23,7 @@ Linux 构建见仓库根目录 `README.md`，本文只覆盖 Windows 专有的�
 | CUDA Toolkit | 13.4 | 默认路径 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4` |
 | NCCL（Windows 移植） | — | CUDA 构建必需，官方不提供 Windows 版，需自行准备带 CMake 配置包的安装目录 |
 | Python | 3.10+ | 仅运行 `ftllm` 时需要 |
-| uv | 最新 | 仅运行 `ftllm` 时需要，用于建 `.venv` |
+| uv | 最新 | 仅运行 `ftllm` 时需要，用于建 `fastllm\.venv` |
 
 CPU 构建（`build_tools.bat cpu`）只需要 VS2022。
 
@@ -35,25 +35,26 @@ CPU 构建（`build_tools.bat cpu`）只需要 VS2022。
 set CMAKE_PREFIX_PATH=E:\Learn\nccl-windows\install
 ```
 
-该目录下应有 `lib\cmake\NCCL\`。首次 configure 后路径会写进 `fastllm\build-vs-gpu\CMakeCache.txt` 的
-`NCCL_DIR`，后续构建不必再设。若 configure 报找不到 NCCL，就是这一步漏了或路径写错。
+该目录下应有 `lib\cmake\NCCL\`。CMake 会把同名环境变量当作 `CMAKE_PREFIX_PATH` 的初值，
+首次 configure 后路径记在 `build-vs-gpu\CMakeCache.txt` 的 `NCCL_DIR`，后续构建不必再设。
+若 configure 报找不到 NCCL，就是这一步漏了或路径写错。
 
 `build_tools.bat` 在 `CUDA_PATH` 未设置时会尝试使用 `...\CUDA\v13.4`；装在别处时先自己 `set CUDA_PATH=...`。
 
 ## 第二步：编译
 
 ```bat
-build_tools.bat gpu     :: USE_CUDA=ON
-build_tools.bat cpu     :: USE_CUDA=OFF
+scripts\windows\build_tools.bat gpu     :: USE_CUDA=ON
+scripts\windows\build_tools.bat cpu     :: USE_CUDA=OFF
 ```
 
 脚本行为：
 
-- 生成器固定 `Visual Studio 17 2022` + `-A x64`，构建目录 `fastllm\build-vs-gpu`（CPU 为 `build-vs-cpu`）。
+- 生成器固定 `Visual Studio 17 2022` + `-A x64`，构建目录 `build-vs-gpu`（CPU 为 `build-vs-cpu`）。
 - 只在 `build-vs-gpu\CMakeCache.txt` 不存在时才 configure，想换配置先删掉该文件。
 - 构建目标只有 `fastllm_tools`，配置 `Release`。
 - 并行度默认取 `%NUMBER_OF_PROCESSORS%`，可用环境变量 `FTLLM_BUILD_JOBS` 覆盖。
-- 构建完成后检查 `fastllm\build-vs-gpu\tools\ftllm\fastllm_tools.dll` 是否存在。
+- 构建完成后检查 `build-vs-gpu\tools\ftllm\fastllm_tools.dll` 是否存在。
 
 CUDA 构建的额外产物是 `tools\ftllm\nccl.dll`（CMake 的后置步骤从 `NCCL::nccl` 拷过来），
 缺了它加载 DLL 会报 `找不到指定的模块 (or one of its dependencies)`。
@@ -61,23 +62,23 @@ CUDA 构建的额外产物是 `tools\ftllm\nccl.dll`（CMake 的后置步骤从 
 只编译命令行的 `main` 示例时可以直接用 MSBuild：
 
 ```bat
-cmake --build fastllm\build-vs-gpu --config Release --target main -- /m
+cmake --build build-vs-gpu --config Release --target main -- /m
 ```
 
 ## 第三步：运行
 
 ```bat
 set FTLLM_BUILD=gpu
-run_ftllm.bat server <模型路径> --port 8080 --device cuda
+scripts\windows\run_ftllm.bat server <模型路径> --port 8080 --device cuda
 ```
 
 `FTLLM_BUILD` 决定用哪份产物（`cpu` / `gpu`，默认 `cpu`）。脚本首次运行会：
 
-1. 用 `uv` 在工作区建 `.venv`；
-2. 按 `ftllm_deps.txt` 安装依赖；
-3. 把 `fastllm\build-vs-<后端>\tools` 加进 `PYTHONPATH`，并以 `python -m ftllm.cli` 启动。
+1. 用 `uv` 在仓库根目录建 `.venv`（已加入 `.gitignore`）；
+2. 按 `scripts\windows\ftllm_deps.txt` 安装依赖；
+3. 把 `build-vs-<后端>\tools` 加进 `PYTHONPATH`，并以 `python -m ftllm.cli` 启动。
 
-需要重建 venv 时：`set FTLLM_SETUP=1 && run_ftllm.bat --help`。
+需要重建 venv 时：`set FTLLM_SETUP=1 && scripts\windows\run_ftllm.bat --help`。
 
 其它子命令同样是 `run_ftllm.bat <命令>`：
 
@@ -123,13 +124,14 @@ KV cache 类型用 `--kv_dtype`，且 `--moe_device` 必须与 `--device` 同时
 ## 验证
 
 - 启动日志里应出现 `[fastllm-pinned-staging] slots=16 slot=4 MB total=64 MB`，说明中转环按预期建立。
-- 服务起来后请求 `http://127.0.0.1:8080/v1/chat/completions`，或直接用 `run_ftllm.bat chat <模型路径> --device cuda`。
+- 服务起来后请求 `http://127.0.0.1:8080/v1/chat/completions`，或直接
+  `scripts\windows\run_ftllm.bat chat <模型路径> --device cuda`。
 - 需要跑单测时单独配置一份构建目录：
 
 ```bat
-cmake -S fastllm -B fastllm\build-vs-gpu-test -G "Visual Studio 17 2022" -A x64 -DUSE_CUDA=ON -DUNIT_TEST=ON
-cmake --build fastllm\build-vs-gpu-test --config Release --target nvfp4Block16GemmRegression
-fastllm\build-vs-gpu-test\Release\nvfp4Block16GemmRegression.exe --bench --gb 1
+cmake -S . -B build-vs-gpu-test -G "Visual Studio 17 2022" -A x64 -DUSE_CUDA=ON -DUNIT_TEST=ON
+cmake --build build-vs-gpu-test --config Release --target nvfp4Block16GemmRegression
+build-vs-gpu-test\Release\nvfp4Block16GemmRegression.exe --bench --gb 1
 ```
 
 其中 `--linear` 走 `--moe_device cpu` 的 decode 路径（`RunLinearFloat16NVFP4`），不加它则是
@@ -141,7 +143,7 @@ fastllm\build-vs-gpu-test\Release\nvfp4Block16GemmRegression.exe --bench --gb 1
   attention 走 `fastllm-paged-attention-native.cu` 的原生实现（half / float32 两条路径）。
   因此 Windows 与 Linux 的结果、性能不会完全一致，做精度对比时以 CPU 参考为准。
 - **NCCL 无官方 Windows 构建**：多卡通信依赖第三方移植，遇到加载或通信失败先确认
-  `tools\ftllm\nccl.dll` 的实际版本与 CUDA 运行时是否匹配。
+  `build-vs-gpu\tools\ftllm\nccl.dll` 的实际版本与 CUDA 运行时是否匹配。
 - **nvcc + MSVC 的编译坑**：CUDA 13 的 CCCL 头文件要求 `/Zc:preprocessor`；
   部分泛型 lambda 实例化会让 nvcc 生成的 host stub 触发 cl.exe `C1001`，故补 `/permissive`。
   这两项已在 `CMakeLists.txt` 里处理。

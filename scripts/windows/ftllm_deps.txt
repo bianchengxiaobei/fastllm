@@ -1,0 +1,40 @@
+# 本地构建 fastllm_tools.dll 后运行 `ftllm server` / `ftllm run` / `ftllm webui` 所需的依赖
+# 与 ftllm 的 install_requires 对齐（tools/scripts/setup.py），去掉 Linux 专用与 CUDA 运行时 wheel
+
+# API server（ftllm server）
+fastapi
+pydantic
+uvicorn
+openai
+shortuuid
+httpx>=0.27
+websockets>=12
+jsonschema>=4.18
+
+# 模型加载 / 对话 / tokenizer
+transformers
+jinja2>=3.1.0
+numpy
+Pillow
+tiktoken
+blobfile
+partial_json_parser
+requests
+pyreadline3
+
+# 可选：WebUI 附件处理
+# python-pptx
+# pypdf
+# pandas
+# openpyxl
+# XlsxWriter
+
+# 可选：视频多模态
+# imageio
+# imageio-ffmpeg
+
+# 可选：ModelScope 下载 / Launcher
+# modelscope>=1.34.0,<2
+
+# 可选：`ftllm export` 从 HF 权重转换
+# torch
