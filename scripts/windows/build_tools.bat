@@ -24,9 +24,20 @@ if /I "%BACKEND%"=="gpu" (
             set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
         )
     )
+    rem NCCL 只在首次 configure 时解析：环境变量优先，其次用子模块里 build_nccl.bat 的产物
+    if not defined CMAKE_PREFIX_PATH (
+        if defined NCCL_ROOT (
+            set "CMAKE_PREFIX_PATH=%NCCL_ROOT%"
+        ) else (
+            if exist "%REPO%\third_party\nccl-windows\install\lib\cmake\NCCL\NCCLConfig.cmake" (
+                set "CMAKE_PREFIX_PATH=%REPO%\third_party\nccl-windows\install"
+            )
+        )
+    )
 )
 
 if /I "%BACKEND%"=="gpu" echo [build] CUDA_PATH=%CUDA_PATH%
+if /I "%BACKEND%"=="gpu" echo [build] CMAKE_PREFIX_PATH=%CMAKE_PREFIX_PATH%
 
 if not exist "%BUILD%\CMakeCache.txt" (
     echo [build] configure %BUILD%

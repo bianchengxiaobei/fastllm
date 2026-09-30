@@ -10,6 +10,8 @@ Windows 辅助脚本随仓库一起维护，位于 `scripts\windows\`，命令�
 | 文件 | 用途 |
 | --- | --- |
 | `scripts\windows\build_tools.bat` | 编译 `fastllm_tools.dll`（`cpu` / `gpu` 两个后端） |
+| `scripts\windows\build_nccl.bat` | 编译子模块里的 NCCL for Windows（`build_tools.bat gpu` 的前置依赖） |
+| `scripts\windows\cuda_arch.ps1` | 探测本机 GPU 架构号，供 `build_nccl.bat` 使用 |
 | `scripts\windows\run_ftllm.bat` | 建 venv 并运行 `ftllm`（`server` / `chat` / `webui` ...） |
 | `scripts\windows\ftllm_deps.txt` | `run_ftllm.bat` 安装的运行期 Python 依赖 |
 
@@ -21,23 +23,40 @@ Windows 辅助脚本随仓库一起维护，位于 `scripts\windows\`，命令�
 | --- | --- | --- |
 | Visual Studio 2022 | 17.x | 需要"使用 C++ 的桌面开发"工作负载，x64 工具链 |
 | CUDA Toolkit | 13.4 | 默认路径 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4` |
-| NCCL（Windows 移植） | — | CUDA 构建必需，官方不提供 Windows 版，需自行准备带 CMake 配置包的安装目录 |
+| NCCL（Windows 移植） | 2.29.x | CUDA 构建必需，官方不提供 Windows 版；仓库已把 [SystemPanic/nccl-windows](https://github.com/SystemPanic/nccl-windows) 挂成 `third_party/nccl-windows` 子模块并钉住 commit |
+| Ninja | 1.10+ | 仅编译 NCCL 时需要 |
 | Python | 3.10+ | 仅运行 `ftllm` 时需要 |
 | uv | 最新 | 仅运行 `ftllm` 时需要，用于建 `fastllm\.venv` |
 
 CPU 构建（`build_tools.bat cpu`）只需要 VS2022。
 
-## 第一步：让 CMake 找到 NCCL
+## 第一步：准备 NCCL
 
-`CMakeLists.txt` 在 Windows 上用 `find_package(NCCL CONFIG REQUIRED)` 定位 NCCL，需要提前给出安装目录：
+CUDA 构建要链接 NCCL，官方没有 Windows 版，所以仓库把 Windows 移植挂成了子模块：
 
 ```bat
-set CMAKE_PREFIX_PATH=E:\Learn\nccl-windows\install
+git submodule update --init third_party/nccl-windows
+scripts\windows\build_nccl.bat
 ```
 
-该目录下应有 `lib\cmake\NCCL\`。CMake 会把同名环境变量当作 `CMAKE_PREFIX_PATH` 的初值，
-首次 configure 后路径记在 `build-vs-gpu\CMakeCache.txt` 的 `NCCL_DIR`，后续构建不必再设。
-若 configure 报找不到 NCCL，就是这一步漏了或路径写错。
+`build_nccl.bat` 会自动探测 GPU 架构（`cuda_arch.ps1` 读 `nvidia-smi`，取不到时交给 CMake 的 `native`）、
+`call vcvarsall.bat x64` 进入 MSVC 环境，再以 Ninja 构建并安装到 `third_party\nccl-windows\install`。
+产物 100MB 量级，首次约十几分钟。
+
+可覆盖项：
+
+| 变量 | 说明 |
+| --- | --- |
+| `NCCL_CUDA_ARCHS` | 目标架构号，如 `75`、`86;120`；默认按本机 GPU 探测 |
+| `NCCL_JOBS` | 并行编译任务数，默认取 `%NUMBER_OF_PROCESSORS%` |
+| `NCCL_VCVARS` | `vcvarsall.bat` 的绝对路径，默认由 `vswhere` 查找 |
+
+之后 `build_tools.bat gpu` 会自动把 `third_party\nccl-windows\install` 当作 `CMAKE_PREFIX_PATH`
+（`CMakeLists.txt` 里是 `find_package(NCCL CONFIG REQUIRED)`）。要改用别的 NCCL，
+先 `set NCCL_ROOT=<install 目录>` 或直接 `set CMAKE_PREFIX_PATH=<install 目录>`。
+
+该路径只在首次 configure 时解析，结果记在 `build-vs-gpu\CMakeCache.txt` 的 `NCCL_DIR`；
+换了 NCCL 位置要删掉 `CMakeCache.txt` 重新 configure。configure 报找不到 NCCL，就是这一步没做。
 
 `build_tools.bat` 在 `CUDA_PATH` 未设置时会尝试使用 `...\CUDA\v13.4`；装在别处时先自己 `set CUDA_PATH=...`。
 
