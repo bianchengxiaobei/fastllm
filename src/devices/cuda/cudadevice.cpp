@@ -18,6 +18,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm
 #include "utils.h"
 #include "json11.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
@@ -49,6 +50,12 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm
 bool FastllmCudaDeepGemmLinearFp8Sm90(const fastllm::Data &input, fastllm::Data &weight,
     const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 #endif
+
+// 定义在 fastllm-cuda.cu: 走固定内存中转的 H2D 上传(不可用时返回 false), 以及
+// 槽位等待计时. 故意放在全局作用域, 与 fastllm-cuda.cu 的定义一致.
+bool FastllmCudaUploadHostToDevicePinnedStaged(
+    void *dst, const void *src, size_t size, void *stream);
+double FastllmCudaPinnedStagedSlotWaitSeconds();
 
 namespace fastllm {
     // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
@@ -6290,8 +6297,10 @@ namespace fastllm {
 #ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
                     !TryCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k) &&
 #endif
+#if !defined(_WIN32) && !defined(USE_ROCM)
                     !TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
                     !TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
+#endif
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
                     TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
                     FastllmCudaHalfMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
@@ -6369,8 +6378,10 @@ namespace fastllm {
 #ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
                     !TryCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k) &&
 #endif
+#if !defined(_WIN32) && !defined(USE_ROCM)
                     !TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
                     !TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
+#endif
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
                     TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
                     FastllmCudaBFloat16MatMulFP8E4M3(input, weight, bias, output, n, m, k);
@@ -9116,30 +9127,121 @@ namespace fastllm {
 
         // Temporary uploads preserve host storage; disk-cache residents have
         // none and must keep their device allocation after this invocation.
-        auto uploadWeight = [](Data *weight, void *stream = nullptr) {
-            if (weight->cpuData || !weight->numasData.empty()) weight->ToCudaTemporary({}, true, stream);
+        // 专家权重在可换页内存里, 直拷会把 PCIe 拷贝和计算串起来; 默认改走固定
+        // 内存中转, 让预取真正和当前专家的计算重叠. FASTLLM_MOE_PINNED_UPLOAD=0 关闭.
+        const char *pinnedUploadEnv = std::getenv("FASTLLM_MOE_PINNED_UPLOAD");
+        const bool pinnedUpload = pinnedUploadEnv == nullptr ||
+                                  pinnedUploadEnv[0] == '\0' ||
+                                  pinnedUploadEnv[0] != '0';
+        // FASTLLM_PROFILE_MOE_STREAM=1: 打印专家流式循环的耗时构成, 用来分辨瓶颈在
+        // 主机侧(每个专家的入队/中转开销)还是在设备侧(PCIe DMA 跟不上).
+        static const bool profileMoeStream = []() {
+            const char *env = std::getenv("FASTLLM_PROFILE_MOE_STREAM");
+            return env != nullptr && env[0] != '\0' && env[0] != '0';
+        }();
+        double profileUpload = 0.0, profileCompute = 0.0, profileRelease = 0.0;
+        double profileUploadBytes = 0.0;
+        int profileUploads = 0;
+        auto profileNow = []() {
+            return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-9;
         };
-        auto releaseWeight = [](Data *weight) {
-            if (weight->cpuData || !weight->numasData.empty()) weight->FreeCudaTemporary({}, false);
+        auto doUploadWeight = [pinnedUpload](Data *weight, void *stream) {
+            if (!(weight->cpuData || !weight->numasData.empty())) {
+                return;
+            }
+            if (pinnedUpload && weight->cpuData != nullptr) {
+                if (weight->cudaData == nullptr) {
+                    weight->ToCudaTemporary({}, false);
+                }
+                if (FastllmCudaUploadHostToDevicePinnedStaged(
+                        weight->cudaData, weight->cpuData,
+                        weight->GetBytes(), stream)) {
+                    return;
+                }
+            }
+            weight->ToCudaTemporary({}, true, stream);
+        };
+        auto uploadWeight = [&](Data *weight, void *stream = nullptr) {
+            if (!profileMoeStream) {
+                doUploadWeight(weight, stream);
+                return;
+            }
+            double start = profileNow();
+            doUploadWeight(weight, stream);
+            profileUpload += profileNow() - start;
+            profileUploadBytes += (double)weight->GetBytes();
+            profileUploads++;
+        };
+        // 延迟释放: 池里对 reusePending 的块用 cudaEventQuery 挡住复用, 复用要等
+        // 该块记录过事件的计算流排空. 于是主机不必替回收显存等事件, 预取的 DMA
+        // 也不用排在计算后面, 拷贝可以一直往中转环里灌.
+        auto doReleaseWeight = [pinnedUpload](Data *weight) {
+            if (!(weight->cpuData || !weight->numasData.empty())) {
+                return;
+            }
+            if (pinnedUpload && weight->isModelWeight &&
+                !weight->cudaDataBorrowed && weight->cudaData != nullptr) {
+                FastllmCudaFreeAfterCurrentThreadStream(weight->cudaData);
+                weight->dataDevice = DataDevice::CPU;
+                weight->cudaData = nullptr;
+                weight->cudaDataBorrowed = false;
+                return;
+            }
+            weight->FreeCudaTemporary({}, false);
+        };
+        auto releaseWeight = [&](Data *weight) {
+            if (!profileMoeStream) {
+                doReleaseWeight(weight);
+                return;
+            }
+            double start = profileNow();
+            doReleaseWeight(weight);
+            profileRelease += profileNow() - start;
         };
         void *copyStream = FastllmCudaStreamCreate(true);
         void *computeDoneEvent = FastllmCudaEventCreate();
+        void *prefetchDoneEvent = FastllmCudaEventCreate();
+        // 固定内存中转之后拷贝才是真异步, 此时改成事件排序: 计算流按事件等"当前
+        // 专家"的拷贝, 主机不再阻塞等每个专家的拷贝, 拷贝就能和上一个专家的计算
+        // 重叠. 设 FASTLLM_MOE_ASYNC_PREFETCH=1 也能单独打开这个排序.
+        const char *asyncPrefetchEnv = std::getenv("FASTLLM_MOE_ASYNC_PREFETCH");
+        const bool asyncPrefetch = asyncPrefetchEnv != nullptr &&
+                                   asyncPrefetchEnv[0] != '\0' && asyncPrefetchEnv[0] != '0';
+        const bool eventOrderedPrefetch = pinnedUpload || asyncPrefetch;
+        bool prefetchPending = false;
         int curExpert = findNextValidExpert(-1);
-
         if (curExpert >= 0) {
             uploadWeight(weights[curExpert * 2]);
             uploadWeight(weights[curExpert * 2 + 1]);
         }
 
         int prevExpert = -1;
+        const double loopStart = profileMoeStream ? profileNow() : 0.0;
+        const double slotWaitBefore = profileMoeStream ?
+            FastllmCudaPinnedStagedSlotWaitSeconds() : 0.0;
+        int loopExperts = 0;
         while (curExpert >= 0) {
+            loopExperts++;
+            // 等待要放在本轮预取之前: 完成事件会被下一次记录覆盖, 放后面就变成等
+            // "下一份"拷贝, 计算和拷贝又串起来了.
+            if (eventOrderedPrefetch && prefetchPending) {
+                FastllmCudaCurrentThreadStreamWaitEvent(prefetchDoneEvent);
+                prefetchPending = false;
+            }
+
             int nextExpert = findNextValidExpert(curExpert);
 
             if (nextExpert >= 0) {
                 uploadWeight(weights[nextExpert * 2], copyStream);
                 uploadWeight(weights[nextExpert * 2 + 1], copyStream);
+                if (eventOrderedPrefetch) {
+                    FastllmCudaEventRecord(prefetchDoneEvent, copyStream);
+                    prefetchPending = true;
+                }
             }
 
+            const double computeStart = profileMoeStream ? profileNow() : 0.0;
             int i = curExpert;
             tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
             FastllmCudaPickInput (
@@ -9236,10 +9338,19 @@ namespace fastllm {
                 );
             }
 
+            if (profileMoeStream) {
+                profileCompute += profileNow() - computeStart;
+            }
             FastllmCudaEventRecord(computeDoneEvent);
-            FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
+            // 非中转路径保留旧的保守排序: 副本流排在本次计算之后, 预取的下一份权重
+            // 不会早于本次计算落地. 中转路径上面已经改成延迟释放, 池会用事件挡住
+            // 复用, 所以副本流不必再等计算 —— DMA 不等计算, 主机才不会被槽位事件
+            // 反压(那正是 slotWait 的来源).
+            if (!pinnedUpload) {
+                FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
+            }
 
-            if (nextExpert >= 0) {
+            if (nextExpert >= 0 && !eventOrderedPrefetch) {
                 FastllmCudaStreamSynchronize(copyStream);
             }
 
@@ -9257,11 +9368,30 @@ namespace fastllm {
             releaseWeight(weights[prevExpert * 2]);
             releaseWeight(weights[prevExpert * 2 + 1]);
         }
+        if (profileMoeStream) {
+            static std::atomic<int> profilePrintCounter(0);
+            const double loopSeconds = profileNow() - loopStart;
+            if ((profilePrintCounter.fetch_add(1) % 8) == 0) {
+                const double slotWait = FastllmCudaPinnedStagedSlotWaitSeconds() -
+                                        slotWaitBefore;
+                const double other = loopSeconds - profileUpload - profileCompute -
+                                     profileRelease - slotWait;
+                printf("[fastllm-moe-stream] call=%d experts=%d upload=%.4f s (%d calls, "
+                       "%.2f GB, %.2f GB/s) computeEnqueue=%.4f s release=%.4f s "
+                       "slotWait=%.4f s other=%.4f s loop=%.4f s\n",
+                       profilePrintCounter.load() - 1, loopExperts, profileUpload,
+                       profileUploads, profileUploadBytes / 1e9,
+                       loopSeconds > 0.0 ? profileUploadBytes / loopSeconds / 1e9 : 0.0,
+                       profileCompute, profileRelease, slotWait, other, loopSeconds);
+                fflush(stdout);
+            }
+        }
         if (accurateFp8Moe || deepSeekV41Mode) {
             FastllmFloatToBF16(
                 floatOutput.cudaData, output.cudaData,
                 output.Count(0));
         }
+        FastllmCudaEventDestroy(prefetchDoneEvent);
         FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);
 

@@ -1744,7 +1744,15 @@ struct FastllmCudaMoeExpertParallelStats {
     uint64_t steps = 0, cpuRoutes = 0, multiGpuSteps = 0;
     std::vector<uint64_t> gpuRoutes, admissions;
 };
+#ifdef _MSC_VER
+// MSVC rejects C-linkage functions returning C++ class types (C2526), so the
+// factory uses C++ linkage there. GCC/Clang keep the existing C linkage.
+}
+#endif
 std::shared_ptr<FastllmCudaMoeExpertParallel> FastllmCudaCreateMoeExpertParallel(int ranks);
+#ifdef _MSC_VER
+extern "C" {
+#endif
 // Read only between calls, after all ranks have finished expert dispatch.
 FastllmCudaMoeExpertParallelStats FastllmCudaGetMoeExpertParallelStats(
         const FastllmCudaMoeExpertParallel &state);

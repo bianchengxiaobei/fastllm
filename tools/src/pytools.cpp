@@ -93,6 +93,10 @@ extern "C" {
         fastllm::SetCudaGraph(cuda_graph);
     }
 
+    DLL_EXPORT void set_moe_pinned_staging(int slots, int slot_mb) {
+        fastllm::SetMoePinnedStaging(slots, slot_mb);
+    }
+
     DLL_EXPORT void set_cuda_slab(int mb) {
         fastllm::SetCudaSlabMB(mb);
     }

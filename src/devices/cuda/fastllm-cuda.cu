@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cfloat>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -6025,6 +6026,122 @@ void FastllmCudaCopyFromHostToDeviceAsync(void *dst, void *src, size_t size, voi
 void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t size, void *stream) {
     cudaError_t state = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, (cudaStream_t)stream);
     checkCudaErrors("Error: CUDA error when async copy from pinned memory to GPU!", state);
+}
+
+// 仅为性能归因: 固定内存中转槽位等待(DMA 没跟上, 环被写满)的累计秒数.
+static std::atomic<double> gPinnedStagedSlotWaitSeconds(0.0);
+
+double FastllmCudaPinnedStagedSlotWaitSeconds() {
+    return gPinnedStagedSlotWaitSeconds.load(std::memory_order_relaxed);
+}
+
+// 中转环配置. 这是不可换出的主机内存(懒分配), 总量 = 槽数 × 单槽宽.
+// 参数入口: --moe_pinned_slots / --moe_pinned_slot_mb (见 fastllm::SetMoePinnedStaging).
+// 环要够深: 主机必须能跑到 DMA 前面, 才不会被槽位事件反压(反压就是 DMA 等计算).
+struct PinnedStagingConfig {
+    int slotCount = 16;
+    size_t slotBytes = 4ULL * 1024 * 1024;
+};
+
+static PinnedStagingConfig GetPinnedStagingConfig() {
+    const fastllm::FastllmEnv &env = fastllm::GetFastllmEnv();
+    int slotMb = env.moePinnedStagingSlotMb;
+    int slots = env.moePinnedStagingSlots;
+    slotMb = slotMb < 1 ? 1 : (slotMb > 1024 ? 1024 : slotMb);
+    slots = slots < 2 ? 2 : (slots > 256 ? 256 : slots);
+    // 总量上限 256MB, 超了就减槽数, 避免在别人机器上悄悄钉住一大块内存.
+    const long long capBytes = 256LL * 1024 * 1024;
+    while (slots > 2 && (long long)slotMb * 1024LL * 1024LL * slots > capBytes) {
+        slots = slots / 2 < 2 ? 2 : slots / 2;
+    }
+    PinnedStagingConfig config;
+    config.slotCount = slots;
+    config.slotBytes = (size_t)slotMb * 1024 * 1024;
+    printf("[fastllm-pinned-staging] slots=%d slot=%d MB total=%d MB\n",
+           config.slotCount, slotMb,
+           (int)(config.slotBytes * (size_t)config.slotCount / 1024 / 1024));
+    fflush(stdout);
+    return config;
+}
+
+// 可换页内存上的 cudaMemcpyAsync 对主机是同步的: 必须等整块数据都被读走才返回,
+// 后面的 CPU 也就没法先把 kernel 排下去, PCIe 拷贝和 GPU 计算于是串起来跑.
+// 这里用一小圈固定内存做中转: 先把数据 memcpy 进固定内存(纯主机带宽), 再异步
+// 下发到设备, 拷贝就能和计算重叠. 每个槽位复用前等自己的拷贝事件, 所以调用方
+// 只需要保证在用完设备缓冲之后再释放显存即可.
+// 单块超过一个槽宽就沿行切片: 每片一片槽, 按序发在同一个副本流上, 顺序不变,
+// 所以任何大小的权重块都能走中转. 环装不下时返回 false(调用方回退直拷).
+bool FastllmCudaUploadHostToDevicePinnedStaged(
+        void *dst, const void *src, size_t size, void *stream) {
+    if (dst == nullptr || src == nullptr || stream == nullptr || size == 0) {
+        return false;
+    }
+    static PinnedStagingConfig config = GetPinnedStagingConfig();
+    static std::vector<uint8_t*> slots;
+    static std::vector<cudaEvent_t> slotCopied;
+    static std::vector<char> slotUsed;
+    static size_t nextSlot = 0;
+    static bool unusable = false;
+    static std::mutex lock;
+    std::lock_guard<std::mutex> guard(lock);
+    if (unusable) {
+        return false;
+    }
+    const size_t chunks = (size + config.slotBytes - 1) / config.slotBytes;
+    if (chunks > (size_t)config.slotCount) {
+        return false;
+    }
+    if (slots.empty()) {
+        slots.assign(config.slotCount, nullptr);
+        slotCopied.assign(config.slotCount, nullptr);
+        slotUsed.assign(config.slotCount, false);
+        for (int i = 0; i < config.slotCount; i++) {
+            cudaError_t state = cudaHostAlloc(
+                (void**)&slots[i], config.slotBytes, cudaHostAllocDefault);
+            if (state == cudaSuccess) {
+                state = cudaEventCreateWithFlags(
+                    &slotCopied[i], cudaEventDisableTiming);
+            }
+            if (state != cudaSuccess) {
+                for (int j = 0; j < i; j++) {
+                    cudaEventDestroy(slotCopied[j]);
+                    cudaFreeHost(slots[j]);
+                }
+                slots.clear();
+                slotCopied.clear();
+                slotUsed.clear();
+                unusable = true;
+                return false;
+            }
+        }
+    }
+    for (size_t chunk = 0; chunk < chunks; chunk++) {
+        const size_t offset = chunk * config.slotBytes;
+        const size_t bytes = std::min(config.slotBytes, size - offset);
+        const size_t slot = nextSlot;
+        nextSlot = (nextSlot + 1) % (size_t)config.slotCount;
+        if (slotUsed[slot]) {
+            // 这里阻塞说明 DMA 没跟上(环被写满), 是判断"拷贝是否是瓶颈"的直接证据.
+            auto waitStart = std::chrono::steady_clock::now();
+            cudaEventSynchronize(slotCopied[slot]);
+            gPinnedStagedSlotWaitSeconds.fetch_add(
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - waitStart).count(),
+                std::memory_order_relaxed);
+        }
+        memcpy(slots[slot], (const uint8_t*)src + offset, bytes);
+        cudaError_t state = cudaMemcpyAsync(
+            (uint8_t*)dst + offset, slots[slot], bytes,
+            cudaMemcpyHostToDevice, (cudaStream_t)stream);
+        if (state != cudaSuccess) {
+            return false;
+        }
+        if (cudaEventRecord(slotCopied[slot], (cudaStream_t)stream) != cudaSuccess) {
+            return false;
+        }
+        slotUsed[slot] = true;
+    }
+    return true;
 }
 
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {

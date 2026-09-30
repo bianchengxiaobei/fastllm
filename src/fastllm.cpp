@@ -26,6 +26,10 @@
 #include <atomic>
 #include <queue>
 
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #ifdef USE_MMAP
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -338,7 +342,38 @@ namespace fastllm {
         {DataType::NVFP4, 4}
     };
 
+    // 中间张量缓存池：让 glibc arena 复用 4MB~64MB 级别的 transient 块。
+    //
+    // prefill 里 in_proj 的 q/k/v/beta、GDN 的 attn 等中间张量都在 16~33MB
+    // 量级，而且每层都新建 Data 再销毁。glibc 对超过 mmap_threshold 的块
+    // 直接走 mmap：new 时重建一整套页表，delete 时 munmap 并对全机 TLB 发
+    // IPI。实测 44 核 / 88 线程的机器上单次 33MB 的 Allocate 要 46ms，而
+    // 同量数据的 mul 只要 2.4ms —— 分配比计算慢 19 倍。
+    //
+    // 抬高 mmap / trim 阈值后这些块留在 arena 的 free list 里，下一次同尺寸
+    // 申请直接复用已 fault 的页，不再有系统调用和 TLB shootdown。这层缓存
+    // 不登记指针所有权，所以代码里散落在各设备里的 `new uint8_t[]` /
+    // `delete[]` 对全部自动受益，也不存在跨线程释放的归属问题。
+    //
+    // 需要在任何大块分配之前生效，因此放在 FastllmEnv 的静态初始化里。
+    // 权重加载阶段仍由各处显式的 malloc_trim(0) 归还未使用的页。
+    // FASTLLM_MMAP_THRESHOLD_MB=0 可关闭该调整。
+    static void TuneGlibcAllocatorForTransientTensors() {
+#if defined(__linux__) && defined(__GLIBC__)
+        const char *env = std::getenv("FASTLLM_MMAP_THRESHOLD_MB");
+        long long mb = env != nullptr ? std::atoll(env) : 1024;
+        if (mb <= 0) {
+            return;
+        }
+        int threshold = (int)std::min<long long>(mb * 1024 * 1024, INT_MAX);
+        mallopt(M_MMAP_THRESHOLD, threshold);
+        mallopt(M_TRIM_THRESHOLD, threshold);
+#endif
+    }
+
     FastllmEnv::FastllmEnv() {
+        TuneGlibcAllocatorForTransientTensors();
+
         const char *activateNumaEnv = std::getenv("FASTLLM_ACTIVATE_NUMA");
         std::string activateNumaValue = activateNumaEnv ? activateNumaEnv : "";
         this->activateNuma = !activateNumaValue.empty() && activateNumaValue != "OFF";
@@ -378,14 +413,89 @@ namespace fastllm {
         if (useFusedGdnPrefillEnv != nullptr && std::strcmp(useFusedGdnPrefillEnv, "0") == 0) {
             this->useFusedGdnPrefill = false;
         }
+
+        // 中转环的默认值也可以从环境变量给; 命令行参数(--moe_pinned_slots /
+        // --moe_pinned_slot_mb)会通过 SetMoePinnedStaging 覆盖.
+        const char *moePinnedSlotsEnv = std::getenv("FASTLLM_MOE_PINNED_SLOTS");
+        if (moePinnedSlotsEnv != nullptr) {
+            int value = atoi(moePinnedSlotsEnv);
+            if (value > 0) {
+                this->moePinnedStagingSlots = value;
+            }
+        }
+
+        const char *moePinnedSlotMbEnv = std::getenv("FASTLLM_MOE_PINNED_SLOT_MB");
+        if (moePinnedSlotMbEnv != nullptr) {
+            int value = atoi(moePinnedSlotMbEnv);
+            if (value > 0) {
+                this->moePinnedStagingSlotMb = value;
+            }
+        }
     }
 
     const FastllmEnv &GetFastllmEnv() {
         return fastllmEnv;
     }
 
+    // CPU 侧分配/释放探针，由 FASTLLM_PRINT_PROFILE 打开。
+    //
+    // MallocSpace 里的 new uint8_t[] 只负责向内核要地址空间，页是在之后
+    // 第一次写入时才 fault 的，所以这里量到的是「分配系统调用」本身的
+    // 代价（mmap/munmap/brk），和算子内部的计算/访存时间可以分开看。
+    // 用 exchange(0) 读，每次打印给出的是上一个窗口的增量。
+    static const bool profileCpuAlloc =
+        std::getenv("FASTLLM_PRINT_PROFILE") != nullptr;
+    static std::atomic<long long> cpuAllocNanos{0};
+    static std::atomic<long long> cpuFreeNanos{0};
+    static std::atomic<long long> cpuAllocBytes{0};
+    static std::atomic<long long> cpuAllocCalls{0};
+
+    static inline long long ElapsedNanos(std::chrono::steady_clock::time_point st) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - st).count();
+    }
+
+    void ClearCpuAllocProfile() {
+        cpuAllocNanos.store(0);
+        cpuFreeNanos.store(0);
+        cpuAllocBytes.store(0);
+        cpuAllocCalls.store(0);
+    }
+
+    void PrintCpuAllocProfile(const char *tag) {
+        const long long allocNanos = cpuAllocNanos.exchange(0);
+        const long long freeNanos = cpuFreeNanos.exchange(0);
+        const long long bytes = cpuAllocBytes.exchange(0);
+        const long long calls = cpuAllocCalls.exchange(0);
+        if (calls == 0) {
+            return;
+        }
+        double allocSeconds = allocNanos / 1.0e9;
+        double freeSeconds = freeNanos / 1.0e9;
+        printf("[fastllm-cpu-alloc]%s calls=%lld bytes=%.1f MiB "
+               "alloc=%.4f s (%.1f us/call) free=%.4f s total=%.4f s\n",
+               tag == nullptr ? "" : tag, calls,
+               bytes / 1024.0 / 1024.0, allocSeconds,
+               allocNanos / 1.0e3 / calls, freeSeconds,
+               allocSeconds + freeSeconds);
+        fflush(stdout);
+    }
+
     void SetCudaGraph(bool v) {
         fastllmEnv.cudaGraph = v;
+    }
+
+    // 专家权重流式的中转环: 槽数越多, 主机越能跑到 DMA 前面(不容易被槽位事件反压);
+    // 单槽宽越大, 单个权重块需要切的片越少. 总量是不可换出的主机内存, 夹在 256MB 内.
+    void SetMoePinnedStaging(int slots, int slotMb) {
+        int clampedSlots = slots < 2 ? 2 : (slots > 256 ? 256 : slots);
+        int clampedSlotMb = slotMb < 1 ? 1 : (slotMb > 1024 ? 1024 : slotMb);
+        while (clampedSlots > 2 &&
+               (long long)clampedSlotMb * 1024LL * 1024LL * clampedSlots > 256LL * 1024LL * 1024LL) {
+            clampedSlots = clampedSlots / 2 < 2 ? 2 : clampedSlots / 2;
+        }
+        fastllmEnv.moePinnedStagingSlots = clampedSlots;
+        fastllmEnv.moePinnedStagingSlotMb = clampedSlotMb;
     }
 
     void PrintInstructionInfo() {
@@ -2198,7 +2308,14 @@ namespace fastllm {
                 (size * this->unitSize - 1) / this->unitSizeDiv + 1;
         }
         if (this->dataDevice == DataDevice::CPU) {
+            auto allocSt = profileCpuAlloc ? std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             this->cpuData = new uint8_t[this->expansionBytes];
+            if (profileCpuAlloc) {
+                cpuAllocNanos.fetch_add(ElapsedNanos(allocSt));
+                cpuAllocBytes.fetch_add((long long)this->expansionBytes);
+                cpuAllocCalls.fetch_add(1);
+            }
             if (zero) {
                 memset(this->cpuData, 0, this->expansionBytes*sizeof(uint8_t));
             }
@@ -2240,12 +2357,21 @@ namespace fastllm {
         this->expansionSize = 0;
         this->expansionBytes = 0;
         if (this->cpuData != nullptr) {
+            // mapFile != nullptr 时 cpuData 指向 mmap 出来的权重区，由
+            // mapFile 持有，这里不释放（也不计入分配探针）。
 #ifdef USE_MMAP
-            if (this->mapFile == nullptr)
-                delete[] this->cpuData;
+            const bool ownsCpuData = this->mapFile == nullptr;
 #else
-            delete[] this->cpuData;
+            const bool ownsCpuData = true;
 #endif
+            if (ownsCpuData) {
+                auto freeSt = profileCpuAlloc ? std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
+                delete[] this->cpuData;
+                if (profileCpuAlloc) {
+                    cpuFreeNanos.fetch_add(ElapsedNanos(freeSt));
+                }
+            }
             this->cpuData = nullptr;
         }
 #ifdef USE_CUDA

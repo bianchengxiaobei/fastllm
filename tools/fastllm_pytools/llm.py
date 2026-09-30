@@ -222,7 +222,10 @@ def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
     return diagnostics
 
 if platform.system() == 'Windows':
-    fastllm_lib = ctypes.CDLL(os.path.join(os.path.split(os.path.realpath(__file__))[0], "fastllm_tools.dll"), winmode=0)
+    # winmode=0走默认搜索序(应用目录/系统目录/PATH)，不含dll自己所在目录，
+    # 构建目录里旁置的依赖(如nccl.dll)就会报 "(or one of its dependencies)"；
+    # 0x8是LOAD_WITH_ALTERED_SEARCH_PATH，把该dll所在目录也纳入依赖搜索。
+    fastllm_lib = ctypes.CDLL(os.path.join(os.path.split(os.path.realpath(__file__))[0], "fastllm_tools.dll"), winmode=0x8)
 elif platform.system() == 'Darwin':
     fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], "libfastllm_tools.dylib"))
 else:
@@ -344,6 +347,10 @@ fastllm_lib.disable_cuda_malloc.argtypes = []
 if hasattr(fastllm_lib, "set_cuda_graph"):
     fastllm_lib.set_cuda_graph.argtypes = [ctypes.c_bool]
     fastllm_lib.set_cuda_graph.restype = None
+
+if hasattr(fastllm_lib, "set_moe_pinned_staging"):
+    fastllm_lib.set_moe_pinned_staging.argtypes = [ctypes.c_int, ctypes.c_int]
+    fastllm_lib.set_moe_pinned_staging.restype = None
 
 fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 
@@ -615,6 +622,13 @@ def set_cuda_graph(cuda_graph):
     if native_setter is None:
         return False
     native_setter(ctypes.c_bool(cuda_graph))
+    return True
+
+def set_moe_pinned_staging(slots, slot_mb):
+    native_setter = getattr(fastllm_lib, "set_moe_pinned_staging", None)
+    if native_setter is None:
+        return False
+    native_setter(ctypes.c_int(int(slots)), ctypes.c_int(int(slot_mb)))
     return True
 
 def set_cuda_slab(mb: int):

@@ -846,6 +846,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
+    parser.add_argument('--moe_pinned_slots', type = int, default = -1,
+                        help = 'MoE专家权重流式的固定内存中转槽数（越大主机越能跑到DMA前面；0表示用默认16）')
+    parser.add_argument('--moe_pinned_slot_mb', type = int, default = -1,
+                        help = 'MoE专家权重流式的中转单槽宽(MB)；超过槽宽的权重块会自动分片（0表示用默认4）')
     parser.add_argument('--fast_prefill', '--fast-prefill', action = 'store_true',
                         help = '启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；默认关闭')
     parser.add_argument('--device', type = str, help = '使用的设备')
@@ -1767,6 +1771,11 @@ def make_normal_llm_model(args, startup_progress = None):
             model.set_kv_cache_limit(args.kv_cache_limit)
         if (args.chunked_prefill_size > 0):
             model.set_chunked_prefill_size(args.chunked_prefill_size)
+        if (args.moe_pinned_slots > 0 or args.moe_pinned_slot_mb > 0):
+            slots = args.moe_pinned_slots if args.moe_pinned_slots > 0 else 16
+            slot_mb = args.moe_pinned_slot_mb if args.moe_pinned_slot_mb > 0 else 4
+            if hasattr(llm, "set_moe_pinned_staging"):
+                llm.set_moe_pinned_staging(slots, slot_mb)
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()

@@ -10,6 +10,7 @@
 //   ./nvfp4Block16GemmRegression --bench         correctness + bandwidth
 //   ./nvfp4Block16GemmRegression --bench --threads 8 --gb 4
 //   ./nvfp4Block16GemmRegression --bench --layout compact
+//   ./nvfp4Block16GemmRegression --bench --linear   the --moe_device cpu decode path
 #include "fastllm.h"
 #include "devices/cpu/computeutils.h"
 #include "utils.h"
@@ -21,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <thread>
@@ -374,15 +376,90 @@ static void Bench(const BenchShape &shape, int threads, double gigabytes, bool c
            bytes / 1e9 / best, bytes / 1e9 / best / threads);
 }
 
+// The decode path with `--moe_device cpu` does *not* go through FastllmGemm:
+// the expert projections are dispatched as the Linear op, i.e.
+// RunLinearFloat16NVFP4 -> MultiThreadLinearBFloat16NVFP4Op.  Same weight bytes,
+// different kernel, so measure both to compare machines honestly.
+static void BenchLinear(const BenchShape &shape, int threads, double gigabytes) {
+    constexpr int blockK = 16, blockM = 16;
+    const size_t weightBytes = GetNVFP4WeightBytes(shape.k, shape.m);
+    const size_t scaleBytes = GetNVFP4ScaleBytes(shape.k, shape.m, blockK, blockM);
+    const size_t expertBytes = weightBytes + scaleBytes;
+    const int experts = std::max(1, (int)(gigabytes * 1e9 / expertBytes));
+
+    std::vector<std::unique_ptr<Data> > weights(experts);
+    for (int e = 0; e < experts; e++) {
+        std::unique_ptr<Data> weight(new Data(DataType::NVFP4, {shape.k, shape.m}));
+        weight->blockK = blockK;
+        weight->blockM = blockM;
+        weight->Allocate(false);
+        for (size_t i = 0; i < weightBytes; i++) {
+            const uint8_t low = (uint8_t)((i * 5 + e) & 0xf);
+            const uint8_t high = (uint8_t)((i * 11 + e * 3 + 1) & 0xf);
+            weight->cpuData[i] = low | (high << 4);
+        }
+        uint8_t *scales = GetNVFP4ScaleData(*weight);
+        if (scales == nullptr || weightBytes == 0) {
+            printf("inline  linear  NVFP4 scale storage unavailable, skipping\n");
+            return;
+        }
+        for (size_t i = 0; i < scaleBytes; i++) {
+            scales[i] = (uint8_t)(119 + ((i + e) % 7));
+        }
+        weights[e] = std::move(weight);
+    }
+
+    // RunLinearFloat16NVFP4 takes FLOAT16 activations; 0x3c00 is exactly 1.0f,
+    // so no conversion helper is needed for a pure bandwidth measurement.
+    std::vector<std::vector<uint16_t> > inputs(threads,
+        std::vector<uint16_t>((size_t)shape.rows * shape.m, 0x3c00));
+    std::vector<std::vector<uint16_t> > outputs(threads,
+        std::vector<uint16_t>((size_t)shape.rows * shape.k, 0));
+    SetThreads(threads);
+
+    // Same shape as the Gemm bench: one task owns one whole expert, workers
+    // stream the expert pile, and the single-thread split matches CpuMergeMOE.
+    double best = 0.0;
+    for (int pass = 0; pass < 5; pass++) {
+        std::atomic<int> next(0);
+        auto start = std::chrono::steady_clock::now();
+        std::vector<std::thread> pool;
+        for (int t = 0; t < threads; t++) {
+            pool.emplace_back([&, t]() {
+                while (true) {
+                    const int e = next.fetch_add(1, std::memory_order_relaxed);
+                    if (e >= experts) break;
+                    RunLinearFloat16NVFP4(inputs[t].data(), *weights[e],
+                        outputs[t].data(), nullptr, shape.rows, shape.m, shape.k,
+                        GetAlivePool(), t, 1);
+                }
+            });
+        }
+        for (auto &th : pool) th.join();
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (pass > 0) {
+            best = best == 0.0 ? seconds : std::min(best, seconds);
+        }
+    }
+    const double bytes = (double)expertBytes * experts;
+    printf("%-6s %-7s threads=%2d n=%d m=%4d k=%5d experts=%4d bytes=%6.2f GB  "
+           "%8.1f ms  %6.1f GB/s  %6.2f GB/s/core\n",
+           shape.name, "linear", threads, shape.rows,
+           shape.m, shape.k, experts, bytes / 1e9, best * 1000.0,
+           bytes / 1e9 / best, bytes / 1e9 / best / threads);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool bench = false;
     double gigabytes = 4.0;
     std::vector<int> threadList;
-    bool compactOnly = false, inlineOnly = false;
+    bool compactOnly = false, inlineOnly = false, linearBench = false;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--bench") bench = true;
+        else if (arg == "--linear") linearBench = true;
         else if (arg == "--gb" && i + 1 < argc) gigabytes = atof(argv[++i]);
         else if (arg == "--threads" && i + 1 < argc) threadList.push_back(atoi(argv[++i]));
         else if (arg == "--layout" && i + 1 < argc) {
@@ -413,6 +490,7 @@ int main(int argc, char **argv) {
         };
         for (int t : threadList) {
             for (const auto &shape : shapes) {
+                if (linearBench) BenchLinear(shape, t, gigabytes);
                 if (!compactOnly) Bench(shape, t, gigabytes, false);
                 if (!inlineOnly) Bench(shape, t, gigabytes, true);
             }

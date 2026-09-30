@@ -2,6 +2,10 @@
 // Created by huangyuyang on 8/2/24.
 //
 
+#ifdef _MSC_VER
+#define strcasecmp _stricmp
+#endif
+
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"

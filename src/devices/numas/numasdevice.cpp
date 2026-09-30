@@ -2125,7 +2125,7 @@ namespace fastllm {
         float *gateUp = nullptr, *swiglu = nullptr, *downOutput = nullptr;
         DataType inputType = FLOAT32, downType = FLOAT32;
         int inputDim = 0, interDim = 0, outputDim = 0, numaCnt = 0;
-        int gateUnitRows = 4;
+        int gateUnitRows = 4, downUnitRows = 4;
         size_t downRowBytes = 0;
         bool gate = true, fuseConvert = false;
     };
@@ -2139,7 +2139,7 @@ namespace fastllm {
             const int columns = c.gate ? c.interDim * 2 : c.outputDim;
             const int perNode = columns / c.numaCnt;
             const int base = perNode * node;
-            const int unit = c.gate ? c.gateUnitRows : 4;
+            const int unit = c.gate ? c.gateUnitRows : c.downUnitRows;
             const int units = perNode * (int)c.experts->size() / unit;
             const int first = unit * (worker * (units / workers) +
                                       std::min(worker, units % workers));
@@ -4214,6 +4214,28 @@ namespace fastllm {
         auto *numaConfig = GetNumaConfig();
 
         if (!CanUseNumasLinearPath(input, weight, output, numaConfig)) {
+            // numas-linear 只吃 f16/bf16/fp8/f32 权重（见 CanUseNumasLinearPath）。
+            // 量化权重会退到 CpuLinearOp 的单设备内核：既不做 NUMA 列分片，
+            // 也没有 MoE gateUp 那条融合内核，同形状实测慢一倍以上。
+            // 每个 weight 只报一次，用来判断该不该把它留在 bf16。
+            if (GetFastllmEnv().printProfile) {
+                static std::mutex fallbackLogMutex;
+                static std::set<std::string> reportedFallbacks;
+                std::lock_guard<std::mutex> guard(fallbackLogMutex);
+                std::string key = weight.name + "|" +
+                    GetDataTypeName(input.dataType) + "|" +
+                    GetDataTypeName(weight.GetDataType()) + "|" +
+                    GetDataTypeName(output.dataType);
+                if (reportedFallbacks.insert(key).second) {
+                    printf("[fastllm-numas-linear] fallback to CpuLinearOp: "
+                           "weight=%s itype=%s wtype=%s otype=%s\n",
+                           weight.name.c_str(),
+                           GetDataTypeName(input.dataType).c_str(),
+                           GetDataTypeName(weight.GetDataType()).c_str(),
+                           GetDataTypeName(output.dataType).c_str());
+                    fflush(stdout);
+                }
+            }
             CpuLinearOp::Run(opType, datas, floatParams, intParams);
             return;
         }
@@ -4221,8 +4243,10 @@ namespace fastllm {
             bias.dataType == DataType::FLOAT32,
             "Linear's bias' type should be float32.\n");
 
-        // numas-linear 逐次耗时日志太吵，已关闭；需要时改回 GetFastllmEnv().printProfile
-        const bool profile = false;
+        // numas-linear 逐次耗时日志：FASTLLM_PRINT_PROFILE=1 打开，
+        // 用来看 n/m/k 下的 register/alloc/convert/prepare/gemm/finalize
+        // 与实测 GFLOPS 各占多少。
+        const bool profile = GetFastllmEnv().printProfile;
         const auto begin = profile ? std::chrono::steady_clock::now() :
             std::chrono::steady_clock::time_point();
         EnsureNumasLinearWeightRegistered(weight);
@@ -8106,6 +8130,7 @@ namespace fastllm {
         double profileGatePrepMs = 0.0, profileGateMs = 0.0, profileSwigluConvertMs = 0.0;
         double profileDownPrepMs = 0.0, profileDownMs = 0.0, profileReduceMs = 0.0, profileOutputMs = 0.0;
         int profileExpertCalls = 0;
+        double profileGateBytes = 0.0, profileDownBytes = 0.0;
         auto profileLap = [&](double &bucket) {
             if (!profileDetail) {
                 return;
@@ -8340,6 +8365,18 @@ namespace fastllm {
                         }
                     }
                     profileExpertCalls += (int)v.size();
+                    if (profileDetail) {
+                        // 按权重的实际数据类型统计，量化权重（NVFP4_BLOCK_16 为
+                        // 0.75B/元素）按 2B/元素估算会让带宽虚高 2~8 倍。
+                        for (const auto &expert : v) {
+                            profileGateBytes += (double)GetDataBytes(
+                                weights[expert.first * 2]->GetDataType(),
+                                interDim * 2, inputDim);
+                            profileDownBytes += (double)GetDataBytes(
+                                weights[expert.first * 2 + 1]->GetDataType(),
+                                outputDim, interDim);
+                        }
+                    }
                     profileLap(profileRegisterMs);
 
                     // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
@@ -8531,7 +8568,25 @@ namespace fastllm {
                         decodeContext.interDim = interDim;
                         decodeContext.outputDim = outputDim;
                         decodeContext.numaCnt = numaConfig->numaCnt;
-                        decodeContext.gateUnitRows = canFuseGroup32 ? 64 : 4;
+                        // 每次 GEMM 调用都要重转换一遍输入 tile
+                        // (NVFP4Block16GemmPackInput_AVX2) 并走一遍 FastllmGemm 的类型
+                        // 分发，4 列/任务时这部分固定开销约占 gate 的 6%。在不超
+                        // 16 的前提下取能整除每节点列数的最大粒度来摊薄它，同时
+                        // 保住 NUMA 内的负载均衡（perNode 必须被 unit 整除，否则
+                        // worker 覆盖不到尾部列）。
+                        auto pickUnitRows = [](int columns, int numaCnt) {
+                            const int perNode = columns / std::max(1, numaCnt);
+                            for (int unit : {16, 8, 4}) {
+                                if (perNode % unit == 0) {
+                                    return unit;
+                                }
+                            }
+                            return 4;
+                        };
+                        decodeContext.gateUnitRows = canFuseGroup32 ? 64 :
+                            pickUnitRows(interDim * 2, numaConfig->numaCnt);
+                        decodeContext.downUnitRows =
+                            pickUnitRows(outputDim, numaConfig->numaCnt);
                         decodeContext.downRowBytes = GetDataBytes(downInputDataType, 1, interDim);
                         decodeContext.fuseConvert = canFuseDstConvert && !deepSeekV4Mode;
                         rowWorkers.resize(numaConfig->threads);
@@ -9180,22 +9235,19 @@ namespace fastllm {
                                    profileGateMs + profileSwigluConvertMs + profileDownPrepMs + profileDownMs +
                                    profileReduceMs + profileOutputMs;
                     int workersPerNode = numaConfig->numaToCpuDict[0].size();
-                    // Bytes scanned per token: gate weight (inputDim x interDim*2 x 2B x experts)
-                    // + down weight (interDim x outputDim x 2B x experts), read once per token.
-                    double gateBytes = (double)inputDim * (interDim * 2.0) * 2.0 * profileExpertCalls;
-                    double downBytes = (double)interDim * outputDim * 2.0 * profileExpertCalls;
+                    // 扫过的字节数按权重实际类型累计（见上面的 profileGateBytes）。
                     double gateSec = profileGateMs / 1000.0;
                     double downSec = profileDownMs / 1000.0;
-                    double gateGBs = gateSec > 0 ? gateBytes / gateSec / 1e9 : 0;
-                    double downGBs = downSec > 0 ? downBytes / downSec / 1e9 : 0;
+                    double gateGBs = gateSec > 0 ? profileGateBytes / gateSec / 1e9 : 0;
+                    double downGBs = downSec > 0 ? profileDownBytes / downSec / 1e9 : 0;
                     printf("[fastllm-profile-numas-moe] small_batch bs=%d topk=%d experts=%d inputDim=%d interDim=%d outputDim=%d gateType=%d downType=%d numaCnt=%d threads=%d workersPerNode=%d register=%.3f resize=%.3f input=%.3f gate_prep=%.3f gate_swiglu=%.3f(%.1fGB/s %dMB) swiglu_convert=%.3f down_prep=%.3f down=%.3f(%.1fGB/s %dMB) reduce=%.3f output=%.3f total=%.3f\n",
                            bs, topk, profileExpertCalls, inputDim, interDim, outputDim,
                            (int)weights[2]->GetDataType(), (int)weights[3]->GetDataType(),
                            numaConfig->numaCnt, numaConfig->threads, workersPerNode,
                            profileRegisterMs, profileResizeMs, profileInputMs,
-                           profileGatePrepMs, profileGateMs, gateGBs, (int)(gateBytes / 1e6),
+                           profileGatePrepMs, profileGateMs, gateGBs, (int)(profileGateBytes / 1e6),
                            profileSwigluConvertMs, profileDownPrepMs,
-                           profileDownMs, downGBs, (int)(downBytes / 1e6),
+                           profileDownMs, downGBs, (int)(profileDownBytes / 1e6),
                            profileReduceMs, profileOutputMs, total);
                     fflush(stdout);
                 }

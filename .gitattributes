@@ -1,0 +1,3 @@
+# Windows 批处理行尾必须固定为 CRLF：LF 会让 cmd.exe 的标签/块解析错位。
+*.bat text eol=crlf
+*.cmd text eol=crlf

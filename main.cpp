@@ -1,5 +1,8 @@
 #include "model.h"
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <thread>
 #ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -26,28 +29,105 @@ struct RunConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     std::string systemPrompt = "";
     std::set <std::string> eosToken;
-    int threads = 4; // 使用的线程数
+    int threads = 0; // 使用的线程数，<= 0 表示按CPU核数自动选择
     bool lowMemMode = false; // 是否使用低内存模式
+
+    std::string device = ""; // 主计算设备，例如 cuda、cuda:0、cpu、numa
+    std::string moeDevice = ""; // MoE 专家层设备，例如 cpu、numa
+    int moeDeviceLayers = -1; // 仅最后 N 层 MoE 使用 moeDevice，-1 表示全部
 
     fastllm::DataType dtype = fastllm::DataType::FLOAT16;
     fastllm::DataType moeDtype = fastllm::DataType::FLOAT32;
     fastllm::DataType atype = fastllm::DataType::FLOAT32;
+    fastllm::DataType kvDtype = fastllm::DataType::FLOAT32; // 仅 --kv_dtype 显式指定时生效
+    bool useKvDtype = false;
+    bool useAtype = false; // 仅在显式传入 --atype 时调用 SetDataType
     int groupCnt = -1;
     int moeGroupCnt = -1;
     bool useMoeDtype = false;
 };
 
+// 与 ftllm 的默认值保持一致：留两个核给系统调度，最多 32 个线程
+static int DefaultThreadNum() {
+    unsigned int cores = std::thread::hardware_concurrency();
+    if (cores == 0) {
+        return 4;
+    }
+    int available = (int)cores - 2;
+    return available > 0 ? std::min(32, available) : 1;
+}
+
+// 去掉设备名里的引号、空格等装饰字符
+static std::string StripDeviceToken(const std::string &text) {
+    std::string ret;
+    for (char c : text) {
+        if (isalnum((unsigned char)c) || c == '_' || c == ':' || c == '-' || c == '.') {
+            ret += c;
+        }
+    }
+    return ret;
+}
+
+// --device / --moe_device 既支持单个设备名（cuda、cuda:0、cpu、numa），
+// 也支持 ftllm 风格的比例分配（"{'cuda':1,'numa':8}"），逗号分隔的多个
+// 设备名按等比例串行处理。
+static std::map <std::string, int> ParseDeviceMap(const std::string &spec) {
+    std::map <std::string, int> ret;
+    std::string text = spec;
+    size_t begin = text.find('{');
+    size_t end = text.rfind('}');
+    if (begin == std::string::npos || end == std::string::npos || end <= begin) {
+        size_t pos = 0;
+        while (pos <= text.size()) {
+            size_t comma = text.find(',', pos);
+            if (comma == std::string::npos) {
+                comma = text.size();
+            }
+            std::string name = StripDeviceToken(text.substr(pos, comma - pos));
+            if (!name.empty()) {
+                ret[name] = 1;
+            }
+            pos = comma + 1;
+        }
+        return ret;
+    }
+    text = text.substr(begin + 1, end - begin - 1);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t colon = text.find(':', pos);
+        if (colon == std::string::npos) {
+            break;
+        }
+        size_t comma = text.find(',', colon + 1);
+        std::string name = StripDeviceToken(text.substr(pos, colon - pos));
+        std::string value = text.substr(colon + 1, comma == std::string::npos ?
+                                        std::string::npos : comma - colon - 1);
+        if (!name.empty() && atoi(value.c_str()) > 0) {
+            ret[name] = atoi(value.c_str());
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return ret;
+}
+
 void Usage() {
     std::cout << "Usage:" << std::endl;
     std::cout << "[-h|--help]:                  显示帮助" << std::endl;
     std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
-    std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
+    std::cout << "<-t|--threads> <args>:        使用的线程数量，不填时按CPU核数自动选择" << std::endl;
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
+    std::cout << "<--device> <args>:            主计算设备，如 cuda、cuda:0、cpu、numa 或 \"{'cuda':1,'numa':8}\"" << std::endl;
+    std::cout << "<--moe_device> <args>:        MoE专家层设备，如 cpu、numa，需与--device一起使用" << std::endl;
+    std::cout << "<--moe_device_layers> <args>: 仅最后N层MoE使用--moe_device，-1表示全部" << std::endl;
     std::cout << "<--system> <args>:            设置系统提示词(system prompt)" << std::endl;
     std::cout << "<--eos_token> <args>:         设置eos token" << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<--moe_dtype> <args>:         设置MoE expert权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<--atype> <args>:             设置推理使用的数据类型(float32/float16)" << std::endl;
+    std::cout << "<--kv_dtype> <args>:          设置KV cache数据类型(float32/float16/bfloat16/fp8/fp4)，不填则跟随atype" << std::endl;
     std::cout << "<--top_p> <args>:             采样参数top_p" << std::endl;
     std::cout << "<--top_k> <args>:             采样参数top_k" << std::endl;
     std::cout << "<--temperature> <args>:       采样参数温度，越高结果越不固定" << std::endl;
@@ -69,6 +149,12 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
             config.threads = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "-l" || sargv[i] == "--low") {
             config.lowMemMode = true;
+        } else if (sargv[i] == "--device") {
+            config.device = sargv[++i];
+        } else if (sargv[i] == "--moe_device") {
+            config.moeDevice = sargv[++i];
+        } else if (sargv[i] == "--moe_device_layers") {
+            config.moeDeviceLayers = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "-m" || sargv[i] == "--model") {
             i++;
         } else if (sargv[i] == "--top_p") {
@@ -107,6 +193,13 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
             fastllm::AssertInFastLLM(dataTypeDict.find(atypeStr) != dataTypeDict.end(),
                                     "Unsupport act type: " + atypeStr);
             config.atype = dataTypeDict[atypeStr];
+            config.useAtype = true;
+        } else if (sargv[i] == "--kv_dtype") {
+            std::string kvStr = sargv[++i];
+            fastllm::AssertInFastLLM(dataTypeDict.find(kvStr) != dataTypeDict.end(),
+                                    "Unsupport kv cache type: " + kvStr);
+            config.kvDtype = dataTypeDict[kvStr];
+            config.useKvDtype = true;
         } else {
             Usage();
             exit(-1);
@@ -148,8 +241,28 @@ int main(int argc, char **argv) {
     ParseArgs(argc, argv, config, generationConfig);
 
     fastllm::PrintInstructionInfo();
-    fastllm::SetThreads(config.threads);
+    fastllm::SetThreads(config.threads > 0 ? config.threads : DefaultThreadNum());
     fastllm::SetLowMemMode(config.lowMemMode);
+    // device map 必须在创建模型之前设置：模型构造时会把它们拷进自己的成员
+    if (!config.device.empty()) {
+        fastllm::SetDeviceMap(ParseDeviceMap(config.device));
+    }
+    if (!config.moeDevice.empty()) {
+        if (config.device.empty()) {
+            printf(u8"[fastllm] --moe_device 需要与 --device 一起使用，本次已忽略。\n");
+        } else if (config.moeDeviceLayers >= 0) {
+            fastllm::SetMoeDeviceMap(ParseDeviceMap(config.device));
+            fastllm::SetLayeredMoeDeviceMap(ParseDeviceMap(config.moeDevice));
+            fastllm::SetMoeDeviceLayers(config.moeDeviceLayers);
+        } else {
+            fastllm::SetMoeDeviceMap(ParseDeviceMap(config.moeDevice));
+        }
+    }
+    printf(u8"[fastllm] device = %s, moe = %s, threads = %d\n",
+           config.device.empty() ? "(default)" : config.device.c_str(),
+           config.moeDevice.empty() ? "(follow device)" : config.moeDevice.c_str(),
+           fastllm::GetThreads());
+
     if (!fastllm::FileExists(config.path)) {
         printf(u8"模型文件 %s 不存在！\n", config.path.c_str());
         exit(0);
@@ -159,7 +272,10 @@ int main(int argc, char **argv) {
                  fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt,
                                                false, "", "", false,
                                                config.useMoeDtype, config.moeDtype, config.moeGroupCnt);
-    if (config.atype != fastllm::DataType::FLOAT32) {
+    if (config.useKvDtype) {
+        model->SetKVCacheDataType(config.kvDtype);
+    }
+    if (config.useAtype) {
         model->SetDataType(config.atype);
     }
     model->SetSaveHistoryChat(true);

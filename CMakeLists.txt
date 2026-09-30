@@ -272,6 +272,22 @@ endif()
 
 if (USE_CUDA)
     enable_language(CUDA)
+    if (MSVC)
+        # CUDA 13 CCCL headers require the conforming preprocessor; pass it to
+        # both the host compiler and nvcc's host pass.
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:preprocessor")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
+        # nvcc's generated host stubs crash cl.exe (fatal error C1001 /
+        # 0xC0000005) on some generic-lambda instantiations; /permissive
+        # avoids that code path.
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/permissive")
+        # MSVC's nvcc front end does not implement the `__is_same` builtin the
+        # kernel headers use; the compat header maps it onto libcu++.
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --pre-include=${CMAKE_CURRENT_SOURCE_DIR}/include/utils/msvc_cuda_compat.cuh")
+        # NCCL's Windows headers pull in winsock2.h, which conflicts with the
+        # legacy winsock.h that windows.h includes by default.
+        add_compile_definitions(WIN32_LEAN_AND_MEAN)
+    endif()
     if (CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_CUDA_FLAGS_RELEASE STREQUAL "")
         set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "CUDA release flags" FORCE)
     endif()
@@ -314,8 +330,13 @@ if (USE_CUDA)
             set(FASTLLM_CUDA_LEGACY_ONLY OFF)
         endif()
     endforeach()
+    if (MSVC)
+        # The vendored FlashInfer headers use GCC-only syntax (__attribute__,
+        # inline asm, ushort); MSVC builds fall back to the native attention path.
+        set(FASTLLM_CUDA_LEGACY_ONLY ON)
+    endif()
     if (FASTLLM_CUDA_LEGACY_ONLY)
-        message(STATUS "FlashInfer kernels: OFF (all CUDA architectures are below sm_70)")
+        message(STATUS "FlashInfer kernels: OFF")
         add_compile_definitions(FASTLLM_CUDA_LEGACY_ONLY)
     endif()
     if (CUDA_NO_TENSOR_CORE)
@@ -527,7 +548,15 @@ if (USE_CUDA)
         src/devices/multicuda/fastllm-custom-allreduce.cu)
 
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda ${CMAKE_DL_LIBS})
+    if (WIN32)
+        # NCCL has no upstream Windows build; point CMAKE_PREFIX_PATH at a local
+        # install (e.g. the nccl-windows port) so this resolves.
+        find_package(NCCL CONFIG REQUIRED)
+        include_directories(${NCCL_INCLUDE_DIRS})
+        set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas ${NCCL_LIBRARIES} cuda ${CMAKE_DL_LIBS})
+    else()
+        set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda ${CMAKE_DL_LIBS})
+    endif()
     set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
 endif()
 
@@ -828,6 +857,7 @@ if (UNIT_TEST)
     target_link_libraries(nvfp4Block16GemmRegression fastllm)
     add_test(NAME nvfp4_block16_gemm COMMAND nvfp4Block16GemmRegression)
     add_test(NAME nvfp4_block16_gemm_bench COMMAND nvfp4Block16GemmRegression --bench --gb 1)
+    add_test(NAME nvfp4_block16_linear_bench COMMAND nvfp4Block16GemmRegression --bench --linear --gb 1)
     add_executable(deepseekV41OpsRegression test/ops/deepseekV41OpsRegression.cpp)
     target_link_libraries(deepseekV41OpsRegression fastllm)
     if (USE_CUDA)
@@ -1434,6 +1464,18 @@ if (${CMAKE_HOST_WIN32})
             COMMAND ${CMAKE_COMMAND} -E remove $<TARGET_FILE:fastllm_tools>
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
+    # tools/ftllm 下的 fastllm_tools.dll 依赖 nccl.dll，但该目录不在依赖搜索路径里，
+    # 少了它会以"(or one of its dependencies)"的形式报找不到模块，这里拷到它旁边。
+    if (USE_CUDA AND TARGET NCCL::nccl)
+        get_target_property(_FASTLLM_NCCL_DLL NCCL::nccl IMPORTED_LOCATION_RELEASE)
+        if (_FASTLLM_NCCL_DLL AND EXISTS "${_FASTLLM_NCCL_DLL}")
+            add_custom_command(
+                    TARGET fastllm_tools
+                    POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_FASTLLM_NCCL_DLL}" ${CMAKE_BINARY_DIR}/tools/ftllm/.
+            )
+        endif()
+    endif()
 else()
     # Keep the linker output at its packaged location so dependent targets
     # track a stable artifact. The generator expression also keeps that path

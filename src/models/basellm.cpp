@@ -5,6 +5,7 @@
 #include "basellm.h"
 #include "utils.h"
 #include "utils/cuda_cache_budget.h"
+#include "utils/fastllm_int128.h"
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
@@ -4685,14 +4686,14 @@ namespace fastllm {
                 int budgetPercent = std::max(
                     1, std::min(100,
                                 this->GetAutoWarmupLinearAttentionBatchBudgetPercent()));
-                __int128 budget = (__int128)avail * budgetPercent / 100;
+                FASTLLM_INT128 budget = (FASTLLM_INT128)avail * budgetPercent / 100;
                 int low = 0, high = getBaseBatchLimit();
                 while (low < high) {
                     int mid = low + (high - low + 1) / 2;
                     long long runtimeReserve = std::max(
                         0LL, this->GetAutoWarmupCudaRuntimeReserveBytes(id, mid));
-                    __int128 fixedNeed = (__int128)mid * linearBytesOnDevice +
-                                         (__int128)runtimeReserve;
+                    FASTLLM_INT128 fixedNeed = (FASTLLM_INT128)mid * linearBytesOnDevice +
+                                         (FASTLLM_INT128)runtimeReserve;
                     if (fixedNeed <= budget) {
                         low = mid;
                     } else {
@@ -4781,10 +4782,10 @@ namespace fastllm {
                 while (low < high) {
                     long long mid = (low + high + 1) / 2;
                     long long activeBatch = std::min<long long>(batchLimit, mid);
-                    __int128 need = (__int128)mid * kvBytesPerPage +
-                                    (__int128)mid * delayedCacheBytesPerPage +
-                                    (__int128)activeBatch * linearBytesOnDevice +
-                                    (__int128)runtimeReserveBytes(activeBatch);
+                    FASTLLM_INT128 need = (FASTLLM_INT128)mid * kvBytesPerPage +
+                                    (FASTLLM_INT128)mid * delayedCacheBytesPerPage +
+                                    (FASTLLM_INT128)activeBatch * linearBytesOnDevice +
+                                    (FASTLLM_INT128)runtimeReserveBytes(activeBatch);
                     if (need <= avail) {
                         low = mid;
                     } else {
@@ -5170,10 +5171,10 @@ namespace fastllm {
                         if (bytesPerFinalPage <= 0) {
                             continue;
                         }
-                        __int128 freedCurrentCacheBytes =
-                            (__int128)currentPages * bytesPerPageOnDevice;
-                        __int128 finalPageBudget =
-                            (__int128)freeAfterWarmup[id] + freedCurrentCacheBytes - targetFree;
+                        FASTLLM_INT128 freedCurrentCacheBytes =
+                            (FASTLLM_INT128)currentPages * bytesPerPageOnDevice;
+                        FASTLLM_INT128 finalPageBudget =
+                            (FASTLLM_INT128)freeAfterWarmup[id] + freedCurrentCacheBytes - targetFree;
                         long long pages = finalPageBudget > 0 ?
                             (long long)(finalPageBudget / bytesPerFinalPage) : 0;
                         pages = std::min<long long>(

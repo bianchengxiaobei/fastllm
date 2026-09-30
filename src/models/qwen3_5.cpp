@@ -28,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 
 #include <cctype>
 #include <cstring>
@@ -54,6 +55,48 @@
 #endif
 
 namespace fastllm {
+
+#ifdef USE_CUDA
+    // "专家权重在内存, 逐专家异步上卡, 用 GPU 算" 的 MergeMOE 实现(cudadevice.cpp),
+    // disk/numa 设备也用它; 这里声明在命名空间作用域, 避免落到匿名命名空间里。
+    extern void DoCudaMergeMOEFromCPU(Data &input, Data &output, Data &index, Data &score,
+        Data &w1, Data &w2, Data &w3, Data **weights, Data **biass, float sharedScale,
+        bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
+        MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit,
+        int activationQuantBlock, bool quantizeSharedExpert);
+#endif
+
+    // runChunkPrefillReference 逐 chunk 把结果原地写进 core_attn_out 的第 ci 个槽位。
+    // 参考实现既可能在 CPU 上跑, 也可能在 CUDA 上跑(例如 FASTLLM_USE_FUSED_GDN_PREFILL=0),
+    // 所以这里按 dataDevice 选择拷贝方式; 之前直接用 cpuData 会空指针崩溃。
+    static void Qwen35CopyGdnChunkInplace(Data &out, Data &atv, int ci) {
+        int blocks = atv.dims[0] * atv.dims[1];
+        int chunkLen = atv.dims[3];
+        int v = atv.dims[4];
+        int totalLen = out.dims[3];
+        int unitSize = atv.unitSize;
+        size_t chunkBytes = (size_t)chunkLen * v * unitSize;
+        uint8_t *dstBase = out.cpuData;
+        uint8_t *srcBase = atv.cpuData;
+#ifdef USE_CUDA
+        bool onCuda = out.dataDevice == DataDevice::CUDA;
+        if (onCuda) {
+            dstBase = (uint8_t*)out.cudaData;
+            srcBase = (uint8_t*)atv.cudaData;
+        }
+#endif
+        for (int o = 0; o < blocks; o++) {
+            uint8_t *dst = dstBase + ((long long)o * totalLen + (long long)ci * chunkLen) * v * unitSize;
+            uint8_t *src = srcBase + (long long)o * chunkLen * v * unitSize;
+#ifdef USE_CUDA
+            if (onCuda) {
+                FastllmCudaCopyFromDeviceToDevice(dst, src, chunkBytes);
+                continue;
+            }
+#endif
+            memcpy(dst, src, chunkBytes);
+        }
+    }
 
 #ifdef USE_CUDA
     // Query the existing SM70 backend without including CUDA runtime types in
@@ -2664,6 +2707,110 @@ namespace fastllm {
                 FastllmCudaMemset0(dst.cudaData, dst.GetBytes());
             }
         }
+
+#ifdef USE_CUDA
+        // 方案C原型: --moe_device cpu 时, prefill 把内存里的路由专家逐专家异步搬到显存,
+        // 复用 disk/numa 设备已有的 DoCudaMergeMOEFromCPU 在 GPU 上算(它内部带
+        // copyStream 预取下一个专家 + PickInput gather + CUDA GEMM)。
+        // 这里传 isCrossSwiglu=false, 权重保持 checkpoint 原始行序、不做行重排,
+        // 所以 CPU/GPU 两条路径可以共存: decode 仍走原来的 CPU MergeMOE。
+        static bool Qwen35PrefillMoeGpuFromHostEnabled() {
+            static const bool enabled = []() {
+                const char *env = std::getenv("FASTLLM_PREFILL_MOE_GPU");
+                return env != nullptr && env[0] != '\0' && env[0] != '0';
+            }();
+            return enabled;
+        }
+
+        static int Qwen35PrefillMoeGpuFromHostMinTokens() {
+            static const int minTokens = []() {
+                const char *env = std::getenv("FASTLLM_PREFILL_MOE_GPU_MIN_TOKENS");
+                int value = env == nullptr ? 1024 : atoi(env);
+                return value > 0 ? value : 1;
+            }();
+            return minTokens;
+        }
+
+        // 成功返回true(此时output是显存上的[tokens, hidden]); 失败返回false, 调用方回落到CPU路径
+        static bool Qwen35TryPrefillMoeGpuFromHost(
+                Data &input, Data &expertIndex, Data &expertScore,
+                std::vector <Data*> &weights, std::vector <Data*> &biass,
+                Data &w1, Data &w2, Data &w3, Data &output,
+                int numExperts, int gpuId, int layer) {
+            if (!Qwen35PrefillMoeGpuFromHostEnabled() || numExperts <= 0 ||
+                weights.size() < (size_t)(2 + numExperts * 2) || biass.size() != weights.size()) {
+                return false;
+            }
+            if (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) {
+                return false;
+            }
+            if (input.dims.size() < 2 || expertIndex.dims.size() < 2) {
+                return false;
+            }
+            if (input.dims[0] < Qwen35PrefillMoeGpuFromHostMinTokens()) {
+                return false;
+            }
+            // 第0/1个槽位是共享专家, 本模型没有, 只在占位
+            if (weights[2] == nullptr || weights[3] == nullptr) {
+                return false;
+            }
+            // 路由要在host侧做, 先把index/score拷回内存
+            expertIndex.ToDevice(DataDevice::CPU);
+            expertScore.ToDevice(DataDevice::CPU);
+            if (expertIndex.cpuData == nullptr || expertScore.cpuData == nullptr ||
+                expertIndex.dims[0] <= 0 || expertIndex.dims[1] <= 0 ||
+                expertScore.Count(0) != expertIndex.Count(0)) {
+                return false;
+            }
+            std::unordered_set <int> selectedExperts;
+            selectedExperts.reserve(numExperts);
+            const int32_t *indexData = (const int32_t*)expertIndex.cpuData;
+            int64_t slots = (int64_t)expertIndex.Count(0);
+            for (int64_t slot = 0; slot < slots; slot++) {
+                int expert = indexData[slot];
+                expert = expert < 0 ? 0 : (expert >= numExperts ? numExperts - 1 : expert);
+                selectedExperts.insert(expert + 1);
+            }
+            if (selectedExperts.empty()) {
+                return false;
+            }
+            FastllmCudaSetDevice(gpuId);
+            Qwen35ResetCpuScratch(output);
+            output.dataType = input.dataType;
+            output.UpdateUnitSize();
+            output.dataDevice = DataDevice::CUDA;
+            output.dataDeviceIds = {gpuId};
+            output.Resize(input.dims);
+            output.Allocate();
+            // sm70 TurboMind NVFP4 / native-nvfp4 这些"原地重排权重"的路径只在
+            // force-sync 打开时启用, 它们会改写 weight.cudaData 并把 IsRepacked
+            // 永久置位; 而这里的专家权重是临时上传缓冲(用完即释放), 会留下
+            // 悬垂状态。按稳态语义(lib 在 warmup 结束后也会关掉, basellm.cpp:4010)
+            // 临时关掉 force-sync, 让 GEMM 走普通反量化+cublas 路径。
+            const bool oldNcclForceSync = FastllmCudaGetNcclForceSync();
+            FastllmCudaSetNcclForceSync(false);
+            bool moeOk = false;
+            try {
+                DoCudaMergeMOEFromCPU(input, output, expertIndex, expertScore, w1, w2, w3,
+                                      weights.data(), biass.data(), 1.0f, true, selectedExperts,
+                                      false, MoeGateSwiglu, false, 0.0f, 128, false);
+                moeOk = true;
+            } catch (const std::exception &e) {
+                printf("[fastllm] prefill MoE on GPU failed on layer %d: %s, falling back to CPU.\n",
+                       layer, e.what());
+                fflush(stdout);
+            } catch (...) {
+                printf("[fastllm] prefill MoE on GPU failed on layer %d, falling back to CPU.\n", layer);
+                fflush(stdout);
+            }
+            FastllmCudaSetNcclForceSync(oldNcclForceSync);
+            if (!moeOk) {
+                return false;
+            }
+            FastllmCudaSetDevice(gpuId);
+            return output.dataDevice == DataDevice::CUDA && output.cudaData != nullptr;
+        }
+#endif
 
         static void Qwen35PrepareFusedMoeWeightForCuda(Data &weight, int device) {
             FastllmCudaSetDevice(device);
@@ -8657,6 +8804,15 @@ namespace fastllm {
         if (q.dataType == DataType::FLOAT16 || q.dataType == DataType::BFLOAT16) {
             return q.dataType;
         }
+#ifdef USE_CUDA
+        // Keep float32 activations in float32: the paged attention has a
+        // float32 kernel (FastllmCudaFloatPagedAttentionNative), and computing
+        // in half here was the only place a float32 CUDA run lost precision
+        // against the float32 CPU path.
+        if (preferredType == DataType::FLOAT32) {
+            return DataType::FLOAT32;
+        }
+#endif
         return preferredType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
     }
 
@@ -15845,8 +16001,17 @@ namespace fastllm {
             }
 
             bool layerMappedNonCudaMoe = Qwen35LayerUsesMappedNonCudaMoe(this, i);
+            // 原型: prefill 时把内存里的路由专家逐专家搬上卡交给GPU算(env开关, 默认关)
+            bool prefillMoeOnGpu = layerMappedNonCudaMoe && !tensorParallel &&
+                                   Qwen35TryPrefillMoeGpuFromHost(
+                                       attenInput, expertIndex, expertScore,
+                                       weights[i], biass[i],
+                                       w1, w2, w3, moeFinal,
+                                       this->num_experts, gpuId, i);
             if (layerMappedNonCudaMoe) {
-                if (!tensorParallel || firstTensorParallelRank) {
+                if (prefillMoeOnGpu) {
+                    // 已在 Qwen35TryPrefillMoeGpuFromHost 里用GPU算完, moeFinal 就绪
+                } else if (!tensorParallel || firstTensorParallelRank) {
                     std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
                     Qwen35ResetCpuScratch(moeFinal);
                     FastllmCudaSetDevice(gpuId);
@@ -21615,7 +21780,14 @@ namespace fastllm {
         const bool useLinearReplay = useDFlash && !useLinearPrefixSnapshots &&
             Qwen35DFlashBatchPrefixSnapshotsEnabled();
         if (useLinearReplay) {
+#ifdef _MSC_VER
+            // MSVC's vector growth paths (resize/reserve) require
+            // copy-constructible elements, but these maps hold unique_ptr, so
+            // rebuild the vector instead: value-construct plus move-assign.
+            dflashLinearReplay = decltype(dflashLinearReplay)((size_t)block_cnt);
+#else
             dflashLinearReplay.resize(block_cnt);
+#endif
             for (int layer = 0; layer < block_cnt; layer++) {
                 if (isAttentionLayerAt(layer)) continue;
                 for (int device : devices) {
@@ -24619,6 +24791,13 @@ namespace fastllm {
                                 (void)totalSpend;
                                 printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
                                        st, len, st * 100 / len, chunkSpeed);
+                                // 每个 prefill block 结束后打一次按 op 汇总的
+                                // 分表 + CPU 分配探针。表是增量（打一次清一次），
+                                // 正好对应这一块 2048 个 token。用来判断慢在算子
+                                // 本身、还是慢在反复申请/释放中间张量。
+                                if (GetFastllmEnv().printProfile) {
+                                    PrintProfileSummary();
+                                }
                             }
                         }
                         if (longPrefillDFlashSeeded) {
@@ -34324,6 +34503,13 @@ namespace fastllm {
 
                 Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
                 Linear(qkv, weight[oWeightName], oBias, attenInput);
+                // The paged attention path runs in the KV cache dtype, so its
+                // output can be narrower than the residual stream (float32
+                // activations with a float16 cache). Convert back before the
+                // residual add so the dtypes stay consistent.
+                if (attenInput.dataType != hiddenStates.dataType) {
+                    ToDataType(attenInput, hiddenStates.dataType);
+                }
             } else {
                 std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
                 std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
@@ -34743,18 +34929,7 @@ namespace fastllm {
                             // 计算目标偏移，不依赖 strides（CatDirect 要求 strides[axis-1]
                             // 恰好等于外层块的物理间距，与逻辑 dims 不一致时会写错/越界）。
                             auto gdnCpSt = std::chrono::system_clock::now();
-                            {
-                                int blocks = atv.dims[0] * atv.dims[1];
-                                int chunkLen = atv.dims[3];
-                                int v = atv.dims[4];
-                                int totalLen = out.dims[3];
-                                int unitSize = atv.unitSize;
-                                for (int o = 0; o < blocks; o++) {
-                                    memcpy(out.cpuData + ((long long)o * totalLen + (long long)ci * chunkLen) * v * unitSize,
-                                           atv.cpuData + (long long)o * chunkLen * v * unitSize,
-                                           (size_t)chunkLen * v * unitSize);
-                                }
-                            }
+                            Qwen35CopyGdnChunkInplace(out, atv, ci);
                             if (gdnChunkProf) {
                                 gdnCopySpend += GetSpan(gdnCpSt, std::chrono::system_clock::now());
                             }
@@ -36071,6 +36246,13 @@ namespace fastllm {
 
                 Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
                 Linear(qkv, weight[oWeightName], oBias, attenInput);
+                // The paged attention path runs in the KV cache dtype, so its
+                // output can be narrower than the residual stream (float32
+                // activations with a float16 cache). Convert back before the
+                // residual add so the dtypes stay consistent.
+                if (attenInput.dataType != hiddenStates.dataType) {
+                    ToDataType(attenInput, hiddenStates.dataType);
+                }
             } else {
                 // Gated Delta Net Block
                 Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
@@ -36561,7 +36743,6 @@ namespace fastllm {
                         last_recurrent_state.isLinearAttentionTransposed = false;
                         last_recurrent_state.Allocate(0.0f);
                     }
-
                     auto runChunkPrefillReference = [&](Data &state, Data &out) {
                         auto makeChunk4D = [](Data &src, int idx, Data &dst) {
                             dst.dims = {src.dims[1], src.dims[2], src.dims[3], src.dims[4]};
@@ -36628,18 +36809,7 @@ namespace fastllm {
                             // 计算目标偏移，不依赖 strides（CatDirect 要求 strides[axis-1]
                             // 恰好等于外层块的物理间距，与逻辑 dims 不一致时会写错/越界）。
                             auto gdnCpSt = std::chrono::system_clock::now();
-                            {
-                                int blocks = atv.dims[0] * atv.dims[1];
-                                int chunkLen = atv.dims[3];
-                                int v = atv.dims[4];
-                                int totalLen = out.dims[3];
-                                int unitSize = atv.unitSize;
-                                for (int o = 0; o < blocks; o++) {
-                                    memcpy(out.cpuData + ((long long)o * totalLen + (long long)ci * chunkLen) * v * unitSize,
-                                           atv.cpuData + (long long)o * chunkLen * v * unitSize,
-                                           (size_t)chunkLen * v * unitSize);
-                                }
-                            }
+                            Qwen35CopyGdnChunkInplace(out, atv, ci);
                             if (gdnChunkProf) {
                                 gdnCopySpend += GetSpan(gdnCpSt, std::chrono::system_clock::now());
                             }

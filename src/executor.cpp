@@ -61,6 +61,92 @@ namespace fastllm {
         return it->second->name;
     }
 
+    // MoE 算子的层号在 intParams 里。只看总耗时无法判断某层是否异常，
+    // 把层号带上才能按层归因、决定哪些层的专家该放哪块设备。
+    static std::string GetProfileLayerInfo(const std::string &opType,
+                                           const fastllm::IntDict &intParams) {
+        if (opType != "MergeMOE" && opType != "FusedMOE") {
+            return "";
+        }
+        auto it = intParams.find("layer");
+        if (it == intParams.end()) {
+            return "";
+        }
+        return " layer=" + std::to_string(it->second);
+    }
+
+    // 给慢算子日志补上形状/类型/有效算力。只看 spend 无法判断一个 GEMM 是
+    // 算力不够、带宽不够，还是选错了内核；把 batch/n/m/k、权重类型和实测
+    // GFLOPS、GBPS 一起打出来，一次运行就能定位。
+    static std::string GetProfileShapeInfo(const std::string &opType,
+                                           const fastllm::DataDict &datas,
+                                           float spend) {
+        auto findData = [&datas](const char *key) -> fastllm::Data* {
+            auto it = datas.find(key);
+            return (it == datas.end() || it->second == nullptr) ? nullptr : it->second;
+        };
+        fastllm::Data *input = nullptr;
+        fastllm::Data *weight = nullptr;
+        fastllm::Data *output = nullptr;
+        if (opType == "Linear") {
+            input = findData("input");
+            weight = findData("weight");
+            output = findData("output");
+        } else if (opType == "MatMul" || opType == "MatMulTransB") {
+            // input1 在 batch 维度上可以广播（batch1 < batch0），MoE/GDN
+            // 里的小 GEMM 大量走这条路径。
+            input = findData("input0");
+            weight = findData("input1");
+            output = findData("output");
+        } else {
+            return "";
+        }
+        if (input == nullptr || output == nullptr || input->dims.size() < 2 ||
+            output->dims.empty()) {
+            return "";
+        }
+        const int last = (int)input->dims.size() - 1;
+        const int n = input->dims[last - 1];
+        const int m = input->dims[last];
+        const int k = output->dims.back();
+        long long batch = (n > 0 && m > 0) ?
+            (long long)(input->Count(0) / ((long long)n * m)) : 1;
+        if (batch <= 0) {
+            batch = 1;
+        }
+        long long batch1 = 1;
+        if (weight != nullptr && weight->dims.size() >= 2) {
+            long long spatial = (long long)weight->dims[weight->dims.size() - 2] *
+                weight->dims.back();
+            if (spatial > 0) {
+                batch1 = (long long)(weight->Count(0) / spatial);
+            }
+        }
+        if (batch1 <= 0) {
+            batch1 = 1;
+        }
+        double flops = 2.0 * (double)batch * n * m * k;
+        double gflops = spend > 0.0f ? flops / spend / 1.0e9 : 0.0;
+        // 必须搬动的字节数（广播的输入按实际重复次数计）。GBPS 远低于
+        // GFLOPS 对应的强度说明是访存/延迟瓶颈，反之是内核算力瓶颈。
+        double bytes = (double)input->GetBytes() + output->GetBytes() +
+            (weight != nullptr ?
+                (double)weight->GetBytes() * (double)batch / (double)batch1 : 0.0);
+        double gbps = spend > 0.0f ? bytes / spend / 1.0e9 : 0.0;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 " batch=%lld n=%d m=%d k=%d itype=%s wtype=%s otype=%s "
+                 "gflops=%.1f gbps=%.1f",
+                 batch, n, m, k,
+                 fastllm::GetDataTypeName(input->dataType).c_str(),
+                 weight != nullptr ?
+                     fastllm::GetDataTypeName(weight->GetDataType()).c_str() :
+                     "none",
+                 fastllm::GetDataTypeName(output->dataType).c_str(),
+                 gflops, gbps);
+        return std::string(buf);
+    }
+
     // 按线程汇总所有算子的累计耗时。算子始终在调用线程上派发，
     // 因此嵌套 Executor（MoE 层的 thread_local Executor 等）也能被统计到。
     static std::map <std::string, float> &GetThreadProfileSummary() {
@@ -138,6 +224,7 @@ namespace fastllm {
     void ClearProfileSummary() {
         GetThreadProfileSummary().clear();
         execPhaseProfile.clear();
+        ClearCpuAllocProfile();
     }
 
     void PrintProfileSummary() {
@@ -156,6 +243,7 @@ namespace fastllm {
         }
         printf("total spend %f\n", sum);
         PrintExecPhaseProfile();
+        PrintCpuAllocProfile(" total");
         fflush(stdout);
     }
 
@@ -555,8 +643,12 @@ namespace fastllm {
         static const bool profileSlowOps = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
         if (profileSlowOps && spend > GetProfileSlowOpThreshold()) {
             const std::string weightName = GetProfileWeightName(datas);
-            printf("[fastllm-slow-op] %s spend=%.6f s%s%s\n", opType.c_str(), spend,
-                   weightName.empty() ? "" : " weight=", weightName.c_str());
+            const std::string layerInfo = GetProfileLayerInfo(opType, intParams);
+            const std::string shapeInfo = GetProfileShapeInfo(opType, datas, spend);
+            printf("[fastllm-slow-op] %s spend=%.6f s%s%s%s%s\n", opType.c_str(), spend,
+                   layerInfo.c_str(),
+                   weightName.empty() ? "" : " weight=", weightName.c_str(),
+                   shapeInfo.c_str());
             fflush(stdout);
         }
     }
@@ -661,9 +753,13 @@ namespace fastllm {
         static const bool profileSlowOps = std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr;
         if (profileSlowOps && spend > GetProfileSlowOpThreshold()) {
             const std::string weightName = GetProfileWeightName(datas);
-            printf("[fastllm-slow-op] %s (device=%s) spend=%.6f s%s%s\n",
+            const std::string layerInfo = GetProfileLayerInfo(opType, intParams);
+            const std::string shapeInfo = GetProfileShapeInfo(opType, datas, spend);
+            printf("[fastllm-slow-op] %s (device=%s) spend=%.6f s%s%s%s%s\n",
                    opType.c_str(), deviceType.c_str(), spend,
-                   weightName.empty() ? "" : " weight=", weightName.c_str());
+                   layerInfo.c_str(),
+                   weightName.empty() ? "" : " weight=", weightName.c_str(),
+                   shapeInfo.c_str());
             fflush(stdout);
         }
     }

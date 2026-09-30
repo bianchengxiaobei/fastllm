@@ -370,7 +370,7 @@ bool FastllmCudaFloat32MergeMOEBFloat16Indexed(
     using namespace fastllm;
     if (input.dataType != FLOAT32 || input.dims.size() != 2 ||
         input.dims[0] < 1 || input.dims[0] > 4 || input.dims[1] <= 0 ||
-        index.dataType != INT32 || score.dataType != FLOAT32 ||
+        index.dataType != fastllm::DataType::INT32 || score.dataType != FLOAT32 ||
         index.dims.size() != 2 || index.dims[0] != input.dims[0] ||
         index.dims[1] < 1 || index.dims[1] > 16 || score.dims != index.dims ||
         weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||

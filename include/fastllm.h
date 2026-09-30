@@ -49,10 +49,15 @@ namespace fastllm {
         bool cudaTriton = false;
         bool useFusedTransferAttn = true;
         bool useFusedGdnPrefill = true;
+        // 专家权重流式的固定内存中转环: 槽数 × 单槽宽(MB). 参数入口见
+        // SetMoePinnedStaging(--moe_pinned_slots / --moe_pinned_slot_mb).
+        int moePinnedStagingSlots = 16;
+        int moePinnedStagingSlotMb = 4;
     };
 
     const FastllmEnv &GetFastllmEnv();
     void SetCudaGraph(bool v);
+    void SetMoePinnedStaging(int slots, int slotMb);
 
     struct ModelLoadProgress {
         std::string stage;
@@ -955,6 +960,12 @@ namespace fastllm {
     void ClearProfileSummary();
 
     void PrintProfileSummary();
+
+    // CPU 侧 new[]/delete[] 的耗时探针，FASTLLM_PRINT_PROFILE 打开。
+    // Print 会清零计数，所以每次调用给出的是上一个窗口的增量。
+    void ClearCpuAllocProfile();
+
+    void PrintCpuAllocProfile(const char *tag = nullptr);
 
     void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total); // 执行到了current, 一共total，使用deviceMap切换设备
 

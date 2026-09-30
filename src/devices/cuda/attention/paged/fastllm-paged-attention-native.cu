@@ -59,7 +59,7 @@ __device__ __forceinline__ float FastllmPagedSoftmaxExp(float x) {
 }
 
 // Gather paged KV [maxPages, pageLen, numHeads, headDim] -> contiguous HND [numHeads, kvLen, headDim].
-template <typename SrcT, int THREAD_PER_BLOCK>
+template <typename SrcT, typename DstT, int THREAD_PER_BLOCK>
 __global__ void FastllmPagedCacheGatherKernel(
     const uint8_t *pagedData,
     const int32_t *pageIndices,
@@ -94,14 +94,14 @@ __global__ void FastllmPagedCacheGatherKernel(
     }
 
     const SrcT *src = (const SrcT*)pagedData;
-    half *dst = (half*)outData;
+    DstT *dst = (DstT*)outData;
     int pageStride = pageLen * numHeads * headDim;
     int tokenStride = numHeads * headDim;
     int srcOffset = pageIndices[pageListIdx] * pageStride + offsetInPage * tokenStride + head * headDim + dim;
-    dst[idx] = __float2half(FastllmAttentionValueToFloat<SrcT>(src[srcOffset]));
+    dst[idx] = FastllmAttentionFloatToValue<DstT>(FastllmAttentionValueToFloat<SrcT>(src[srcOffset]));
 }
 
-template <typename SrcT>
+template <typename SrcT, typename DstT>
 static void FastllmCudaPagedCacheGatherContiguous(
     uint8_t *pagedData,
     const int32_t *pageIndices,
@@ -111,14 +111,14 @@ static void FastllmCudaPagedCacheGatherContiguous(
     int numHeads,
     int headDim,
     int kvLen,
-    half *outData) {
+    DstT *outData) {
     int totalElements = numHeads * kvLen * headDim;
     if (totalElements <= 0) {
         return;
     }
     const int THREAD_PER_BLOCK = 256;
     int numBlocks = (totalElements + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
-    FastllmPagedCacheGatherKernel<SrcT, THREAD_PER_BLOCK><<<numBlocks, THREAD_PER_BLOCK>>>(
+    FastllmPagedCacheGatherKernel<SrcT, DstT, THREAD_PER_BLOCK><<<numBlocks, THREAD_PER_BLOCK>>>(
         pagedData, pageIndices, numPages, lastPageLen, pageLen, numHeads, headDim, kvLen,
         (uint8_t*)outData);
 }
@@ -140,17 +140,59 @@ static void FastllmCudaPagedCacheGatherToHalf(
     cudaMemcpy(pageIndicesGpu, pageIndices.data(), (size_t)numPages * sizeof(int32_t), cudaMemcpyHostToDevice);
     uint8_t *pagedBytes = (uint8_t*)pagedKVCache->cudaData;
     if (pagedKVCache->dataType == fastllm::DataType::FLOAT16) {
-        FastllmCudaPagedCacheGatherContiguous<half>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
-                                                    pageLen, numHeads, headDim, kvLen, outData);
+        FastllmCudaPagedCacheGatherContiguous<half, half>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
+                                                          pageLen, numHeads, headDim, kvLen, outData);
     } else if (pagedKVCache->dataType == fastllm::DataType::BFLOAT16) {
-        FastllmCudaPagedCacheGatherContiguous<__nv_bfloat16>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
-                                                             pageLen, numHeads, headDim, kvLen, outData);
+        FastllmCudaPagedCacheGatherContiguous<__nv_bfloat16, half>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
+                                                                   pageLen, numHeads, headDim, kvLen, outData);
+    } else if (pagedKVCache->dataType == fastllm::DataType::FLOAT32) {
+        FastllmCudaPagedCacheGatherContiguous<float, half>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
+                                                           pageLen, numHeads, headDim, kvLen, outData);
     } else if (pagedKVCache->dataType == fastllm::DataType::FP8_E4M3) {
-        FastllmCudaPagedCacheGatherContiguous<__nv_fp8_e4m3>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
-                                                             pageLen, numHeads, headDim, kvLen, outData);
+        FastllmCudaPagedCacheGatherContiguous<__nv_fp8_e4m3, half>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
+                                                                   pageLen, numHeads, headDim, kvLen, outData);
     } else {
         FastllmCudaFree(pageIndicesGpu);
         printf("FastllmCudaPagedCacheGatherToHalf: unsupported paged KV cache dataType=%d\n",
+               (int)pagedKVCache->dataType);
+        exit(0);
+    }
+    FastllmCudaFree(pageIndicesGpu);
+}
+
+// Same as the half variant, but keeps full float32 precision so a float32
+// query can run the plain (non half) attention kernel and match the CPU path.
+static void FastllmCudaPagedCacheGatherToFloat(
+    fastllm::Data *pagedKVCache,
+    const std::vector<int32_t> &pageIndices,
+    int lastPageLen,
+    int pageLen,
+    int numHeads,
+    int headDim,
+    int kvLen,
+    float *outData) {
+    int numPages = (int)pageIndices.size();
+    if (numPages <= 0 || kvLen <= 0) {
+        return;
+    }
+    int32_t *pageIndicesGpu = (int32_t*)FastllmCudaMalloc((size_t)numPages * sizeof(int32_t));
+    cudaMemcpy(pageIndicesGpu, pageIndices.data(), (size_t)numPages * sizeof(int32_t), cudaMemcpyHostToDevice);
+    uint8_t *pagedBytes = (uint8_t*)pagedKVCache->cudaData;
+    if (pagedKVCache->dataType == fastllm::DataType::FLOAT32) {
+        FastllmCudaPagedCacheGatherContiguous<float, float>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
+                                                            pageLen, numHeads, headDim, kvLen, outData);
+    } else if (pagedKVCache->dataType == fastllm::DataType::FLOAT16) {
+        FastllmCudaPagedCacheGatherContiguous<half, float>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
+                                                           pageLen, numHeads, headDim, kvLen, outData);
+    } else if (pagedKVCache->dataType == fastllm::DataType::BFLOAT16) {
+        FastllmCudaPagedCacheGatherContiguous<__nv_bfloat16, float>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
+                                                                    pageLen, numHeads, headDim, kvLen, outData);
+    } else if (pagedKVCache->dataType == fastllm::DataType::FP8_E4M3) {
+        FastllmCudaPagedCacheGatherContiguous<__nv_fp8_e4m3, float>(pagedBytes, pageIndicesGpu, numPages, lastPageLen,
+                                                                    pageLen, numHeads, headDim, kvLen, outData);
+    } else {
+        FastllmCudaFree(pageIndicesGpu);
+        printf("FastllmCudaPagedCacheGatherToFloat: unsupported paged KV cache dataType=%d\n",
                (int)pagedKVCache->dataType);
         exit(0);
     }
@@ -1104,9 +1146,72 @@ static bool FastllmCudaHalfPagedAttentionNative(
     FastllmCudaFree(kContig);
     FastllmCudaFree(vContig);
     if (ok && permuteOutput) {
-        // FastllmCudaHalfAttention 将结果写为 head-major 物理布局 [numHeads, qoLen, headDim]，
-        // 这里显式按该物理布局设置 dims（不依赖入口 dims），再转置成与 FlashInfer 一致的
-        // token-major 布局 [qoLen, numHeads, headDim]。
+        // 批量路径要求 token-major：FastllmCudaHalfAttention 写出的 head-major 结果
+        // 在这里显式转置成 [qoLen, numHeads, headDim]（AttentionPagedBatch 的输出约定）。
+        int numHeads = q.dims[0];
+        int qoLen = q.dims[1];
+        int outHeadDim = output.dims[2];
+        output.Resize({numHeads, qoLen, outHeadDim});
+        FastllmCudaPermute(output, {1, 0, 2});
+        DeviceSync();
+    }
+    return ok;
+}
+
+// Float32 counterpart of FastllmCudaHalfPagedAttentionNative. The half path
+// quantizes the gathered cache to half and runs the half attention kernel,
+// which drives the whole forward away from the float32 CPU reference; a
+// float32 query now keeps the cache in float32 and uses the plain attention
+// kernel so a float32 run stays numerically close to the CPU path.
+static bool FastllmCudaFloatPagedAttentionNative(
+    fastllm::Data &q,
+    const std::vector<int32_t> &pageIndices,
+    int lastPageLen,
+    fastllm::Data *pagedKVCacheK,
+    fastllm::Data *pagedKVCacheV,
+    int pageLen,
+    int numKvHeads,
+    int headDim,
+    fastllm::Data &output,
+    int group,
+    float scale,
+    bool permuteOutput = true) {
+    if (q.dataType != fastllm::DataType::FLOAT32) {
+        printf("FastllmCudaFloatPagedAttentionNative: only FLOAT32 query is supported, got %d\n",
+               (int)q.dataType);
+        return false;
+    }
+    int numPages = (int)pageIndices.size();
+    if (numPages <= 0) {
+        printf("FastllmCudaFloatPagedAttentionNative: empty page list\n");
+        return false;
+    }
+    int kvLen = (numPages - 1) * pageLen + lastPageLen;
+    if (kvLen <= 0) {
+        return false;
+    }
+
+    size_t kvBytes = (size_t)numKvHeads * kvLen * headDim * sizeof(float);
+    float *kContig = (float*)FastllmCudaMalloc(kvBytes);
+    float *vContig = (float*)FastllmCudaMalloc(kvBytes);
+    FastllmCudaPagedCacheGatherToFloat(pagedKVCacheK, pageIndices, lastPageLen, pageLen, numKvHeads, headDim, kvLen, kContig);
+    FastllmCudaPagedCacheGatherToFloat(pagedKVCacheV, pageIndices, lastPageLen, pageLen, numKvHeads, headDim, kvLen, vContig);
+
+    fastllm::Data kData, vData, emptyMask;
+    kData.dataType = fastllm::DataType::FLOAT32;
+    kData.dataDevice = fastllm::DataDevice::CUDA;
+    // 使用 Resize 正确填充 strides，否则 Data::Count 会越界访问 strides。
+    kData.Resize({numKvHeads, kvLen, headDim});
+    kData.cudaData = (uint8_t*)kContig;
+    kData.isFake = true; // 视图，内存由本函数显式管理，析构时不要释放
+    vData = kData;
+    vData.cudaData = (uint8_t*)vContig;
+    vData.isFake = true;
+
+    bool ok = FastllmCudaAttention(q, kData, vData, emptyMask, output, group, scale, 0);
+    FastllmCudaFree(kContig);
+    FastllmCudaFree(vContig);
+    if (ok && permuteOutput) {
         int numHeads = q.dims[0];
         int qoLen = q.dims[1];
         int outHeadDim = output.dims[2];
@@ -1148,8 +1253,15 @@ bool FastllmCudaHalfPagedAttentionFastllmFallback(
         if (ok) output.Resize(q.dims);
         return ok;
     }
+    // AttentionPaged 的输出约定来自 CpuAttentionPagedOp::Reshape：head-major
+    // [numHeads, qoLen, headDim]，调用方自己再转成 token-major。这里必须传
+    // permuteOutput=false，否则调用方的转置会叠加成多转一层，前缀填充结果全错。
+    if (q.dataType == fastllm::DataType::FLOAT32 && output.dataType == q.dataType) {
+        return FastllmCudaFloatPagedAttentionNative(q, k.pageIndex, k.lastPageLen, pagedKVCacheK, pagedKVCacheV,
+                                                    k.pageLen, numKvHeads, headDim, output, group, scale, false);
+    }
     return FastllmCudaHalfPagedAttentionNative(q, k.pageIndex, k.lastPageLen, pagedKVCacheK, pagedKVCacheV,
-                                               k.pageLen, numKvHeads, headDim, output, group, scale);
+                                               k.pageLen, numKvHeads, headDim, output, group, scale, false);
 }
 
 // CUDA-graph 可捕获的分页注意力 kernel（前缀填充 + 解码统一实现）。
