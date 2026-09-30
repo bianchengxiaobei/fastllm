@@ -52,10 +52,15 @@ bool FastllmCudaDeepGemmLinearFp8Sm90(const fastllm::Data &input, fastllm::Data 
 #endif
 
 // 定义在 fastllm-cuda.cu: 走固定内存中转的 H2D 上传(不可用时返回 false), 以及
-// 槽位等待计时. 故意放在全局作用域, 与 fastllm-cuda.cu 的定义一致.
+// 槽位等待/中转内部计时/真 cudaMalloc 计数的读口. 故意放在全局作用域, 与
+// fastllm-cuda.cu 的定义一致.
 bool FastllmCudaUploadHostToDevicePinnedStaged(
     void *dst, const void *src, size_t size, void *stream);
 double FastllmCudaPinnedStagedSlotWaitSeconds();
+double FastllmCudaPinnedStagedMemcpySeconds();
+double FastllmCudaPinnedStagedEnqueueSeconds();
+unsigned long long FastllmCudaRealMallocCount();
+unsigned long long FastllmCudaRealMallocBytes();
 
 namespace fastllm {
     // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
@@ -9141,18 +9146,34 @@ namespace fastllm {
         }();
         double profileUpload = 0.0, profileCompute = 0.0, profileRelease = 0.0;
         double profileUploadBytes = 0.0;
+        double profileAlloc = 0.0;
         int profileUploads = 0;
         auto profileNow = []() {
             return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-9;
         };
-        auto doUploadWeight = [pinnedUpload](Data *weight, void *stream) {
+        // 归因基线要在第一次上传之前取, 否则开头那次上传的耗时会被漏掉.
+        const double stagedMemcpyBefore =
+            profileMoeStream ? FastllmCudaPinnedStagedMemcpySeconds() : 0.0;
+        const double stagedEnqueueBefore =
+            profileMoeStream ? FastllmCudaPinnedStagedEnqueueSeconds() : 0.0;
+        const unsigned long long realMallocBefore =
+            profileMoeStream ? FastllmCudaRealMallocCount() : 0;
+        const unsigned long long realMallocBytesBefore =
+            profileMoeStream ? FastllmCudaRealMallocBytes() : 0;
+        // allocSeconds 只在开归因时非空: 延迟释放把 cudaData 清回 nullptr, 每次上传
+        // 都要重新向池子要一块显存, 这段开销原本混在 upload 里看不出来.
+        auto doUploadWeight = [&](Data *weight, void *stream, double *allocSeconds) {
             if (!(weight->cpuData || !weight->numasData.empty())) {
                 return;
             }
             if (pinnedUpload && weight->cpuData != nullptr) {
                 if (weight->cudaData == nullptr) {
+                    const double allocStart = allocSeconds != nullptr ? profileNow() : 0.0;
                     weight->ToCudaTemporary({}, false);
+                    if (allocSeconds != nullptr) {
+                        *allocSeconds += profileNow() - allocStart;
+                    }
                 }
                 if (FastllmCudaUploadHostToDevicePinnedStaged(
                         weight->cudaData, weight->cpuData,
@@ -9164,11 +9185,11 @@ namespace fastllm {
         };
         auto uploadWeight = [&](Data *weight, void *stream = nullptr) {
             if (!profileMoeStream) {
-                doUploadWeight(weight, stream);
+                doUploadWeight(weight, stream, nullptr);
                 return;
             }
             double start = profileNow();
-            doUploadWeight(weight, stream);
+            doUploadWeight(weight, stream, &profileAlloc);
             profileUpload += profileNow() - start;
             profileUploadBytes += (double)weight->GetBytes();
             profileUploads++;
@@ -9374,14 +9395,26 @@ namespace fastllm {
             if ((profilePrintCounter.fetch_add(1) % 8) == 0) {
                 const double slotWait = FastllmCudaPinnedStagedSlotWaitSeconds() -
                                         slotWaitBefore;
+                const double stageMemcpy = FastllmCudaPinnedStagedMemcpySeconds() -
+                                           stagedMemcpyBefore;
+                const double stageEnqueue = FastllmCudaPinnedStagedEnqueueSeconds() -
+                                            stagedEnqueueBefore;
+                const unsigned long long realMalloc =
+                    FastllmCudaRealMallocCount() - realMallocBefore;
+                const unsigned long long realMallocBytes =
+                    FastllmCudaRealMallocBytes() - realMallocBytesBefore;
                 const double other = loopSeconds - profileUpload - profileCompute -
                                      profileRelease - slotWait;
                 printf("[fastllm-moe-stream] call=%d experts=%d upload=%.4f s (%d calls, "
-                       "%.2f GB, %.2f GB/s) computeEnqueue=%.4f s release=%.4f s "
+                       "%.2f GB, %.2f GB/s) alloc=%.4f s stageMemcpy=%.4f s "
+                       "stageEnqueue=%.4f s cudaMalloc=%llu (%.1f MB) "
+                       "computeEnqueue=%.4f s release=%.4f s "
                        "slotWait=%.4f s other=%.4f s loop=%.4f s\n",
                        profilePrintCounter.load() - 1, loopExperts, profileUpload,
                        profileUploads, profileUploadBytes / 1e9,
                        loopSeconds > 0.0 ? profileUploadBytes / loopSeconds / 1e9 : 0.0,
+                       profileAlloc, stageMemcpy, stageEnqueue,
+                       realMalloc, realMallocBytes / 1048576.0,
                        profileCompute, profileRelease, slotWait, other, loopSeconds);
                 fflush(stdout);
             }

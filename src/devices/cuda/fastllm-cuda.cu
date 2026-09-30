@@ -309,6 +309,10 @@ static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line,
     fflush(stderr);
 }
 
+// 归因用: 池子没兜住、真的走到 cudaMalloc 的次数与字节数.
+static std::atomic<unsigned long long> gCudaRealMallocCount(0);
+static std::atomic<unsigned long long> gCudaRealMallocBytes(0);
+
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
     if (ret != nullptr) {
         *ret = nullptr;
@@ -339,6 +343,8 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
             return syncState;
         }
     }
+    gCudaRealMallocCount.fetch_add(1, std::memory_order_relaxed);
+    gCudaRealMallocBytes.fetch_add(size, std::memory_order_relaxed);
     return cudaMalloc(ret, size);
 }
 
@@ -6030,9 +6036,28 @@ void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t siz
 
 // 仅为性能归因: 固定内存中转槽位等待(DMA 没跟上, 环被写满)的累计秒数.
 static std::atomic<double> gPinnedStagedSlotWaitSeconds(0.0);
+// 归因用: 中转上传内部"主机 memcpy 进槽"和"H2D 入队"各花了多少秒.
+static std::atomic<double> gPinnedStagedMemcpySeconds(0.0);
+static std::atomic<double> gPinnedStagedEnqueueSeconds(0.0);
 
 double FastllmCudaPinnedStagedSlotWaitSeconds() {
     return gPinnedStagedSlotWaitSeconds.load(std::memory_order_relaxed);
+}
+
+double FastllmCudaPinnedStagedMemcpySeconds() {
+    return gPinnedStagedMemcpySeconds.load(std::memory_order_relaxed);
+}
+
+double FastllmCudaPinnedStagedEnqueueSeconds() {
+    return gPinnedStagedEnqueueSeconds.load(std::memory_order_relaxed);
+}
+
+unsigned long long FastllmCudaRealMallocCount() {
+    return gCudaRealMallocCount.load(std::memory_order_relaxed);
+}
+
+unsigned long long FastllmCudaRealMallocBytes() {
+    return gCudaRealMallocBytes.load(std::memory_order_relaxed);
 }
 
 // 中转环配置. 这是不可换出的主机内存(懒分配), 总量 = 槽数 × 单槽宽.
@@ -6062,6 +6087,20 @@ static PinnedStagingConfig GetPinnedStagingConfig() {
            (int)(config.slotBytes * (size_t)config.slotCount / 1024 / 1024));
     fflush(stdout);
     return config;
+}
+
+// 归因开关: 环境变量只读一次, 关掉时下面只剩一个可预测分支.
+static bool PinnedStagingProfileOn() {
+    static const bool on = []() {
+        const char *env = std::getenv("FASTLLM_PROFILE_MOE_STREAM");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return on;
+}
+
+static double PinnedStagingNow() {
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-9;
 }
 
 // 可换页内存上的 cudaMemcpyAsync 对主机是同步的: 必须等整块数据都被读走才返回,
@@ -6129,10 +6168,20 @@ bool FastllmCudaUploadHostToDevicePinnedStaged(
                     std::chrono::steady_clock::now() - waitStart).count(),
                 std::memory_order_relaxed);
         }
+        const bool profileStaged = PinnedStagingProfileOn();
+        const double copyStart = profileStaged ? PinnedStagingNow() : 0.0;
         memcpy(slots[slot], (const uint8_t*)src + offset, bytes);
+        const double enqueueStart = profileStaged ? PinnedStagingNow() : 0.0;
         cudaError_t state = cudaMemcpyAsync(
             (uint8_t*)dst + offset, slots[slot], bytes,
             cudaMemcpyHostToDevice, (cudaStream_t)stream);
+        if (profileStaged) {
+            const double now = PinnedStagingNow();
+            gPinnedStagedMemcpySeconds.fetch_add(
+                enqueueStart - copyStart, std::memory_order_relaxed);
+            gPinnedStagedEnqueueSeconds.fetch_add(
+                now - enqueueStart, std::memory_order_relaxed);
+        }
         if (state != cudaSuccess) {
             return false;
         }
