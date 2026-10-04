@@ -3423,6 +3423,27 @@ static size_t ParseSizeFromEnv(const char* env_name, size_t default_size) {
     return result;
 }
 
+struct FastllmCudaTempDeviceBuffer {
+    int device = -1;
+    void *data = nullptr;
+    size_t size = 0;
+
+    explicit FastllmCudaTempDeviceBuffer(int device) : device(device) {}
+
+    ~FastllmCudaTempDeviceBuffer() {
+        if (data == nullptr) {
+            return;
+        }
+        int oldDevice = -1;
+        cudaGetDevice(&oldDevice);
+        cudaSetDevice(device);
+        FastllmCudaDirectFree(data);
+        if (oldDevice >= 0) {
+            cudaSetDevice(oldDevice);
+        }
+    }
+};
+
 struct FlashInferWorkSpaceManager {
     const size_t float_workspace_size = ParseSizeFromEnv("FT_FLOAT_WORKSPACE_SIZE", 256 * 1024 * 1024);
     size_t int_workspace_size = 1024 * 1024;
@@ -3431,6 +3452,19 @@ struct FlashInferWorkSpaceManager {
     void* d_float_workspace = nullptr;
     void* d_int_workspace = nullptr;
     void* h_page_locked_int_workspace = nullptr;
+
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    struct MLADecodePlan : FastllmCudaTempDeviceBuffer {
+        flashinfer::MLAPlanInfo info;
+        uint64_t last_used = 0;
+        explicit MLADecodePlan(int device) : FastllmCudaTempDeviceBuffer(device) {}
+    };
+    // Sparse decode has one query and page size one. The scheduler depends
+    // only on heads, latent width, KV length and this workspace's device;
+    // token indices and tensor addresses remain per-call kernel arguments.
+    std::map<std::array<int, 3>, std::unique_ptr<MLADecodePlan>> mla_decode_plans;
+    uint64_t mla_plan_clock = 0;
+#endif
 
     // Integer schedules are usually only a few KiB. Size the staging arena
     // from the counting planner; keep the float arena (kernel split policy)
@@ -3496,27 +3530,6 @@ void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize) {
     }
     return workspace.d_float_workspace;
 }
-
-struct FastllmCudaTempDeviceBuffer {
-    int device = -1;
-    void *data = nullptr;
-    size_t size = 0;
-
-    explicit FastllmCudaTempDeviceBuffer(int device) : device(device) {}
-
-    ~FastllmCudaTempDeviceBuffer() {
-        if (data == nullptr) {
-            return;
-        }
-        int oldDevice = -1;
-        cudaGetDevice(&oldDevice);
-        cudaSetDevice(device);
-        FastllmCudaDirectFree(data);
-        if (oldDevice >= 0) {
-            cudaSetDevice(oldDevice);
-        }
-    }
-};
 
 static std::map<int, std::unique_ptr<FastllmCudaTempDeviceBuffer>> s_fastllmCudaTempBuffers;
 // s_fastllmCudaTempBuffersMapLock 仅保护 map 结构本身（查找/插入），
@@ -4836,7 +4849,8 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 }
 
 bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
-                         fastllm::Data &output, float softmaxScale, int requestedKvLen) {
+                         fastllm::Data &output, float softmaxScale, int requestedKvLen,
+                         const fastllm::Data *physicalTokenIndices) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     // FlashInfer 不可用（sm_70 以下），分页 MLA 暂无原生实现。
     return false;
@@ -4859,25 +4873,81 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     int kvLen = requestedKvLen > 0 ? requestedKvLen : fullKvLen;
     int qoLen = b * s;
     if (kvLen <= 0 || kvLen > fullKvLen || kvLen < s) return false;
+    if (physicalTokenIndices != nullptr) {
+        // A selected physical token is a page of length one in the same KV
+        // pool. Keep the GPU indices on device and reuse FlashInfer's split-K
+        // paged MLA scheduler, without copying or quantizing any cached KV.
+        if (b != 1 || s != 1 ||
+            physicalTokenIndices->dataDevice != fastllm::DataDevice::CUDA ||
+            physicalTokenIndices->dataType != fastllm::DataType::INT32 ||
+            !physicalTokenIndices->cudaData ||
+            physicalTokenIndices->Count(0) < (uint64_t)kvLen ||
+            physicalTokenIndices->dataDeviceIds != qNope.dataDeviceIds) return false;
+        pageLen = 1;
+    }
     numPages = (kvLen + pageLen - 1) / pageLen;
 
-    std::vector<int32_t> q_indptr_h = {0, qoLen};
-    std::vector<int32_t> kv_indptr_h = {0, numPages};
-    std::vector<int32_t> kv_len_arr_h = {kvLen};
-    const uint32_t batch_size = 1;
-
-    // MLA uses a separate scheduler without a counting interface.
+    if (numPages <= 0 || head_dim_kpe != 64 ||
+        (head_dim_ckv != 128 && head_dim_ckv != 512)) return false;
     std::lock_guard<std::mutex> workspace_guard(workspace.plan_mutex);
-    workspace.EnsureIntCapacity(64ULL << 20);
     MLAPlanInfo plan_info;
-    cudaError_t plan_status = MLAPlan<int32_t>(
-        workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-        workspace.int_workspace_size, plan_info, q_indptr_h.data(), kv_indptr_h.data(), kv_len_arr_h.data(),
-        batch_size, (uint32_t)h, (uint32_t)head_dim_ckv, causal, 0);
-    if (plan_status != cudaSuccess || numPages <= 0) return false;
+    void *int_plan;
+    // Keep capture on its existing path: captured graphs must never retain
+    // pointers into this bounded, evictable eager cache.
+    const bool cache_plan = physicalTokenIndices != nullptr && !FastllmCudaGraphIsCapturing();
+    const std::array<int, 3> plan_key = {h, head_dim_ckv, kvLen};
+    auto cached = cache_plan ? workspace.mla_decode_plans.find(plan_key) : workspace.mla_decode_plans.end();
+    if (cached != workspace.mla_decode_plans.end()) {
+        cached->second->last_used = ++workspace.mla_plan_clock;
+        plan_info = cached->second->info;
+        int_plan = cached->second->data;
+    } else {
+        // MLA uses a separate scheduler without a counting interface.
+        workspace.EnsureIntCapacity(64ULL << 20);
+        int32_t q_indptr_h[] = {0, qoLen};
+        int32_t kv_indptr_h[] = {0, numPages};
+        int32_t kv_len_arr_h[] = {kvLen};
+        cudaError_t plan_status = MLAPlan<int32_t>(
+            workspace.d_float_workspace, workspace.float_workspace_size,
+            workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+            workspace.int_workspace_size, plan_info, q_indptr_h, kv_indptr_h, kv_len_arr_h,
+            1, (uint32_t)h, (uint32_t)head_dim_ckv, causal, 0);
+        if (plan_status != cudaSuccess) return false;
+        int_plan = workspace.d_int_workspace;
+        if (cache_plan) {
+            constexpr size_t max_cached_plans = 16;
+            if (workspace.mla_decode_plans.size() >= max_cached_plans) {
+                // Entries can have consumers on other host threads/streams.
+                checkCudaErrors("MLA plan eviction sync", cudaDeviceSynchronize());
+                auto oldest = std::min_element(workspace.mla_decode_plans.begin(), workspace.mla_decode_plans.end(),
+                    [](const auto &a, const auto &b) { return a.second->last_used < b.second->last_used; });
+                workspace.mla_decode_plans.erase(oldest);
+            }
+            int device = -1;
+            cudaGetDevice(&device);
+            auto entry = std::make_unique<FlashInferWorkSpaceManager::MLADecodePlan>(device);
+            entry->info = plan_info;
+            entry->last_used = ++workspace.mla_plan_clock;
+            // work_indptr is the last integer allocation in MLAPlan. Only
+            // num_blks_y + 1 entries are read; preceding offsets stay intact.
+            entry->size = plan_info.work_indptr_offset + (plan_info.num_blks_y + 1) * sizeof(int32_t);
+            fastllm::AssertInFastLLM(entry->size <= workspace.int_workspace_size, "MLA plan exceeds workspace.\n");
+            entry->data = FastllmCudaDirectMalloc(entry->size);
+            checkCudaErrors("MLA plan cache copy", cudaMemcpyAsync(entry->data, workspace.d_int_workspace,
+                entry->size, cudaMemcpyDeviceToDevice, 0));
+            // Finish the upload before another planner reuses pinned staging,
+            // and publish immutable plan data only after it is ready.
+            checkCudaErrors("MLA plan cache ready", cudaStreamSynchronize(0));
+            int_plan = entry->data;
+            workspace.mla_decode_plans.emplace(plan_key, std::move(entry));
+        }
+    }
 
-    int32_t *d_kv_indices = (int32_t*)FastllmCudaMalloc(numPages * sizeof(int32_t));
-    cudaMemcpy(d_kv_indices, kvCachePaged.pageIndex.data(), numPages * sizeof(int32_t), cudaMemcpyHostToDevice);
+    int32_t *d_kv_indices = physicalTokenIndices != nullptr
+        ? (int32_t*)physicalTokenIndices->cudaData
+        : (int32_t*)FastllmCudaMalloc(numPages * sizeof(int32_t));
+    if (physicalTokenIndices == nullptr)
+        cudaMemcpy(d_kv_indices, kvCachePaged.pageIndex.data(), numPages * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     uint_fastdiv num_heads_div((uint32_t)h);
     uint_fastdiv block_size_div((uint32_t)pageLen);
@@ -4891,21 +4961,21 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
         params.kpe = (scalar_t*)kvCachePaged.pagedKVCacheData->cudaData;
         params.final_o = (scalar_t*)output.cudaData;
         params.final_lse = nullptr;
-        params.q_indptr = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.q_indptr_offset);
-        params.kv_indptr = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.kv_indptr_offset);
-        params.partial_indptr = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.partial_indptr_offset);
+        params.q_indptr = (int32_t*)((uint8_t*)int_plan + plan_info.q_indptr_offset);
+        params.kv_indptr = (int32_t*)((uint8_t*)int_plan + plan_info.kv_indptr_offset);
+        params.partial_indptr = (int32_t*)((uint8_t*)int_plan + plan_info.partial_indptr_offset);
         params.kv_indices = d_kv_indices;
-        params.q_len = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.q_len_offset);
-        params.kv_len = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.kv_len_offset);
-        params.q_start = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.q_start_offset);
-        params.kv_start = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.kv_start_offset);
-        params.kv_end = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.kv_end_offset);
-        params.work_indptr = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.work_indptr_offset);
-        params.merge_packed_offset_start = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_packed_offset_start_offset);
-        params.merge_packed_offset_end = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_packed_offset_end_offset);
-        params.merge_partial_packed_offset_start = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_partial_packed_offset_start_offset);
-        params.merge_partial_packed_offset_end = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_partial_packed_offset_end_offset);
-        params.merge_partial_stride = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_partial_stride_offset);
+        params.q_len = (int32_t*)((uint8_t*)int_plan + plan_info.q_len_offset);
+        params.kv_len = (int32_t*)((uint8_t*)int_plan + plan_info.kv_len_offset);
+        params.q_start = (int32_t*)((uint8_t*)int_plan + plan_info.q_start_offset);
+        params.kv_start = (int32_t*)((uint8_t*)int_plan + plan_info.kv_start_offset);
+        params.kv_end = (int32_t*)((uint8_t*)int_plan + plan_info.kv_end_offset);
+        params.work_indptr = (int32_t*)((uint8_t*)int_plan + plan_info.work_indptr_offset);
+        params.merge_packed_offset_start = (int32_t*)((uint8_t*)int_plan + plan_info.merge_packed_offset_start_offset);
+        params.merge_packed_offset_end = (int32_t*)((uint8_t*)int_plan + plan_info.merge_packed_offset_end_offset);
+        params.merge_partial_packed_offset_start = (int32_t*)((uint8_t*)int_plan + plan_info.merge_partial_packed_offset_start_offset);
+        params.merge_partial_packed_offset_end = (int32_t*)((uint8_t*)int_plan + plan_info.merge_partial_packed_offset_end_offset);
+        params.merge_partial_stride = (int32_t*)((uint8_t*)int_plan + plan_info.merge_partial_stride_offset);
         params.partial_o = (scalar_t*)((uint8_t*)workspace.d_float_workspace + plan_info.partial_o_offset);
         params.partial_lse = (float*)((uint8_t*)workspace.d_float_workspace + plan_info.partial_lse_offset);
         params.num_heads = num_heads_div;
@@ -4924,23 +4994,20 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
         params.sm_scale = softmaxScale;
         params.return_lse_base_on_e = false;
 
-        if (head_dim_ckv == 128 && head_dim_kpe == 64) {
+        if (head_dim_ckv == 128) {
             return mla::BatchMLAPagedAttention<MaskMode::kCausal, 128, 64>(
                 params, (uint32_t)plan_info.num_blks_x,
                 (uint32_t)plan_info.num_blks_y, 0);
         }
-        if (head_dim_ckv == 512 && head_dim_kpe == 64) {
-            return mla::BatchMLAPagedAttention<MaskMode::kCausal, 512, 64>(
-                params, (uint32_t)plan_info.num_blks_x,
-                (uint32_t)plan_info.num_blks_y, 0);
-        }
-        return cudaErrorNotSupported;
+        return mla::BatchMLAPagedAttention<MaskMode::kCausal, 512, 64>(
+            params, (uint32_t)plan_info.num_blks_x,
+            (uint32_t)plan_info.num_blks_y, 0);
     };
 
     cudaError_t status = qNope.dataType == fastllm::DataType::BFLOAT16 ?
         runAttention(__nv_bfloat16()) : runAttention(half());
 
-    FastllmCudaFree(d_kv_indices);
+    if (physicalTokenIndices == nullptr) FastllmCudaFree(d_kv_indices);
 
     if (status != cudaSuccess) return false;
     DeviceSync();

@@ -768,6 +768,57 @@ namespace fastllm {
     }
 #endif
 
+#ifdef __AVX2__
+    static inline __m256 FP8E4M3ToFloat_AVX2(__m128i bytes) {
+        const __m256i words = _mm256_cvtepu8_epi32(bytes);
+        const __m256i magnitude = _mm256_and_si256(words, _mm256_set1_epi32(0x7f));
+        const __m256i sign = _mm256_slli_epi32(
+            _mm256_and_si256(words, _mm256_set1_epi32(0x80)), 24);
+        const __m256 normal = _mm256_castsi256_ps(_mm256_add_epi32(
+            _mm256_slli_epi32(magnitude, 20), _mm256_set1_epi32(120 << 23)));
+        const __m256 subnormal = _mm256_mul_ps(_mm256_cvtepi32_ps(magnitude), _mm256_set1_ps(1.0f / 512));
+        const __m256 tiny = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(8), magnitude));
+        return _mm256_or_ps(_mm256_blendv_ps(normal, subnormal, tiny), _mm256_castsi256_ps(sign));
+    }
+#endif
+
+    bool FastllmGemmFP8Block128_AVX2(
+            const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+            int n, int m, int st, int end) {
+#ifdef __AVX2__
+        if (m % 8 != 0) return false;
+        for (int row = 0; row < n; row++) {
+            float *out = (float *)((uint8_t *)C + (size_t)row * ldc);
+            for (int col = st; col < end; col++) {
+                float sum = 0;
+                for (int start = 0; start < m; start += 128) {
+                    const uint8_t *a = (const uint8_t *)A + (size_t)row * lda + (start / 128) * 132;
+                    const uint8_t *b = (const uint8_t *)B + (size_t)col * ldb + (start / 128) * 132;
+                    int count = std::min(128, m - start);
+                    __m256 accum = _mm256_setzero_ps();
+                    for (int c = 0; c < count; c += 8) {
+                        __m256 va = FP8E4M3ToFloat_AVX2(_mm_loadl_epi64((const __m128i *)(a + c)));
+                        __m256 vb = FP8E4M3ToFloat_AVX2(_mm_loadl_epi64((const __m128i *)(b + c)));
+                        accum = _mm256_fmadd_ps(va, vb, accum);
+                    }
+                    __m128 half = _mm_add_ps(_mm256_castps256_ps128(accum), _mm256_extractf128_ps(accum, 1));
+                    half = _mm_hadd_ps(half, half);
+                    half = _mm_hadd_ps(half, half);
+                    float dot = _mm_cvtss_f32(half);
+                    float as, bs;
+                    std::memcpy(&as, a + count, sizeof(as));
+                    std::memcpy(&bs, b + count, sizeof(bs));
+                    sum += (dot * as) * bs;
+                }
+                out[col] = sum;
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
     bool LinearBFloat16_FP8E4M3BLOCK128_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX2__

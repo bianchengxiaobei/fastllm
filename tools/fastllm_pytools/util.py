@@ -8,9 +8,9 @@ import math
 from decimal import Decimal, InvalidOperation, localcontext
 
 try:
-    from .gguf_metadata import get_gguf_model_config
+    from .gguf_metadata import get_gguf_model_config, read_gguf_metadata, read_gguf_tensor_names
 except ImportError:
-    from gguf_metadata import get_gguf_model_config
+    from gguf_metadata import get_gguf_model_config, read_gguf_metadata, read_gguf_tensor_names
 
 def _positive_int(value: str) -> int:
     try:
@@ -20,6 +20,15 @@ def _positive_int(value: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return value
+
+def _probability(value: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a probability in [0, 1]")
+    if not 0.0 <= result <= 1.0:
+        raise argparse.ArgumentTypeError("must be a probability in [0, 1]")
+    return result
 
 def _memory_size_bytes(value) -> int:
     """Parse a non-negative binary memory size such as 3g or 512m."""
@@ -809,7 +818,7 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "Glm5NextForConditionalGeneration",
     ] or model_type in [
         "deepseek_v4", "deepseek_v41", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
-        "kimi_k3", "dots3_note", "glm5_next", "glm5_next_text", "qwen4_exp",
+        "kimi_k3", "dots3_note", "naive_n05_flash", "glm5_next", "glm5_next_text", "qwen4_exp",
         "qwen3_8_flash_next",
     ] or text_model_type in [
         "deepseek_v41_text", "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
@@ -900,8 +909,11 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = "prefix_cache_snapshot_max_records", type = int, default = -1,
                         help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
-    parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
+    parser.add_argument("--cuda_slab", type = int, default = None,
+                        help = "CUDA模型权重slab大小（MiB）；默认按模型选择，0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--mtp_min_p", "--mtp-min-p", type = _probability, default = None,
+                        help = "Qwen4 贪心 MTP 草稿概率阈值；低于阈值时停止草稿链，0 关闭（默认），--mtp 指定最大草稿数")
     parser.add_argument("--mtp_fp8_draft_head", "--mtp-fp8-draft-head",
                         type = int, choices = [0, 1], default = None,
                         help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
@@ -913,7 +925,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
                         "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
-                        help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可直接指定 mtp.safetensors")
+                        help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可指定 mtp.safetensors 或 Qwen4 MTP GGUF")
     parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
                         help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
@@ -990,6 +1002,10 @@ def make_normal_llm_model(args, startup_progress = None):
 
     user_set_device = bool(args.device and args.device != "")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
+    # Resolve this after loading a saved JSON configuration. An explicit zero
+    # must remain an opt-out, including when another model previously used slabs.
+    cuda_slab_auto = getattr(args, "cuda_slab", None) is None
+    args.cuda_slab = 0 if cuda_slab_auto else max(0, int(args.cuda_slab))
     if str(getattr(args, "speculative_algorithm", "") or "").strip().lower() == "off":
         # Explicitly disabling speculation takes precedence over saved draft settings.
         args.mtp = args.dspark = 0
@@ -1016,38 +1032,52 @@ def make_normal_llm_model(args, startup_progress = None):
     draft_architectures = []
     draft_text_config = {}
     draft_has_mtp_weights = False
+    draft_is_mtp_gguf = False
     if speculative_draft_path:
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
         draft_is_file = os.path.isfile(speculative_draft_path)
-        draft_config_dir = (os.path.dirname(speculative_draft_path)
-                            if draft_is_file else speculative_draft_path)
-        draft_config_path = os.path.join(draft_config_dir, "config.json")
-        if not os.path.isfile(draft_config_path):
-            raise ValueError(
-                "speculative draft model has no adjacent config.json: %s" %
-                speculative_draft_path)
-        with open(draft_config_path, "r", encoding = "utf-8") as file:
-            draft_config = json.load(file)
-        draft_architectures = draft_config.get("architectures", [])
-        draft_text_config = draft_config.get("text_config", draft_config)
-        if not isinstance(draft_text_config, dict):
-            draft_text_config = {}
-        draft_has_mtp_weights = (
-            (draft_is_file and
-             speculative_draft_path.lower().endswith(".safetensors")) or
-            os.path.isfile(os.path.join(draft_config_dir, "mtp.safetensors")))
-        if not draft_has_mtp_weights:
-            draft_index_path = os.path.join(
-                draft_config_dir, "model.safetensors.index.json")
-            if os.path.isfile(draft_index_path):
-                with open(draft_index_path, "r", encoding = "utf-8") as file:
-                    draft_index = json.load(file)
-                draft_weight_map = draft_index.get("weight_map", {})
-                draft_has_mtp_weights = isinstance(
-                    draft_weight_map, dict) and any(
-                        str(name).startswith("mtp.")
-                        for name in draft_weight_map)
+        draft_is_mtp_gguf = draft_is_file and speculative_draft_path.lower().endswith(".gguf")
+        if draft_is_mtp_gguf:
+            metadata = read_gguf_metadata(speculative_draft_path, {"general.architecture"})
+            if metadata.get("general.architecture") != "qwen4exp-mtp":
+                raise ValueError("external MTP GGUF must have qwen4exp-mtp architecture")
+            names = read_gguf_tensor_names(speculative_draft_path)
+            if not names or any(not name.startswith("mtp.") for name in names):
+                raise ValueError("external MTP GGUF must contain only mtp.* tensors")
+            draft_has_mtp_weights = True
+            draft_text_config = {"model_type": "qwen4_exp", "mtp_num_hidden_layers": 1}
+            if speculative_algorithm and speculative_algorithm != "mtp":
+                raise ValueError("Qwen4 MTP GGUF requires the mtp speculative algorithm")
+        else:
+            draft_config_dir = (os.path.dirname(speculative_draft_path)
+                                if draft_is_file else speculative_draft_path)
+            draft_config_path = os.path.join(draft_config_dir, "config.json")
+            if not os.path.isfile(draft_config_path):
+                raise ValueError(
+                    "speculative draft model has no adjacent config.json: %s" %
+                    speculative_draft_path)
+            with open(draft_config_path, "r", encoding = "utf-8") as file:
+                draft_config = json.load(file)
+            draft_architectures = draft_config.get("architectures", [])
+            draft_text_config = draft_config.get("text_config", draft_config)
+            if not isinstance(draft_text_config, dict):
+                draft_text_config = {}
+            draft_has_mtp_weights = (
+                (draft_is_file and
+                 speculative_draft_path.lower().endswith(".safetensors")) or
+                os.path.isfile(os.path.join(draft_config_dir, "mtp.safetensors")))
+            if not draft_has_mtp_weights:
+                draft_index_path = os.path.join(
+                    draft_config_dir, "model.safetensors.index.json")
+                if os.path.isfile(draft_index_path):
+                    with open(draft_index_path, "r", encoding = "utf-8") as file:
+                        draft_index = json.load(file)
+                    draft_weight_map = draft_index.get("weight_map", {})
+                    draft_has_mtp_weights = isinstance(
+                        draft_weight_map, dict) and any(
+                            str(name).startswith("mtp.")
+                            for name in draft_weight_map)
         if not speculative_algorithm:
             if "DFlash2DraftModel" in draft_architectures:
                 speculative_algorithm = "dflash"
@@ -1140,7 +1170,7 @@ def make_normal_llm_model(args, startup_progress = None):
                     speculative_draft_path)
             draft_model_type = str(
                 draft_text_config.get("model_type", "") or "")
-            if draft_model_type not in ("qwen3_5", "qwen3_5_text"):
+            if not draft_is_mtp_gguf and draft_model_type not in ("qwen3_5", "qwen3_5_text"):
                 raise ValueError(
                     "external MTP checkpoint must be Qwen3.5, got model_type=%s" %
                     draft_model_type)
@@ -1305,10 +1335,10 @@ def make_normal_llm_model(args, startup_progress = None):
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
-                            model_type != "kimi_k3"):
+                            model_type not in ("kimi_k3", "naive_n05_flash")):
                         raise ValueError(
                             "external DSpark draft checkpoints currently target "
-                            "Kimi-K3, got architecture=%s model_type=%s" %
+                            "Kimi-K3 / Naive-N0.5, got architecture=%s model_type=%s" %
                             (architecture, model_type))
                 else:
                     if not (is_deepseek_v4_model or is_deepseek_v41_model):
@@ -1527,7 +1557,7 @@ def make_normal_llm_model(args, startup_progress = None):
         # Large MoE checkpoints have tens of thousands of routed-expert tensors.
         # Pack their TP shards into slabs to avoid exhausting the CUDA driver's
         # allocation-count limit before device memory is full.
-        if args.cuda_slab <= 0:
+        if cuda_slab_auto:
             # Laguna TP=4 owns 64 experts/rank.  Its merged gate-up and down
             # sources are 6 MiB and 3 MiB, and one layer is exactly 576 MiB per
             # rank.  A 96 MiB slab packs both shapes and the whole layer without
@@ -1536,7 +1566,7 @@ def make_normal_llm_model(args, startup_progress = None):
             args.cuda_slab = (96 if is_laguna_hybrid_tp_model and
                               _thread_tp_cuda_device_count(args.tp) == 4
                               else 256)
-    if (is_qwen38_flash_next_model and args.cuda_slab <= 0 and
+    if (is_qwen38_flash_next_model and cuda_slab_auto and
             _uses_cuda_device(args.device) and
             (args.moe_device_layers >= 0 or
              _uses_cuda_device(args.moe_device))):
@@ -1546,6 +1576,15 @@ def make_normal_llm_model(args, startup_progress = None):
         # avoids CUDA page/allocation overhead from tens of thousands of tiny
         # expert tensors.
         args.cuda_slab = 225
+    elif (is_qwen38_flash_next_model and cuda_slab_auto and
+            gguf_config is not None and _uses_cuda_device(args.device) and
+            args.moe_device_layers < 0 and
+            str(args.moe_device).strip().lower() in ("cpu", "numa", "disk")):
+        # Host-offloaded experts have their own cache arena. Pack the persistent
+        # dense GPU weights instead: their many 6.25 MiB and smaller allocations
+        # otherwise waste hundreds of MiB at the CUDA allocation granularity.
+        # A 64 MiB slab retains 256-byte alignment and the existing compute paths.
+        args.cuda_slab = 64
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
@@ -1554,6 +1593,12 @@ def make_normal_llm_model(args, startup_progress = None):
                 import glob
                 numa_nodes = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
                 numa_count = len(numa_nodes)
+                try:
+                    requested_numas = int(os.environ.get("FT_NUMAS", "0"))
+                except ValueError:
+                    requested_numas = 0
+                if 0 < requested_numas <= numa_count:
+                    numa_count = requested_numas
                 if numa_count > 0:
                     physical_cores_per_numa = set()
                     for entry in os.listdir(numa_nodes[0]):
@@ -1564,6 +1609,11 @@ def make_normal_llm_model(args, startup_progress = None):
                                     physical_cores_per_numa.add(f.read().strip())
                     cpus_per_numa = len(physical_cores_per_numa) if physical_cores_per_numa else 1
                     args.threads = max(1, numa_count * (cpus_per_numa - 4))
+                    if hasattr(os, "sched_getaffinity"):
+                        # Workers spin between tasks. Leave CPUs available for
+                        # the inference/CUDA controller even under numactl.
+                        available_cpus = len(os.sched_getaffinity(0))
+                        args.threads = min(args.threads, max(1, available_cpus - 4))
                 else:
                     args.threads = 4
             except:
@@ -1705,6 +1755,12 @@ def make_normal_llm_model(args, startup_progress = None):
         os.environ["FASTLLM_MTP_FP8_DRAFT_HEAD"] = "1" if _arg_enabled(mtp_fp8_draft_head) else "0"
     os.environ["FASTLLM_QWEN4_ENABLE_MTP"] = str(
         mtp if is_qwen38_flash_next_model else 0)
+    mtp_min_p = getattr(args, "mtp_min_p", None)
+    if mtp_min_p is not None:
+        mtp_min_p = _probability(mtp_min_p)
+        if mtp_min_p > 0 and (not is_qwen38_flash_next_model or mtp <= 0):
+            raise ValueError("--mtp_min_p requires Qwen4 with --mtp enabled")
+        os.environ["FASTLLM_QWEN4_MTP_MIN_P"] = str(mtp_min_p)
     os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"] = str(mtp)
     graph = None
     if (args.custom != ""):

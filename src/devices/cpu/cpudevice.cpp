@@ -2481,6 +2481,31 @@ namespace fastllm {
         int st, int end, // calc C[0 : n, st : end]
         DataType AType, DataType BType, DataType CType
     ) {
+        if (AType == DataType::FP8_E4M3_BLOCK_128 && BType == AType && CType == DataType::FLOAT32) {
+            if (cpuInstructInfo.hasAVX512BF16 && FastllmGemmFP8Block128_AVX512BF16(
+                    A, lda, B, ldb, C, ldc, n, m, st, end)) return;
+            if (cpuInstructInfo.hasAVX2 && FastllmGemmFP8Block128_AVX2(
+                    A, lda, B, ldb, C, ldc, n, m, st, end)) return;
+            for (int row = 0; row < n; row++) {
+                float *out = (float *)((uint8_t *)C + (size_t)row * ldc);
+                for (int col = st; col < end; col++) {
+                    float sum = 0;
+                    for (int start = 0; start < m; start += 128) {
+                        const uint8_t *a = (const uint8_t *)A + (size_t)row * lda + (start / 128) * 132;
+                        const uint8_t *b = (const uint8_t *)B + (size_t)col * ldb + (start / 128) * 132;
+                        int count = std::min(128, m - start);
+                        float dot = 0, as, bs;
+                        for (int c = 0; c < count; c++)
+                            dot += fp8e4m3tofp32.dict[a[c]] * fp8e4m3tofp32.dict[b[c]];
+                        memcpy(&as, a + count, sizeof(as));
+                        memcpy(&bs, b + count, sizeof(bs));
+                        sum += (dot * as) * bs;
+                    }
+                    out[col] = sum;
+                }
+            }
+            return;
+        }
         bool finish = false;
 // printf("into fastllm gemm %s %s %s\n", GetDataTypeName(AType).c_str(), GetDataTypeName(BType).c_str(), GetDataTypeName(CType).c_str());
         if (AType >= DataType::DATA_GGUF_FORMAT && AType < DataType::DATA_GGUF_FORMAT_END) {
@@ -3244,26 +3269,28 @@ namespace fastllm {
             int swigluColSt = globalSt / 2;   // swiglu 输出的列起始位置
             const long ldc = GetDataBytes(gateUpOutputDataType, 1, k);
 
-            // Group-32 activation quantization needs a complete group to
-            // calculate its scale and sum. NUMA MergeMOE aligns these tasks
+            // Group-32 and GGUF Q8_0 quantization need a complete group to
+            // calculate quantization parameters. NUMA MergeMOE aligns tasks
             // to 64 gate/up columns, so compute each 32-value SwiGLU group in
             // a small L1-resident buffer and quantize it immediately. This
             // avoids both the large float intermediate write and a second
             // thread-pool pass over all routed experts.
+            constexpr DataType q8_0 = static_cast<DataType>(
+                DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_0);
             if (dstOutputData != nullptr &&
-                    dstOutputDataType == DataType::INF_INT8_GROUP32) {
+                    (dstOutputDataType == DataType::INF_INT8_GROUP32 ||
+                     dstOutputDataType == q8_0)) {
                 constexpr int groupSize = 32;
                 AssertInFastLLM(
                     globalSt % (groupSize * 2) == 0 &&
                         localCols % (groupSize * 2) == 0 &&
-                        swigluColSt % groupSize == 0 &&
-                        swigluCols % groupSize == 0,
-                    "MultiThreadGemmAndCrossSwigluOp: INF_INT8_GROUP32 "
+                        interDim % groupSize == 0,
+                    "MultiThreadGemmAndCrossSwigluOp: group32/Q8_0 "
                     "destination requires group-aligned columns.\n");
                 const size_t dstRowBytes = GetDataBytes(
                     dstOutputDataType, 1, interDim);
                 const size_t dstGroupBytes = GetDataBytes(
-                    DataType::INF_INT8_PERCHANNEL, 1, groupSize);
+                    dstOutputDataType, 1, groupSize);
                 for (int row = 0; row < n; row++) {
                     const float *gateUpRow = (const float*)(
                         gateUpOutputData + ldc * row);
@@ -3276,7 +3303,7 @@ namespace fastllm {
                         CrossSwigluFloat32Chunk(
                             cur + group * 2, groupSize, values);
                         ConvertFromFloat32(
-                            dst, DataType::INF_INT8_GROUP32,
+                            dst, dstOutputDataType,
                             values, 1, groupSize);
                         dst += dstGroupBytes;
                     }

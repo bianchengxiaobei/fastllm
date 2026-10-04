@@ -66,6 +66,9 @@ namespace fastllm {
                 std::vector<std::vector<float> *> *logits = nullptr) override;
 
         void WarmUp() override;
+        PagedCacheManager *GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(
+                int layerIndex, bool isKey) const override;
 
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens,
                                     int &cacheLen) override;
@@ -75,6 +78,7 @@ namespace fastllm {
 
     private:
         friend struct Qwen4PrefixCacheTestAccess;
+        friend struct Qwen4GGUFTestAccess;
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
         struct PleStagingState;
@@ -101,7 +105,7 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
-            // Exclusive request lease on the model's startup allocation.
+            // Keep the model's preallocated pools alive while this request uses them.
             std::shared_ptr<ServingCache> servingCache;
             std::shared_ptr<PleStagingState> pleStaging;
             int previousToken1 = -1;
@@ -140,9 +144,9 @@ namespace fastllm {
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
-            // Keeps GPU-resident snapshot storage alive while restored cache
-            // tensors borrow it. The next Forward detaches mutable tensors
-            // with a device-to-device copy and releases this reference.
+            // Keeps snapshot storage alive while restoring fixed linear slots
+            // and request-local QSA state. Nonlinear KV retains page references
+            // and detaches only a shared partial page before append.
             std::shared_ptr<PrefixSnapshot> borrowedPrefixSnapshot;
             // The one-layer MTP cache is request-local. Prefix snapshots keep
             // a compact, independently owned copy only when it is aligned at
@@ -153,15 +157,16 @@ namespace fastllm {
         };
 
         struct ServingCache {
-            std::vector<std::pair<Data, Data>> layers;
-            std::pair<Data, Data> mtp;
-            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> hostMirrors;
+            using Pools = std::pair<std::shared_ptr<PagedCacheManager>,
+                                    std::shared_ptr<PagedCacheManager>>;
+            std::vector<Pools> layers;
+            Pools mtp;
         };
         std::shared_ptr<ServingCache> servingCache;
         void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);
         void ReserveServingCache(std::vector<std::pair<Data, Data>> &warmupCache);
         void AcquireServingCache(std::vector<std::pair<Data, Data>> &cache,
-                                 RequestState &state);
+                                 RequestState &state, int appendTokens = 1);
         std::shared_ptr<QsaHostMirrorTransfer> &GetQsaHostMirror(
                 RequestState &state, int layer);
 
@@ -209,9 +214,10 @@ namespace fastllm {
         };
 
         struct MtpRuntimeState {
+            // Pool ownership must outlive destruction of the KV page references.
+            RequestState attentionState;
             Data key;
             Data value;
-            RequestState attentionState;
             // Keep sampling outputs resident on CUDA across verifier cycles;
             // the host reads only the compact token-id prefix.
             Data sampledTokenIds;
@@ -254,8 +260,12 @@ namespace fastllm {
             uint64_t tensorBytes = 0;
             uint64_t stateBytes = 0;
             std::vector<int> tokens;
-            std::vector<PrefixLayerSnapshot> layers;
+            // Destroy page references before releasing their pool owner.
             RequestState state;
+            std::vector<PrefixLayerSnapshot> layers;
+            // A TP hit pins the same token boundary on every rank. These
+            // references survive rank-local eviction until restore completes.
+            std::vector<std::shared_ptr<PrefixSnapshot>> ranks;
         };
 
         struct PendingPrefixRestore {
@@ -307,6 +317,10 @@ namespace fastllm {
         std::vector<float> visionImageStd = {0.5f, 0.5f, 0.5f};
 
         bool preparedWeights = false;
+        bool ggufWeightsRestored = false;
+        void RestoreGgufWeights();
+        void RestoreGdnOutputWeight(Data &weight, int tpSize);
+        void RunGdnOutputProjection(Data &input, Data &weight, Data &output);
         std::atomic<int> mtpWeightsStatus{-1};
         std::mutex prepareMutex;
         mutable std::mutex stateMutex;
@@ -456,7 +470,8 @@ namespace fastllm {
                         const Data *deviceTokenIds = nullptr,
                         Data *sampledTokenIds = nullptr,
                         Data *sampledTokenValues = nullptr,
-                        int sampledTokenOffset = 0);
+                        int sampledTokenOffset = 0,
+                        float *topProbability = nullptr);
         void CaptureRequestRuntimeCheckpoint(
             RequestState &state,
             const std::map<int, int> &qsaLengths,
@@ -524,6 +539,12 @@ namespace fastllm {
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,
             int exactLen = -1) const;
+        static std::shared_ptr<PrefixSnapshot> FindCommonPrefixSnapshot(
+            const std::vector<Qwen4ExpModel *> &models,
+            const std::vector<int> &tokens, int maxCachedLen);
+        bool RestoreThreadTpPrefixSnapshot(
+            ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot);
         bool ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             const RequestState &state, int &cachedLen) const;
@@ -532,6 +553,10 @@ namespace fastllm {
             RequestState &state);
         bool RestorePrefixSnapshot(
             ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot);
+        bool RestorePrefixSnapshot(
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
             const std::shared_ptr<PrefixSnapshot> &snapshot);
 
         void DumpTensorIfRequested(const std::string &name, const Data &data) const;

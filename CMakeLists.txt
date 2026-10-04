@@ -229,7 +229,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/deepseekv41.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -413,7 +413,13 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-cuda-mtp.cu
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
+        src/devices/cuda/fastllm-gguf-t8-extended.cu
+        src/devices/cuda/fastllm-gguf-t8-tiled.cu
+        src/devices/cuda/fastllm-gguf-planar-t8.cu
+        src/devices/cuda/fastllm-gguf-planar.cu
+        src/devices/cuda/fastllm-gguf-planar-mixed.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-moe-stream.cu
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
@@ -434,13 +440,17 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass-sm89.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-cache.cu
+        src/devices/cuda/moe/fastllm-moe-gguf-cache.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
+        src/devices/cuda/models/glm5-next-dsa.cpp
         src/devices/cuda/models/dots3-note-kernels.cu
+        src/devices/cuda/models/naive-n05-kernels.cu
+        src/devices/cuda/models/naive-n05-experts.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
         src/devices/cuda/models/deepseekv41-kernels.cu
         src/devices/cuda/models/deepseekv41-reference.cu
@@ -491,6 +501,21 @@ if (USE_CUDA)
         message(STATUS "DeepSeek-V4 SM120 sparse MLA kernel: OFF")
         message(STATUS "DeepSeek-V4 SM120 DeepGEMM MoE kernel: OFF")
         message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF")
+    endif()
+
+    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp
+        APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
+
+    # GLM53 prefill uses architecture-specific register and matrix-load
+    # instructions. Keep its newer FlashInfer headers private to this target.
+    if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        set(FASTLLM_GLM53_FLASHINFER_SM120_ENABLED ON)
+        set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_GLM53_FLASHINFER_SM120)
+        message(STATUS "GLM53 FlashInfer sparse prefill: ON (sm_120a)")
+    else()
+        message(STATUS "GLM53 FlashInfer sparse prefill: OFF (BF16 DSA fallback)")
     endif()
 
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
@@ -679,6 +704,20 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     set(FASTLLM_CUDA_SM120_OBJECTS $<TARGET_OBJECTS:fastllm_cuda_sm120>)
 endif()
 
+if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
+    add_library(fastllm_glm53_flashinfer_sm120 OBJECT
+        src/devices/cuda/models/glm5-next-dsa-sm120.cu)
+    # nvcc's -arch shorthand also emits generic compute_120 PTX, which cannot
+    # represent these instructions. Emit only the architecture-specific cubin.
+    set_target_properties(fastllm_glm53_flashinfer_sm120 PROPERTIES
+        CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(fastllm_glm53_flashinfer_sm120 PRIVATE
+        "--generate-code=arch=compute_120a,code=sm_120a")
+    target_include_directories(fastllm_glm53_flashinfer_sm120 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_glm53/include")
+    set(FASTLLM_GLM53_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_glm53_flashinfer_sm120>)
+endif()
+
 if (PY_API)
     if(POLICY CMP0148)
         cmake_policy(SET CMP0148 NEW)
@@ -692,7 +731,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -712,6 +751,10 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     # fastllm consumer gets the implementations referenced by the core code.
     target_link_libraries(
         fastllm INTERFACE $<TARGET_OBJECTS:fastllm_cuda_sm120>)
+endif()
+
+if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_GLM53_FLASHINFER_OBJECTS})
 endif()
 
 add_executable(main main.cpp)
@@ -745,6 +788,60 @@ if (UNIT_TEST)
     set_target_properties(qwen35_mtp_shortlist_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     fastllm_add_checked_test(qwen35_mtp_shortlist qwen35_mtp_shortlist_test "PASS" 60)
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cuda_gguf_iq_r4_test test/basic/test_cuda_gguf_iq_r4.cu)
+        target_link_libraries(cuda_gguf_iq_r4_test PRIVATE fastllm)
+        target_include_directories(cuda_gguf_iq_r4_test PRIVATE src/devices/cuda ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_gguf_iq_r4 cuda_gguf_iq_r4_test "PASS: IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS R4 CUDA" 60)
+        set_tests_properties(cuda_gguf_iq_r4 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_moe_cache_test test/basic/test_cuda_gguf_moe_cache.cu)
+        target_include_directories(cuda_gguf_moe_cache_test PRIVATE include/devices/cuda third_party/gguf ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cuda_gguf_moe_cache_test PRIVATE fastllm)
+        fastllm_add_checked_test(cuda_gguf_moe_cache cuda_gguf_moe_cache_test "PASS: generic GGUF CUDA expert cache" 300)
+        set_tests_properties(cuda_gguf_moe_cache PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_gguf_moe_compact cuda_gguf_moe_cache_test "PASS: compact heterogeneous GGUF cache" 60 --compact)
+        set_tests_properties(cuda_gguf_moe_compact PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_gguf_mmq cuda_gguf_moe_cache_test "PASS: FP32 GGUF MMQ and Linear dispatch" 60 --mmq)
+        set_tests_properties(cuda_gguf_mmq PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_gguf_moe_grouped cuda_gguf_moe_cache_test "PASS: grouped GGUF expert prefill" 600 --grouped)
+        set_tests_properties(cuda_gguf_moe_grouped PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_gguf_moe_host cuda_gguf_moe_cache_test "PASS: streamed GGUF prefill" 600 --host)
+        set_tests_properties(cuda_gguf_moe_host PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+        if (USE_NUMAS)
+            fastllm_add_checked_test(cuda_gguf_moe_hybrid cuda_gguf_moe_cache_test "PASS: GGUF CPU/GPU hybrid expert decode" 300 --hybrid)
+            set_tests_properties(cuda_gguf_moe_hybrid PROPERTIES LABELS "cuda;gguf;moe;numa" RUN_SERIAL TRUE)
+            fastllm_add_checked_test(cuda_gguf_moe_hybrid_single cuda_gguf_moe_cache_test "PASS: single-GPU GGUF CPU/GPU hybrid expert decode" 300 --hybrid-single)
+            set_tests_properties(cuda_gguf_moe_hybrid_single PROPERTIES LABELS "cuda;gguf;moe;numa" RUN_SERIAL TRUE)
+            fastllm_add_checked_test(cuda_gguf_moe_frequency cuda_gguf_moe_cache_test "PASS: frequency admission" 300 --frequency)
+            set_tests_properties(cuda_gguf_moe_frequency PROPERTIES LABELS "cuda;gguf;moe;numa" RUN_SERIAL TRUE)
+        endif()
+        add_executable(cuda_gguf_tp_shards_test test/basic/test_cuda_gguf_moe_cache.cu)
+        target_compile_definitions(cuda_gguf_tp_shards_test PRIVATE FASTLLM_GGUF_TP_SHARD_TEST=1)
+        target_include_directories(cuda_gguf_tp_shards_test PRIVATE include/devices/cuda third_party/gguf ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cuda_gguf_tp_shards_test PRIVATE fastllm)
+        fastllm_add_checked_test(cuda_gguf_tp_shards cuda_gguf_tp_shards_test "PASS: packed GGUF TP shards" 300)
+        set_tests_properties(cuda_gguf_tp_shards PROPERTIES LABELS "cuda;gguf;tp" RUN_SERIAL TRUE)
+        add_executable(cuda_tp2_reduce_test test/basic/test_cuda_tp2_reduce.cu)
+        target_include_directories(cuda_tp2_reduce_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cuda_tp2_reduce_test PRIVATE fastllm)
+        fastllm_add_checked_test(cuda_tp2_reduce cuda_tp2_reduce_test "PASS: TP2 in-place peer sum" 60)
+        set_tests_properties(cuda_tp2_reduce PROPERTIES LABELS "cuda;tp" RUN_SERIAL TRUE)
+        add_executable(cuda_data_device_test test/basic/test_cuda_data_device.cu)
+        target_include_directories(cuda_data_device_test PRIVATE include/devices/cuda ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cuda_data_device_test PRIVATE fastllm)
+        fastllm_add_checked_test(cuda_data_device cuda_data_device_test "PASS: source-device CPU read and CopyFrom" 60)
+        set_tests_properties(cuda_data_device PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        add_executable(cuda_gguf_q3_k_test test/basic/test_cuda_gguf_q3_k.cu)
+        target_link_libraries(cuda_gguf_q3_k_test PRIVATE fastllm)
+        target_include_directories(cuda_gguf_q3_k_test PRIVATE src/devices/cuda src/devices/cuda/gguf_mmq ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_gguf_q3_k cuda_gguf_q3_k_test "PASS: Q3_K CUDA GEMV CPU reference" 60)
+        set_tests_properties(cuda_gguf_q3_k PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
+        add_executable(cuda_gguf_q2_0_test test/basic/test_cuda_gguf_q2_0.cu)
+        target_link_libraries(cuda_gguf_q2_0_test PRIVATE fastllm)
+        target_include_directories(cuda_gguf_q2_0_test PRIVATE src/devices/cuda ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_gguf_q2_0 cuda_gguf_q2_0_test "PASS: Q2_0 CPU decoding/dot and CUDA" 60)
+        set_tests_properties(cuda_gguf_q2_0 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
         add_executable(qwen35_dflash_shortlist_test test/basic/test_qwen35_dflash_shortlist.cpp)
         target_link_libraries(qwen35_dflash_shortlist_test PRIVATE fastllm)
         fastllm_add_checked_test(qwen35_dflash_shortlist qwen35_dflash_shortlist_test "PASS: padded rows excluded" 180)
@@ -754,13 +851,56 @@ if (UNIT_TEST)
         add_executable(cpu_isa_compat_test test/basic/test_cpu_isa_compat.cpp)
         target_link_libraries(cpu_isa_compat_test PRIVATE fastllm)
         add_test(NAME cpu_isa_compat COMMAND cpu_isa_compat_test)
+
+        add_executable(cpu_gguf_iq_native_test test/basic/test_cpu_gguf_iq_native.cpp)
+        target_link_libraries(cpu_gguf_iq_native_test PRIVATE fastllm)
+        fastllm_add_checked_test(cpu_gguf_iq_native cpu_gguf_iq_native_test "PASS: IQ3_S/IQ4_XS CPU" 60)
+
+        add_executable(cpu_gguf_iq4_nl_test test/basic/test_cpu_gguf_iq4_nl.cpp)
+        target_link_libraries(cpu_gguf_iq4_nl_test PRIVATE fastllm)
+        fastllm_add_checked_test(cpu_gguf_iq4_nl cpu_gguf_iq4_nl_test "PASS: IQ4_NL multi-row CPU" 60)
+
+        add_executable(cpu_swiglu_q8_0_test test/basic/test_cpu_swiglu_q8_0.cpp)
+        target_link_libraries(cpu_swiglu_q8_0_test PRIVATE fastllm)
+        fastllm_add_checked_test(cpu_swiglu_q8_0 cpu_swiglu_q8_0_test "PASS: fused Q8_0 SwiGLU" 60)
+        if (USE_NUMAS)
+            add_executable(cpu_gguf_moe_decode_test test/basic/test_cpu_gguf_moe_decode.cpp)
+            target_link_libraries(cpu_gguf_moe_decode_test PRIVATE fastllm)
+            fastllm_add_checked_test(cpu_gguf_moe_decode cpu_gguf_moe_decode_test "PASS: GGUF CPU decode slices" 120)
+            set_tests_properties(cpu_gguf_moe_decode PROPERTIES ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4")
+            set_tests_properties(cpu_gguf_moe_decode PROPERTIES LABELS "cpu;gguf;moe;numa")
+        endif()
     endif()
+
+    add_executable(moe_decode_policy_test test/basic/test_moe_decode_policy.cpp)
+    target_include_directories(moe_decode_policy_test PRIVATE include)
+    set_target_properties(moe_decode_policy_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    fastllm_add_checked_test(moe_decode_policy moe_decode_policy_test "ALL_PASS" 60)
+
+    add_executable(cpu_moe_cache_layout_test test/basic/test_cpu_moe_cache_layout.cpp)
+    target_include_directories(cpu_moe_cache_layout_test PRIVATE include)
+    fastllm_add_checked_test(cpu_moe_cache_layout cpu_moe_cache_layout_test "PASS: cache size classes" 60)
+
+    add_executable(cpu_cuda_embedding_policy_test test/basic/test_cpu_cuda_embedding_policy.cpp)
+    target_link_libraries(cpu_cuda_embedding_policy_test PRIVATE fastllm)
+    foreach(graph_default 0 1)
+        add_test(NAME cpu_cuda_embedding_policy_${graph_default}
+                 COMMAND cpu_cuda_embedding_policy_test ${graph_default})
+        set_tests_properties(cpu_cuda_embedding_policy_${graph_default} PROPERTIES
+            ENVIRONMENT "FASTLLM_CUDA_GRAPH=${graph_default}"
+            PASS_REGULAR_EXPRESSION "PASS: explicit CUDA embedding policy"
+            TIMEOUT 60)
+    endforeach()
 
     add_executable(device_operator_lifetime_test test/basic/test_device_operator_lifetime.cpp)
     target_link_libraries(device_operator_lifetime_test PRIVATE fastllm)
     add_test(NAME device_operator_lifetime COMMAND device_operator_lifetime_test)
 
     if (NOT WIN32)
+        add_executable(qwen4_gguf_test test/basic/test_qwen4_gguf.cpp)
+        target_link_libraries(qwen4_gguf_test PRIVATE fastllm)
+        fastllm_add_checked_test(qwen4_gguf qwen4_gguf_test "PASS: Qwen4 three-shard GGUF" 60)
+
         add_executable(disk_moe_cache_test test/basic/test_disk_moe_cache.cpp)
         target_link_libraries(disk_moe_cache_test PRIVATE fastllm)
         add_test(NAME disk_moe_cache COMMAND disk_moe_cache_test)
@@ -791,12 +931,29 @@ if (UNIT_TEST)
     target_link_libraries(qwen4_mtp_weights_test PRIVATE fastllm)
     add_test(NAME qwen4_mtp_weights COMMAND qwen4_mtp_weights_test)
 
+    add_executable(qwen4_mtp_confidence_test test/basic/test_qwen4_mtp_confidence.cpp)
+    target_include_directories(qwen4_mtp_confidence_test PRIVATE include)
+    add_test(NAME qwen4_mtp_confidence COMMAND qwen4_mtp_confidence_test)
+
     add_executable(qwen35_paged_cache_test test/basic/test_qwen35_paged_cache.cpp)
     add_test(NAME qwen35_paged_cache COMMAND qwen35_paged_cache_test)
 
     add_executable(multimodal_history_cache_test test/basic/test_multimodal_history_cache.cpp)
     target_link_libraries(multimodal_history_cache_test PRIVATE fastllm)
     add_test(NAME multimodal_history_cache COMMAND multimodal_history_cache_test)
+
+    add_executable(legacy_paged_scheduler_test test/basic/test_legacy_paged_scheduler.cpp)
+    target_link_libraries(legacy_paged_scheduler_test PRIVATE fastllm)
+    fastllm_add_checked_test(legacy_paged_scheduler legacy_paged_scheduler_test "ALL_PASS" 60)
+    set_tests_properties(legacy_paged_scheduler PROPERTIES RUN_SERIAL TRUE)
+
+    add_executable(speculative_sampling_test test/basic/test_speculative_sampling.cpp)
+    target_link_libraries(speculative_sampling_test PRIVATE fastllm)
+    add_test(NAME speculative_sampling COMMAND speculative_sampling_test)
+    add_executable(naive_n05_history_test test/basic/test_naive_n05_history.cpp)
+    target_link_libraries(naive_n05_history_test PRIVATE fastllm)
+    add_test(NAME naive_n05_history COMMAND naive_n05_history_test)
+    set_tests_properties(naive_n05_history PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     add_executable(qwen4_multimodal_cache_test test/basic/test_qwen4_multimodal_cache.cpp)
     target_link_libraries(qwen4_multimodal_cache_test PRIVATE fastllm)
@@ -812,6 +969,22 @@ if (UNIT_TEST)
     set_tests_properties(reduce_batch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     if (USE_NUMAS)
+        add_executable(numas_fp8_moe_bench tools/numas_fp8_moe_bench.cpp)
+        target_link_libraries(numas_fp8_moe_bench PRIVATE fastllm)
+        add_executable(numas_fp8_eager_moe_test test/basic/test_numas_fp8_eager_moe.cpp)
+        target_link_libraries(numas_fp8_eager_moe_test PRIVATE fastllm)
+        add_test(NAME numas_fp8_eager_moe COMMAND numas_fp8_eager_moe_test)
+        add_test(NAME numas_fp8_eager_moe_avx2 COMMAND numas_fp8_eager_moe_test --avx2)
+        set_tests_properties(numas_fp8_eager_moe numas_fp8_eager_moe_avx2 PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=0;FASTLLM_ACTIVATE_NUMA=ON"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+        if (USE_CUDA)
+            target_include_directories(numas_fp8_eager_moe_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME numas_fp8_eager_moe_hybrid COMMAND numas_fp8_eager_moe_test --hybrid)
+            set_tests_properties(numas_fp8_eager_moe_hybrid PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=1;FASTLLM_ACTIVATE_NUMA=ON"
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        endif()
         add_executable(numas_nvfp4_moe_test test/basic/test_numas_nvfp4_moe.cpp)
         target_link_libraries(numas_nvfp4_moe_test PRIVATE fastllm)
         add_test(NAME numas_nvfp4_moe COMMAND numas_nvfp4_moe_test)
@@ -1024,6 +1197,28 @@ if (UNIT_TEST)
         add_test(NAME cuda_single_query_attention COMMAND cuda_single_query_attention_test)
         set_tests_properties(cuda_single_query_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
 
+        add_executable(glm5_next_dsa_test test/basic/test_glm5_next_dsa.cpp)
+        target_link_libraries(glm5_next_dsa_test PRIVATE fastllm)
+        target_include_directories(glm5_next_dsa_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME glm5_next_dsa COMMAND glm5_next_dsa_test)
+        set_tests_properties(glm5_next_dsa PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(glm5_next_flashinfer_test test/basic/test_glm5_next_flashinfer.cpp)
+        target_link_libraries(glm5_next_flashinfer_test PRIVATE fastllm)
+        target_include_directories(glm5_next_flashinfer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
+            target_compile_definitions(glm5_next_flashinfer_test PRIVATE FASTLLM_ENABLE_GLM53_FLASHINFER_SM120)
+        endif()
+        add_test(NAME glm5_next_flashinfer COMMAND glm5_next_flashinfer_test)
+        set_tests_properties(glm5_next_flashinfer PROPERTIES
+            LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(glm5_next_mla_prefill_test test/basic/test_glm5_next_mla_prefill.cpp)
+        target_link_libraries(glm5_next_mla_prefill_test PRIVATE fastllm)
+        target_include_directories(glm5_next_mla_prefill_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME glm5_next_mla_prefill COMMAND glm5_next_mla_prefill_test)
+        set_tests_properties(glm5_next_mla_prefill PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
         if (NOT WIN32)
             add_executable(cuda_paged_fragmented_attention_test test/basic/test_cuda_paged_fragmented_attention.cpp)
             target_link_libraries(cuda_paged_fragmented_attention_test PRIVATE fastllm)
@@ -1051,6 +1246,35 @@ if (UNIT_TEST)
         target_include_directories(cuda_qwen4_attention_fusion_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME cuda_qwen4_attention_fusion COMMAND cuda_qwen4_attention_fusion_test)
         set_tests_properties(cuda_qwen4_attention_fusion PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(naive_n05_speculative_bench tools/naive_n05_speculative_bench.cpp)
+        target_link_libraries(naive_n05_speculative_bench PRIVATE fastllm)
+        add_executable(naive_n05_draft_test test/basic/test_naive_n05_draft.cpp)
+        target_link_libraries(naive_n05_draft_test PRIVATE fastllm)
+        target_include_directories(naive_n05_draft_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_executable(naive_n05_attention_test test/basic/test_naive_n05_attention.cpp)
+        target_link_libraries(naive_n05_attention_test PRIVATE fastllm)
+        target_include_directories(naive_n05_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
+        set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(naive_n05_decode_test test/basic/test_naive_n05_decode.cpp)
+        target_link_libraries(naive_n05_decode_test PRIVATE fastllm)
+        target_include_directories(naive_n05_decode_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_decode COMMAND naive_n05_decode_test)
+        set_tests_properties(naive_n05_decode PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(cuda_qwen4_paged_cache_test test/basic/test_cuda_qwen4_paged_cache.cpp)
+        target_link_libraries(cuda_qwen4_paged_cache_test PRIVATE fastllm)
+        target_include_directories(cuda_qwen4_paged_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_qwen4_paged_cache cuda_qwen4_paged_cache_test "ALL_PASS" 180)
+        set_tests_properties(cuda_qwen4_paged_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_qwen4_gdn_output_test test/basic/test_cuda_qwen4_gdn_output.cpp)
+        target_link_libraries(cuda_qwen4_gdn_output_test PRIVATE fastllm)
+        target_include_directories(cuda_qwen4_gdn_output_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_qwen4_gdn_output cuda_qwen4_gdn_output_test "ALL_PASS" 180)
+        set_tests_properties(cuda_qwen4_gdn_output PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
         add_executable(cuda_qwen4_shared_expert_test test/basic/test_cuda_qwen4_shared_expert.cpp)
         target_link_libraries(cuda_qwen4_shared_expert_test PRIVATE fastllm)
@@ -1158,6 +1382,32 @@ if (UNIT_TEST)
             set_tests_properties(cuda_${cache_test} PROPERTIES LABELS cuda)
         endforeach()
 
+        foreach(kda_test IN ITEMS conv prefill)
+            add_executable(cuda_kda_${kda_test}_test test/basic/test_cuda_kda_${kda_test}.cu)
+            target_link_libraries(cuda_kda_${kda_test}_test PRIVATE fastllm)
+            set_target_properties(cuda_kda_${kda_test}_test PROPERTIES
+                CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME cuda_kda_${kda_test} COMMAND cuda_kda_${kda_test}_test)
+            set_tests_properties(cuda_kda_${kda_test} PROPERTIES
+                LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77 TIMEOUT 300)
+        endforeach()
+
+        add_executable(cuda_nvfp4_marlin_moe_test test/basic/test_cuda_nvfp4_marlin_moe.cu)
+        target_link_libraries(cuda_nvfp4_marlin_moe_test PRIVATE fastllm)
+        set_target_properties(cuda_nvfp4_marlin_moe_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_nvfp4_marlin_moe COMMAND cuda_nvfp4_marlin_moe_test)
+        set_tests_properties(cuda_nvfp4_marlin_moe PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+        add_test(NAME cuda_nvfp4_marlin_clamped_native COMMAND cuda_nvfp4_marlin_moe_test --clamped-native)
+        set_tests_properties(cuda_nvfp4_marlin_clamped_native PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
+        add_executable(cuda_nvfp4_compact_moe_test test/basic/test_cuda_nvfp4_compact_moe.cu)
+        target_link_libraries(cuda_nvfp4_compact_moe_test PRIVATE fastllm)
+        set_target_properties(cuda_nvfp4_compact_moe_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_nvfp4_compact_moe COMMAND cuda_nvfp4_compact_moe_test)
+        set_tests_properties(cuda_nvfp4_compact_moe PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
         add_executable(cuda_moe_cache_test test/basic/test_cuda_moe_cache.cu)
         target_link_libraries(cuda_moe_cache_test PRIVATE fastllm)
         set_target_properties(cuda_moe_cache_test PROPERTIES
@@ -1253,6 +1503,47 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_nvfp4_swiglu_sm120 cuda_nvfp4_fused_test "PASS SM120 SwiGLU" 600 sm120-swiglu)
         set_tests_properties(cuda_nvfp4_sm120_tiles cuda_nvfp4_swiglu_sm120 PROPERTIES
             LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_t8_extended_test test/basic/test_cuda_gguf_t8_extended.cu)
+        target_link_libraries(cuda_gguf_t8_extended_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_t8_extended_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_t8_extended cuda_gguf_t8_extended_test "PASS T8 extended projections" 600)
+        set_tests_properties(cuda_gguf_t8_extended PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        add_executable(cuda_gguf_t8_tiled_test test/basic/test_cuda_gguf_t8_tiled.cu)
+        target_link_libraries(cuda_gguf_t8_tiled_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_t8_tiled_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_t8_tiled cuda_gguf_t8_tiled_test "PASS T8 tiled projections" 600)
+        set_tests_properties(cuda_gguf_t8_tiled PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_t8_register_test test/basic/test_cuda_gguf_t8_register.cu)
+        target_link_libraries(cuda_gguf_t8_register_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_t8_register_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_t8_register cuda_gguf_t8_register_test "PASS T8 register projections" 600)
+        set_tests_properties(cuda_gguf_t8_register PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_decode_fusions_test test/basic/test_cuda_gguf_decode_fusions.cu)
+        target_link_libraries(cuda_gguf_decode_fusions_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_decode_fusions_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_decode_fusions cuda_gguf_decode_fusions_test "PASS GGUF decode fusions" 600)
+        set_tests_properties(cuda_gguf_decode_fusions PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_planar_t8_test test/basic/test_cuda_gguf_planar_t8.cu)
+        target_link_libraries(cuda_gguf_planar_t8_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_planar_t8_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_planar_t8 cuda_gguf_planar_t8_test "PASS planar T8 cases=" 600)
+        set_tests_properties(cuda_gguf_planar_t8 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_planar_test test/basic/test_cuda_gguf_planar.cu)
+        target_link_libraries(cuda_gguf_planar_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_planar_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_planar cuda_gguf_planar_test "PASS planar general cases=" 600)
+        set_tests_properties(cuda_gguf_planar PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_linear_add_test test/basic/test_cuda_gguf_linear_add.cu)
+        target_link_libraries(cuda_gguf_linear_add_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_linear_add_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_linear_add cuda_gguf_linear_add_test "PASS GGUF LinearAdd" 600)
+        set_tests_properties(cuda_gguf_linear_add PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
         add_executable(cuda_fp8_linear_add_test test/basic/test_cuda_fp8_linear_add.cu)
         target_link_libraries(cuda_fp8_linear_add_test PRIVATE fastllm)
@@ -1421,7 +1712,7 @@ if (BUILD_CLI)
     target_link_libraries(FastllmStudio_cli fastllm)
 endif()
 
-add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
+add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 set(BUILD_INFO_USE_CUDA "false")

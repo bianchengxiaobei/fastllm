@@ -1,7 +1,10 @@
 #include "glm5_next.h"
+#include "glm5_next_mla_prefill.h"
+#include "glm5_next_dsa.h"
 
 #include "blocks/baseblock.h"
 #include "gguf.h"
+#include "executor.h"
 #include "utils.h"
 
 #ifdef USE_CUDA
@@ -175,6 +178,27 @@ namespace fastllm {
                 Glm5NextWriteFloat(data, index, value);
             }
             data.ToDevice(originalDevice, originalDeviceIds);
+        }
+
+        void Glm5NextHcPreNorm(Data &input, Data &fn, Data &scale,
+                Data &base, Data &norm, int hcMult, int sinkhornIters,
+                float eps, float normEps, Data &output, Data &post, Data &comb) {
+#ifdef USE_CUDA
+            auto *executor = static_cast<Executor*>(GetExecutor());
+            if (input.dims == std::vector<int>({1, 1, 4, 4096}) &&
+                executor->GetFirstDeviceType() == "cuda") {
+                const auto devices = executor->GetDeviceIds("cuda");
+                for (Data *x : {&input, &fn, &scale, &base, &norm})
+                    x->ToDevice(DataDevice::CUDA, devices);
+                FastllmCudaSetDevice(GetPointerDeviceId(input.cudaData));
+                if (FastllmCudaGlm5NextHcPreNorm(input, fn, scale, base, norm,
+                        hcMult, sinkhornIters, eps, normEps, output, post, comb)) return;
+            }
+#endif
+            Data mixed;
+            DeepSeekV4HcPre(input, fn, scale, base, hcMult, sinkhornIters,
+                eps, normEps, mixed, post, comb);
+            KimiK3RMSNorm(mixed, norm, normEps, output);
         }
 
         void Glm5NextHcMean(const Data &input, Data &output) {
@@ -388,6 +412,10 @@ namespace fastllm {
             languagePrefix + "layers.*.self_attn.g_a_proj.weight",
             languagePrefix + "layers.*.self_attn.g_b_proj.weight",
             languagePrefix + "layers.*.self_attn.o_proj.weight",
+            languagePrefix + "layers.*.self_attn.indexer.wq_b.weight",
+            languagePrefix + "layers.*.self_attn.indexer.wk.weight",
+            languagePrefix + "layers.*.self_attn.indexer.weights_proj.weight",
+            languagePrefix + "layers.*.self_attn.indexer.index_kpool_compress_gate",
             languagePrefix + "layers.*.self_attn.q_a_proj.weight",
             languagePrefix + "layers.*.self_attn.q_b_proj.weight",
             languagePrefix + "layers.*.self_attn.kv_a_proj_with_mqa.weight",
@@ -424,6 +452,10 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(mtpStatesMutex);
             mtpStates.clear();
+        }
+        {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            indexerCaches.clear();
         }
         ClearAllPagedCacheManagers();
     }
@@ -483,12 +515,26 @@ namespace fastllm {
         rms_norm_eps = requiredFloat("rms_norm_eps");
 
         indexTopK = requiredInt("index_topk");
+        const char *backendEnv = std::getenv("FASTLLM_GLM5_NEXT_DSA_BACKEND");
+        const std::string backend = backendEnv && backendEnv[0] ? backendEnv : "auto";
+        AssertInFastLLM(backend == "auto" || backend == "bf16" || backend == "dense",
+            "FASTLLM_GLM5_NEXT_DSA_BACKEND must be auto, bf16 or dense.");
+        dsaBackend = backend == "dense" ? DsaBackend::Dense :
+            backend == "bf16" ? DsaBackend::BFloat16 : DsaBackend::Auto;
+        if (UsesDsa()) {
+            AssertInFastLLM(requiredInt("index_n_heads") == 32 &&
+                requiredInt("index_head_dim") == 128 && requiredInt("index_kpool") == 4,
+                "GLM DSA requires the 32-head, 128-dim, KPool-4 configuration.");
+        }
         max_positions = requiredInt("max_position_embeddings");
         useCompressedMla = !Glm5NextEnvEnabled(
             "FASTLLM_GLM5_NEXT_EXPANDED_DSA");
         mtpDraftsPerStep = Glm5NextEnvInt(
             "FASTLLM_GLM5_NEXT_ENABLE_MTP", 0, 0, 8);
         mtpEnabled = mtpDraftsPerStep > 0;
+        AssertInFastLLM(!UsesDsa() || (!mtpEnabled && useCompressedMla),
+            "GLM DSA requires compressed MLA and --mtp 0; "
+            "FASTLLM_GLM5_NEXT_DSA_BACKEND=dense restores the legacy dense path.");
         const int nextnLayers = requiredInt("num_nextn_predict_layers");
         AssertInFastLLM(
             !mtpEnabled || nextnLayers == 1,
@@ -569,7 +615,7 @@ namespace fastllm {
             if (!kdaLayers[layer]) {
                 if (useCompressedMla) {
                     elementsInKVCachePerToken +=
-                        kvLoraRank + mlaPaddedPeHeadDim;
+                        kvLoraRank + mlaPaddedPeHeadDim + (UsesDsa() ? 128 / 4 : 0);
                 } else {
                     elementsInKVCachePerToken +=
                         (long long)num_attention_heads *
@@ -639,7 +685,7 @@ namespace fastllm {
             << "42 MoE layers, BF16 activations.\n"
             << "[GLM-5.3] Context window restored to " << max_positions
             << " tokens. DSA above Top-" << indexTopK
-            << (useCompressedMla ?
+            << (UsesDsa() ? " uses KPool-4 learned sparse MLA. " : useCompressedMla ?
                 " uses exact compressed paged MLA with " :
                 " uses legacy expanded paged attention with ")
             << fastllm::GetPageLen() << "-token cache pages.\n";
@@ -659,6 +705,8 @@ namespace fastllm {
         std::map<std::string,
                  std::vector<std::pair<std::string, DataType>>> result;
         const std::string layersPrefix = languagePrefix + "layers.";
+        const std::set<std::string> tensorNameSet(
+            tensorNames.begin(), tensorNames.end());
 
         for (const std::string &name : tensorNames) {
             if (name == languagePrefix + "embed_tokens.weight") {
@@ -694,8 +742,16 @@ namespace fastllm {
             }
             const std::string suffix = name.substr(position + 1);
 
-            if (suffix.rfind("self_attn.indexer.", 0) == 0 ||
-                Glm5NextEndsWith(suffix, ".weight_scale_inv")) {
+            if (suffix.rfind("self_attn.indexer.", 0) == 0) {
+                if (UsesDsa() && !isMtpLayer && !kdaLayers[layer]) {
+                    const bool fp32 = suffix.find("k_norm.") != std::string::npos ||
+                        suffix.find("weights_proj.") != std::string::npos ||
+                        Glm5NextEndsWith(suffix, "index_kpool_compress_ape");
+                    result[name].emplace_back(name, fp32 ? DataType::FLOAT32 : DataType::BFLOAT16);
+                }
+                continue;
+            }
+            if (Glm5NextEndsWith(suffix, ".weight_scale_inv")) {
                 continue;
             }
             if (isMtpLayer &&
@@ -744,8 +800,24 @@ namespace fastllm {
                  Glm5NextEndsWith(suffix, ".weight")) ||
                 (suffix.rfind("mlp.experts.", 0) == 0 &&
                  Glm5NextEndsWith(suffix, ".weight"))) {
-                result[name].emplace_back(
-                    name, DataType::DATA_AUTO_LINEAR);
+                DataType type = DataType::DATA_AUTO_LINEAR;
+                if (suffix.rfind("mlp.experts.", 0) == 0) {
+                    const std::string base = name.substr(
+                        0, name.size() - std::strlen(".weight"));
+                    const std::string device = SelectMoeDeviceForLayer(
+                        std::min(layer, block_cnt - 1));
+                    // Preserve ModelOpt's E4M3 block scales and separate
+                    // gate/up globals on resident CUDA experts. The loader
+                    // validates the source dtype before accepting this marker.
+                    // CPU/NUMA and tensor-parallel layouts retain their policy.
+                    // Scalar weight_scale_2 is absent from tensorNames;
+                    // the generic loader reads it from the safetensors index.
+                    if (device.rfind("cuda", 0) == 0 &&
+                        tensorNameSet.count(base + ".weight_scale")) {
+                        type = DataType::NVFP4_BLOCK_16_E4M3_PACKED;
+                    }
+                }
+                result[name].emplace_back(name, type);
                 continue;
             }
 
@@ -790,6 +862,13 @@ namespace fastllm {
         require(languagePrefix + "norm.weight");
         require("lm_head.weight");
 
+        if (UsesDsa()) {
+            for (int layer = 0; layer < block_cnt; ++layer) if (!kdaLayers[layer]) {
+                const std::string prefix = languagePrefix + "layers." + std::to_string(layer) + ".self_attn.indexer.";
+                for (const char *suffix : {"wq_b.weight", "wk.weight", "k_norm.weight", "k_norm.bias",
+                        "weights_proj.weight", "index_kpool_compress_gate", "index_kpool_compress_ape"}) require(prefix + suffix);
+            }
+        }
         expertWeights.assign(block_cnt, {});
         expertBiases.assign(block_cnt, {});
         mtpExpertWeights.clear();
@@ -962,7 +1041,8 @@ namespace fastllm {
         if (memory.sequenceLength <= 0 ||
             memory.sequenceLength != (int)memory.tokens.size() ||
             (int)memory.pastKeyValues.size() < block_cnt ||
-            (int)kdaLayers.size() < block_cnt) {
+            (int)kdaLayers.size() < block_cnt ||
+            (UsesDsa() && (int)memory.indexer.size() != block_cnt)) {
             return false;
         }
         for (int layer = 0; layer < block_cnt; layer++) {
@@ -987,6 +1067,11 @@ namespace fastllm {
                     return false;
                 }
                 continue;
+            }
+            if (UsesDsa()) {
+                const auto &cache = memory.indexer[layer];
+                if (cache.tokens != memory.sequenceLength ||
+                    cache.keys.dims != std::vector<int>({1, memory.sequenceLength / 4, 128})) return false;
             }
             auto validPaged = [&](const Data &cache, int cacheHeads,
                                   int headDim) {
@@ -1072,6 +1157,10 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(mtpStatesMutex);
             mtpStates.erase(&context->pastKeyValues);
+        }
+        {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            indexerCaches.erase(&context->pastKeyValues);
         }
         std::lock_guard<std::mutex> guard(responseContextsMutex);
         responseContexts.erase(&context->pastKeyValues);
@@ -1265,8 +1354,23 @@ namespace fastllm {
             }
         }
 
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            auto it = indexerCaches.find(&pastKeyValues);
+            if (it == indexerCaches.end() || (int)it->second.size() != block_cnt) return;
+            for (int layer = 0; layer < block_cnt; ++layer) if (!kdaLayers[layer]) {
+                const auto &cache = it->second[layer];
+                if (cache.tokens != sequenceLength) return;
+                for (const Data *data : {&cache.keys, &cache.tailKeys, &cache.tailGates}) {
+                    const uint64_t bytes = data->dims.empty() ? 0 : data->GetBytes();
+                    estimatedBytes += bytes;
+                    recurrentBytes += bytes;
+                }
+            }
+        }
+
         // DSA pages remain in their runtime pools and are retained by reference;
-        // only the fixed-size KDA recurrent state needs a physical snapshot.
+        // KDA recurrent state and the pooled Indexer state need physical snapshots.
         bool storeOnCpu = GetHistoryCacheInCPU() ||
             !recurrentSourcesOnCuda ||
             recurrentBytes > historyCacheGpuStateLimitBytes;
@@ -1419,6 +1523,24 @@ namespace fastllm {
                     memory->pastKeyValues[layer].second);
             }
         }
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            const auto &sources = indexerCaches.at(&pastKeyValues);
+            memory->indexer.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; ++layer) if (!kdaLayers[layer]) {
+                auto &target = memory->indexer[layer];
+                const auto &source = sources[layer];
+                target.tokens = source.tokens;
+                for (auto pair : {std::make_pair(&source.keys, &target.keys),
+                                  std::make_pair(&source.tailKeys, &target.tailKeys),
+                                  std::make_pair(&source.tailGates, &target.tailGates)}) {
+                    if (!pair.first->dims.empty()) {
+                        copyTensor(*pair.first, *pair.second);
+                        memory->bytes += pair.second->expansionBytes;
+                    }
+                }
+            }
+        }
         if (!CanRestoreHistoryCache(*memory)) {
             for (int layer = 0; layer < block_cnt; layer++) {
                 DebugGlm5NextCacheDescriptor(
@@ -1512,6 +1634,24 @@ namespace fastllm {
                 ShareGlm5NextPagedCache(
                     memory.pastKeyValues[layer].second,
                     context->pastKeyValues[layer].second);
+            }
+        }
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            auto &targets = indexerCaches[&context->pastKeyValues];
+            targets.clear(); targets.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; ++layer) if (!kdaLayers[layer]) {
+                const auto &source = memory.indexer[layer];
+                auto &target = targets[layer];
+                target.tokens = source.tokens;
+                for (auto pair : {std::make_pair(&source.keys, &target.keys),
+                                  std::make_pair(&source.tailKeys, &target.tailKeys),
+                                  std::make_pair(&source.tailGates, &target.tailGates)}) {
+                    if (!pair.first->dims.empty()) {
+                        restoreTensor(*pair.first, *pair.second);
+                        pair.second->lockInCPU = false;
+                    }
+                }
             }
         }
         AssertInFastLLM(
@@ -1671,8 +1811,6 @@ namespace fastllm {
             rms_norm_eps, qNormalized);
         Linear(qNormalized, weight[prefix + "q_b_proj.weight"],
                Data(), query);
-        qResidual.FreeSpace();
-        qNormalized.FreeSpace();
         ToDataType(query, DataType::BFLOAT16);
         query.Reshape(
             {1, sequence, num_attention_heads, qkNopeHeadDim});
@@ -1740,6 +1878,23 @@ namespace fastllm {
             keyPeCache.pageIndex == latentKvCache.pageIndex,
             "GLM-5.3 compressed MLA caches are out of sync.");
 
+        Data dsaIndices;
+#ifdef USE_CUDA
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            auto &caches = indexerCaches[&pastKeyValues];
+            if (caches.empty()) caches.resize(block_cnt);
+            const int past = latentKvCache.dims[1] - sequence;
+            glm5_next_detail::BuildDsaIndices(input, qNormalized, weight,
+                prefix + "indexer.", past, indexTopK, caches[layerIndex], dsaIndices,
+                sequence == 1 ? &latentKvCache : nullptr);
+        }
+#else
+        AssertInFastLLM(!UsesDsa(), "GLM DSA requires a CUDA build.");
+#endif
+        qResidual.FreeSpace();
+        qNormalized.FreeSpace();
+
         const std::string kvWeightName = prefix + "kv_b_proj.weight";
         const std::string keyWeightName = kvWeightName + "__mla_key";
         const std::string valueWeightName = kvWeightName + "__mla_value";
@@ -1789,16 +1944,32 @@ namespace fastllm {
                 num_attention_heads, valueHeadDim, kvLoraRank}),
             "GLM-5.3 compressed MLA split weights have invalid shapes.");
 
-        PermuteSelf(query, {0, 2, 1, 3});
+        // Both attention paths consume the same contiguous HND query.
+        query.Reshape({num_attention_heads, sequence, qkNopeHeadDim});
+#ifdef USE_CUDA
+        if (dsaIndices.dims.empty() && sequence >= 64 &&
+            FastllmCudaGetLinearExactBatchThreshold() < sequence) {
+            Data prefillOutput;
+            if (glm5_next_detail::TryMhaPrefill(
+                    query, latentKvCache, keyWeight, valueWeight,
+                    prefillOutput, 1.0f / std::sqrt((float)qkHeadDim))) {
+                query.FreeSpace();
+                PermuteSelf(prefillOutput, {1, 0, 2});
+                prefillOutput.Reshape({1, sequence, num_attention_heads * valueHeadDim});
+                Linear(prefillOutput, weight[prefix + "o_proj.weight"], Data(), output);
+                return;
+            }
+        }
+#endif
+
         Data queryPe(DataType::BFLOAT16);
-        queryPe.dataDevice = query.dataDevice;
-        queryPe.dataDeviceIds = query.dataDeviceIds;
-        queryPe.Resize({
-            1, sequence, num_attention_heads, mlaPaddedPeHeadDim});
-        queryPe.Allocate(0.0f);
-        PermuteSelf(query, {2, 0, 1, 3});
-        query.Reshape({
-            num_attention_heads, sequence, qkNopeHeadDim});
+        if (dsaIndices.dims.empty()) {
+            queryPe.dataDevice = query.dataDevice;
+            queryPe.dataDeviceIds = query.dataDeviceIds;
+            queryPe.Resize({
+                1, sequence, num_attention_heads, mlaPaddedPeHeadDim});
+            queryPe.Allocate(0.0f);
+        }
 
         Data absorbedQuery;
         bool exactSmallBatchMatmul = false;
@@ -1829,10 +2000,17 @@ namespace fastllm {
         query.FreeSpace();
         ToDataType(absorbedQuery, DataType::BFLOAT16);
         Data latentAttention;
-        MergeMLAPaged(
-            absorbedQuery, queryPe, keyPeCache, latentKvCache,
-            latentAttention,
-            1.0f / std::sqrt((float)qkHeadDim));
+#ifdef USE_CUDA
+        if (!dsaIndices.dims.empty()) {
+            glm5_next_detail::SparseLatentAttention(absorbedQuery, latentKvCache,
+                dsaIndices, 1.0f / std::sqrt((float)qkHeadDim), latentAttention,
+                dsaBackend == DsaBackend::Auto, sequence == 1 ? &keyPeCache : nullptr);
+        } else
+#endif
+        {
+            MergeMLAPaged(absorbedQuery, queryPe, keyPeCache, latentKvCache,
+                latentAttention, 1.0f / std::sqrt((float)qkHeadDim));
+        }
         absorbedQuery.FreeSpace();
         queryPe.FreeSpace();
 
@@ -2966,18 +3144,14 @@ namespace fastllm {
             const std::string prefix = languagePrefix + "layers." +
                 std::to_string(layer) + ".";
 
-            Data attentionInput, attentionPost, attentionComb;
-            DeepSeekV4HcPre(
+            Data normalizedAttention, attentionPost, attentionComb;
+            Glm5NextHcPreNorm(
                 *current, weight[prefix + "hc_attn_fn"],
                 weight[prefix + "hc_attn_scale"],
-                weight[prefix + "hc_attn_base"], hcMult,
+                weight[prefix + "hc_attn_base"],
+                weight[prefix + "input_layernorm.weight"], hcMult,
                 hcSinkhornIters, hcEps, rms_norm_eps,
-                attentionInput, attentionPost, attentionComb);
-            Data normalizedAttention;
-            KimiK3RMSNorm(
-                attentionInput,
-                weight[prefix + "input_layernorm.weight"],
-                rms_norm_eps, normalizedAttention);
+                normalizedAttention, attentionPost, attentionComb);
             Data attentionOutput;
             if (kdaLayers[layer]) {
                 RunKdaAttention(
@@ -2995,18 +3169,14 @@ namespace fastllm {
                 attentionPost, attentionComb, *next);
             std::swap(current, next);
 
-            Data ffnInput, ffnPost, ffnComb;
-            DeepSeekV4HcPre(
+            Data normalizedFfn, ffnPost, ffnComb;
+            Glm5NextHcPreNorm(
                 *current, weight[prefix + "hc_ffn_fn"],
                 weight[prefix + "hc_ffn_scale"],
-                weight[prefix + "hc_ffn_base"], hcMult,
+                weight[prefix + "hc_ffn_base"],
+                weight[prefix + "post_attention_layernorm.weight"], hcMult,
                 hcSinkhornIters, hcEps, rms_norm_eps,
-                ffnInput, ffnPost, ffnComb);
-            Data normalizedFfn;
-            KimiK3RMSNorm(
-                ffnInput,
-                weight[prefix + "post_attention_layernorm.weight"],
-                rms_norm_eps, normalizedFfn);
+                normalizedFfn, ffnPost, ffnComb);
             Data ffnOutput;
             if (denseMlpLayers[layer]) {
                 RunClampedMlp(

@@ -1,11 +1,12 @@
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from unittest.mock import MagicMock, patch
 
 
@@ -19,6 +20,17 @@ from fastllm_pytools.util import make_normal_llm_model, make_normal_parser
 
 
 class SpeculativeDraftCliAliasesTest(unittest.TestCase):
+    def test_mtp_confidence_is_optional_and_validates_probability(self):
+        parser = make_normal_parser("test")
+        self.assertIsNone(parser.parse_args([]).mtp_min_p)
+        for flag in ("--mtp_min_p", "--mtp-min-p"):
+            for value in ("0", "0.5", "1"):
+                self.assertEqual(parser.parse_args([flag, value]).mtp_min_p, float(value))
+            for value in ("-0.1", "1.1", "nan", "inf", "invalid"):
+                with self.subTest(flag=flag, value=value), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args([flag, value])
+
     def configure_without_target(self, argv):
         args = make_normal_parser("test").parse_args(argv)
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as error:
@@ -179,6 +191,32 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different MTP draft counts"):
                 make_normal_llm_model(args)
 
+    def test_qwen4_mtp_gguf_without_adjacent_config(self):
+        def string(value):
+            data = value.encode()
+            return struct.pack("<Q", len(data)) + data
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "mtp.gguf")
+            def write(architecture, name):
+                with open(path, "wb") as file:
+                    file.write(b"GGUF" + struct.pack("<IQQ", 3, 1, 1))
+                    file.write(string("general.architecture") + struct.pack("<I", 8) + string(architecture))
+                    file.write(string(name) + struct.pack("<IQQIQ", 2, 256, 256, 1, 0))
+            write("qwen4exp-mtp", "mtp.fc_hidden.weight")
+            with patch.dict(os.environ, {}, clear=True):
+                args = self.configure_without_target(["--draft", path, "--mtp", "3"])
+                self.assertEqual(args.speculative_algorithm, "mtp")
+                self.assertEqual(args.mtp, 3)
+                self.assertEqual(args.speculative_draft_model_path, path)
+            for architecture, name, message in [
+                ("qwen4exp", "mtp.fc_hidden.weight", "qwen4exp-mtp architecture"),
+                ("qwen4exp-mtp", "output.weight", "only mtp"),
+            ]:
+                write(architecture, name)
+                args = make_normal_parser("test").parse_args(["--draft", path, "--mtp", "3"])
+                with self.assertRaisesRegex(ValueError, message):
+                    make_normal_llm_model(args)
+
     def test_external_mtp_requires_qwen35_config(self):
         with tempfile.TemporaryDirectory() as draft_path:
             self.write_draft_config(draft_path, {
@@ -229,6 +267,32 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                               output.getvalue())
                 self.assertEqual(
                     fake_llm.model.call_args.kwargs["external_mtp_path"], "")
+
+    def test_naive_external_dspark_accepts_full_anchor_first_block(self):
+        with tempfile.TemporaryDirectory() as model_path, tempfile.TemporaryDirectory() as draft_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["NaiveN05FlashForCausalLM"],
+                "model_type": "naive_n05_flash",
+            })
+            self.write_draft_config(draft_path, {
+                "architectures": ["DSparkDraftModel"], "block_size": 7,
+            })
+            args = make_normal_parser("test").parse_args([
+                model_path, "--device", "cuda", "--moe_device", "numa",
+                "--draft", draft_path, "--draft_tokens", "7", "-t", "4",
+            ])
+            fake_model = MagicMock()
+            fake_model.get_max_input_len.return_value = 4096
+            fake_model.get_max_batch.return_value = 1
+            fake_ftllm = types.ModuleType("ftllm")
+            fake_ftllm.llm = MagicMock()
+            fake_ftllm.llm.model.return_value = fake_model
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.dict(sys.modules, {"ftllm": fake_ftllm}), redirect_stdout(io.StringIO()):
+                self.assertIs(make_normal_llm_model(args), fake_model)
+                self.assertEqual(args.speculative_algorithm, "dspark")
+                self.assertEqual(os.environ["FASTLLM_DSPARK_MODEL_PATH"], draft_path)
+                self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], "7")
 
     def test_deepseek_v41_dspark_accepts_shorter_and_longer_blocks(self):
         with tempfile.TemporaryDirectory() as model_path:

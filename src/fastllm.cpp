@@ -298,6 +298,7 @@ namespace fastllm {
     static bool kvCacheInCPU = false;
     static bool historyCacheInCPU = false;
     static bool cudaEmbedding = false;
+    static bool cudaEmbeddingConfigured = false;
     static bool cudaSharedExpert = false;
     static int cudaSlabMB = 0;
     static std::atomic<uint64_t> moeCudaCacheBytes{0};
@@ -528,10 +529,13 @@ namespace fastllm {
 
     void SetCudaEmbedding(bool v) {
         cudaEmbedding = v;
+        cudaEmbeddingConfigured = true;
     }
 
     bool GetCudaEmbedding() {
-        return cudaEmbedding || GetFastllmEnv().cudaGraph;
+        // Graph mode supplies a default, but must not override an explicit
+        // opt-out (for example --low_gpu_mem on a CPU-offloaded MoE model).
+        return cudaEmbeddingConfigured ? cudaEmbedding : GetFastllmEnv().cudaGraph;
     }
 
     bool GetCudaEmbeddingRequested() {
@@ -1239,10 +1243,33 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+        if (this == &ori) return;
 #ifdef USE_CUDA
         if (this->cudaNativeNvfp4Layout) FastllmCudaRestoreNativeNvfp4(*this);
-#endif
+        // A clone belongs to the source device. The executor may currently
+        // point at another pipeline stage while saving an MTP checkpoint.
+        const int callerDevice = FastllmCudaGetDevice();
+        struct RestoreCopyDevice {
+            int device;
+            ~RestoreCopyDevice() { FastllmCudaSetDevice(device); }
+        } restoreDevice{callerDevice};
+        if (ori.dataDevice == DataDevice::CUDA) {
+            int sourceDevice = ori.dataDeviceIds.empty() ? callerDevice : ori.dataDeviceIds[0];
+            if (ori.cudaData != nullptr && !FastllmCudaGraphIsCapturingFast()) {
+                const int actualDevice = GetPointerDeviceId(ori.cudaData);
+                if (actualDevice >= 0) sourceDevice = actualDevice;
+            }
+            FastllmCudaSetDevice(sourceDevice);
+            this->ToDevice(DataDevice::CUDA, {sourceDevice}, false);
+            this->dataDeviceIds = {sourceDevice};
+        } else {
+            this->ToDevice(ori.dataDevice);
+            this->dataDeviceIds = ori.dataDeviceIds;
+        }
+#else
         this->ToDevice(ori.dataDevice);
+        this->dataDeviceIds = ori.dataDeviceIds;
+#endif
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
         this->isLinearAttention = ori.isLinearAttention;
@@ -2353,6 +2380,11 @@ namespace fastllm {
     void Data::FreeSpace() {
         if (isFake)
             return;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
         if (this->cudaNativeNvfp4Layout) { this->cudaNativeNvfp4Layout = false; this->IsRepacked = false; }
         this->expansionSize = 0;
         this->expansionBytes = 0;
@@ -2534,6 +2566,11 @@ namespace fastllm {
             ReleaseDiskMoeCache(this);
         }
 #ifdef USE_CUDA
+#ifndef USE_ROCM
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
         // Hash-route tables keep per-device CUDA replicas while the owning
         // Data is alive. Retire them before either this object or its CPU
         // allocation can be reused by a subsequently loaded model.
@@ -2552,8 +2589,9 @@ namespace fastllm {
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
             FastllmCudaReleaseMergeMOEDeepGemmSm120Cache(this);
 #endif
-        } else if (this->dataType == DataType::INT4_GROUP &&
-                   this->isModelWeight) {
+        } else if ((this->dataType == DataType::INT4_GROUP && this->isModelWeight) ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
             FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
         }
 #endif
@@ -2927,6 +2965,11 @@ namespace fastllm {
         if (alreadyOnTarget) {
             return;
         }
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
 
         if (this->expansionBytes != 0) {
 #ifdef USE_CUDA
@@ -3015,6 +3058,13 @@ namespace fastllm {
                 }
             } else if (this->dataDevice == DataDevice::CUDA) {
                 if (device == DataDevice::CPU) {
+                    const int callerDevice = FastllmCudaGetDevice();
+                    int sourceDevice = this->dataDeviceIds.empty() ? callerDevice : this->dataDeviceIds[0];
+                    if (this->cudaData != nullptr && !FastllmCudaGraphIsCapturingFast()) {
+                        const int actualDevice = GetPointerDeviceId(this->cudaData);
+                        if (actualDevice >= 0) sourceDevice = actualDevice;
+                    }
+                    FastllmCudaSetDevice(sourceDevice);
                     if (this->cudaNativeNvfp4Layout) FastllmCudaRestoreNativeNvfp4(*this);
                     if (this->cpuData == nullptr) {
                         this->cpuData = new uint8_t[expansionBytes];
@@ -3028,6 +3078,7 @@ namespace fastllm {
                         this->cudaData = nullptr;
                         this->cudaDataBorrowed = false;
                     }
+                    FastllmCudaSetDevice(callerDevice);
                 } else if (device == DataDevice::CUDA) {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
                     if (this->cudaData != nullptr) {

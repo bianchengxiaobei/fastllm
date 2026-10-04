@@ -13,6 +13,7 @@
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
 #include "fastllm-rmsnorm-decode.cuh"
+#include "attention/fastllm-kda-prefill.cuh"
 #endif
 #include "fastllm.h"
 #include "utils/utils.h"
@@ -4065,7 +4066,7 @@ __global__ __launch_bounds__(256) void FastllmRMSNormBFloat16Hidden3072ExactKern
 #endif
 
 template <int THREAD_PER_BLOCK>
-__global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *beta, float *output, int outer, int channels) {
+__global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *beta, float *output, int outer, int channels, double epsilon = 1e-10) {
     int o = blockIdx.x;
     input = input + o * channels;
     output = output + o * channels;
@@ -4100,7 +4101,7 @@ __global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *
     if (tid == 0) {
         mean = sdata[0] / channels;
         var = sdata2[0] + mean * mean * channels - 2 * mean * channels * mean;
-        var = sqrt(var / channels + 1e-10);
+        var = sqrt(var / channels + epsilon);
     }
     __syncthreads();
 
@@ -8677,6 +8678,41 @@ namespace {
         }
     }
 
+#ifndef USE_ROCM
+    // Cache one decode row while preserving the generic kernel's accumulation
+    // order and the BF16 rounding before and after applying the FP32 weight.
+    __global__ void KimiK3RMSNorm4096Kernel(
+            const __nv_bfloat16 *input, const float *weight,
+            __nv_bfloat16 *output, float eps) {
+        constexpr int CHANNELS = 4096;
+        constexpr int VALUES_PER_THREAD = CHANNELS / KIMI_K3_CUDA_THREADS;
+        __shared__ float warpSums[KIMI_K3_CUDA_THREADS / 32];
+        float values[VALUES_PER_THREAD];
+        float weights[VALUES_PER_THREAD];
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            int channel = threadIdx.x + part * KIMI_K3_CUDA_THREADS;
+            values[part] = __bfloat162float(input[channel]);
+            weights[part] = weight[channel];
+        }
+        float partial = 0.0f;
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            partial += values[part] * values[part];
+        }
+        float squareSum =
+            KimiK3BlockReduceSum<KIMI_K3_CUDA_THREADS>(partial, warpSums);
+        float scale = rsqrtf(squareSum / CHANNELS + eps);
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            float normalized = __bfloat162float(
+                __float2bfloat16_rn(values[part] * scale));
+            output[threadIdx.x + part * KIMI_K3_CUDA_THREADS] =
+                __float2bfloat16_rn(normalized * weights[part]);
+        }
+    }
+#endif
+
     __global__ void KimiK3L2NormKernel(
             const __nv_bfloat16 *input, __nv_bfloat16 *output,
             int rows, int channels, float eps) {
@@ -8760,7 +8796,9 @@ namespace {
         int batchIndex = item / channels;
         int channel = item % channels;
         int history = kernelSize - 1;
-        for (int token = 0; token < sequence; token++) {
+        // Each output reads only the input and the initial history. Split tokens
+        // across blocks while preserving the original tap accumulation order.
+        for (int token = blockIdx.y; token < sequence; token += gridDim.y) {
             float value = 0.0f;
             for (int kernel = 0; kernel < kernelSize; kernel++) {
                 int sourceToken = token - history + kernel;
@@ -9095,10 +9133,19 @@ bool FastllmCudaKimiK3RMSNorm(
     }
     int channels = input.dims.back();
     int rows = (int)(input.Count(0) / channels);
-    KimiK3RMSNormKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
-        (const __nv_bfloat16*)input.cudaData,
-        (const float*)weight.cudaData,
-        (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+#ifndef USE_ROCM
+    if (rows == 1 && channels == 4096) {
+        KimiK3RMSNorm4096Kernel<<<1, KIMI_K3_CUDA_THREADS>>>(
+            (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
+            (__nv_bfloat16 *)output.cudaData, eps);
+    } else
+#endif
+    {
+        KimiK3RMSNormKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
+            (const __nv_bfloat16*)input.cudaData,
+            (const float*)weight.cudaData,
+            (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+    }
     return KimiK3CudaLastError("KimiK3RMSNorm CUDA kernel failed.");
 }
 
@@ -9185,7 +9232,10 @@ bool FastllmCudaKimiK3CausalConv1D(
     int items = batch * channels;
     int blocks = (items + KIMI_K3_CUDA_THREADS - 1) /
                  KIMI_K3_CUDA_THREADS;
-    KimiK3CausalConv1DKernel<<<blocks, KIMI_K3_CUDA_THREADS>>>(
+    // About eight tokens per block amortizes weight loads without serializing
+    // the entire prefill. Keep grid.y valid even for unusually long sequences.
+    int tokenBlocks = std::min(65535, std::max(1, sequence / 8 + (sequence % 8 != 0)));
+    KimiK3CausalConv1DKernel<<<dim3(blocks, tokenBlocks), KIMI_K3_CUDA_THREADS>>>(
         (const __nv_bfloat16*)input.cudaData,
         (const float*)weight.cudaData,
         cache == nullptr ? nullptr :
@@ -9290,6 +9340,32 @@ bool FastllmCudaKimiK3RecurrentKDA(
     if (initializeState) {
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
     }
+#ifndef USE_ROCM
+    // Ordinary decode and prefill reuse register scan with shared CUDA scratch.
+    // Auxiliary/state replay and graph capture keep the allocation-free path.
+    if (dimension == KIMI_K3_KDA_DIMENSION && batch > 0 && heads > 0 &&
+        (sequence == 1 || sequence >= 64) && !stateOnly && !outputAux &&
+        normalizeQKInFp32 && roundBetaToBfloat16 &&
+        aLog.Count(0) == (uint64_t)heads && !FastllmCudaGraphIsCapturing()) {
+        size_t rows = (size_t)batch * sequence * heads;
+        if (rows <= (size_t)std::numeric_limits<int>::max() - 3) {
+            size_t scratchBytes = rows * (3 * dimension + 1) * sizeof(float);
+            size_t borrowedBytes = 0;
+            bool own = false;
+            void *scratch = FastllmBorrowCudaTempBuffer(scratchBytes, &borrowedBytes, &own);
+            if (scratch != nullptr && borrowedBytes >= scratchBytes) {
+                KimiK3LaunchKdaPrefill(q.cudaData, k.cudaData, v.cudaData, rawGate.cudaData,
+                    (const float*)rawBeta.cudaData, (const float*)aLog.cudaData,
+                    (const float*)dtBias.cudaData, (float*)state.cudaData, output.cudaData,
+                    (float*)scratch, batch, sequence, heads, dimension, lowerBound);
+                bool success = KimiK3CudaLastError("KimiK3 KDA prefill CUDA kernel failed.");
+                FastllmReleaseCudaTempBuffer(scratch, own);
+                return success;
+            }
+            FastllmReleaseCudaTempBuffer(scratch, own);
+        }
+    }
+#endif
     // Vector reductions retain one owner per state column, while all threads
     // cooperate on the row-major decay and rank-one update passes.
     int threads = KIMI_K3_CUDA_THREADS;
@@ -10516,6 +10592,23 @@ bool FastllmCudaRMSNormPartApply(const fastllm::Data &input, fastllm::Data &weig
     return true;
 }
 
+bool FastllmCudaLayerNormWithEpsilon(const fastllm::Data &input,
+        const fastllm::Data &gamma, const fastllm::Data &beta,
+        fastllm::Data &output, float epsilon) {
+    using namespace fastllm;
+    if (input.dataType != FLOAT32 || gamma.dataType != FLOAT32 ||
+        beta.dataType != FLOAT32 || output.dataType != FLOAT32 ||
+        input.dataDevice != DataDevice::CUDA || gamma.dataDevice != DataDevice::CUDA ||
+        beta.dataDevice != DataDevice::CUDA || output.dataDevice != DataDevice::CUDA ||
+        input.dims.empty() || input.dims.back() != 128 || output.dims != input.dims ||
+        gamma.Count(0) != 128 || beta.Count(0) != 128 || epsilon <= 0 ||
+        !input.cudaData || !gamma.cudaData || !beta.cudaData || !output.cudaData) return false;
+    FastllmLayerNormKernelInner1<64><<<input.Count(0) / 128, 64>>>(
+        (float *)input.cudaData, (float *)gamma.cudaData, (float *)beta.cudaData,
+        (float *)output.cudaData, input.Count(0) / 128, 128, epsilon);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fastllm::Data &beta, fastllm::Data &output, int axis) {
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareInput(output);
@@ -11046,17 +11139,16 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
     }
 }
 
-// Shape specialization for 512 experts and top-10, independent of model name.
+// Fixed-shape selection for 512/top-10 and single-row 256/top-8 decode.
 // APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
 // merge tree so both instantiations remain compatible with the legacy path.
-template <bool APPLY_SOFTMAX>
-__global__ void FastllmSelectExpert512Top10Kernel(
+template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK>
+__global__ void FastllmSelectExpertFixedTopKKernel(
         const float *logits, const float *bias, int32_t *index, float *score,
         int hasBias, int needNorm, float routeScale) {
-    constexpr int TOPK = 10;
-    constexpr int VALUES_PER_LANE = 16;
+    constexpr int VALUES_PER_LANE = EXPERTS / 32;
     constexpr int LEGACY_THREADS = 64;
     constexpr float NEG_INF = -FLT_MAX;
     constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
@@ -11067,24 +11159,27 @@ __global__ void FastllmSelectExpert512Top10Kernel(
     __shared__ float legacyKeys[LEGACY_THREADS][TOPK];
     __shared__ float legacyIds[LEGACY_THREADS][TOPK];
     __shared__ float softmaxReduce[257];
-    __shared__ __align__(16) float softmaxProbabilities[512];
+    __shared__ __align__(16) float softmaxProbabilities[EXPERTS];
 
+    static_assert((EXPERTS == 256 && TOPK == 8) ||
+                  (EXPERTS == 512 && TOPK == 10) ||
+                  (!APPLY_SOFTMAX && EXPERTS == 288 && TOPK == 8));
     int token = blockIdx.x;
-    const float *tokenLogits = logits + (size_t)token * 512;
+    const float *tokenLogits = logits + (size_t)token * EXPERTS;
     index += (size_t)token * TOPK;
     score += (size_t)token * TOPK;
     int tid = threadIdx.x;
     const float *probabilityLogits = tokenLogits;
     if constexpr (APPLY_SOFTMAX) {
         float maxValue = -1e100;
-        for (int expert = tid; expert < 512; expert += blockDim.x) {
+        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
             maxValue = max(maxValue, tokenLogits[expert]);
         }
         float softmaxMaximum = fastllm::cuda::OrderedBlockReduce<256>(
             maxValue, softmaxReduce, fastllm::cuda::OrderedMax{});
 
         float sum = 0.0f;
-        for (int expert = tid; expert < 512; expert += blockDim.x) {
+        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
             softmaxProbabilities[expert] =
                 exp(tokenLogits[expert] - softmaxMaximum);
             sum += softmaxProbabilities[expert];
@@ -11092,7 +11187,7 @@ __global__ void FastllmSelectExpert512Top10Kernel(
         float denominator = fastllm::cuda::OrderedBlockReduce<256>(
             sum, softmaxReduce, fastllm::cuda::OrderedSum{});
         if (fabs(denominator) < 1e-6) denominator = 0.0001f;
-        for (int expert = tid; expert < 512; expert += blockDim.x) {
+        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
             softmaxProbabilities[expert] /= denominator;
         }
         __syncthreads();
@@ -11104,34 +11199,34 @@ __global__ void FastllmSelectExpert512Top10Kernel(
     int lane = tid;
     int firstExpert = lane * VALUES_PER_LANE;
     float choiceKeys[VALUES_PER_LANE];
-    float firstProbabilities[8];
-    float secondProbabilities[8];
-    FastllmRouterLoad8(
-        probabilityLogits + firstExpert, firstProbabilities);
-    FastllmRouterLoad8(
-        probabilityLogits + firstExpert + 8, secondProbabilities);
+    float firstProbabilities[8], secondProbabilities[8];
+    if constexpr (EXPERTS != 288) {
+        FastllmRouterLoad8(probabilityLogits + firstExpert, firstProbabilities);
+        if constexpr (VALUES_PER_LANE > 8)
+            FastllmRouterLoad8(probabilityLogits + firstExpert + 8, secondProbabilities);
+    }
 #pragma unroll
     for (int part = 0; part < VALUES_PER_LANE; ++part) {
         int expert = firstExpert + part;
-        float probability = part < 8 ? firstProbabilities[part]
-                                    : secondProbabilities[part - 8];
+        float probability;
+        if constexpr (EXPERTS == 288) probability = probabilityLogits[expert];
+        else probability = part < 8 ? firstProbabilities[part] : secondProbabilities[part - 8];
         float key = probability + (hasBias ? bias[expert] : 0.0f);
         choiceKeys[part] = isfinite(key) ? key : NEG_INF;
     }
 
 #pragma unroll
     for (int rank = 0; rank < TOPK; ++rank) {
-        auto winner = fastllm::cuda::WarpArgMax(choiceKeys, firstExpert, 512);
-        FastllmRouterCandidate best{winner.value, winner.index};
+        auto winner = fastllm::cuda::WarpArgMax(choiceKeys, firstExpert, EXPERTS);
 
-        int owner = best.id / VALUES_PER_LANE;
-        int ownerPart = best.id % VALUES_PER_LANE;
+        int owner = winner.index / VALUES_PER_LANE;
+        int ownerPart = winner.index % VALUES_PER_LANE;
         // The selected row is already available in shared/global storage.
         // A dynamic index into a per-thread array forces a local-memory stack.
-        float probability = probabilityLogits[best.id];
+        float probability = probabilityLogits[winner.index];
         if (lane == 0) {
-            selectedKeys[rank] = best.key;
-            selectedIds[rank] = best.id;
+            selectedKeys[rank] = winner.value;
+            selectedIds[rank] = winner.index;
             selectedProbabilities[rank] =
                 isfinite(probability) ? probability : 0.0f;
         }
@@ -11214,7 +11309,7 @@ __global__ void FastllmSelectExpert512Top10Kernel(
             legacyIds[virtualTid][rank] = -1.0f;
         }
 #pragma unroll
-        for (int part = 0; part < 8; ++part) {
+        for (int part = 0; part < (EXPERTS + LEGACY_THREADS - 1) / LEGACY_THREADS; ++part) {
             int expert = virtualTid + part * LEGACY_THREADS;
             int owner = expert / VALUES_PER_LANE;
             int ownerPart = expert % VALUES_PER_LANE;
@@ -11230,7 +11325,7 @@ __global__ void FastllmSelectExpert512Top10Kernel(
             }
 #pragma unroll
             for (int rank = 0; rank < TOPK; ++rank) {
-                if (key > legacyKeys[virtualTid][rank]) {
+                if (expert < EXPERTS && key > legacyKeys[virtualTid][rank]) {
 #pragma unroll
                     for (int shift = TOPK - 1; shift > rank; --shift) {
                         legacyKeys[virtualTid][shift] =
@@ -12264,7 +12359,7 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
             return false;
         }
         const int tokens = (int)(logits.Count(0) / 512);
-        FastllmSelectExpert512Top10Kernel<true><<<tokens, 256>>>(
+        FastllmSelectExpertFixedTopKKernel<true, 512, 10><<<tokens, 256>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
         const cudaError_t state = cudaGetLastError();
@@ -12464,16 +12559,24 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         return false;
     }
 
-    // The NVIDIA-only single-row specialization covers Qwen4 decode. Preserve
-    // the generic kernel's original MAXK=50 instantiation exactly: changing
+    // Keep decode specializations narrow and preserve the generic kernel's
+    // original MAXK=50 instantiation exactly: changing
     // its shared-memory row stride changes legacy merge behavior for prefill.
 #ifdef USE_ROCM
     FastllmSelectExpertKernel<64, 50><<<n, 64>>>(
         cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
         topk, hasBias, needNorm, routeScale);
 #else
-    if (n <= 9 && numExperts == 512 && topk == 10) {
-        FastllmSelectExpert512Top10Kernel<false><<<n, 32>>>(
+    if (n == 1 && numExperts == 256 && topk == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<1, 32>>>(
+            cudaLogits, cudaBias, cudaIndex, cudaScore,
+            hasBias, needNorm, routeScale);
+    } else if (n == 1 && numExperts == 288 && topk == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 288, 8><<<1, 32>>>(
+            cudaLogits, cudaBias, cudaIndex, cudaScore,
+            hasBias, needNorm, routeScale);
+    } else if (n <= 9 && numExperts == 512 && topk == 10) {
+        FastllmSelectExpertFixedTopKKernel<false, 512, 10><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
     } else {
@@ -21216,7 +21319,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     half *snap5, half *snap6,
     half **snapshotPointers, int numSnaps,
     void **prefixLengths = nullptr, half **initialStates = nullptr,
-    const float *preparedQk = nullptr, const float *preparedBa = nullptr) {
+    const float *preparedQk = nullptr, const float *preparedBa = nullptr,
+    half **outputStates = nullptr) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
@@ -21403,9 +21507,13 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
                 core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
             }
         }
+        // Verification can keep its original state intact and write the final
+        // state to a second owned buffer. No preliminary matrix copy is needed.
+        half *finalRow = outputStates != nullptr ?
+            outputStates[batchIndex] + stateHeadBase + (size_t)v_col * headKDim : state_row;
 #pragma unroll
         for (int j = 0; j < 4; j++) {
-            state_row[lane_id + j * 32] = stateValues[j];
+            finalRow[lane_id + j * 32] = stateValues[j];
         }
     }
 }
@@ -21920,14 +22028,15 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
     return true;
 }
 
-bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
+bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshotsWithOutput(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     const std::vector<fastllm::Data*> &lastRecurrentStates,
     fastllm::Data &coreAttnOut,
     const std::vector<fastllm::Data*> &tokenStates, int numTokenStates,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale,
+    const std::vector<fastllm::Data*> &outputStates) {
     if (lastRecurrentStates.empty() || lastRecurrentStates[0] == nullptr ||
         numTokenStates < 0 ||
         numTokenStates > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
@@ -21983,8 +22092,11 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         return false;
     }
 
+    if (!outputStates.empty() && outputStates.size() != lastRecurrentStates.size()) {
+        return false;
+    }
     std::vector<void*> pointers;
-    pointers.reserve(batch * (1 + numTokenStates));
+    pointers.reserve(batch * (1 + numTokenStates) + outputStates.size());
     for (fastllm::Data *state : lastRecurrentStates) {
         if (state == nullptr || state->dims != first.dims ||
             state->dataType != first.dataType ||
@@ -22021,7 +22133,26 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             pointers.push_back(snapshot->cudaData);
         }
     }
+    // Separate destinations must already be allocated and must not alias any
+    // input, snapshot or other destination. Validate before launching work.
+    for (fastllm::Data *state : outputStates) {
+        int outputDevice = -1;
+        if (state == nullptr || state->cudaData == nullptr ||
+            state->isFake || state->cudaDataBorrowed ||
+            state->isPagedKVCache || state->multiDeviceData ||
+            state->dims != first.dims || state->dataType != first.dataType ||
+            !state->isLinearAttentionTransposed ||
+            !FastllmCudaDataHasDenseStrides(*state) ||
+            !FastllmCudaResolveDataDeviceId(*state, outputDevice) || outputDevice != device ||
+            !tensors.insert(state).second ||
+            std::find(pointers.begin(), pointers.end(), state->cudaData) != pointers.end()) {
+            return false;
+        }
+        pointers.push_back(state->cudaData);
+    }
     void **devicePointers = FastllmCudaStagePointers(pointers);
+    half **outputPointers = outputStates.empty() ? nullptr :
+        (half**)(devicePointers + batch * (1 + numTokenStates));
 
     coreAttnOut.dataType = first.dataType;
     coreAttnOut.Resize({batch, seqLen, numVHeads, headVDim});
@@ -22064,7 +22195,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
                     seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                     (half**)(devicePointers + batch), numTokenStates,
-                    nullptr, nullptr, prepared, prepared + qkCount);
+                    nullptr, nullptr, prepared, prepared + qkCount, outputPointers);
             checkCudaErrors("Error: CUDA error in prepared batched GDN sequence.", cudaGetLastError());
             return true;
         }
@@ -22084,7 +22215,8 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             (half*)coreAttnOut.cudaData,
             seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            (half**)(devicePointers + batch), numTokenStates);
+            (half**)(devicePointers + batch), numTokenStates,
+            nullptr, nullptr, nullptr, nullptr, outputPointers);
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors(
@@ -22093,6 +22225,20 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         return false;
     }
     return true;
+}
+
+// Preserve the original CUDA entry point and its argument ABI.
+bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    const std::vector<fastllm::Data*> &lastRecurrentStates,
+    fastllm::Data &coreAttnOut,
+    const std::vector<fastllm::Data*> &tokenStates, int numTokenStates,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    return FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshotsWithOutput(convOutput, ba, normWeight, aLog, dtBias,
+        lastRecurrentStates, coreAttnOut, tokenStates, numTokenStates,
+        numKHeads, numVHeads, headKDim, headVDim, eps, qScale, {});
 }
 
 bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(

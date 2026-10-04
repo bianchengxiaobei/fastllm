@@ -17,6 +17,41 @@
 #include <vector>
 
 namespace {
+    struct Qwen4CacheAddress {
+        const int32_t *keyPages = nullptr;
+        const int32_t *valuePages = nullptr;
+        int pageLen = 0, heads = 0, headDim = 0;
+
+        __device__ __forceinline__ uint64_t Offset(
+                bool value, int head, int token, uint64_t stride) const {
+            if (pageLen == 0) return (uint64_t)head * stride + (uint64_t)token * headDim;
+            const int page = (value ? valuePages : keyPages)[token / pageLen];
+            return (((uint64_t)page * pageLen + token % pageLen) * heads + head) * headDim;
+        }
+    };
+
+    void *Qwen4CachePayload(const fastllm::Data &cache) {
+        return cache.isPagedKVCache ? cache.pagedKVCacheData->cudaData : cache.cudaData;
+    }
+
+    Qwen4CacheAddress Qwen4GetCacheAddress(const fastllm::Data &key,
+                                           const fastllm::Data &value) {
+        Qwen4CacheAddress address;
+        address.heads = key.dims.empty() ? key.expansionDims[0] : key.dims[0];
+        address.headDim = key.dims.empty() ? key.expansionDims.back() : key.dims.back();
+        if (key.isPagedKVCache || value.isPagedKVCache) {
+            fastllm::AssertInFastLLM(
+                key.isPagedKVCache && value.isPagedKVCache &&
+                key.pagedKVCacheData && value.pagedKVCacheData &&
+                key.pageLen > 0 && key.pageLen == value.pageLen &&
+                key.cudaData && value.cudaData,
+                "Qwen4 paged CUDA kernels require prepared device page tables.\n");
+            address.keyPages = (const int32_t*)key.cudaData;
+            address.valuePages = (const int32_t*)value.cudaData;
+            address.pageLen = key.pageLen;
+        }
+        return address;
+    }
     __global__ void Qwen4MergeTpGreedyKernel(
             const float *candidates, int *output, float *floatOutput,
             int vocabulary, int ranks) {
@@ -2030,7 +2065,8 @@ namespace {
             const int32_t *selectedBlocks, int32_t *indices,
             int rows, int selectedK, int compressRatio,
             int completeBlocks, int keyLength, int outputWidth,
-            int queryStart, const int32_t *decodeMeta) {
+            int queryStart, const int32_t *decodeMeta,
+            const int32_t *pageTable = nullptr, int pageLen = 0) {
         const int dynamicQueryStart =
             queryStart == -2 && decodeMeta != nullptr
                 ? decodeMeta[0] : queryStart;
@@ -2061,6 +2097,10 @@ namespace {
                                       rowBlocks * compressRatio;
                 indices[item] = tail < remainder
                     ? rowBlocks * compressRatio + tail : -1;
+            }
+            if (pageTable != nullptr && indices[item] >= 0) {
+                const int token = indices[item];
+                indices[item] = pageTable[token / pageLen] * pageLen + token % pageLen;
             }
         }
     }
@@ -2095,7 +2135,7 @@ namespace {
             const T *key, const T *value, const int32_t *indices,
             T *compactKey, T *compactValue, int keyHeads,
             int keyLength, int keyHeadStride, int valueHeadStride,
-            int headDim, int width, const int32_t *decodeMeta) {
+            int headDim, int width, const int32_t *decodeMeta, Qwen4CacheAddress address) {
         if (decodeMeta != nullptr) {
             keyLength = decodeMeta[0] + 1;
         }
@@ -2109,12 +2149,8 @@ namespace {
             const int head = item / ((uint64_t)width * headDim);
             const int sourceToken = indices[selected];
             if (sourceToken >= 0 && sourceToken < keyLength) {
-                const uint64_t source =
-                    (uint64_t)sourceToken * headDim + column;
-                compactKey[item] = key[
-                    (uint64_t)head * keyHeadStride + source];
-                compactValue[item] = value[
-                    (uint64_t)head * valueHeadStride + source];
+                compactKey[item] = key[address.Offset(false, head, sourceToken, keyHeadStride) + column];
+                compactValue[item] = value[address.Offset(true, head, sourceToken, valueHeadStride) + column];
             } else {
                 compactKey[item] = Qwen4CudaFromFloat<T>(0.0f);
                 compactValue[item] = Qwen4CudaFromFloat<T>(0.0f);
@@ -2312,7 +2348,7 @@ namespace {
             int qHeads, int kvHeads, int headDim, int rotaryDim,
             int positionStride, bool interleaved, int sectionH, int sectionW,
             float eps, float ropeTheta, int previousLength,
-            uint64_t keyHeadStride, uint64_t valueHeadStride) {
+            uint64_t keyHeadStride, uint64_t valueHeadStride, Qwen4CacheAddress address) {
         const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
         const int row = blockIdx.x / (qHeads + kvHeads);
         const int head = blockIdx.x % (qHeads + kvHeads);
@@ -2358,8 +2394,7 @@ namespace {
         __syncthreads();
         T *destination = isQuery
             ? query + ((uint64_t)(batch * qHeads + h) * sequence + token) * headDim
-            : keyCache + (uint64_t)(batch * kvHeads + h) * keyHeadStride +
-                         (uint64_t)(previousLength + token) * headDim;
+            : keyCache + address.Offset(false, batch * kvHeads + h, previousLength + token, keyHeadStride);
         const int halfDim = rotaryDim / 2;
         for (int d = tid; d < halfDim; d += 64) {
             float angle;
@@ -2384,8 +2419,7 @@ namespace {
             if (isQuery) {
                 gate[((uint64_t)row * qHeads + h) * headDim + d] = input[headDim + d];
             } else {
-                valueCache[(uint64_t)(batch * kvHeads + h) * valueHeadStride +
-                           (uint64_t)(previousLength + token) * headDim + d] =
+                valueCache[address.Offset(true, batch * kvHeads + h, previousLength + token, valueHeadStride) + d] =
                     value[((uint64_t)row * kvHeads + h) * headDim + d];
             }
         }
@@ -2435,7 +2469,7 @@ namespace {
             int sequence, int previousLength,
             int keyInputHeadStride, int valueInputHeadStride,
             int keyCacheHeadStride, int valueCacheHeadStride,
-            int capacity) {
+            int capacity, Qwen4CacheAddress address) {
         const int tokenBase = decodeMeta == nullptr
             ? previousLength : decodeMeta[0];
         if (tokenBase < 0 || tokenBase + sequence > capacity) {
@@ -2447,12 +2481,10 @@ namespace {
             const int column = item % headDim;
             const int token = (item / headDim) % sequence;
             const int head = item / (sequence * headDim);
-            keyCache[(uint64_t)head * keyCacheHeadStride +
-                     (uint64_t)(tokenBase + token) * headDim + column] =
+            keyCache[address.Offset(false, head, tokenBase + token, keyCacheHeadStride) + column] =
                 key[(uint64_t)head * keyInputHeadStride +
                     (uint64_t)token * headDim + column];
-            valueCache[(uint64_t)head * valueCacheHeadStride +
-                       (uint64_t)(tokenBase + token) * headDim + column] =
+            valueCache[address.Offset(true, head, tokenBase + token, valueCacheHeadStride) + column] =
                 value[(uint64_t)head * valueInputHeadStride +
                       (uint64_t)token * headDim + column];
         }
@@ -2484,7 +2516,7 @@ namespace {
             int keyLength, int keyHeadStride, int valueHeadStride,
             int headDim, int width,
             int rowStart, int rows, const int32_t *decodeMeta,
-            int appendedSequence) {
+            int appendedSequence, Qwen4CacheAddress address) {
         if (decodeMeta != nullptr) {
             keyLength = decodeMeta[0] + appendedSequence;
         }
@@ -2506,12 +2538,8 @@ namespace {
                 ? decodeMeta[0] + rowStart + row + 1 : keyLength;
             const bool valid = sourceToken >= 0 && sourceToken < rowLength;
             if (valid) {
-                const uint64_t source =
-                    (uint64_t)sourceToken * headDim + column;
-                compactKey[item] = key[
-                    (uint64_t)head * keyHeadStride + source];
-                compactValue[item] = value[
-                    (uint64_t)head * valueHeadStride + source];
+                compactKey[item] = key[address.Offset(false, head, sourceToken, keyHeadStride) + column];
+                compactValue[item] = value[address.Offset(true, head, sourceToken, valueHeadStride) + column];
             } else {
                 compactKey[item] = Qwen4CudaFromFloat<T>(0.0f);
                 compactValue[item] = Qwen4CudaFromFloat<T>(0.0f);
@@ -2529,7 +2557,7 @@ namespace {
             int keyHeads, int keyLength, int keyHeadStride,
             int valueHeadStride, int headDim, int width,
             int rowStart, int rows, const int32_t *decodeMeta,
-            int appendedSequence) {
+            int appendedSequence, Qwen4CacheAddress address) {
         if (decodeMeta != nullptr) {
             keyLength = decodeMeta[0] + appendedSequence;
         }
@@ -2553,13 +2581,11 @@ namespace {
             uint4 keyVector = make_uint4(0, 0, 0, 0);
             uint4 valueVector = make_uint4(0, 0, 0, 0);
             if (valid) {
-                const uint64_t source =
-                    (uint64_t)sourceToken * headDim +
-                    (uint64_t)vectorColumn * valuesPerVector;
+                const int column = vectorColumn * valuesPerVector;
                 keyVector = *reinterpret_cast<const uint4 *>(
-                    key + (uint64_t)head * keyHeadStride + source);
+                    key + address.Offset(false, head, sourceToken, keyHeadStride) + column);
                 valueVector = *reinterpret_cast<const uint4 *>(
-                    value + (uint64_t)head * valueHeadStride + source);
+                    value + address.Offset(true, head, sourceToken, valueHeadStride) + column);
             }
             reinterpret_cast<uint4 *>(compactKey)[item] = keyVector;
             reinterpret_cast<uint4 *>(compactValue)[item] = valueVector;
@@ -3108,6 +3134,64 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
     return cudaGetLastError() == cudaSuccess;
 }
 
+static bool Qwen4SelectBlocksRaw(const float *scores, int32_t *selectedBlocks,
+        int rows, int scoreCapacity, int selectedK, int queryStart,
+        int compressRatio, const int32_t *decodeMeta) {
+    // Bound the per-thread row cache as capacity grows. Wider blocks spread
+    // long decode rows across more warps; batched prefill keeps one small
+    // block per row. Dispatch uses physical capacity so graph replay can
+    // advance the logical length without overrunning a cached specialization.
+    auto selectKernel = Qwen4QSARadixSelectKernel<0>;
+    int selectThreads = 256;
+    if (rows == 1) {
+        static const struct {
+            int threads;
+            int items;
+            decltype(selectKernel) kernel;
+        } kernels[] = {
+            {256, 8, Qwen4QSARadixSelectKernel<8>},
+            {256, 16, Qwen4QSARadixSelectKernel<16>},
+            {256, 24, Qwen4QSARadixSelectKernel<24>},
+            {256, 32, Qwen4QSARadixSelectKernel<32>},
+            {256, 40, Qwen4QSARadixSelectKernel<40>},
+            {512, 32, Qwen4QSARadixSelectKernel<32, 512>},
+            {512, 40, Qwen4QSARadixSelectKernel<40, 512>},
+            {1024, 24, Qwen4QSARadixSelectKernel<24, 1024>},
+            {1024, 32, Qwen4QSARadixSelectKernel<32, 1024>},
+            {1024, 36, Qwen4QSARadixSelectKernel<36, 1024>},
+            {1024, 40, Qwen4QSARadixSelectKernel<40, 1024>},
+            {1024, 64, Qwen4QSARadixSelectKernel<64, 1024>},
+            {1024, 72, Qwen4QSARadixSelectKernel<72, 1024>}
+        };
+        selectKernel = Qwen4QSARadixSelectKernel<0, 1024>;
+        selectThreads = 1024;
+        for (const auto &entry : kernels) {
+            if (scoreCapacity <= entry.threads * entry.items) {
+                selectKernel = entry.kernel;
+                selectThreads = entry.threads;
+                break;
+            }
+        }
+    }
+    selectKernel<<<rows, selectThreads, 0, cudaStreamPerThread>>>(
+        scores, selectedBlocks, rows, scoreCapacity, selectedK,
+        queryStart, compressRatio, decodeMeta);
+    const cudaError_t selectError = cudaGetLastError();
+    if (selectError != cudaSuccess) {
+        // Configuration/resource errors enqueue no work. Preserve a small
+        // generic fallback on devices that cannot launch the wider variant.
+        if (selectError != cudaErrorInvalidConfiguration &&
+            selectError != cudaErrorLaunchOutOfResources) {
+            return false;
+        }
+        Qwen4QSARadixSelectKernel<0><<<rows, 256, 0, cudaStreamPerThread>>>(
+            scores, selectedBlocks, rows, scoreCapacity, selectedK,
+            queryStart, compressRatio, decodeMeta);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+    return true;
+}
+
 static bool FastllmCudaQwen4QSASelectLaunch(
         const fastllm::Data &query,
         const fastllm::Data &compressedKeys,
@@ -3180,58 +3264,8 @@ static bool FastllmCudaQwen4QSASelectLaunch(
             ? launchScore((const half*)query.cudaData)
             : launchScore((const __nv_bfloat16*)query.cudaData);
     if (!scored) return false;
-    // Bound the per-thread row cache as capacity grows. Wider blocks spread
-    // long decode rows across more warps; batched prefill keeps one small
-    // block per row. Dispatch uses physical capacity so graph replay can
-    // advance the logical length without overrunning a cached specialization.
-    auto selectKernel = Qwen4QSARadixSelectKernel<0>;
-    int selectThreads = threads;
-    if (rows == 1) {
-        static const struct {
-            int threads;
-            int items;
-            decltype(selectKernel) kernel;
-        } kernels[] = {
-            {256, 8, Qwen4QSARadixSelectKernel<8>},
-            {256, 16, Qwen4QSARadixSelectKernel<16>},
-            {256, 24, Qwen4QSARadixSelectKernel<24>},
-            {256, 32, Qwen4QSARadixSelectKernel<32>},
-            {256, 40, Qwen4QSARadixSelectKernel<40>},
-            {512, 32, Qwen4QSARadixSelectKernel<32, 512>},
-            {512, 40, Qwen4QSARadixSelectKernel<40, 512>},
-            {1024, 24, Qwen4QSARadixSelectKernel<24, 1024>},
-            {1024, 32, Qwen4QSARadixSelectKernel<32, 1024>},
-            {1024, 36, Qwen4QSARadixSelectKernel<36, 1024>},
-            {1024, 40, Qwen4QSARadixSelectKernel<40, 1024>},
-            {1024, 64, Qwen4QSARadixSelectKernel<64, 1024>},
-            {1024, 72, Qwen4QSARadixSelectKernel<72, 1024>}
-        };
-        selectKernel = Qwen4QSARadixSelectKernel<0, 1024>;
-        selectThreads = 1024;
-        for (const auto &entry : kernels) {
-            if (scoreCapacity <= entry.threads * entry.items) {
-                selectKernel = entry.kernel;
-                selectThreads = entry.threads;
-                break;
-            }
-        }
-    }
-    selectKernel<<<rows, selectThreads, 0, cudaStreamPerThread>>>(
-        scores, selectedBlocks, rows, scoreCapacity, selectedK,
-        queryStart, compressRatio, decodeMeta);
-    const cudaError_t selectError = cudaGetLastError();
-    if (selectError != cudaSuccess) {
-        // Configuration/resource errors enqueue no work. Preserve a small
-        // generic fallback on devices that cannot launch the wider variant.
-        if (selectError != cudaErrorInvalidConfiguration &&
-            selectError != cudaErrorLaunchOutOfResources) {
-            return false;
-        }
-        Qwen4QSARadixSelectKernel<0><<<rows, threads, 0, cudaStreamPerThread>>>(
-            scores, selectedBlocks, rows, scoreCapacity, selectedK,
-            queryStart, compressRatio, decodeMeta);
-        if (cudaGetLastError() != cudaSuccess) return false;
-    }
+    if (!Qwen4SelectBlocksRaw(scores, selectedBlocks, rows, scoreCapacity,
+            selectedK, queryStart, compressRatio, decodeMeta)) return false;
     const int expandBlocks = std::min<uint64_t>(
         1024,
         ((uint64_t)rows * outputWidth + threads - 1) / threads);
@@ -3241,6 +3275,51 @@ static bool FastllmCudaQwen4QSASelectLaunch(
         rows, selectedK, compressRatio, scoreCapacity,
         keyLength, outputWidth, queryStart, decodeMeta);
     DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4SelectBlocks(const fastllm::Data &scores,
+        int selectedK, int queryStart, int compressRatio, fastllm::Data &selected) {
+    using namespace fastllm;
+    if (scores.dataDevice != DataDevice::CUDA || scores.dataType != FLOAT32 ||
+        !scores.cudaData || scores.dims.size() != 3 || scores.dims[0] != 1 ||
+        scores.dims[1] != 1 || scores.dims[2] <= 0 || selectedK <= 0 ||
+        compressRatio <= 0 || queryStart < 0 ||
+        (queryStart + 1) / compressRatio > scores.dims[2]) return false;
+    selected.dataType = INT32;
+    selected.UpdateUnitSize();
+    selected.Resize({1, selectedK});
+    selected.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
+    selected.Allocate(false);
+    return Qwen4SelectBlocksRaw((const float*)scores.cudaData,
+        (int32_t*)selected.cudaData, 1, scores.dims[2], selectedK,
+        queryStart, compressRatio, nullptr);
+}
+
+bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
+        int keyLength, int queryStart, int compressRatio, fastllm::Data &indices,
+        const fastllm::Data *pageTable, int pageLen) {
+    using namespace fastllm;
+    if (selected.dataDevice != DataDevice::CUDA || selected.dataType != INT32 ||
+        !selected.cudaData || selected.dims.size() != 2 || selected.dims[0] <= 0 ||
+        selected.dims[1] <= 0 || compressRatio <= 0 || queryStart < 0 ||
+        (int64_t)queryStart + selected.dims[0] > keyLength) return false;
+    if (pageTable != nullptr && (pageLen <= 0 ||
+        pageTable->dataDevice != DataDevice::CUDA || pageTable->dataType != INT32 ||
+        !pageTable->cudaData || pageTable->Count(0) < (uint64_t)(keyLength + pageLen - 1) / pageLen ||
+        pageTable->dataDeviceIds != selected.dataDeviceIds)) return false;
+    const int rows = selected.dims[0], count = selected.dims[1];
+    const int width = count * compressRatio + compressRatio - 1;
+    indices.dataType = INT32;
+    indices.Resize({rows, width});
+    indices.ToDevice(DataDevice::CUDA, selected.dataDeviceIds, false);
+    indices.Allocate(false);
+    const int blocks = std::min<uint64_t>(1024, ((uint64_t)rows * width + 255) / 256);
+    Qwen4QSAExpandIndicesKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(
+        (const int32_t *)selected.cudaData, (int32_t *)indices.cudaData,
+        rows, count, compressRatio, keyLength / compressRatio,
+        keyLength, width, queryStart, nullptr,
+        pageTable == nullptr ? nullptr : (const int32_t*)pageTable->cudaData, pageLen);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3617,9 +3696,9 @@ bool FastllmCudaQwen4AttentionPrepare(
             (const T*)qGate.cudaData, (const T*)key.cudaData, (const T*)value.cudaData,
             (const float*)qNorm.cudaData, (const float*)kNorm.cudaData,
             (const float*)positions.cudaData, (T*)query.cudaData, (T*)gate.cudaData,
-            (T*)keyCache.cudaData, (T*)valueCache.cudaData, sequence, qHeads, kvHeads,
+            (T*)Qwen4CachePayload(keyCache), (T*)Qwen4CachePayload(valueCache), sequence, qHeads, kvHeads,
             headDim, rotaryDim, positions.dims[1], interleaved, sectionH, sectionW,
-            eps, ropeTheta, previousLength, keyCache.strides[0], valueCache.strides[0]);
+            eps, ropeTheta, previousLength, keyCache.strides[0], valueCache.strides[0], Qwen4GetCacheAddress(keyCache, valueCache));
     };
     if (qGate.dataType == fastllm::DataType::FLOAT32) launch(float{});
     else if (qGate.dataType == fastllm::DataType::FLOAT16) launch(half{});
@@ -3723,38 +3802,21 @@ static bool FastllmCudaQwen4KVAppendImpl(
     constexpr int threads = 256;
     const int blocks = std::min(
         1024, (heads * sequence * headDim + threads - 1) / threads);
-    if (key.dataType == fastllm::DataType::FLOAT32) {
-        Qwen4KVAppendKernel<<<
-            blocks, threads, 0, cudaStreamPerThread>>>(
-            (const float*)key.cudaData, (const float*)value.cudaData,
-            decodeMeta, (float*)keyCache.cudaData,
-            (float*)valueCache.cudaData, heads, headDim,
+    const auto address = Qwen4GetCacheAddress(keyCache, valueCache);
+    auto launch = [&](auto tag) {
+        using T = decltype(tag);
+        Qwen4KVAppendKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
+            (const T*)key.cudaData, (const T*)value.cudaData,
+            decodeMeta, (T*)Qwen4CachePayload(keyCache),
+            (T*)Qwen4CachePayload(valueCache), heads, headDim,
             sequence, previousLength,
             (int)key.strides[0], (int)value.strides[0],
             (int)keyCache.strides[0], (int)valueCache.strides[0],
-            std::min(keyCapacity, valueCapacity));
-    } else if (key.dataType == fastllm::DataType::FLOAT16) {
-        Qwen4KVAppendKernel<<<
-            blocks, threads, 0, cudaStreamPerThread>>>(
-            (const half*)key.cudaData, (const half*)value.cudaData,
-            decodeMeta, (half*)keyCache.cudaData,
-            (half*)valueCache.cudaData, heads, headDim,
-            sequence, previousLength,
-            (int)key.strides[0], (int)value.strides[0],
-            (int)keyCache.strides[0], (int)valueCache.strides[0],
-            std::min(keyCapacity, valueCapacity));
-    } else {
-        Qwen4KVAppendKernel<<<
-            blocks, threads, 0, cudaStreamPerThread>>>(
-            (const __nv_bfloat16*)key.cudaData,
-            (const __nv_bfloat16*)value.cudaData, decodeMeta,
-            (__nv_bfloat16*)keyCache.cudaData,
-            (__nv_bfloat16*)valueCache.cudaData, heads, headDim,
-            sequence, previousLength,
-            (int)key.strides[0], (int)value.strides[0],
-            (int)keyCache.strides[0], (int)valueCache.strides[0],
-            std::min(keyCapacity, valueCapacity));
-    }
+            std::min(keyCapacity, valueCapacity), address);
+    };
+    if (key.dataType == fastllm::DataType::FLOAT32) launch(float{});
+    else if (key.dataType == fastllm::DataType::FLOAT16) launch(half{});
+    else launch(__nv_bfloat16{});
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
@@ -3826,30 +3888,19 @@ static bool FastllmCudaQwen4GatherKVImpl(
     const uint64_t count = (uint64_t)keyHeads * width * headDim;
     const int blocks = std::min<uint64_t>(
         1024, (count + threads - 1) / threads);
-    if (key.dataType == fastllm::DataType::FLOAT32) {
+    const auto address = Qwen4GetCacheAddress(key, value);
+    auto launch = [&](auto tag) {
+        using T = decltype(tag);
         Qwen4GatherKVKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
-            (const float*)key.cudaData, (const float*)value.cudaData,
-            (const int32_t*)indices.cudaData, (float*)compactKey.cudaData,
-            (float*)compactValue.cudaData, keyHeads, capacity,
+            (const T*)Qwen4CachePayload(key), (const T*)Qwen4CachePayload(value),
+            (const int32_t*)indices.cudaData, (T*)compactKey.cudaData,
+            (T*)compactValue.cudaData, keyHeads, capacity,
             (int)key.strides[0], (int)value.strides[0],
-            headDim, width, decodeMeta);
-    } else if (key.dataType == fastllm::DataType::FLOAT16) {
-        Qwen4GatherKVKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
-            (const half*)key.cudaData, (const half*)value.cudaData,
-            (const int32_t*)indices.cudaData, (half*)compactKey.cudaData,
-            (half*)compactValue.cudaData, keyHeads, capacity,
-            (int)key.strides[0], (int)value.strides[0],
-            headDim, width, decodeMeta);
-    } else {
-        Qwen4GatherKVKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
-            (const __nv_bfloat16*)key.cudaData,
-            (const __nv_bfloat16*)value.cudaData,
-            (const int32_t*)indices.cudaData,
-            (__nv_bfloat16*)compactKey.cudaData,
-            (__nv_bfloat16*)compactValue.cudaData, keyHeads, capacity,
-            (int)key.strides[0], (int)value.strides[0],
-            headDim, width, decodeMeta);
-    }
+            headDim, width, decodeMeta, address);
+    };
+    if (key.dataType == fastllm::DataType::FLOAT32) launch(float{});
+    else if (key.dataType == fastllm::DataType::FLOAT16) launch(half{});
+    else launch(__nv_bfloat16{});
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
@@ -4000,27 +4051,29 @@ static bool FastllmCudaQwen4PrepareSparseBatchImpl(
     const int kvBlocks = std::min<uint64_t>(
         1024, (kvCount + threads - 1) / threads);
     const int32_t *indexData = (const int32_t*)indices.cudaData;
-    if (query.dataType == fastllm::DataType::FLOAT32) {
-        Qwen4PackSparseQueryKernel<<<
-            queryBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const float*)query.cudaData, (float*)packedQuery.cudaData,
+    const auto address = Qwen4GetCacheAddress(key, value);
+    auto launch = [&](auto tag) {
+        using T = decltype(tag);
+        Qwen4PackSparseQueryKernel<<<queryBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const T*)query.cudaData, (T*)packedQuery.cudaData,
             queryHeads, sequence, headDim, rowStart, rows);
-        Qwen4GatherSparseBatchKVKernel<<<
-            kvBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const float*)key.cudaData, (const float*)value.cudaData,
-            indexData, (float*)compactKey.cudaData,
-            (float*)compactValue.cudaData, (float*)paddingMask.cudaData,
+        Qwen4GatherSparseBatchKVKernel<<<kvBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const T*)Qwen4CachePayload(key), (const T*)Qwen4CachePayload(value),
+            indexData, (T*)compactKey.cudaData,
+            (T*)compactValue.cudaData, (T*)paddingMask.cudaData,
             keyHeads, keyCapacity,
             (int)key.strides[0], (int)value.strides[0], headDim,
-            width, rowStart, rows, decodeMeta, appendedSequence);
+            width, rowStart, rows, decodeMeta, appendedSequence, address);
+    };
+    if (query.dataType == fastllm::DataType::FLOAT32) {
+        launch(float{});
     } else if (query.dataType == fastllm::DataType::FLOAT16 &&
                headDim % (int)(sizeof(uint4) / sizeof(half)) == 0 &&
-               ((uintptr_t)key.cudaData % alignof(uint4)) == 0 &&
-               ((uintptr_t)value.cudaData % alignof(uint4)) == 0 &&
+               ((uintptr_t)Qwen4CachePayload(key) % alignof(uint4)) == 0 &&
+               ((uintptr_t)Qwen4CachePayload(value) % alignof(uint4)) == 0 &&
                ((uintptr_t)compactKey.cudaData % alignof(uint4)) == 0 &&
                ((uintptr_t)compactValue.cudaData % alignof(uint4)) == 0) {
-        Qwen4PackSparseQueryKernel<<<
-            queryBlocks, threads, 0, cudaStreamPerThread>>>(
+        Qwen4PackSparseQueryKernel<<<queryBlocks, threads, 0, cudaStreamPerThread>>>(
             (const half*)query.cudaData, (half*)packedQuery.cudaData,
             queryHeads, sequence, headDim, rowStart, rows);
         constexpr int valuesPerVector = sizeof(uint4) / sizeof(half);
@@ -4029,41 +4082,16 @@ static bool FastllmCudaQwen4PrepareSparseBatchImpl(
             1024, (vectorCount + threads - 1) / threads);
         Qwen4GatherSparseBatchKVHalf8Kernel<<<
             vectorBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const half*)key.cudaData, (const half*)value.cudaData,
+            (const half*)Qwen4CachePayload(key), (const half*)Qwen4CachePayload(value),
             indexData, (half*)compactKey.cudaData,
             (half*)compactValue.cudaData, (half*)paddingMask.cudaData,
             keyHeads, keyCapacity,
             (int)key.strides[0], (int)value.strides[0], headDim,
-            width, rowStart, rows, decodeMeta, appendedSequence);
+            width, rowStart, rows, decodeMeta, appendedSequence, address);
     } else if (query.dataType == fastllm::DataType::FLOAT16) {
-        Qwen4PackSparseQueryKernel<<<
-            queryBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const half*)query.cudaData, (half*)packedQuery.cudaData,
-            queryHeads, sequence, headDim, rowStart, rows);
-        Qwen4GatherSparseBatchKVKernel<<<
-            kvBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const half*)key.cudaData, (const half*)value.cudaData,
-            indexData, (half*)compactKey.cudaData,
-            (half*)compactValue.cudaData, (half*)paddingMask.cudaData,
-            keyHeads, keyCapacity,
-            (int)key.strides[0], (int)value.strides[0], headDim,
-            width, rowStart, rows, decodeMeta, appendedSequence);
+        launch(half{});
     } else {
-        Qwen4PackSparseQueryKernel<<<
-            queryBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const __nv_bfloat16*)query.cudaData,
-            (__nv_bfloat16*)packedQuery.cudaData,
-            queryHeads, sequence, headDim, rowStart, rows);
-        Qwen4GatherSparseBatchKVKernel<<<
-            kvBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const __nv_bfloat16*)key.cudaData,
-            (const __nv_bfloat16*)value.cudaData, indexData,
-            (__nv_bfloat16*)compactKey.cudaData,
-            (__nv_bfloat16*)compactValue.cudaData,
-            (__nv_bfloat16*)paddingMask.cudaData,
-            keyHeads, keyCapacity,
-            (int)key.strides[0], (int)value.strides[0], headDim,
-            width, rowStart, rows, decodeMeta, appendedSequence);
+        launch(__nv_bfloat16{});
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;

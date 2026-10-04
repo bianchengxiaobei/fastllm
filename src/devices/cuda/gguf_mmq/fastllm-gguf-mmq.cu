@@ -1,3 +1,6 @@
+#include "fastllm-cuda-gguf-projections.h"
+#include "fastllm-cuda-gguf-linear-add.h"
+#include "../fastllm-gguf-store.cuh"
 #include "fastllm-gguf-mmq-common.cuh"
 
 #include <cuda_bf16.h>
@@ -9,6 +12,7 @@ namespace fastllm_gguf_mmq {
 #include "mmq.cuh"
 #include "fastllm-gguf-iq2-gemv.cuh"
 #include "../fastllm-gguf-small-mmvq.cuh"
+#include "../moe/fastllm-moe-gguf-q8.cuh"
 
 constexpr int kQuantizeBlockSize = 128;
 constexpr int kBlackwellDirectTileThreshold = 1000;
@@ -100,6 +104,13 @@ static bool is_extended_mmvq_type(ggml_type type) {
     }
 }
 
+// Check the actual weight block size, not only the Q8 activation block.
+// The caller must first establish that the type has an implemented kernel.
+static bool supports_mmvq_shape(ggml_type type, int rows, int columns, int output_rows) {
+    return rows > 0 && rows <= 8 && columns > 0 &&
+           columns % ggml_blck_size(type) == 0 && output_rows > 0;
+}
+
 template <ggml_type type>
 struct fastllm_mmvq_type_traits;
 
@@ -158,7 +169,7 @@ static __global__ void quantize_mmvq_q8_1(
     }
 }
 
-template <ggml_type type, int input_rows, int nwarps, typename OutputType>
+template <ggml_type type, int input_rows, int nwarps, typename OutputType, int StoreMode = 0>
 __launch_bounds__(nwarps * WARP_SIZE, 1)
 static __global__ void mul_mat_vec_extended(
         const void *__restrict__ weight,
@@ -236,10 +247,8 @@ static __global__ void mul_mat_vec_extended(
 
         if (threadIdx.x < rows_per_block &&
             output_row0 + threadIdx.x < output_rows) {
-            output[static_cast<size_t>(input_row) * output_rows +
-                   output_row0 + threadIdx.x] =
-                mmq_io<OutputType>::from_float(
-                    sums[input_row][threadIdx.x]);
+            FastllmGgufStore<StoreMode>(output + static_cast<size_t>(input_row) * output_rows +
+                   output_row0 + threadIdx.x, sums[input_row][threadIdx.x]);
         }
     }
 }
@@ -351,7 +360,7 @@ static __global__ void mul_mat_vec_gate_up_extended(
     }
 }
 
-template <ggml_type type, int nwarps, typename OutputType>
+template <ggml_type type, int nwarps, typename OutputType, int StoreMode = 0>
 static void launch_extended_mmvq_rows(
         const void *weight, const block_q8_1 *input, OutputType *output,
         int rows, int input_columns, int output_rows,
@@ -362,7 +371,7 @@ static void launch_extended_mmvq_rows(
         (output_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     const dim3 threads(threads_x, nwarps, 1);
 #define FASTLLM_LAUNCH_MMVQ_ROWS(row_count)                              \
-    mul_mat_vec_extended<type, row_count, nwarps, OutputType>            \
+    mul_mat_vec_extended<type, row_count, nwarps, OutputType, StoreMode>            \
         <<<blocks, threads, 0, stream>>>(                                 \
             weight, input, output, input_columns, output_rows)
     switch (rows) {
@@ -407,7 +416,7 @@ static void launch_extended_gate_up_rows(
 #undef FASTLLM_LAUNCH_GATE_UP_ROWS
 }
 
-template <ggml_type type, typename OutputType>
+template <ggml_type type, typename OutputType, int StoreMode = 0>
 static void launch_extended_mmvq_type(
         const void *weight, const block_q8_1 *input, OutputType *output,
         int rows, int input_columns, int output_rows,
@@ -416,25 +425,25 @@ static void launch_extended_mmvq_type(
                   type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) {
         if (rows >= 2 && rows <= 8 && fastllm_gguf_small_mmvq::Supports(
                 input, input_columns, output_rows, input_columns, output_rows)) {
-            fastllm_gguf_small_mmvq::LaunchBatch<type>(weight, input, output,
+            fastllm_gguf_small_mmvq::LaunchBatch<type, OutputType, StoreMode>(weight, input, output,
                 input_columns, output_rows, rows, input_columns, output_rows, stream);
             return;
         }
     }
     if constexpr (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) {
         if (rows == 1 && iq2_decode::Supports(input, input_columns, output_rows)) {
-            iq2_decode::Launch<type, false>(weight, nullptr, input, output,
+            iq2_decode::Launch<type, false, OutputType, StoreMode>(weight, nullptr, input, output,
                                           input_columns, output_rows, stream);
             return;
         }
     }
     const int nwarps = rows <= 4 ? 4 : 1;
     if (nwarps == 4) {
-        launch_extended_mmvq_rows<type, 4>(
+        launch_extended_mmvq_rows<type, 4, OutputType, StoreMode>(
             weight, input, output, rows, input_columns, output_rows,
             stream);
     } else {
-        launch_extended_mmvq_rows<type, 1>(
+        launch_extended_mmvq_rows<type, 1, OutputType, StoreMode>(
             weight, input, output, rows, input_columns, output_rows,
             stream);
     }
@@ -464,14 +473,14 @@ static void launch_extended_gate_up_type(
     }
 }
 
-template <typename OutputType>
+template <typename OutputType, int StoreMode = 0>
 static void dispatch_extended_mmvq(
         ggml_type type, const void *weight, const block_q8_1 *input,
         OutputType *output, int rows, int input_columns, int output_rows,
         cudaStream_t stream) {
 #define FASTLLM_DISPATCH_EXTENDED_MMVQ(type_name)                        \
     case type_name:                                                       \
-        launch_extended_mmvq_type<type_name>(                             \
+        launch_extended_mmvq_type<type_name, OutputType, StoreMode>(                             \
             weight, input, output, rows, input_columns, output_rows,      \
             stream);                                                      \
         break
@@ -511,14 +520,40 @@ static void dispatch_extended_gate_up(
 #undef FASTLLM_DISPATCH_EXTENDED_GATE_UP
 }
 
-template <typename InputType, typename OutputType>
+// Ordinary Q2_0 rows can use the same Q8/DP4A arithmetic as resident experts.
+// A warp computes one output row; the block shares its quantized activation.
+template<typename OutputType>
+static __global__ void q2_mmvq(
+        const block_q2_0 *weight, const block_q8_1 *input,
+        OutputType *output, int columns, int output_rows) {
+    extern __shared__ uint32_t activation[];
+    const int input_blocks = columns/QK8_1;
+    const auto *source = reinterpret_cast<const uint32_t *>(
+        input + size_t(blockIdx.y)*input_blocks);
+    for (int i = threadIdx.x; i < input_blocks*int(sizeof(block_q8_1))/4;
+         i += blockDim.x) activation[i] = source[i];
+    __syncthreads();
+    const int row = blockIdx.x*8+threadIdx.x/32;
+    if (row >= output_rows) return;
+    const float value = gguf_cache_q8::RowDot<GGML_TYPE_Q2_0>(
+        weight + size_t(row)*(columns/QK2_0),
+        reinterpret_cast<const block_q8_1 *>(activation), columns, nullptr);
+    if (threadIdx.x%32 == 0)
+        output[size_t(blockIdx.y)*output_rows+row] = mmq_io<OutputType>::from_float(value);
+}
+
+template <typename InputType, typename OutputType, int StoreMode = 0>
 static bool matmul_mmvq(
         const InputType *input, const void *weight, OutputType *output,
         ggml_type type, int rows, int input_columns, int output_rows,
         cudaStream_t stream) {
-    if (!is_extended_mmvq_type(type) || rows <= 0 || rows > 8 ||
-        input_columns <= 0 || input_columns % QK8_1 != 0 ||
-        output_rows <= 0) {
+    const bool q2 = type == GGML_TYPE_Q2_0;
+    if constexpr (StoreMode == 1) {
+        if (type != GGML_TYPE_IQ2_S && type != GGML_TYPE_IQ2_XS) return false;
+    }
+    if ((!q2 && !is_extended_mmvq_type(type)) ||
+        !supports_mmvq_shape(type, rows, input_columns, output_rows) ||
+        (q2 && size_t(input_columns/QK8_1)*sizeof(block_q8_1) > 32*1024)) {
         return false;
     }
     if (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) {
@@ -539,9 +574,16 @@ static bool matmul_mmvq(
     quantize_mmvq_q8_1<<<blocks, threads, 0, stream>>>(
         input, quantized, input_columns);
 
-    dispatch_extended_mmvq(
-        type, weight, quantized, output, rows, input_columns, output_rows,
-        stream);
+    if (q2) {
+        q2_mmvq<<<dim3((output_rows+7)/8, rows), 256,
+            size_t(input_columns/QK8_1)*sizeof(block_q8_1), stream>>>(
+                static_cast<const block_q2_0 *>(weight), quantized, output,
+                input_columns, output_rows);
+    } else {
+        dispatch_extended_mmvq<OutputType, StoreMode>(
+            type, weight, quantized, output, rows, input_columns, output_rows,
+            stream);
+    }
     FastllmCudaFree(quantized);
     return true;
 }
@@ -550,13 +592,12 @@ static bool gate_up_mmvq(
         const half *input, const void *gate_weight, const void *up_weight,
         half *output, ggml_type type, int rows, int input_columns,
         int output_rows, cudaStream_t stream) {
-    if (!is_extended_mmvq_type(type) || rows <= 0 || rows > 8 ||
-        input_columns <= 0 || input_columns % QK8_1 != 0 ||
-        output_rows <= 0) {
+    // dispatch_extended_gate_up implements only the IQ2 family. Reject other
+    // formats before allocating/quantizing so callers can use their fallback.
+    if ((type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_IQ2_XS &&
+         type != GGML_TYPE_IQ2_S) ||
+        !supports_mmvq_shape(type, rows, input_columns, output_rows)) {
         return false;
-    }
-    if (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) {
-        ensure_iq1s_grid(stream);
     }
 
     const size_t block_count =
@@ -893,9 +934,10 @@ static void launch_mul_mat_q_to_output(
 }
 
 static bool is_supported_type(ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+    return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
            type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q3_K ||
            type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ3_S ||
+           type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q4_0 ||
            type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0 ||
            type == GGML_TYPE_IQ2_XXS ||
@@ -907,8 +949,8 @@ template <typename InputType>
 static void launch_quantize(
         ggml_type type, const InputType *input,
         block_q8_1_mmq *quantized,
-        int rows, int cols, cudaStream_t stream) {
-    const dim3 blocks((cols + 4 * kQuantizeBlockSize - 1) /
+        int rows, int cols, int padded_cols, cudaStream_t stream) {
+    const dim3 blocks((padded_cols + 4 * kQuantizeBlockSize - 1) /
                           (4 * kQuantizeBlockSize),
                       rows, 1);
     const dim3 threads(kQuantizeBlockSize, 1, 1);
@@ -916,17 +958,17 @@ static void launch_quantize(
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, InputType>
                 <<<blocks, threads, 0, stream>>>(
-                    input, quantized, cols, rows, cols);
+                    input, quantized, cols, rows, padded_cols);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, InputType>
                 <<<blocks, threads, 0, stream>>>(
-                    input, quantized, cols, rows, cols);
+                    input, quantized, cols, rows, padded_cols);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, InputType>
                 <<<blocks, threads, 0, stream>>>(
-                    input, quantized, cols, rows, cols);
+                    input, quantized, cols, rows, padded_cols);
             break;
     }
 }
@@ -935,11 +977,16 @@ template <ggml_type type, typename OutputType>
 static void launch_mmq_type(
         ggml_backend_cuda_context &context, const mmq_args &args,
         OutputType *output, cudaStream_t stream) {
-    // The verifier always supplies exactly eight rows.  The imported chooser
-    // would select mmq_x=8 here; using the prefill-oriented 128-row tile makes
-    // the tensor-core kernel calculate 120 masked rows for every output tile.
+    // Match the token tile to small verifier and prefill batches. A fixed
+    // 128-row tile also computes the rows masked out during write-back.
     if (args.ne11 <= 8) {
         launch_mul_mat_q_to_output<type, 8, OutputType>(
+            context, args, output, stream);
+    } else if (args.ne11 <= 32) {
+        launch_mul_mat_q_to_output<type, 32, OutputType>(
+            context, args, output, stream);
+    } else if (args.ne11 <= 64) {
+        launch_mul_mat_q_to_output<type, 64, OutputType>(
             context, args, output, stream);
     } else {
         launch_mul_mat_q_to_output<type, 128, OutputType>(
@@ -952,6 +999,10 @@ static void launch_mmq(
         ggml_type type, ggml_backend_cuda_context &context,
         const mmq_args &args, OutputType *output, cudaStream_t stream) {
     switch (type) {
+        case GGML_TYPE_Q2_0:
+            launch_mmq_type<GGML_TYPE_Q2_0, OutputType>(
+                context, args, output, stream);
+            break;
         case GGML_TYPE_Q4_K:
             launch_mmq_type<GGML_TYPE_Q4_K, OutputType>(
                 context, args, output, stream);
@@ -970,6 +1021,10 @@ static void launch_mmq(
             break;
         case GGML_TYPE_Q6_K:
             launch_mmq_type<GGML_TYPE_Q6_K, OutputType>(
+                context, args, output, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            launch_mmq_type<GGML_TYPE_IQ3_XXS, OutputType>(
                 context, args, output, stream);
             break;
         case GGML_TYPE_IQ3_S:
@@ -1019,9 +1074,14 @@ static bool matmul(
         ggml_type type,
         int rows, int cols, int output_cols, cudaStream_t stream) {
     if (!is_supported_type(type) || rows <= 0 || cols <= 0 ||
-        cols % (4 * QK8_1) != 0 || output_cols <= 0) {
+        cols % ggml_blck_size(type) != 0 || output_cols <= 0) {
         return false;
     }
+    // Only these tile loaders guard a partial K tile. The quantized activation
+    // allocation must include its zero padding as well as the row-tile guard.
+    if (cols % MMQ_ITER_K != 0 &&
+        type != GGML_TYPE_Q2_0 && type != GGML_TYPE_IQ4_NL) return false;
+    const int padded_cols = ((cols + MMQ_ITER_K - 1) / MMQ_ITER_K) * MMQ_ITER_K;
 
     if (type == GGML_TYPE_IQ1_S) {
         ensure_iq1s_grid(stream);
@@ -1042,7 +1102,7 @@ static bool matmul(
     // guard region for the same reason. Its values need not be initialized:
     // they belong only to output rows masked by the checked write-back path.
     const size_t quantized_payload_count =
-        static_cast<size_t>(rows) * cols / (4 * QK8_1);
+        static_cast<size_t>(rows) * padded_cols / (4 * QK8_1);
     const size_t quantized_count = quantized_payload_count +
         static_cast<size_t>(get_mmq_x_max_host(
             ggml_cuda_info().devices[device].cc));
@@ -1061,16 +1121,16 @@ static bool matmul(
         return false;
     }
 
-    launch_quantize(type, input, quantized, rows, cols, stream);
+    launch_quantize(type, input, quantized, rows, cols, padded_cols, stream);
 
     mmq_args args{};
     args.x = static_cast<const char *>(weight);
     args.y = reinterpret_cast<const char *>(quantized);
     args.dst = float_output;
-    args.ne00 = cols;
+    args.ne00 = padded_cols;
     args.ne01 = output_cols;
     args.stride01 = ggml_row_size(type, cols);
-    args.ne10 = cols;
+    args.ne10 = padded_cols;
     args.ne11 = rows;
     args.stride11 = rows;
     args.ne0 = output_cols;
@@ -1083,7 +1143,18 @@ static bool matmul(
     return true;
 }
 
+#include "fastllm-gguf-moe-grouped.cuh"
+
 } // namespace fastllm_gguf_mmq
+
+bool FastllmCudaFloatMatMulGGUFMMQ(
+        const void *input, const void *weight, void *output, int weight_type,
+        int n, int m, int k, void *stream) {
+    return fastllm_gguf_mmq::matmul(
+        static_cast<const float *>(input), weight, static_cast<float *>(output),
+        static_cast<ggml_type>(weight_type), n, m, k,
+        reinterpret_cast<cudaStream_t>(stream));
+}
 
 bool FastllmCudaHalfMatMulGGUFMMQ(
         const void *input, const void *weight, void *output, int weight_type,
@@ -1113,6 +1184,33 @@ bool FastllmCudaHalfMatMulGGUFMMVQ(
         reinterpret_cast<cudaStream_t>(stream));
 }
 
+bool FastllmCudaGGUFExtendedFromQ8(const void *input, const void *weight,
+        void *output, int weightType, int rows, int columns, int outputRows,
+        int storeMode, void *stream) {
+    using namespace fastllm_gguf_mmq;
+    const auto type = static_cast<ggml_type>(weightType);
+    if ((type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_IQ2_XS && type != GGML_TYPE_IQ2_S && type != GGML_TYPE_IQ1_M) ||
+        !supports_mmvq_shape(type, rows, columns, outputRows) || storeMode < 0 || storeMode > 2)
+        return false;
+    if (type == GGML_TYPE_IQ1_M) ensure_iq1s_grid(reinterpret_cast<cudaStream_t>(stream));
+#define SHARED_CASE(MODE) \
+    case MODE: dispatch_extended_mmvq<half, MODE>(type, weight, \
+        static_cast<const block_q8_1 *>(input), static_cast<half *>(output), \
+        rows, columns, outputRows, reinterpret_cast<cudaStream_t>(stream)); break
+    switch (storeMode) { SHARED_CASE(0); SHARED_CASE(1); SHARED_CASE(2); }
+#undef SHARED_CASE
+    return true;
+}
+
+bool FastllmCudaHalfMatMulGGUFMMVQAddTo(
+        const void *input, const void *weight, void *output, int weightType,
+        int rows, int columns, int outputRows, void *stream) {
+    return fastllm_gguf_mmq::matmul_mmvq<half, half, true>(
+        static_cast<const half *>(input), weight, static_cast<half *>(output),
+        static_cast<ggml_type>(weightType), rows, columns, outputRows,
+        reinterpret_cast<cudaStream_t>(stream));
+}
+
 bool FastllmCudaBFloat16MatMulGGUFMMVQ(
         const void *input, const void *weight, void *output, int weight_type,
         int n, int m, int k, void *stream) {
@@ -1139,4 +1237,37 @@ bool FastllmCudaHalfGgufGateUpSiluMulMMVQ(
         static_cast<const half *>(input), gate_weight, up_weight,
         static_cast<half *>(output), static_cast<ggml_type>(weight_type),
         n, m, k, reinterpret_cast<cudaStream_t>(stream));
+}
+
+size_t FastllmCudaMoeGGUFGroupedWorkspaceBytes(int gateType, int downType,
+        int rows, int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq;
+    if (rows <= 32 || rows > 4096 || experts <= 0 || experts > 1024 || topk <= 0 || topk > 32 ||
+        rows*topk+experts*(grouped_moe::kTile-1)+grouped_moe::kTile-1 > 65535 ||
+        hidden <= 0 || hidden > 24576 || inter <= 0 || inter > 24576 ||
+        !(grouped_moe::MatrixType(gateType, hidden) ||
+          (gateType == GGML_TYPE_IQ1_M && hidden%256 == 0)) ||
+        !grouped_moe::MatrixType(downType, inter)) return 0;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!int8_mma_available(cc)) return 0;
+    return grouped_moe::Workspace(nullptr, rows, hidden, inter, experts, topk).bytes;
+}
+
+bool FastllmCudaMoeGGUFGrouped(const fastllm::Data &input, fastllm::Data &gate,
+        fastllm::Data &output, const void *weightPointers, const int32_t *indices,
+        const float *scores, void *workspace, int gateType, int downType,
+        int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq;
+    const auto *weights = static_cast<const uint8_t *const *>(weightPointers);
+    switch (input.dataType) {
+#define GROUPED_RUN(DType, T) case fastllm::DType: return grouped_moe::Run( \
+            static_cast<const T *>(input.cudaData), static_cast<T *>(gate.cudaData), \
+            static_cast<T *>(output.cudaData), weights, indices, scores, workspace, \
+            gateType, downType, input.dims[0], hidden, inter, experts, topk);
+        GROUPED_RUN(FLOAT32, float)
+        GROUPED_RUN(FLOAT16, half)
+        GROUPED_RUN(BFLOAT16, __nv_bfloat16)
+#undef GROUPED_RUN
+        default: return false;
+    }
 }

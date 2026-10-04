@@ -51,6 +51,12 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             /* to_float */ (ggml_to_float_t) ggml_fp16_to_fp32_row,
             // .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
         }},
+        {GGML_TYPE_Q2_0, ggml_type_traits{/* type_name */"q2_0", /* blck_size */QK2_0,
+            /* type_size */ sizeof(block_q2_0), /* is_quantized */ true,
+            /* vec_dot */ ggml_vec_dot_q2_0_q8_0,
+            /* vec_dot_type */ GGML_TYPE_Q8_0,
+            /* to_float */ (ggml_to_float_t) dequantize_row_q2_0,
+        }},
         {GGML_TYPE_Q4_0, ggml_type_traits{/* type_name */"q4_0", /* blck_size */QK4_0,
             /* type_size */ sizeof(block_q4_0),/* is_quantized */  true,
             nullptr, GGML_TYPE_F32,
@@ -185,8 +191,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
         {GGML_TYPE_IQ3_S, ggml_type_traits{/* type_name */"iq3_s", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq3_s),/* is_quantized */  true,
-            /* vec_dot */ nullptr,
-            /* vec_dot_type */ GGML_TYPE_F32,
+            /* vec_dot */ ggml_vec_dot_iq3_s_q8_K,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
             /* to_float */ (ggml_to_float_t) dequantize_row_iq3_s,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_s_ref,
         }},
@@ -219,7 +225,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
         {GGML_TYPE_IQ4_XS, ggml_type_traits{/* type_name */"iq4_xs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq4_xs),/* is_quantized */  true,
-            nullptr, GGML_TYPE_F32,
+            ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K,
             /* to_float */ (ggml_to_float_t) dequantize_row_iq4_xs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_xs_ref,
         }},
@@ -287,6 +293,15 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .is_quantized             = false,
             .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
             // .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
+        }},
+        {GGML_TYPE_Q2_0, ggml_type_traits{
+            .type_name                = "q2_0",
+            .blck_size                = QK2_0,
+            .type_size                = sizeof(block_q2_0),
+            .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+            .vec_dot_type             = GGML_TYPE_Q8_0,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         }},
         {GGML_TYPE_Q4_0, ggml_type_traits{
             .type_name                = "q4_0",
@@ -503,6 +518,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq3_s),
             .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_iq3_s_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_iq3_s,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_s_ref,
         }},
@@ -562,6 +579,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq4_xs),
             .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_iq4_xs_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_iq4_xs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_xs_ref,
         }},
@@ -766,73 +785,41 @@ namespace fastllm {
     #endif
             int ret = fread(weight->cpuData, 1, ggml_nbytes(tensor), fi);
             fclose(fi);
-/*
-            auto repack = get_repack_info(tensor->type);
-            if (repack != nullptr && regex_search(tensor->name, std::regex(R"(blk.(\d+).ffn_(gate|up|down)_exps.weight)"))) {
-                int nrows = tensor->ne[1], n_per_row = tensor->ne[0];
-                auto row_size = ggml_row_size(tensor->type, n_per_row);
-                std::vector<uint8_t> qtmp(repack->num_rows * row_size);
-                uint8_t *qcur = (uint8_t*)weight->cpuData;
-                for (int row = 0; row < nrows; row += repack->num_rows) {
-                    memcpy(qtmp.data(), qcur, repack->num_rows * row_size);
-                    repack->repack(repack->num_rows, n_per_row, (const char *)qtmp.data(), (char *)qcur, false);
-                    qcur += repack->num_rows * row_size;
-                }
 
-                ((ggml_tensor*)weight->ggmlTensor)->type = repack->new_type;
-                weight->ggmlType = (int)repack->new_type;
+        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
+                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+            const bool fp32 = replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32;
+            weight->dataType = fp32 ? DataType::FLOAT32 : DataType::FLOAT16;
+            weight->Resize(tensor->dims);
+            weight->Allocate();
+
+            const size_t bytes = ggml_nbytes(tensor);
+            std::vector<uint8_t> original(bytes);
+            FILE *fi = fopen(fileName.c_str(), "rb");
+            AssertInFastLLM(fi != nullptr, "WeightImportGGUFTensor: cannot open " + fileName);
+    #if defined(_WIN32) || defined(_WIN64)
+            _fseeki64(fi, offset, 0);
+    #else
+            fseek(fi, offset, 0);
+    #endif
+            const size_t bytesRead = fread(original.data(), 1, bytes, fi);
+            fclose(fi);
+            AssertInFastLLM(bytesRead == bytes, "WeightImportGGUFTensor: truncated weight " + tensor->name);
+
+            const auto toFloat = ggml_type_to_float(tensor->type);
+            AssertInFastLLM(tensor->type == GGML_TYPE_F32 || toFloat != nullptr,
+                "WeightImportGGUFTensor: weight " + tensor->name + "(type " +
+                ggml_type_name(tensor->type) + ") can't convert to fp32.");
+            std::vector<float> floatData(fp32 ? 0 : weight->Count(0));
+            float *destination = fp32 ? reinterpret_cast<float *>(weight->cpuData) : floatData.data();
+            if (tensor->type == GGML_TYPE_F32) {
+                std::memcpy(destination, original.data(), bytes);
             } else {
-                // printf("name = %s, type = %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
-                // weight->PrintShape();
+                toFloat(original.data(), destination, weight->Count(0));
             }
-*/
-        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32) {
-            weight->dataType = DataType::FLOAT32;    
-            weight->Resize(tensor->dims);
-            weight->Allocate();
-
-            auto len = ggml_nbytes(tensor);
-            std::vector <uint8_t> oriData;
-            oriData.resize(len);
-
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
-
-            auto toFloat = ggml_type_to_float(tensor->type);
-            AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
-                ggml_type_name(tensor->type) + ") can't convert to fp32.");
-            toFloat(oriData.data(), (float*)weight->cpuData, weight->Count(0));
-        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
-            weight->dataType = DataType::FLOAT16;    
-            weight->Resize(tensor->dims);
-            weight->Allocate();
-
-            auto len = ggml_nbytes(tensor);
-            std::vector <uint8_t> oriData;
-            std::vector <float> floatData;
-            oriData.resize(len);
-            floatData.resize(weight->Count(0));
-
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
-
-            auto toFloat = ggml_type_to_float(tensor->type);
-            AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
-                ggml_type_name(tensor->type) + ") can't convert to fp32.");
-            toFloat(oriData.data(), floatData.data(), weight->Count(0));
-            Float32ToFloat16(floatData.data(), (uint16_t*)weight->cpuData, weight->Count(0));
+            if (!fp32) {
+                Float32ToFloat16(destination, reinterpret_cast<uint16_t *>(weight->cpuData), weight->Count(0));
+            }
         } else {
             ErrorInFastLLM("WeightImportGGUFTensor: Unsupport replace type.");
         }

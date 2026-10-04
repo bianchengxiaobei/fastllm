@@ -465,6 +465,9 @@ fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
+if hasattr(fastllm_lib, "fastllm_moe_cuda_cache_stats"):
+    fastllm_lib.fastllm_moe_cuda_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_bool]
+    fastllm_lib.fastllm_moe_cuda_cache_stats.restype = ctypes.c_bool
 fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
 fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
 
@@ -639,6 +642,23 @@ def set_moe_cuda_cache(bytes_: int):
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
     fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+
+def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
+    """Synchronize a CUDA device and read expert-cache counters outside inference timing.
+
+    Reset clears route counters only; cached weights and LRU residency are retained.
+    Byte and slot counts cover all prepared expert tables on the selected device.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_stats", None)
+    if query is None:
+        raise RuntimeError("GPU expert-cache statistics require an updated CUDA build")
+    values = (ctypes.c_uint64 * 5)()
+    if not query(int(device), values, bool(reset)):
+        raise RuntimeError("Could not read GPU expert-cache statistics")
+    result = dict(zip(("hits", "misses", "payload_bytes", "slots", "records"), values))
+    routes = result["hits"] + result["misses"]
+    result["hit_rate"] = result["hits"] / routes if routes else None
+    return result
 
 def set_moe_cpu_cache(bytes_: int):
     bytes_ = int(bytes_)
@@ -1188,9 +1208,16 @@ def try_load_hf_tokenizer(path):
             # 2. 完全禁止所有 logging 输出
             logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
             from transformers import AutoTokenizer
-            ret = AutoTokenizer.from_pretrained(
-                path, trust_remote_code = True,
-                **_hf_tokenizer_compat_kwargs(path))
+            compat_kwargs = _hf_tokenizer_compat_kwargs(path)
+            try:
+                ret = AutoTokenizer.from_pretrained(
+                    path, trust_remote_code = True, **compat_kwargs)
+            except TypeError as error:
+                # Newer Qwen2 tokenizers already supply this keyword to their
+                # backend. Retry without our compatibility override.
+                if "fix_mistral_regex" not in compat_kwargs or "multiple values" not in str(error) or "fix_mistral_regex" not in str(error):
+                    raise
+                ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
         finally:
             logging.disable(original_level)  # 恢复原来的日志级别
             if original_use_torch is None:
@@ -1974,7 +2001,7 @@ class model:
             for i in range(len(conversation)):
                 if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
-        elif model_struct in ("dots3_note", "glm5_next"):
+        elif model_struct in ("dots3_note", "glm5_next", "naive_n05_flash"):
             # These chat templates iterate over argument objects, while the
             # OpenAI wire protocol stores function.arguments as a JSON string.
             # Normalize assistant tool-call history before rendering so a
@@ -3131,7 +3158,7 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
-        self.save_history = True
+        self.save_history = bool(save)
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):

@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
 #include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
@@ -5546,7 +5547,8 @@ namespace fastllm {
         const int width = indices.dims[1];
         const int sequence = query.dims[1];
         if (sequence > 1) {
-            if (FastllmCudaTryTritonQwen4SparseAttention(
+            if (!key.isPagedKVCache && !value.isPagedKVCache &&
+                FastllmCudaTryTritonQwen4SparseAttention(
                     query, key, value, indices,
                     intParams.find("group")->second,
                     floatParams.find("scale")->second, output)) {
@@ -6094,7 +6096,7 @@ namespace fastllm {
     }
 
     bool CudaEmbedding::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        if (GetLowMemMode() || !GetCudaEmbedding()) {
+        if (GetLowMemMode() || !GetCudaEmbedding() || datas.at("weight")->lockInCPU) {
             return false;
         }
         Data &input = *(datas.find("input")->second);
@@ -6115,7 +6117,7 @@ namespace fastllm {
     }
 
     bool CudaEmbeddingDirect::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        if (GetLowMemMode() || (!GetCudaEmbedding())) {
+        if (GetLowMemMode() || !GetCudaEmbedding() || datas.at("weight")->lockInCPU) {
             return false;
         }
         Data &input = *(datas.find("input")->second);
@@ -6419,6 +6421,7 @@ namespace fastllm {
     }
 
     bool DoCudaLinearAdd(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (FastllmCudaGGUFLinearAdd(input, weight, bias, output)) return true;
         if (FastllmCudaFP8LinearAddCanRun(input, weight, bias, output)) {
             FastllmCudaFP8LinearAdd(input, weight, bias, output);
             return true;
@@ -8814,10 +8817,15 @@ namespace fastllm {
         FastllmCudaAddHostToDevice(output.cudaData, output.cpuData, len, output.dataType);
     }
 
-    static inline void ApplyCudaMoeGate(Data &input, Data &output, MoeGateType gateType, bool isCrossSwiglu = false) {
+    static inline void ApplyCudaMoeGate(Data &input, Data &output, MoeGateType gateType, bool isCrossSwiglu = false, float swigluLimit = 0.0f) {
         if (gateType == MoeGateGeglu) {
             DoCudaGegluReshape(input, output);
             DoCudaGeglu(input, output);
+            return;
+        }
+        if (swigluLimit > 0.0f) {
+            AssertInFastLLM(!isCrossSwiglu && FastllmCudaSwigluClamped(input, swigluLimit, output),
+                           "CUDA clamped SwiGLU failed.");
             return;
         }
         DoCudaSwigluReshape(input, output);
@@ -8831,6 +8839,10 @@ namespace fastllm {
 
     struct CudaMergeMoeFromCpuWorkspace {
         std::mutex mutex;
+#ifndef USE_ROCM
+        Data ggufGate;
+        Data ggufWorkspace;
+#endif
         Data tempInput;
         Data tempMiddle;
         Data tempSwiglu;
@@ -8924,6 +8936,17 @@ namespace fastllm {
             }
         }
         int m = maxExpert + 1; // 专家数量
+
+#ifndef USE_ROCM
+        if (setZero && !deepSeekV4Mode && gateType == MoeGateSwiglu &&
+            output.dataType == input.dataType && output.dims == input.dims &&
+            FastllmCudaMergeMOEGGUFHost(input, workspace.ggufGate,
+                workspace.ggufWorkspace, output, weights, m, indexData,
+                scoreData, topk, experts, isCrossSwiglu)) {
+            input.FreeCudaTemporary({}, false);
+            return;
+        }
+#endif
         
         std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
         expertTasks.resize(m + 1);
@@ -9679,7 +9702,8 @@ namespace fastllm {
     static bool IsCudaMergeMoeNVFP4WeightType(DataType dataType) {
         return dataType == DataType::NVFP4 ||
                dataType == DataType::NVFP4_BLOCK_16 ||
-               dataType == DataType::NVFP4_BLOCK_16_E8M0;
+               dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+               dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED;
     }
 
     static bool TryCudaMergeMOEBatch1Int8Indexed(
@@ -9816,7 +9840,8 @@ namespace fastllm {
         for (int slot = 2; slot < weightsBatch; ++slot) {
             Data *weight = weights[slot];
             if (weight != nullptr &&
-                weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 &&
+                (weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                 weight->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
                 weight->cudaData == nullptr) {
                 return true;
             }
@@ -9838,14 +9863,16 @@ namespace fastllm {
             const Data &input, Data &output, const Data &index,
             const Data &score, int batch, int topk, Data &gateOutput,
             Data &activation, Data **weights, int weightsBatch,
-            MoeGateType gateType) {
+            MoeGateType gateType, float swigluLimit) {
         bool hasCandidate =
             weights != nullptr && weightsBatch >= 4 &&
             weights[2] != nullptr &&
-            weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3;
+            (weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+             weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED);
         if (gateType != MoeGateSwiglu ||
             (input.dataType != DataType::FLOAT16 &&
-             input.dataType != DataType::FLOAT32) ||
+             input.dataType != DataType::FLOAT32 &&
+             input.dataType != DataType::BFLOAT16) ||
             input.dataDevice != DataDevice::CUDA ||
             input.dims.size() != 2 || input.dims[0] != batch ||
             batch <= 0 || topk <= 0 || topk > 16 ||
@@ -9863,10 +9890,10 @@ namespace fastllm {
             }
             return false;
         }
-        bool success = FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
+        bool success = FastllmCudaMergeMOENVFP4E4M3MarlinIndexedClamped(
             input, gateOutput, activation, output, weights, weightsBatch,
             (const int32_t *)index.cudaData, (const float *)score.cudaData,
-            batch, topk);
+            batch, topk, swigluLimit);
         if (!success &&
             CudaNvfp4E4M3MoeCompactFallbackUnavailable(
                 weights, weightsBatch)) {
@@ -9893,6 +9920,26 @@ namespace fastllm {
             success,
             "Prepared CUDA expert cache failed during decode.");
         return true;
+    }
+
+    static bool TryCudaMergeMOEGGUFResidentIndexed(
+            const Data &input, Data &output, const Data &index,
+            const Data &score, Data &gateOutput, Data &workspace,
+            Data **weights, int weightsBatch, float sharedScale,
+            MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeGGUFInputType(input.dataType) ||
+            input.dataDevice != DataDevice::CUDA || input.dims.size() != 2 || input.dims[0] <= 0 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            index.dims.size() != 2 || index.dims[0] != input.dims[0] ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            score.dims != index.dims || weights == nullptr || weightsBatch < 4 ||
+            (weights[0] != nullptr && sharedScale != 0.0f)) {
+            return false;
+        }
+        return FastllmCudaMergeMOEGGUFResidentIndexed(
+            input, gateOutput, workspace, output, weights, weightsBatch,
+            reinterpret_cast<const int32_t *>(index.cudaData),
+            reinterpret_cast<const float *>(score.cudaData), index.dims[1]);
     }
 #endif
 
@@ -10329,9 +10376,7 @@ namespace fastllm {
     }
 
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-                        Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch) {
-// static std::map<std::string, float> mergeMoeTimeCnt;
-// auto st = std::chrono::system_clock::now();
+                        Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch, float swigluLimit) {
         int curDeviceId = FastllmCudaGetDevice();
         auto clearIfOnOtherDevice = [curDeviceId](Data &data) {
             if (data.cudaData == nullptr) {
@@ -10349,25 +10394,31 @@ namespace fastllm {
         clearIfOnOtherDevice(w2);
         clearIfOnOtherDevice(w3);
         clearIfOnOtherDevice(output);
-// ForceDeviceSync(); mergeMoeTimeCnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         {
             int batch = input.dims[0];
 
             int marlinTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
 #ifndef USE_ROCM
-            if (TryCudaMergeMOECache(
-                    input, output, index, score,
-                    w1, weights, weightsBatch, gateType)) {
-                return;
+            if (swigluLimit == 0.0f) {
+                if (TryCudaMergeMOECache(
+                        input, output, index, score,
+                        w1, weights, weightsBatch, gateType)) {
+                    return;
+                }
+                if (TryCudaMergeMOEGGUFResidentIndexed(
+                        input, output, index, score, w1, w2,
+                        weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
             }
 #endif
             if (TryCudaMergeMOENVFP4E4M3MarlinIndexed(
                     input, output, index, score, batch, marlinTopk,
-                    w1, w2, weights, weightsBatch, gateType)) {
+                    w1, w2, weights, weightsBatch, gateType, swigluLimit)) {
                 return;
             }
 #ifndef USE_ROCM
-            if (gateType == MoeGateSwiglu &&
+            if (swigluLimit == 0.0f && gateType == MoeGateSwiglu &&
                 FastllmCudaFloat32MergeMOEBFloat16Indexed(
                     input, index, score, w3, w1, w2, output, weights, weightsBatch)) {
                 return;
@@ -10378,43 +10429,46 @@ namespace fastllm {
             // until after that path so decode does not enqueue one redundant
             // output memset per MoE layer.
             output.Allocate();
-            if (TryCudaMergeMOEInt4GroupMarlinIndexed(
-                    input, output, index, score, batch, marlinTopk, w1, w2,
-                    weights, weightsBatch, gateType)) {
-                return;
-            }
-            if (batch == 1 && index.dims.size() >= 2) {
-                int topk = index.dims[1];
-                if (TryCudaMergeMOEBatch1Int8Indexed(
-                        input, output, index, score, topk, w1,
+            // These specialized paths implement ordinary SwiGLU only.
+            if (swigluLimit == 0.0f) {
+                if (TryCudaMergeMOEInt4GroupMarlinIndexed(
+                        input, output, index, score, batch, marlinTopk, w1, w2,
                         weights, weightsBatch, gateType)) {
                     return;
                 }
-                if (TryCudaMergeMOEBatch1Int4GroupIndexed(
-                        input, output, index, score, topk, w1,
-                        weights, weightsBatch, gateType)) {
-                    return;
-                }
-                if (TryCudaMergeMOEBatch1Fp8Indexed(input, output, index, score, topk,
-                                                    w1, weights, weightsBatch, sharedScale, gateType)) {
-                    return;
-                }
-            } else if (batch > 1 && batch <= 64 && index.dims.size() >= 2) {
-                int topk = index.dims[1];
-                if (TryCudaMergeMOESmallBatchInt4GroupIndexed(
-                        input, output, index, score, batch, topk, w1,
-                        weights, weightsBatch, gateType)) {
-                    return;
-                }
-                if (TryCudaMergeMOESmallBatchFp8Indexed(input, output, index, score, batch, topk,
+                if (batch == 1 && index.dims.size() >= 2) {
+                    int topk = index.dims[1];
+                    if (TryCudaMergeMOEBatch1Int8Indexed(
+                            input, output, index, score, topk, w1,
+                            weights, weightsBatch, gateType)) {
+                        return;
+                    }
+                    if (TryCudaMergeMOEBatch1Int4GroupIndexed(
+                            input, output, index, score, topk, w1,
+                            weights, weightsBatch, gateType)) {
+                        return;
+                    }
+                    if (TryCudaMergeMOEBatch1Fp8Indexed(input, output, index, score, topk,
                                                         w1, weights, weightsBatch, sharedScale, gateType)) {
-                    return;
-                }
-            } else if (batch > 64 && index.dims.size() >= 2) {
-                int topk = index.dims[1];
-                if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, batch, topk,
-                                                    w1, weights, weightsBatch, sharedScale, gateType)) {
-                    return;
+                        return;
+                    }
+                } else if (batch > 1 && batch <= 64 && index.dims.size() >= 2) {
+                    int topk = index.dims[1];
+                    if (TryCudaMergeMOESmallBatchInt4GroupIndexed(
+                            input, output, index, score, batch, topk, w1,
+                            weights, weightsBatch, gateType)) {
+                        return;
+                    }
+                    if (TryCudaMergeMOESmallBatchFp8Indexed(input, output, index, score, batch, topk,
+                                                            w1, weights, weightsBatch, sharedScale, gateType)) {
+                        return;
+                    }
+                } else if (batch > 64 && index.dims.size() >= 2) {
+                    int topk = index.dims[1];
+                    if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, batch, topk,
+                                                        w1, weights, weightsBatch, sharedScale, gateType)) {
+                        return;
+                    }
                 }
             }
             cudaMergeMOEUsedGraphUnsafeFallback = true;
@@ -10427,13 +10481,12 @@ namespace fastllm {
             int n = index.dims[0];
             int topk = index.dims[1];
             
-            if (batch == 1) {
-                if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
-                    TryCudaMergeMOEBatch1Fp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
+            if (batch == 1 && swigluLimit == 0.0f &&
+                score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32) {
+                if (TryCudaMergeMOEBatch1Fp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
                     return;
                 }
-                if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
-                    TryCudaMergeMOEBatch1GGUF(input, output, indexData, (float*)score.cudaData, true, topk,
+                if (TryCudaMergeMOEBatch1GGUF(input, output, indexData, (float*)score.cudaData, true, topk,
                                               w1, weights, weightsBatch, sharedScale, gateType)) {
                     return;
                 }
@@ -10444,12 +10497,14 @@ namespace fastllm {
             float *scoreData = (float*)score.cpuData;
 
             if (batch == 1) {
-                if (TryCudaMergeMOEBatch1Fp8(input, output, indexData, scoreData, false, topk, w1, weights, sharedScale, gateType)) {
-                    return;
-                }
-                if (TryCudaMergeMOEBatch1GGUF(input, output, indexData, scoreData, false, topk,
-                                              w1, weights, weightsBatch, sharedScale, gateType)) {
-                    return;
+                if (swigluLimit == 0.0f) {
+                    if (TryCudaMergeMOEBatch1Fp8(input, output, indexData, scoreData, false, topk, w1, weights, sharedScale, gateType)) {
+                        return;
+                    }
+                    if (TryCudaMergeMOEBatch1GGUF(input, output, indexData, scoreData, false, topk,
+                                                  w1, weights, weightsBatch, sharedScale, gateType)) {
+                        return;
+                    }
                 }
                 std::vector <std::pair <int, float> > v;
                 v.resize(topk + 1);
@@ -10460,7 +10515,6 @@ namespace fastllm {
                     v[j] = std::make_pair(expertIdx + 1, expertScore);
                 }
                 v.back() = (std::make_pair(0, sharedScale));
-// ForceDeviceSync(); mergeMoeTimeCnt["get_experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 bool wroteOutput = false;
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
@@ -10471,14 +10525,11 @@ namespace fastllm {
 
                     DoCudaLinearReshape(input, *weights[idx * 2], w3);
                     DoCudaLinear(input, *weights[idx * 2], *GetEmptyData(), w3);
-// ForceDeviceSync(); mergeMoeTimeCnt["linear1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
-                    ApplyCudaMoeGate(w3, w1, gateType);
-// ForceDeviceSync(); mergeMoeTimeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                    ApplyCudaMoeGate(w3, w1, gateType, false, swigluLimit);
 
                     DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
                     DoCudaLinear(w1, *weights[idx * 2 + 1], *GetEmptyData(), w2);
-// ForceDeviceSync(); mergeMoeTimeCnt["linear2"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                     if (!wroteOutput) {
                         output.dataType = w2.dataType;
                         output.Resize(w2.dims);
@@ -10487,7 +10538,6 @@ namespace fastllm {
                     } else {
                         FastllmCudaAddTo(output, w2, value);
                     }
-// ForceDeviceSync(); mergeMoeTimeCnt["mul_add"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 }
                 if (!wroteOutput) {
                     output.dataType = input.dataType;
@@ -10497,7 +10547,7 @@ namespace fastllm {
                 }
             } else {
 
-                if (CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_GROUPED_INDEXED") &&
+                if (swigluLimit == 0.0f && CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_GROUPED_INDEXED") &&
                     TryCudaMergeMOELargeBatchFp8Grouped(input, output, indexData, scoreData, batch, topk,
                                                         w1, w2, weights, weightsBatch, sharedScale, gateType)) {
                     return;
@@ -10538,15 +10588,12 @@ namespace fastllm {
                         scales.push_back(expertTasks[i][j].second);
                     }
                 }
-// ForceDeviceSync(); mergeMoeTimeCnt["get_experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                 int *cudaIndex = (int*)FastllmCudaMalloc(indexVec2.size() * sizeof(int));
-// ForceDeviceSync(); mergeMoeTimeCnt["malloc_index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec2.data(), indexVec2.size() * sizeof(int));
 
                 float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
                 FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
-// ForceDeviceSync(); mergeMoeTimeCnt["copy_index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                 Data *firstLocalGate = nullptr;
                 int localWeightsBatch = weightsBatch > 0 ? weightsBatch : (int)expertTasks.size() * 2;
@@ -10582,13 +10629,11 @@ namespace fastllm {
                 tempOutput.dataType = output.dataType;
                 tempOutput.ToDevice(output.dataDevice);
                 tempOutput.Allocate();
-// ForceDeviceSync(); mergeMoeTimeCnt["alloc_data"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                 for (int i = 0; i < expertTasks.size(); i++) {
                     if (expertTasks[i].size() == 0 || weights[i * 2] == nullptr) {
                         continue;
                     }
-// ForceDeviceSync(); mergeMoeTimeCnt["expert_start"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
                     FastllmCudaPickInput (
@@ -10598,18 +10643,14 @@ namespace fastllm {
                         GetDataBytes(input.dataType, 1, input.dims[1]), 
                         cudaIndex + startIdx[i]
                     );
-// ForceDeviceSync(); mergeMoeTimeCnt["pick_input"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
                     DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
-// ForceDeviceSync(); mergeMoeTimeCnt["linear1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
-                    ApplyCudaMoeGate(tempMiddle, tempSwiglu, gateType);
-// ForceDeviceSync(); mergeMoeTimeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                    ApplyCudaMoeGate(tempMiddle, tempSwiglu, gateType, false, swigluLimit);
 
                     DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
                     DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
-// ForceDeviceSync(); mergeMoeTimeCnt["linear2"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     FastllmCudaPickOutput (
                         (uint8_t*)tempOutput.cudaData, 
@@ -10620,20 +10661,12 @@ namespace fastllm {
                         cudaScales + startIdx[i], 
                         output.dataType
                     );
-// ForceDeviceSync(); mergeMoeTimeCnt["pick_output"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 }
 
                 FastllmCudaFree(cudaIndex);
                 FastllmCudaFree(cudaScales);
-// ForceDeviceSync(); mergeMoeTimeCnt["free"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             }
         }
-// float totalTime = 0.0f;
-// for (auto &it : mergeMoeTimeCnt) {
-    // printf("[DoCudaMergeMOE] %s: %f s.\n", it.first.c_str(), it.second);
-    // totalTime += it.second;
-// }
-// printf("[DoCudaMergeMOE] total: %f s.\n", totalTime);
     }
 
     void CudaMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -10652,8 +10685,11 @@ namespace fastllm {
             (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
         int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : -1;
 
+        const float swigluLimit = floatParams.count("swigluLimit") ? floatParams.at("swigluLimit") : 0.0f;
+        AssertInFastLLM(std::isfinite(swigluLimit) && swigluLimit >= 0.0f,
+                       "CUDA MoE swigluLimit must be finite and non-negative.");
         DoCudaMergeMOE (
-            input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch
+            input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch, swigluLimit
         );
     }
 

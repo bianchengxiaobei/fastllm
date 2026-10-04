@@ -2844,13 +2844,41 @@ namespace fastllm {
                         int limit = maxTotalLens;
                         int promptLimit = model->promptLimit;
 
-                        int lenSum = 0, currentActivate = 0;
+                        // A TP root may expose only a non-owning cache view.
+                        // Ask the model for its pool instead of interpreting
+                        // that view's used-page capacity as contiguous growth.
+                        auto *pagedManager = model->GetPagedKVCacheManager(model->kvCacheId, true);
+                        const bool preallocatedPagedCache = pagedManager != nullptr &&
+                            pagedManager->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE &&
+                            pagedManager->pageLen > 0 && pagedManager->maxPages > 0;
+                        const int pageLen = preallocatedPagedCache ? pagedManager->pageLen : 1;
+                        const long long pagedTokenLimit = preallocatedPagedCache
+                            ? std::min(((long long)limit + pageLen - 1) / pageLen,
+                                       (long long)pagedManager->maxPages) * pageLen
+                            : 0;
+                        auto allocatedTokens = [](const Data &cache) -> long long {
+                            if (cache.isPagedKVCache) {
+                                return (long long)cache.pageIndex.size() * cache.pageLen;
+                            }
+                            return cache.expansionDims.size() > 1 ? cache.expansionDims[1] : 0;
+                        };
+                        long long lenSum = 0;
+                        int currentActivate = 0;
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
-                                lenSum += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                                const Data &cache = it.second->pastKeyValues[model->kvCacheId].first;
+                                lenSum += allocatedTokens(cache);
                                 currentActivate++;
                             }
                         }
+                        auto reservePagedAppend = [&](const Data &cache, int append) {
+                            const long long length = cache.dims.size() > 1 ? cache.dims[1] : 0;
+                            const long long required = (length + append + pageLen - 1) / pageLen * pageLen;
+                            const long long additional = std::max(0LL, required - allocatedTokens(cache));
+                            if (lenSum + additional > pagedTokenLimit) return false;
+                            lenSum += additional;
+                            return true;
+                        };
                         std::vector <std::pair <int, int> > orders;
                         for (auto &it : model->responseContextDict.dicts) {
                             orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
@@ -2929,7 +2957,12 @@ namespace fastllm {
                                 }
 
                                 if (!isPrompt) {
-                                    if (it.second->pastKeyValues[model->kvCacheId].first.isPagedKVCache) {
+                                    if (preallocatedPagedCache) {
+                                        if (!reservePagedAppend(it.second->pastKeyValues[model->kvCacheId].first,
+                                                                it.second->currentTokens.size())) {
+                                            continue;
+                                        }
+                                    } else if (it.second->pastKeyValues[model->kvCacheId].first.isPagedKVCache) {
                                         if (it.second->pastKeyValues[model->kvCacheId].first.pageLen == it.second->pastKeyValues[model->kvCacheId].first.lastPageLen) {
                                             int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;
                                             int predictLen = 256;
@@ -2942,7 +2975,7 @@ namespace fastllm {
                                             lenSum += predictLen;
                                         }
                                     } else {
-                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
+                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[model->kvCacheId].first.dims[1]) {
                                             int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;
                                             int predictLen = 256;
                                             if (sur > 0) {
@@ -2959,7 +2992,14 @@ namespace fastllm {
                                         continue;
                                     }
                                     currentMaxLen = std::max(currentMaxLen, (int)it.second->currentTokens.size());
-                                    lenSum += it.second->currentTokens.size();
+                                    if (preallocatedPagedCache) {
+                                        if (!reservePagedAppend(it.second->pastKeyValues[model->kvCacheId].first,
+                                                                it.second->currentTokens.size())) {
+                                            continue;
+                                        }
+                                    } else {
+                                        lenSum += it.second->currentTokens.size();
+                                    }
                                     currentActivate++;
                                 }
 
@@ -3167,6 +3207,7 @@ namespace fastllm {
                                     it.second->tokens.Push(curRet);
                                     it.second->curTokens++;
                                     if (it.second->curTokens == it.second->generationConfig.output_token_limit
+                                        || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
                                         || it.second->allTokens.size() >= model->max_positions) {
                                         it.second->isEnding = true;
                                         it.second->TryRecord(model);
@@ -3176,6 +3217,20 @@ namespace fastllm {
                             model->dictCV.notify_all();
                             ReleasePendingResultLogits(logits);
                         } else {
+                            // Finished requests keep their pages until the
+                            // caller drains their output and removes them.
+                            // Wait for that release instead of terminating a
+                            // live request which could then fit in the pool.
+                            if (preallocatedPagedCache && std::any_of(
+                                    model->responseContextDict.dicts.begin(),
+                                    model->responseContextDict.dicts.end(),
+                                    [&](const auto &entry) {
+                                        return entry.second->isEnding && allocatedTokens(
+                                            entry.second->pastKeyValues[model->kvCacheId].first) > 0;
+                                    })) {
+                                model->dictCV.wait(dictLocker);
+                                continue;
+                            }
                             int maxLen = -1, select = -1;
                             for (auto &it: model->responseContextDict.dicts) {
                                 if (it.second->isEnding) {
@@ -3624,6 +3679,7 @@ namespace fastllm {
                             this->model_struct == "deepseek_v2" ||
                             this->model_struct == "deepseek_v4" ||
                             this->model_struct == "dots3_note" ||
+                            this->model_struct == "naive_n05_flash" ||
                             this->model_struct == "qwen3_moe" ||
                             this->model_struct == "minimax_m2" ||
                             this->model_struct == "hunyuan" ||

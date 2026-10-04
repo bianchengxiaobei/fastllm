@@ -1,0 +1,131 @@
+#include "devices/moe_decode_scheduler.h"
+#include "devices/moe_frequency_policy.h"
+#include <cmath>
+#include <iostream>
+#include <stdexcept>
+
+static void Require(bool ok, const char *message) {
+    if (!ok) throw std::runtime_error(message);
+}
+
+static void TestFrequencyAdmission() {
+    using fastllm::MoeFrequencyPolicy;
+    MoeFrequencyPolicy policy({0,0,0,0,1,1}, {0,1}, 2);
+    int owners[] = {0,4}; policy.SetResidents(owners);
+    int resident = 0, cold = 1;
+    for (int step = 0; step < 8; ++step) {
+        policy.BeginStep(); policy.Observe(0, &resident, 1);
+    }
+    policy.Observe(0, &cold, 1);
+    Require(policy.Select(0,0,&cold,1).key < 0, "single miss admitted");
+    // Hysteresis prevents replacing a resident at equal/slightly higher heat.
+    for (int i = 0; i < 10; ++i) policy.Observe(0,&cold,1);
+    Require(policy.Select(0,0,&cold,1).key < 0, "replacement hysteresis ignored");
+    policy.Observe(0,&cold,1);
+    auto admission = policy.Select(0,0,&cold,1);
+    Require(admission.key == 1 && admission.slot == 0, "hot miss did not select compatible victim");
+    policy.Admit(0,admission);
+    Require(policy.Select(0,0,&resident,1).key < 0, "layer admitted twice");
+    int duplicates[] = {1,1,-1,999};
+    policy.Observe(0,duplicates,4);
+    Require(policy.Score(1) == 13, "duplicate or invalid route inflated frequency");
+    int other = 5;
+    for (int i = 0; i < 30; ++i) policy.Observe(0,&other,1);
+    admission = policy.Select(1,0,&other,1);
+    Require(admission.slot == 1, "admission crossed a record-size partition");
+    policy.Admit(1,admission);
+    // A newly admitted expert cannot be churned out by the next hot route.
+    policy.BeginStep();
+    for (int i = 0; i < 100; ++i) policy.Observe(0,&resident,1);
+    Require(policy.Select(0,0,&resident,1).key < 0, "minimum residence ignored");
+    const float heat = policy.Score(1);
+    for (int i = 0; i < 128; ++i) policy.BeginStep();
+    Require(std::abs(policy.Score(1) - heat * .5f) < 1e-4f, "frequency half-life incorrect");
+    admission = policy.Select(0,0,&resident,1);
+    Require(admission.key == 0, "policy did not adapt to a changed hot set");
+    // A prefill may change all slots; decode frequencies survive reconciliation.
+    const float retainedHeat = policy.Score(1);
+    int changed[] = {2,5}; policy.SetResidents(changed);
+    Require(policy.Score(1) == retainedHeat, "prefill reconciliation lost decode history");
+    bool rejected = false;
+    try { int invalid[] = {5,2}; policy.SetResidents(invalid); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    Require(rejected, "invalid partition snapshot accepted");
+
+    for (const int layers : {1, 3, 8, 10, 48}) {
+        MoeFrequencyPolicy fair(std::vector<int>(2*layers,0), std::vector<int>(layers,0), layers);
+        std::vector<int> ownersFair(layers);
+        for (int i = 0; i < layers; ++i) ownersFair[i] = i;
+        fair.SetResidents(ownersFair.data());
+        for (int i = 0; i < MoeFrequencyPolicy::minimumResidence; ++i) fair.BeginStep();
+        for (int layer = 0; layer < layers; ++layer) {
+            fair.Observe(layers,&layer,1); fair.Observe(layers,&layer,1);
+        }
+        const int budget = std::min(layers, MoeFrequencyPolicy::maxReplacementsPerStep);
+        std::vector<bool> visited(layers,false);
+        for (int step = 0; step < (layers + budget - 1) / budget; ++step) {
+            fair.BeginStep(); int admitted = 0;
+            for (int layer = 0; layer < layers; ++layer) {
+                auto a = fair.Select(layer,layers,&layer,1);
+                if (a.key < 0) continue;
+                fair.Admit(layer,a); visited[layer] = true; ++admitted;
+            }
+            Require(admitted > 0 && admitted <= budget, "per-token admission budget incorrect");
+        }
+        Require(std::all_of(visited.begin(),visited.end(),[](bool v) { return v; }), "later layers starved");
+    }
+    MoeFrequencyPolicy coldStart(std::vector<int>(10,0), std::vector<int>(8,0), 1);
+    int empty[] = {-1,-1,-1,-1,-1,-1,-1,-1}; coldStart.SetResidents(empty);
+    int routes[] = {0,1,2,3,4,5,6,7,8,9};
+    for (int i = 0; i < 2; ++i) {
+        coldStart.BeginStep(); coldStart.Observe(0,routes,10);
+        for (int j = 0; j < 4; ++j) {
+            auto a = coldStart.Select(0,0,routes,10);
+            Require(a.key == i * 4 + j, "cold cache did not fill distinct empty slots"); coldStart.Admit(0,a);
+        }
+        Require(coldStart.Select(0,0,routes,10).key < 0, "cold fill budget or residence ignored");
+    }
+    MoeFrequencyPolicy zero({0,0}, {}, 1);
+    zero.SetResidents(nullptr); zero.BeginStep();
+    zero.Observe(0,&resident,1); zero.Observe(0,&resident,1);
+    Require(zero.Select(0,0,&resident,1).key < 0, "zero capacity admitted an expert");
+}
+
+int main() {
+    TestFrequencyAdmission();
+    using fastllm::MoeDecodePolicy;
+    // Four alternating experts fit in a global cache, but cannot borrow
+    // unused slots from a different record-size partition.
+    MoeDecodePolicy global(8, 6), split({0,0,0,0,1,1,1,1}, {2,4});
+    auto sample = [](MoeDecodePolicy &p, int step) {
+        int ids[] = {(step % 2) * 2, (step % 2) * 2 + 1};
+        p.ObserveRoutes(0, ids, 2);
+        int resident[] = {0,1}; p.ObserveRoutes(4, resident, 2);
+        p.ObserveStep(1000, 100, 10, 2, 2);
+    };
+    for (int i = 0; i < 32; ++i) { sample(global,i); sample(split,i); }
+    Require(global.UseGpu() && global.MissRate() < .05, "global reference should fit");
+    Require(split.MissRate() > .50 && split.MissRate() < .52, "partition capacity was borrowed");
+
+    // Nonadjacent layers of equal record size share a single partition.
+    MoeDecodePolicy shared({0,0,1,1,0,0}, {1,2});
+    for (int i = 0; i < 32; ++i) {
+        int id = 0;
+        shared.ObserveRoutes(0,&id,1); shared.ObserveRoutes(4,&id,1);
+        shared.ObserveStep(1000,1000,10,2,1);
+    }
+    Require(shared.MissRate() == 1 && !shared.UseGpu(), "shared partition did not evict across layers");
+
+    // A failed GPU trial clears occupancy, but preserves partition ownership.
+    for (int i = 0; i < 180; ++i) split.ObserveStep(2000,100,10,2,2);
+    Require(!split.UseGpu(), "slower GPU trial did not return to hybrid");
+    for (int i = 0; i < 64; ++i) sample(split,i);
+    Require(std::abs(split.MissRate() - .5) < .001, "reset lost partition configuration");
+    MoeDecodePolicy zero({0,0}, {0});
+    for (int i = 0; i < 32; ++i) {
+        int ids[] = {0,-1,9}; zero.ObserveRoutes(0,ids,3);
+        zero.ObserveStep(1000,1000,10,1,1);
+    }
+    Require(zero.MissRate() == 1 && !zero.UseGpu(), "zero capacity incorrectly counted hits");
+    std::cout << "ALL_PASS\n";
+}
