@@ -1,9 +1,12 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
+#include "naive-n05-topk.cuh"
 #include <cuda_bf16.h>
+#include <nccl.h>
 #include <cuda_fp8.h>
 #include <cub/block/block_scan.cuh>
+#include <cub/block/block_radix_sort.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <climits>
@@ -25,11 +28,159 @@
 
 namespace {
 using BF16 = __nv_bfloat16;
+// Decode graphs keep launch geometry fixed while the live KV length changes.
+// Ordinary launches retain the int specialization, with no device-side branch.
+struct DecodeKeys {
+    const int *length;
+    int window;
+    __device__ operator int() const { return window ? min(*length, window) : *length; }
+};
+__device__ int ShortCount(int, int count) { return count; }
+__device__ int ShortCount(DecodeKeys keys, int count) { return min((int)keys, count); }
+__device__ int VerifyCount(int first, int row) { return first + row; }
+__device__ int VerifyCount(DecodeKeys keys, int row) {
+    keys.length += row;
+    return keys;
+}
+
+// Draft graphs append a noncausal block to a bounded sliding prefix.
+struct DraftLength {
+    const int *length;
+    int window, extra;
+    __device__ operator int() const { return min(*length - 1, window - 1) + extra; }
+};
+__device__ int ShortCount(DraftLength keys, int count) { return min((int)keys, count); }
+
 __device__ float RoundBF16(float x) { return __bfloat162float(__float2bfloat16(x)); }
 __device__ float WarpSum(float x) {
     for (int offset = 16; offset; offset >>= 1)
         x += __shfl_down_sync(0xffffffff, x, offset);
     return x;
+}
+
+// Preserve the 256-thread FP32 GEMV accumulation and ascending reduction
+// tree. Loading all 16 terms before arithmetic hides their memory latency.
+__global__ void RouterSigmoid4096(const BF16 *input, const float *weight,
+                                  float *output) {
+    int t = threadIdx.x, expert = blockIdx.x;
+    __shared__ float sums[8];
+    float values[16], weights[16], partial = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] = (float)input[t + i * 256];
+        weights[i] = weight[(size_t)expert * 4096 + t + i * 256];
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) partial += values[i] * weights[i];
+    #pragma unroll
+    for (int stride = 1; stride < 32; stride *= 2)
+        partial += __shfl_down_sync(0xffffffffu, partial, stride);
+    if (t % 32 == 0) sums[t / 32] = partial;
+    __syncthreads();
+    if (t < 32) {
+        partial = t < 8 ? sums[t] : 0;
+        #pragma unroll
+        for (int stride = 1; stride < 8; stride *= 2)
+            partial += __shfl_down_sync(0xffffffffu, partial, stride);
+        if (t == 0) {
+            float logit = partial + 0.0f;
+            // Match standalone FP32 sigmoid's double-precision division.
+            output[expert] = 1.0 / (1.0 + expf(-logit));
+        }
+    }
+}
+
+// Reuse each expert's weights across a few verify rows while preserving the
+// exact GEMV accumulation order. Sigmoid is fused with multi-row selection.
+template <int Rows>
+__global__ void VerifyRouter4096(const BF16 *input, const float *weight,
+        float *output, int rows, int experts) {
+    const int t = threadIdx.x, first = blockIdx.y * Rows, expert = blockIdx.x;
+    __shared__ float sums[Rows][8];
+    float weights[16], values[Rows][16], partial[Rows]{};
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        weights[i] = weight[(size_t)expert * 4096 + t + i * 256];
+        #pragma unroll
+        for (int row = 0; row < Rows; ++row)
+            values[row][i] = first + row < rows
+                ? (float)input[(size_t)(first + row) * 4096 + t + i * 256] : 0;
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        #pragma unroll
+        for (int row = 0; row < Rows; ++row) partial[row] += values[row][i] * weights[i];
+    }
+    #pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        #pragma unroll
+        for (int stride = 1; stride < 32; stride *= 2)
+            partial[row] += __shfl_down_sync(0xffffffffu, partial[row], stride);
+        if (t % 32 == 0) sums[row][t / 32] = partial[row];
+    }
+    __syncthreads();
+    if (t < 32) {
+        #pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float value = t < 8 ? sums[row][t] : 0;
+            #pragma unroll
+            for (int stride = 1; stride < 8; stride *= 2)
+                value += __shfl_down_sync(0xffffffffu, value, stride);
+            // Keep the reference GEMV's zero-bias addition, including signed zero.
+            if (t == 0 && first + row < rows)
+                output[(size_t)(first + row) * experts + expert] = value + 0.0f;
+        }
+    }
+}
+
+constexpr int kDraftKVLayersPerLaunch = 16;
+struct DraftKVWeights { const void *data[kDraftKVLayersPerLaunch]; };
+__global__ void DraftKVPointerTable(DraftKVWeights weights, const void *input,
+        BF16 *output, void **pointers, int first, int count, int layers, size_t stride) {
+    int i = threadIdx.x;
+    if (i < count) {
+        const int layer = first + i;
+        pointers[layer] = const_cast<void *>(weights.data[i]);
+        pointers[layers + layer] = const_cast<void *>(input);
+        pointers[2 * layers + layer] = output + (size_t)layer * stride;
+    }
+}
+struct DraftKVDestinations {
+    const BF16 *raw[kDraftKVLayersPerLaunch];
+    const float *norm[kDraftKVLayersPerLaunch];
+    BF16 *key[kDraftKVLayersPerLaunch], *value[kDraftKVLayersPerLaunch];
+    int length[kDraftKVLayersPerLaunch];
+};
+__global__ void DraftNormRopeWrite(DraftKVDestinations dst, int rows,
+        int heads, int dim, int start, float eps, float theta) {
+    int head = blockIdx.x % heads, row = (blockIdx.x / heads) % rows;
+    int slot = blockIdx.x / (heads * rows);
+    int t = threadIdx.x, width = heads * dim;
+    const BF16 *key = dst.raw[slot] + (size_t)row * 2 * width + head * dim;
+    __shared__ float sums[8];
+    __shared__ BF16 normalized[256];
+    float value = t < dim ? (float)key[t] : 0;
+    float partial = WarpSum(value * value);
+    if ((t & 31) == 0) sums[t / 32] = partial;
+    __syncthreads();
+    if (t < 32) {
+        float total = WarpSum(t < 8 ? sums[t] : 0);
+        if (t == 0) sums[0] = total;
+    }
+    __syncthreads();
+    // Match KimiK3RMSNorm: BF16 normalization, FP32 weight, then BF16.
+    if (t < dim)
+        normalized[t] = __float2bfloat16(RoundBF16(value * rsqrtf(sums[0] / dim + eps)) * dst.norm[slot][t]);
+    __syncthreads();
+    size_t offset = (size_t)(dst.length[slot] + row) * width + head * dim;
+    if (t < dim / 2) {
+        float angle = (float)(start + row) * powf(theta, -2.0f * t / dim);
+        float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
+        float a = (float)normalized[t], b = (float)normalized[t + dim / 2];
+        dst.key[slot][offset + t] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+        dst.key[slot][offset + t + dim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+    }
+    if (t < dim) dst.value[slot][offset + t] = key[width + t];
 }
 void Output(fastllm::Data &out, fastllm::DataType type, const std::vector<int> &dims) {
     out.dataType = type;
@@ -37,8 +188,37 @@ void Output(fastllm::Data &out, fastllm::DataType type, const std::vector<int> &
     out.ToDevice(fastllm::DataDevice::CUDA, {FastllmCudaGetDevice()}, false);
     out.Allocate(false);
 }
+// Return zero without touching output when the router fast path is unsupported.
+int RouterRows(const fastllm::Data &input, const fastllm::Data &weight,
+               const fastllm::Data &output) {
+    using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
+    auto onDevice = [&](const Data &x) {
+        return x.dataDevice == DataDevice::CUDA && x.dataDeviceIds.size() == 1 &&
+            x.dataDeviceIds[0] == device && x.cudaData;
+    };
+    if (&input == &output || &weight == &output ||
+        (output.cudaData && (output.cudaData == input.cudaData || output.cudaData == weight.cudaData)) ||
+        !onDevice(input) || !onDevice(weight) || input.dataType != BFLOAT16 ||
+        weight.dataType != FLOAT32 || input.dims.empty() || input.dims.back() != 4096 ||
+        weight.dims.size() != 2 || weight.dims[1] != 4096 || weight.dims[0] <= 0 ||
+        weight.strides.size() != 2 || weight.strides[0] != 4096 || weight.strides[1] != 1 ||
+        input.strides.size() != input.dims.size()) return 0;
+    int64_t count = 1;
+    for (int axis = (int)input.dims.size() - 1; axis >= 0; --axis) {
+        if (input.strides[axis] != count || input.dims[axis] <= 0) return 0;
+        count *= input.dims[axis];
+        if (count > 8 * 4096) return 0;
+    }
+    return count / 4096;
+}
+
 void CheckLaunch() {
     auto status = cudaGetLastError();
+    if (status != cudaSuccess && FastllmCudaGraphIsCapturingFast()) {
+        FastllmCudaSetThreadError();
+        return;
+    }
     fastllm::AssertInFastLLM(status == cudaSuccess,
         std::string("Naive-N0.5 CUDA: ") + cudaGetErrorString(status));
 }
@@ -64,9 +244,10 @@ constexpr int kTrimMaxRows = 128;
 // A CTA owns a disjoint 64-byte column tile and stages all retained rows
 // before writing. The barrier makes overlapping suffix moves safe while rows
 // are copied in parallel; other CTAs never read or write these columns.
-template <typename T>
+template <typename T, bool Dynamic = false>
 __global__ void TrimCachePairTiled(T *key, T *value, int keyColumns,
-                                 int valueColumns, int drop, int keep) {
+                                 int valueColumns, int drop, int keep, const int *decodeKeys = nullptr) {
+    if constexpr (Dynamic) { if (*decodeKeys <= keep) return; }
     constexpr int columns = kTrimTileBytes / sizeof(T);
     __shared__ T rows[kTrimMaxRows * columns];
     int keyBlocks = (keyColumns + columns - 1) / columns;
@@ -85,7 +266,6 @@ __global__ void TrimCachePairTiled(T *key, T *value, int keyColumns,
     }
 }
 
-
 template <typename T>
 void LaunchTrimCachePair(T *key, T *value, int keyColumns,
                         int valueColumns, int drop, int keep) {
@@ -100,10 +280,18 @@ void LaunchTrimCachePair(T *key, T *value, int keyColumns,
     }
 }
 
-__device__ unsigned OrderedScoreBits(float score) {
-    unsigned bits = score == 0.0f ? 0u : __float_as_uint(score);
-    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
-}
+using naive_topk::OrderedScoreBits;
+
+// Emit ordered scores during decode scoring. Only the CUB fallback needs
+// an explicit position array; cooperative selection derives positions itself.
+struct IndexerTopKOutput {
+    unsigned *scoreBits;
+    int *positions;
+    __device__ void Store(int index, float score) const {
+        scoreBits[index] = OrderedScoreBits(score);
+        if (positions) positions[index] = index;
+    }
+};
 
 __device__ unsigned long long TopKOrder(unsigned scoreBits, int index) {
     return ((unsigned long long)scoreBits << 32) | (0xffffffffu - (unsigned)index);
@@ -145,6 +333,84 @@ __global__ void EncodeTopKPairs(const float *scores, unsigned *bits, int *positi
 __global__ void DecodeTopKPairs(const int *positions, int *indices, int count, int topK) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < topK) indices[i] = i < count ? positions[i] : -1;
+}
+
+// Cache device capability once per worker/device, before repeated Graph captures.
+// The selector specializes K=2048; other shapes retain the CUB fallback.
+int CooperativeTopKBlocks(int count, int topK) {
+    using namespace naive_topk;
+    if (topK != kTopK || count < kMinKeys || count > kMaxKeys) return 0;
+    int device = FastllmCudaGetDevice();
+    static thread_local std::vector<int> blockCounts;
+    if (device >= (int)blockCounts.size()) blockCounts.resize(device + 1, -1);
+    if (blockCounts[device] < 0) {
+        cudaDeviceProp prop;
+        auto status = cudaGetDeviceProperties(&prop, device);
+        fastllm::AssertInFastLLM(status == cudaSuccess, "Naive TopK device query failed.");
+        blockCounts[device] = 0;
+        if (prop.cooperativeLaunch) {
+            int floatBlocks, bitBlocks;
+            status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&floatBlocks,
+                Select<float>, kThreads, 0);
+            fastllm::AssertInFastLLM(status == cudaSuccess, "Naive TopK occupancy query failed.");
+            status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bitBlocks,
+                Select<unsigned>, kThreads, 0);
+            fastllm::AssertInFastLLM(status == cudaSuccess, "Naive TopK occupancy query failed.");
+            blockCounts[device] = std::min(kMaxBlocks,
+                std::min(floatBlocks, bitBlocks) * prop.multiProcessorCount);
+        }
+    }
+    return blockCounts[device];
+}
+
+template <typename Score>
+void CooperativeTopK(const Score *scores, int count, int blocks, fastllm::Data &indices) {
+    using namespace fastllm;
+    using namespace naive_topk;
+    // Each invocation owns its scratch through the existing graph-aware allocator.
+    Data workspace;
+    Output(workspace, INT32, {(int)(sizeof(Workspace) / sizeof(int))});
+    Output(indices, INT32, {1, kTopK});
+    auto *scratch = (Workspace *)workspace.cudaData;
+    auto *candidates = &scratch->candidates;
+    auto *histograms = scratch->partials;
+    auto *ties = scratch->ties;
+    auto *state = &scratch->state;
+    void *args[] = {&scores, &count, &histograms, &ties, &state, &candidates};
+    auto status = cudaLaunchCooperativeKernel((void *)naive_topk::Select<Score>,
+        blocks, kThreads, args, 0, cudaStreamPerThread);
+    AssertInFastLLM(status == cudaSuccess, "Naive cooperative TopK selection failed.");
+    naive_topk::Sort<<<1, kThreads, 0, cudaStreamPerThread>>>(candidates, state, (int *)indices.cudaData);
+    CheckLaunch();
+}
+
+// Owning outputs hold all sorted positions and expose only the first topK.
+// A borrowed row can hold only topK indices: sort into separate storage when
+// count exceeds that view, then copy its selected prefix without overrunning it.
+void SortTopKPairs(const unsigned *input, const int *positions, int count,
+                   int topK, fastllm::Data &indices) {
+    using namespace fastllm;
+    Data sorted, workspace, sortedPositions;
+    const bool copyPrefix = indices.isFake && count > topK;
+    Data &positionsOutput = copyPrefix ? sortedPositions : indices;
+    Output(sorted, INT32, {count});
+    Output(positionsOutput, INT32, {1, std::max(count, topK)});
+    auto *output = (unsigned *)sorted.cudaData;
+    auto *outputPositions = (int *)positionsOutput.cudaData;
+    size_t bytes = 0;
+    // Stable sorting resolves equal score bits by ascending input position.
+    auto status = cub::DeviceRadixSort::SortPairsDescending(nullptr, bytes,
+        input, output, positions, outputPositions, count, 0, 32, cudaStreamPerThread);
+    AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
+        "Naive-N0.5 TopK workspace query failed.");
+    Output(workspace, INT32, {(int)((bytes + 3) / 4)});
+    status = cub::DeviceRadixSort::SortPairsDescending(workspace.cudaData, bytes,
+        input, output, positions, outputPositions, count, 0, 32, cudaStreamPerThread);
+    AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 GPU TopK failed.");
+    if (copyPrefix || count < topK)
+        DecodeTopKPairs<<<(topK + 255) / 256, 256>>>(
+            outputPositions, (int *)indices.cudaData, count, topK);
+    indices.Resize({1, topK});
 }
 
 // Select a bounded superset of the top K before sorting it. A radix prefix can
@@ -248,15 +514,20 @@ __global__ void SelectTopKCompact(const float *scores, unsigned long long *selec
     }
 }
 
-__device__ void RopeHead(BF16 *x, float position, int rotaryDim, float theta) {
+__device__ void RopeHeadTo(const BF16 *x, BF16 *out, float position,
+                           int rotaryDim, float theta) {
     for (int d = threadIdx.x; d < rotaryDim / 2; d += blockDim.x) {
         float angle = position * powf(theta, -2.0f * d / rotaryDim);
         float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
         float a = (float)x[d], b = (float)x[d + rotaryDim / 2];
         // Match eager GPT-NeoX RoPE, including each BF16 multiplication.
-        x[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
-        x[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+        out[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+        out[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
     }
+}
+
+__device__ void RopeHead(BF16 *x, float position, int rotaryDim, float theta) {
+    RopeHeadTo(x, x, position, rotaryDim, theta);
 }
 
 __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
@@ -265,21 +536,67 @@ __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
     RopeHead(data + (size_t)row * dim, positions[row / heads], rotaryDim, theta);
 }
 
-// Q/K rotate in place; V keeps the eager Mul's BF16 coefficient rounding.
-// Each CTA owns one head, so all three outputs are independent.
+// Each CTA owns one head. Packed projection input is unpacked while rotating
+// Q/K and scaling V, without intermediate Split kernels.
+template <bool Packed>
 __global__ void RopeQKScaleV(BF16 *q, BF16 *k, BF16 *v, const float *positions,
                             int heads, int kvHeads, int dim, int valueDim,
-                            int rotaryDim, float theta, BF16 valueScale) {
+                            int rotaryDim, float theta, BF16 valueScale, const BF16 *qkv) {
     int totalHeads = heads + 2 * kvHeads;
     int token = blockIdx.x / totalHeads, head = blockIdx.x % totalHeads;
+    const size_t base = (size_t)token * ((heads + kvHeads) * dim + kvHeads * valueDim);
     if (head < heads + kvHeads) {
         BF16 *x = head < heads ? q + ((size_t)token * heads + head) * dim
             : k + ((size_t)token * kvHeads + head - heads) * dim;
-        RopeHead(x, positions[token], rotaryDim, theta);
+        const BF16 *src = Packed ? qkv + base + head * dim : x;
+        RopeHeadTo(src, x, positions[token], rotaryDim, theta);
+        if constexpr (Packed)
+            for (int d = rotaryDim + threadIdx.x; d < dim; d += blockDim.x) x[d] = src[d];
     } else {
         BF16 *x = v + ((size_t)token * kvHeads + head - heads - kvHeads) * valueDim;
+        const BF16 *src = Packed ? qkv + base + (heads + kvHeads) * dim
+            + (head - heads - kvHeads) * valueDim : x;
         for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
-            x[d] = __float2bfloat16_rn((float)x[d] * (float)valueScale);
+            x[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
+    }
+}
+
+template <bool Packed>
+__global__ void RopeAppendCache(BF16 *q, const BF16 *k, const BF16 *v,
+        const BF16 *indexKey, const float *positions, BF16 *key, BF16 *value,
+        const int *length, int heads, int kvHeads, int dim, int valueDim,
+        int indexDim, int rotaryDim, float theta, BF16 valueScale, int window,
+        int keyRows, int valueRows, int cachePast, const BF16 *qkv) {
+    const int totalHeads = heads + 2 * kvHeads + (indexDim != 0);
+    const int token = blockIdx.x / totalHeads, head = blockIdx.x % totalHeads;
+    const int past = length ? (window ? min(*length - 1, window - 1) : *length - 1) : cachePast;
+    const int row = past + token;
+    if (past < 0 || row >= keyRows || row >= valueRows) return;
+    const size_t base = (size_t)token * ((heads + kvHeads) * dim + kvHeads * valueDim);
+    if (head < heads) {
+        BF16 *dst = q + ((size_t)token * heads + head) * dim;
+        const BF16 *src = Packed ? qkv + base + head * dim : dst;
+        RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
+        if constexpr (Packed)
+            for (int d = rotaryDim + threadIdx.x; d < dim; d += blockDim.x) dst[d] = src[d];
+    } else if (head < heads + kvHeads || head == heads + 2 * kvHeads) {
+        const bool index = head == heads + 2 * kvHeads;
+        const int width = index ? indexDim : dim;
+        const BF16 *src = index ? indexKey + (size_t)token * indexDim
+            : (Packed ? qkv + base + head * dim
+                      : k + ((size_t)token * kvHeads + head - heads) * dim);
+        BF16 *dst = key + (size_t)row * (kvHeads * dim + indexDim)
+            + (index ? kvHeads * dim : (head - heads) * dim);
+        RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
+        for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x)
+            dst[d] = src[d];
+    } else {
+        const int h = head - heads - kvHeads;
+        const BF16 *src = Packed ? qkv + base + (heads + kvHeads) * dim + h * valueDim
+                                : v + ((size_t)token * kvHeads + h) * valueDim;
+        BF16 *dst = value + ((size_t)row * kvHeads + h) * valueDim;
+        for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
+            dst[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
     }
 }
 
@@ -321,10 +638,19 @@ __global__ void IndexScores(const float *q, const float *k, const BF16 *weights,
         scores[(size_t)query * keys + key] = key <= queryStart + query ? score : -INFINITY;
 }
 
-// Decode consumes each packed K row once. Keep its original E4M3-rounded
-// FP32 operands in registers across the 16 heads, avoiding a full temporary K.
+// Decode consumes each packed BF16 K row once. Keep its FP32 values in
+// registers across the 16 heads, avoiding a full temporary K.
+template <typename ScoreOutput, typename Length = int, bool Verify = false>
 __global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
-        const BF16 *weights, float *scores, int stride, int keys, int queryStart) {
+        const BF16 *weights, ScoreOutput scores, int stride, Length liveKeys, int queryStart) {
+    if constexpr (Verify) {
+        const int row = blockIdx.y;
+        q += (size_t)row * 16 * 128;
+        weights += row * 16;
+        liveKeys.length += row;
+        scores.scoreBits += (size_t)row * (queryStart + 1);
+    }
+    int keys = liveKeys;
     int key = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (key >= keys) return;
     float k[4];
@@ -340,7 +666,7 @@ __global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
         dot = WarpSum(dot);
         score += fmaxf(dot, 0.0f) * (float)weights[h];
     }
-    if (lane == 0) scores[key] = key <= queryStart ? score : -INFINITY;
+    if (lane == 0) scores.Store(key, key <= queryStart ? score : -INFINITY);
 }
 
 // Two 16-lane subgroups evaluate adjacent heads in parallel. Each lane owns
@@ -466,9 +792,12 @@ __device__ int KeyIndex(const int *indices, int query, int slot, int count,
     return window ? max(0, past + query - window + 1) + slot : slot;
 }
 
+template <typename Length = int, typename Count = int>
 __global__ void AttentionScores(const BF16 *q, const BF16 *k, const int *indices,
                                 float *scores, int heads, int kvHeads, int dim,
-                                int keyStride, int keys, int count, int past, int window, bool causal) {
+                                int keyStride, Length liveKeys, Count liveCount, int past, int window, bool causal) {
+    int count = liveCount;
+    int keys = liveKeys;
     int query = blockIdx.y, h = blockIdx.x;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     int kvHead = h / (heads / kvHeads);
@@ -491,15 +820,138 @@ __global__ void AttentionScores(const BF16 *q, const BF16 *k, const int *indices
     }
 }
 
+// Shared by the single-query score, softmax and split-PV paths.
+constexpr int kDecodePVKeys = 2048;
+constexpr int kDecodePVValueDim = 128;
+constexpr int kDecodePVParts = 32;
+constexpr int kDecodeQkDim = 192;
+constexpr int kDecodeSharedHeads = 16;
+constexpr int kDecodeSharedThreads = 256;
+constexpr int kDecodeQkKeyTile = 8;
+constexpr int kDecodeValueTile = 64;
+
+// Preserve each head's arithmetic order while sharing gathered K loads.
+template<int HeadTile, int MaxDim, int KeyTile = 32, typename Length = int, bool Verify = false>
+__global__ void AttentionScoresDecodeGrouped(const BF16 *q, const BF16 *k,
+        const int *indices, float *scores, int heads, int kvHeads, int dim,
+        int keyStride, Length liveKeys, int count, int past, bool causal) {
+    if constexpr (Verify) {
+        const int row = blockIdx.z;
+        liveKeys.length += row;
+        q += (size_t)row * heads * dim;
+        indices += (size_t)row * count;
+        scores += (size_t)row * heads * count;
+        past = (int)liveKeys - 1;
+    }
+    int keys = liveKeys;
+    constexpr int warps = 4;
+    int firstHead = blockIdx.x * HeadTile;
+    int kvHead = firstHead / (heads / kvHeads);
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    float query[HeadTile][MaxDim / 32];
+    #pragma unroll
+    for (int h = 0; h < HeadTile; ++h) {
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j)
+            query[h][j] = lane + j * 32 < dim
+                ? (float)q[(size_t)(firstHead + h) * dim + lane + j * 32] : 0;
+    }
+    int first = blockIdx.y * KeyTile, end = min(count, first + KeyTile);
+    for (int slot = first + warp; slot < end; slot += warps) {
+        int key = indices ? indices[slot] : slot;
+        bool valid = key >= 0 && key < keys && (!causal || key <= past);
+        float dot[HeadTile] = {};
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j) {
+            if (valid && lane + j * 32 < dim) {
+                float value = (float)k[(size_t)key * keyStride + kvHead * dim + lane + j * 32];
+                #pragma unroll
+                for (int h = 0; h < HeadTile; ++h)
+                    dot[h] += query[h][j] * value;
+            }
+        }
+        #pragma unroll
+        for (int h = 0; h < HeadTile; ++h) {
+            dot[h] = WarpSum(dot[h]);
+            if (lane == 0)
+                scores[(size_t)(firstHead + h) * count + slot] = valid
+                    ? RoundBF16(RoundBF16(dot[h]) * rsqrtf((float)dim)) : -INFINITY;
+        }
+    }
+}
+
+// Stage eight selected K rows once for sixteen Q heads. The aligned load
+// path keeps each head's original lane sum, warp tree and BF16 rounding.
+template <typename Length = int>
+__global__ void AttentionScoresDecodeShared(const BF16 *q, const BF16 *k,
+        const int *indices, float *scores, int heads, int kvHeads, int dim,
+        int keyStride, Length liveKeys, int count, int past, bool causal) {
+    int keys = liveKeys;
+    constexpr int HeadTile = kDecodeSharedHeads, KeyTile = kDecodeQkKeyTile, HeadsPerWarp = 2;
+    constexpr int MaxDim = kDecodeQkDim, threads = kDecodeSharedThreads;
+    __shared__ __align__(16) BF16 values[KeyTile][MaxDim];
+    __shared__ int selected[KeyTile];
+    int t = threadIdx.x, lane = t % 32, warp = t / 32, firstHead = blockIdx.x * HeadTile;
+    int kvHead = firstHead / (heads / kvHeads), first = blockIdx.y * KeyTile;
+    if (t < KeyTile) {
+        int slot = first + t, key = slot < count ? (indices ? indices[slot] : slot) : -1;
+        selected[t] = key >= 0 && key < keys && (!causal || key <= past) ? key : -1;
+    }
+    __syncthreads();
+    // Dispatch guarantees 16-byte alignment for every selected K row.
+    #pragma unroll
+    for (int i = t; i < KeyTile * (MaxDim / 8); i += threads) {
+        int row = i / (MaxDim / 8), d = i % (MaxDim / 8) * 8, key = selected[row];
+        *reinterpret_cast<uint4 *>(&values[row][d]) = key >= 0
+            ? *reinterpret_cast<const uint4 *>(k + (size_t)key * keyStride + kvHead * dim + d)
+            : make_uint4(0, 0, 0, 0);
+    }
+    int head = firstHead + warp * HeadsPerWarp;
+    float query[HeadsPerWarp][MaxDim / 32];
+    #pragma unroll
+    for (int h = 0; h < HeadsPerWarp; ++h) {
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j)
+            query[h][j] = lane + j * 32 < dim ? (float)q[(head + h) * dim + lane + j * 32] : 0;
+    }
+    __syncthreads();
+    for (int slot = 0; slot < KeyTile && first + slot < count; ++slot) {
+        float dot[HeadsPerWarp] = {};
+        bool valid = selected[slot] >= 0;
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j) {
+            if (lane + j * 32 < dim && valid) {
+                float value = (float)values[slot][lane + j * 32];
+                #pragma unroll
+                for (int h = 0; h < HeadsPerWarp; ++h)
+                    dot[h] += query[h][j] * value;
+            }
+        }
+        #pragma unroll
+        for (int offset = 16; offset; offset >>= 1) {
+            #pragma unroll
+            for (int h = 0; h < HeadsPerWarp; ++h)
+                dot[h] += __shfl_down_sync(0xffffffff, dot[h], offset);
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int h = 0; h < HeadsPerWarp; ++h)
+                scores[(head + h) * count + first + slot] = valid
+                    ? RoundBF16(RoundBF16(dot[h]) * rsqrtf((float)dim)) : -INFINITY;
+        }
+    }
+}
+
 // Keep each warp's original lane-strided dot product and reduction order,
 // but retain Q in registers and interleave four independent selected keys.
 // The bounded query register tile leaves larger head dimensions on the
 // general kernel; this path is only used for multiple-query prefill.
-template <int MaxDim>
+template <int MaxDim, typename Length = int, typename Past = int>
 __global__ void AttentionScoresPrefill(const BF16 *q, const BF16 *k, const int *indices,
                                       float *scores, int heads, int kvHeads, int dim,
-                                      int keyStride, int keys, int count, int past,
+                                      int keyStride, Length liveKeys, Length liveCount, Past livePast,
                                       int window, bool causal) {
+    int keys = liveKeys, count = liveCount, past = livePast;
     constexpr int keysPerWarp = 4, warps = 4;
     int query = blockIdx.y, h = blockIdx.x;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -578,9 +1030,11 @@ __global__ void AttentionScoresPrefillGrouped(const BF16 *q, const BF16 *k, cons
 // Four output columns per lane amortize index/probability reads and permit
 // aligned 64-bit V loads. Each column keeps its original slot-ordered FP32
 // accumulation. Four independent heads per CTA avoid one-warp block limits.
+template <typename Length = int, typename Past = int>
 __global__ void AttentionValuesPrefill(const float *prob, const BF16 *v, const int *indices,
                                       BF16 *out, int heads, int kvHeads, int dim,
-                                      int keys, int count, int past, int window, bool causal) {
+                                      Length liveKeys, Length liveCount, Past livePast, int window, bool causal) {
+    int keys = liveKeys, count = liveCount, past = livePast;
     constexpr int columns = 4, headGroup = 4;
     int query = blockIdx.y, lane = threadIdx.x % 32;
     int h = blockIdx.x * headGroup + threadIdx.x / 32;
@@ -607,7 +1061,9 @@ __global__ void AttentionValuesPrefill(const float *prob, const BF16 *v, const i
     }
 }
 
-__global__ void AttentionSoftmax(float *scores, const float *sink, int heads, int count) {
+template <typename Length = int>
+__global__ void AttentionSoftmax(float *scores, const float *sink, int heads, Length liveCount) {
+    int count = liveCount;
     __shared__ float scratch[256];
     int row = blockIdx.x, t = threadIdx.x;
     float *values = scores + (size_t)row * count;
@@ -641,13 +1097,64 @@ __global__ void AttentionSoftmax(float *scores, const float *sink, int heads, in
         values[i] = sum > 0 ? RoundBF16(values[i] / sum) : 0;
 }
 
+// Preserve the 256-lane softmax tree and sequential per-thread sum, while
+// retaining eight exponentials in registers and folding the tree within a warp.
+__global__ void AttentionSoftmaxDecode(float *scores, const float *sink) {
+    constexpr int threads = kDecodeSharedThreads, count = kDecodePVKeys;
+    constexpr int items = count / threads;
+    __shared__ float scratch[threads], maximum, denominator;
+    int h = blockIdx.x, t = threadIdx.x;
+    float logits[items], bias = sink ? sink[h] : -INFINITY;
+    float top = bias;
+    #pragma unroll
+    for (int i = 0; i < items; ++i) {
+        logits[i] = scores[h * count + t + i * threads];
+        top = fmaxf(top, logits[i]);
+    }
+    scratch[t] = top;
+    __syncthreads();
+    if (t < 32) {
+        float a = fmaxf(scratch[t], scratch[t + 128]), b = fmaxf(scratch[t + 64], scratch[t + 192]);
+        float c = fmaxf(scratch[t + 32], scratch[t + 160]), d = fmaxf(scratch[t + 96], scratch[t + 224]);
+        float mx = fmaxf(fmaxf(a, b), fmaxf(c, d));
+        #pragma unroll
+        for (int offset = 16; offset; offset >>= 1)
+            mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, offset));
+        if (t == 0) maximum = mx;
+    }
+    __syncthreads();
+    float sum = 0;
+    #pragma unroll
+    for (int i = 0; i < items; ++i) {
+        logits[i] = expf(logits[i] - maximum);
+        sum += logits[i];
+    }
+    if (t == 0 && sink) sum += expf(bias - maximum);
+    scratch[t] = sum;
+    __syncthreads();
+    if (t < 32) {
+        // Fold strides 128, 64 and 32 in the original block-reduction order.
+        float a = scratch[t] + scratch[t + 128], b = scratch[t + 64] + scratch[t + 192];
+        float c = scratch[t + 32] + scratch[t + 160], d = scratch[t + 96] + scratch[t + 224];
+        float total = WarpSum((a + b) + (c + d));
+        if (t == 0) denominator = total;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < items; ++i)
+        scores[h * count + t + i * threads] = denominator > 0 ? RoundBF16(logits[i] / denominator) : 0;
+}
+
 // Short full attention and the 128-token sliding window fit in shared memory.
 // Keep eager's BF16 score/probability rounding, sink and reduction order while
 // removing the score tensor round-trip and two launches per layer.
+template <typename Length = int, typename Past = int>
 __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
                                const int *indices, const float *sink, BF16 *out,
                                int heads, int kvHeads, int dim, int valueDim,
-                               int keyStride, int keys, int count, int past, int window, bool causal) {
+                               int keyStride, Length liveKeys, int count, Past livePast, int window, bool causal) {
+    int keys = liveKeys, past = livePast;
+    count = ShortCount(liveKeys, count);
     __shared__ float scores[256], scratch[256];
     int query = blockIdx.y, h = blockIdx.x, t = threadIdx.x;
     int lane = t % 32, warp = t / 32, kvHead = h / (heads / kvHeads);
@@ -700,34 +1207,49 @@ constexpr int kSwaValueDim = 128;
 constexpr int kSwaOutputTile = 32;
 constexpr int kSwaThreads = 256;
 
-// Single-query sliding window with head dimensions 192/128. Four
+// Single-query attention with head dimensions 192/128 and up to 256 keys. Four
 // output slices spread the work across SMs; cooperative V loads avoid the
 // reference kernel's dependent global load for every output/slot pair.
 // The softmax tree, BF16 rounding and slot-ordered FP32 FMAs are unchanged.
-__global__ void AttentionSwaDecode(const BF16 *q, const BF16 *k, const BF16 *v,
-        const float *sink, BF16 *out, int heads, int kvHeads, int keys) {
-    __shared__ float scores[kSwaWindow], scratch[kSwaThreads], maximum, denominator;
-    __shared__ BF16 values[kSwaWindow][kSwaOutputTile];
+template <int MaxKeys, typename Length = int, bool Verify = false, int Threads = kSwaThreads, int OutputTile = kSwaOutputTile>
+__global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v,
+        const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, Length liveKeys) {
+    if constexpr (Verify) {
+        const int row = blockIdx.y;
+        q += (size_t)row * heads * kSwaQkDim;
+        out += (size_t)row * heads * kSwaValueDim;
+        if constexpr (MaxKeys == kSwaWindow) {
+            // Verification appends all rows before attention. Read each
+            // causal window directly instead of copying it into scratch.
+            const int end = (int)liveKeys + row;
+            const int begin = max(0, end - kSwaWindow);
+            k += (size_t)begin * keyStride;
+            v += (size_t)begin * kvHeads * kSwaValueDim;
+        }
+    }
+    int keys = Verify ? min(VerifyCount(liveKeys, blockIdx.y), MaxKeys) : (int)liveKeys;
+    __shared__ float scores[MaxKeys], scratch[kSwaThreads], maximum, denominator;
+    __shared__ BF16 values[MaxKeys][OutputTile];
     int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
-    int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * kSwaOutputTile;
-    for (int i = t; i < keys * kSwaOutputTile; i += kSwaThreads) {
-        int row = i / kSwaOutputTile, col = i % kSwaOutputTile;
+    int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * OutputTile;
+    for (int i = t; i < keys * OutputTile; i += Threads) {
+        int row = i / OutputTile, col = i % OutputTile;
         values[row][col] = v[((size_t)row * kvHeads + kvHead) * kSwaValueDim + firstDim + col];
     }
     float query[kSwaQkDim / 32];
     #pragma unroll
     for (int i = 0; i < kSwaQkDim / 32; ++i) query[i] = (float)q[(size_t)h * kSwaQkDim + lane + i * 32];
-    for (int slot = warp; slot < keys; slot += 8) {
+    for (int slot = warp; slot < keys; slot += Threads / 32) {
         float dot = 0;
         #pragma unroll
         for (int i = 0; i < kSwaQkDim / 32; ++i)
-            dot += query[i] * (float)k[((size_t)slot * kvHeads + kvHead) * kSwaQkDim + lane + i * 32];
+            dot += query[i] * (float)k[(size_t)slot * keyStride + kvHead * kSwaQkDim + lane + i * 32];
         dot = WarpSum(dot);
         if (lane == 0) scores[slot] = RoundBF16(RoundBF16(dot) * rsqrtf((float)kSwaQkDim));
     }
     __syncthreads();
     float bias = sink ? sink[h] : -INFINITY;
-    scratch[t] = t < keys ? fmaxf(bias, scores[t]) : bias;
+    if (t < kSwaThreads) scratch[t] = t < keys ? fmaxf(bias, scores[t]) : bias;
     __syncthreads();
     // Fold the first three stages of the original 256-lane tree into
     // warp-local work; separate scalars keep scratch reuse race-free.
@@ -746,7 +1268,7 @@ __global__ void AttentionSwaDecode(const BF16 *q, const BF16 *k, const BF16 *v,
     float probability = t < keys ? expf(scores[t] - maximum) : 0;
     float sum = probability;
     if (t == 0 && sink) sum += expf(bias - maximum);
-    scratch[t] = sum;
+    if (t < kSwaThreads) scratch[t] = sum;
     __syncthreads();
     if (t < 32) {
         float a = scratch[t] + scratch[t + 128];
@@ -759,7 +1281,7 @@ __global__ void AttentionSwaDecode(const BF16 *q, const BF16 *k, const BF16 *v,
     __syncthreads();
     if (t < keys) scores[t] = denominator > 0 ? RoundBF16(probability / denominator) : 0;
     __syncthreads();
-    if (t < kSwaOutputTile) {
+    if (t < OutputTile) {
         float result = 0;
         for (int first = 0; first < keys; first += 8) {
             float p[8], value[8];
@@ -776,6 +1298,39 @@ __global__ void AttentionSwaDecode(const BF16 *q, const BF16 *k, const BF16 *v,
         }
         out[(size_t)h * kSwaValueDim + firstDim + t] = __float2bfloat16(result);
     }
+}
+
+// Dispatch by workload shape, independent of TP rank count. All variants retain
+// the same QK/softmax/PV arithmetic; only the work assigned to each CTA changes.
+template <bool Verify>
+void LaunchShortAttention(const BF16 *q, const BF16 *k, const BF16 *v,
+        const float *bias, BF16 *out, int rows, int heads, int kvHeads,
+        int keyStride, DecodeKeys keys, bool sliding) {
+    int threads = kSwaThreads, tile = kSwaOutputTile;
+    auto kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, Verify>
+                          : AttentionShortDecode<256, DecodeKeys, Verify>;
+    if (heads == 8 || heads == 16) {
+        if constexpr (Verify) {
+            if (rows == 8) {
+                tile = 64;
+                if (heads == 8) {
+                    threads = 1024;
+                    kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, true, 1024, 64>
+                                     : AttentionShortDecode<256, DecodeKeys, true, 1024, 64>;
+                } else {
+                    threads = 512;
+                    kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, true, 512, 64>
+                                     : AttentionShortDecode<256, DecodeKeys, true, 512, 64>;
+                }
+            }
+        } else {
+            threads = 1024;
+            kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, false, 1024>
+                             : AttentionShortDecode<256, DecodeKeys, false, 1024>;
+        }
+    }
+    kernel<<<dim3(heads, rows, kSwaValueDim / tile), threads>>>(
+        q, k, v, bias, out, heads, kvHeads, keyStride, keys);
 }
 
 __global__ void AttentionValues(const float *prob, const BF16 *v, const int *indices,
@@ -795,17 +1350,15 @@ __global__ void AttentionValues(const float *prob, const BF16 *v, const int *ind
     }
 }
 
-constexpr int kDecodePVKeys = 2048;
-constexpr int kDecodePVValueDim = 128;
-constexpr int kDecodePVParts = 32;
-
 // Decode has just one query. Split its 2048 selected keys across CTAs so
 // every thread accumulates one value column, then combine FP32 partial sums.
 // Inputs/probability rounding and BF16 output are unchanged; the FP32 sum order
 // differs from the serial fallback. Prefill and other shapes keep their paths.
+template <typename Length = int>
 __global__ void AttentionValuesDecodePartial(const float *prob, const BF16 *v,
         const int *indices, float *partial, int heads, int kvHeads,
-        int keys, int past, bool causal) {
+        Length liveKeys, int past, bool causal) {
+    int keys = liveKeys;
     constexpr int count = kDecodePVKeys, dim = kDecodePVValueDim;
     constexpr int parts = kDecodePVParts, slots = count / parts;
     int h = blockIdx.x, part = blockIdx.y, d = threadIdx.x;
@@ -828,8 +1381,120 @@ __global__ void AttentionValuesDecodePartial(const float *prob, const BF16 *v,
     partial[(h * parts + part) * dim + d] = sum;
 }
 
+template<int HeadTile, typename Length = int, bool Verify = false>
+__global__ void AttentionValuesDecodeGrouped(const float *prob, const BF16 *v,
+        const int *indices, float *partial, int heads, int kvHeads,
+        Length liveKeys, int past, bool causal) {
+    constexpr int count = kDecodePVKeys, dim = kDecodePVValueDim;
+    constexpr int parts = kDecodePVParts, slots = count / parts;
+    if constexpr (Verify) {
+        const int row = blockIdx.z;
+        liveKeys.length += row;
+        prob += (size_t)row * heads * count;
+        indices += (size_t)row * count;
+        partial += (size_t)row * heads * parts * dim;
+        past = (int)liveKeys - 1;
+    }
+    int keys = liveKeys;
+    int firstHead = blockIdx.x * HeadTile, part = blockIdx.y, d = threadIdx.x;
+    int kvHead = firstHead / (heads / kvHeads);
+    float sum[HeadTile] = {};
+    for (int base = part * slots; base < (part + 1) * slots; base += 8) {
+        float values[8];
+        bool valid[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int key = indices ? indices[base + i] : base + i;
+            valid[i] = key >= 0 && key < keys && (!causal || key <= past);
+            values[i] = valid[i] ? (float)v[((size_t)key * kvHeads + kvHead) * dim + d] : 0;
+        }
+        #pragma unroll
+        for (int h = 0; h < HeadTile; ++h) {
+            float probabilities[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                probabilities[i] = prob[(firstHead + h) * count + base + i];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (valid[i]) sum[h] = fmaf(probabilities[i], values[i], sum[h]);
+        }
+    }
+    #pragma unroll
+    for (int h = 0; h < HeadTile; ++h)
+        partial[((firstHead + h) * parts + part) * dim + d] = sum[h];
+}
+
+// Sixteen Q heads share a 64-key by 64-column V tile. Each warp computes
+// two heads; the existing 64-key partial sums and final reduction stay ordered.
+template <typename Length = int>
+__global__ void AttentionValuesDecodeShared(const float *prob, const BF16 *v,
+        const int *indices, float *partial, int heads, int kvHeads,
+        Length liveKeys, int past, bool causal) {
+    int keys = liveKeys;
+    constexpr int HeadTile = kDecodeSharedHeads, ValueTile = kDecodeValueTile, HeadsPerWarp = 2;
+    constexpr int count = kDecodePVKeys, parts = kDecodePVParts, slots = count / parts;
+    constexpr int dim = kDecodePVValueDim, columns = ValueTile / 32, threads = kDecodeSharedThreads;
+    __shared__ __align__(16) BF16 values[slots][ValueTile];
+    __shared__ int selected[slots];
+    __shared__ float probabilities[HeadTile][slots];
+    int t = threadIdx.x, lane = t % 32, warp = t / 32;
+    int firstHead = blockIdx.x * HeadTile, part = blockIdx.y;
+    int kvHead = firstHead / (heads / kvHeads), firstColumn = blockIdx.z * ValueTile;
+    if (t < slots) {
+        int key = indices ? indices[part * slots + t] : part * slots + t;
+        selected[t] = key >= 0 && key < keys && (!causal || key <= past) ? key : -1;
+    }
+    for (int i = t; i < HeadTile * slots; i += threads)
+        probabilities[i / slots][i % slots] = prob[(firstHead + i / slots) * count + part * slots + i % slots];
+    __syncthreads();
+    #pragma unroll
+    for (int i = t; i < slots * (ValueTile / 8); i += threads) {
+        int row = i / (ValueTile / 8), d = i % (ValueTile / 8) * 8, key = selected[row];
+        *reinterpret_cast<uint4 *>(&values[row][d]) = key >= 0
+            ? *reinterpret_cast<const uint4 *>(v + ((size_t)key * kvHeads + kvHead) * dim + firstColumn + d)
+            : make_uint4(0, 0, 0, 0);
+    }
+    __syncthreads();
+    float sums[HeadsPerWarp][columns] = {};
+    for (int base = 0; base < slots; base += 8) {
+        float valueTile[8][columns], probTile[HeadsPerWarp][8];
+        bool valid[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            valid[i] = selected[base + i] >= 0;
+            #pragma unroll
+            for (int d = 0; d < columns; ++d)
+                valueTile[i][d] = (float)values[base + i][lane * columns + d];
+            #pragma unroll
+            for (int h = 0; h < HeadsPerWarp; ++h) {
+                int head = warp * HeadsPerWarp + h;
+                probTile[h][i] = probabilities[head][base + i];
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (valid[i]) {
+                #pragma unroll
+                for (int h = 0; h < HeadsPerWarp; ++h) {
+                    #pragma unroll
+                    for (int d = 0; d < columns; ++d)
+                        sums[h][d] = fmaf(probTile[h][i], valueTile[i][d], sums[h][d]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int h = 0; h < HeadsPerWarp; ++h) {
+        #pragma unroll
+        for (int d = 0; d < columns; ++d)
+            partial[((firstHead + warp * HeadsPerWarp + h) * parts + part) * dim + firstColumn + lane * columns + d] = sums[h][d];
+    }
+}
+
 __global__ void AttentionValuesDecodeReduce(const float *partial, BF16 *out, int heads) {
     constexpr int dim = kDecodePVValueDim, parts = kDecodePVParts;
+    partial += (size_t)blockIdx.y * heads * parts * dim;
+    out += (size_t)blockIdx.y * heads * dim;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= heads * dim) return;
     int h = i / dim, d = i % dim;
@@ -843,9 +1508,12 @@ __global__ void AttentionValuesDecodeReduce(const float *partial, BF16 *out, int
 // Cooperatively stage a tile of V instead of issuing one dependent global
 // load for each of 2048 slots. Output dimensions form separate CTAs; each
 // output keeps exactly the original slot order and FP32 FMA accumulation.
+template <typename Length = int, typename Count = int>
 __global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
         const int *indices, BF16 *out, int heads, int kvHeads, int dim,
-        int keys, int count, int past, int window, bool causal) {
+        Length liveKeys, Count liveCount, int past, int window, bool causal) {
+    int count = liveCount;
+    int keys = liveKeys;
     __shared__ BF16 values[64][32];
     __shared__ float probabilities[64];
     __shared__ int selected[64];
@@ -877,6 +1545,239 @@ __global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
     }
     if (t < 32 && d < dim) out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
 }
+}
+
+namespace {
+// Q and K share the original 256-lane RMSNorm reduction and BF16 rounding.
+// Each K CTA also writes its V head; separate CTAs own disjoint cache columns.
+__global__ void DraftQKVNormRope(const BF16 *raw, const float *qNorm,
+        const float *kNorm, const float *positions, const int *live,
+        BF16 *key, BF16 *value, BF16 *query, int heads, int kvHeads,
+        int dim, int window, int past, float eps, float theta) {
+    const int head = blockIdx.x, row = blockIdx.y, t = threadIdx.x;
+    const bool isKey = head >= heads;
+    const int h = isKey ? head - heads : head;
+    const int qw = heads * dim, kw = kvHeads * dim, width = qw + 2 * kw;
+    const BF16 *src = raw + (size_t)row * width + (isKey ? qw : 0) + h * dim;
+    const float *norm = isKey ? kNorm : qNorm;
+    __shared__ float sums[8];
+    __shared__ BF16 normalized[256];
+    float v = t < dim ? (float)src[t] : 0;
+    float partial = WarpSum(v * v);
+    if ((t & 31) == 0) sums[t / 32] = partial;
+    __syncthreads();
+    if (t < 32) {
+        float total = WarpSum(t < 8 ? sums[t] : 0);
+        if (t == 0) sums[0] = total;
+    }
+    __syncthreads();
+    if (t < dim) normalized[t] = __float2bfloat16(RoundBF16(v * rsqrtf(sums[0] / dim + eps)) * norm[t]);
+    __syncthreads();
+    int base = live ? min(*live - 1, window - 1) : past;
+    BF16 *dst = isKey ? key + (size_t)(base + row) * kw + h * dim
+                     : query + (size_t)row * qw + h * dim;
+    if (t < dim / 2) {
+        float angle = positions[row] * powf(theta, -2.0f * t / dim);
+        float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
+        float a = (float)normalized[t], b = (float)normalized[t + dim / 2];
+        dst[t] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+        dst[t + dim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+    }
+    if (isKey && t < dim)
+        value[(size_t)(base + row) * kw + h * dim + t] = src[kw + t];
+}
+__global__ void DraftRoundedSwiGLU(const BF16 *input, BF16 *output, int width, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int at = (i / width) * 2 * width + i % width;
+    float gate = (float)input[at], up = (float)input[at + width];
+    output[i] = __float2bfloat16(RoundBF16(gate / (1.0f + expf(-gate))) * up);
+}
+bool DraftDense(const fastllm::Data &x, fastllm::DataType type) {
+    if (x.dataType != type || x.dataDevice != fastllm::DataDevice::CUDA ||
+        x.multiDeviceData || x.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        !x.cudaData || x.dims.empty() || x.strides.size() != x.dims.size()) return false;
+    uint64_t stride = 1;
+    for (int i = (int)x.dims.size() - 1; i >= 0; --i) {
+        if (x.dims[i] <= 0 || x.strides[i] != stride) return false;
+        stride *= x.dims[i];
+    }
+    return true;
+}
+}
+
+bool FastllmCudaNaiveDraftKVProject(const fastllm::Data &input,
+        const std::vector<const fastllm::Data *> &weights,
+        fastllm::Data &output, fastllm::Data &pointers) {
+    using namespace fastllm;
+    if (!DraftDense(input, BFLOAT16) || input.dims.size() != 3 || input.dims[0] != 1 ||
+        weights.empty() || weights.size() > INT_MAX / (3 * sizeof(void *) / sizeof(int)) ||
+        &output == &pointers || output.isFake || pointers.isFake ||
+        output.multiDeviceData || pointers.multiDeviceData ||
+        (output.cudaData && output.cudaData == pointers.cudaData)) return false;
+    auto aliases = [&](const Data &x) {
+        return &x == &output || &x == &pointers || (x.cudaData &&
+            (x.cudaData == output.cudaData || x.cudaData == pointers.cudaData));
+    };
+    if (aliases(input)) return false;
+    const int rows = input.dims[1], inner = input.dims[2], layers = weights.size();
+    int columns = 0;
+    for (const Data *weight : weights) {
+        if (!weight || !DraftDense(*weight, BFLOAT16) || aliases(*weight) ||
+            weight->dims.size() != 2 || weight->dims[1] != inner ||
+            (columns && weight->dims[0] != columns)) return false;
+        columns = weight->dims[0];
+    }
+    Output(output, BFLOAT16, {layers, rows, columns});
+    Output(pointers, INT32, {layers * 3 * (int)(sizeof(void *) / sizeof(int))});
+    auto table = (void **)pointers.cudaData;
+    // Tiny pointer tables are constructed on the current stream. No pageable
+    // H2D copy, global pointer cache, or weight-lifetime assumption is needed.
+    for (int first = 0; first < layers; first += kDraftKVLayersPerLaunch) {
+        DraftKVWeights addresses{};
+        int count = std::min(kDraftKVLayersPerLaunch, layers - first);
+        for (int i = 0; i < count; ++i) addresses.data[i] = weights[first + i]->cudaData;
+        DraftKVPointerTable<<<1, 32, 0, cudaStreamPerThread>>>(addresses, input.cudaData,
+            (BF16 *)output.cudaData, table, first, count, layers, (size_t)rows * columns);
+    }
+    CheckLaunch();
+    const float alpha = 1, beta = 0;
+    return cublasGemmBatchedEx(getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        columns, rows, inner, &alpha, (const void *const *)table, CUDA_R_16BF, inner,
+        (const void *const *)(table + layers), CUDA_R_16BF, inner, &beta,
+        (void *const *)(table + 2 * layers), CUDA_R_16BF, columns, layers,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+}
+
+bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
+        const fastllm::Data &qNorm, const fastllm::Data &kNorm,
+        const fastllm::Data &positions, const fastllm::Data &liveKeys,
+        fastllm::Data &key, fastllm::Data &value, fastllm::Data &query,
+        int heads, int kvHeads, int dim, int window, float eps, float theta) {
+    using namespace fastllm;
+    if (heads <= 0 || kvHeads <= 0 || heads % kvHeads || dim <= 0 || dim > 256 || dim % 2 ||
+        window <= 1 || !std::isfinite(eps) || eps < 0 || !std::isfinite(theta) || theta <= 0 ||
+        (int64_t)(heads + 2LL * kvHeads) * dim > INT_MAX ||
+        !DraftDense(raw, BFLOAT16) || raw.dims.size() != 3 || raw.dims[0] != 1 ||
+        raw.dims[2] != (heads + 2 * kvHeads) * dim ||
+        !DraftDense(qNorm, FLOAT32) || qNorm.dims != std::vector<int>{dim} ||
+        !DraftDense(kNorm, FLOAT32) || kNorm.dims != std::vector<int>{dim} ||
+        !DraftDense(positions, FLOAT32) || positions.Count(0) != raw.dims[1]) return false;
+    const int rows = raw.dims[1], width = kvHeads * dim;
+    const bool dynamic = !liveKeys.dims.empty();
+    if (dynamic && (!DraftDense(liveKeys, INT32) || liveKeys.Count(0) != 1)) return false;
+    if (key.dims != value.dims || key.dims.size() != 3 || key.dims[0] != 1 ||
+        key.dims[1] < 0 || key.dims[2] != width) return false;
+    int64_t needed = (dynamic ? window - 1 : key.dims[1]) + (int64_t)rows;
+    for (const Data *cache : {&key, &value}) {
+        if (cache->dataType != BFLOAT16 || cache->dataDevice != DataDevice::CUDA ||
+            cache->multiDeviceData || cache->dataDeviceIds != raw.dataDeviceIds || !cache->cudaData ||
+            cache->expansionDims.size() != 3 || cache->expansionDims[0] != 1 ||
+            cache->expansionDims[1] < needed || cache->expansionDims[2] != width ||
+            cache->strides.size() != 3 || cache->strides[1] != width || cache->strides[2] != 1) return false;
+    }
+    for (const Data *src : {&raw, &qNorm, &kNorm, &positions, &liveKeys, (const Data *)&key, (const Data *)&value})
+        if (&query == src || (query.cudaData && query.cudaData == src->cudaData)) return false;
+    if (raw.cudaData == key.cudaData || raw.cudaData == value.cudaData || key.cudaData == value.cudaData) return false;
+    Output(query, BFLOAT16, {1, rows, heads * dim});
+    DraftQKVNormRope<<<dim3(heads + kvHeads, rows), 256, 0, cudaStreamPerThread>>>(
+        (const BF16 *)raw.cudaData, (const float *)qNorm.cudaData, (const float *)kNorm.cudaData,
+        (const float *)positions.cudaData, dynamic ? (const int *)liveKeys.cudaData : nullptr,
+        (BF16 *)key.cudaData, (BF16 *)value.cudaData, (BF16 *)query.cudaData,
+        heads, kvHeads, dim, window, key.dims[1], eps, theta);
+    CheckLaunch();
+    return true;
+}
+
+void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &output) {
+    using namespace fastllm;
+    AssertInFastLLM(DraftDense(gateUp, BFLOAT16) && gateUp.dims.back() % 2 == 0 &&
+        gateUp.Count(0) <= INT_MAX && &gateUp != &output &&
+        (!output.cudaData || output.cudaData != gateUp.cudaData), "Invalid draft GateUp layout.");
+    auto dims = gateUp.dims;
+    dims.back() /= 2;
+    Output(output, BFLOAT16, dims);
+    const int count = gateUp.Count(0) / 2;
+    DraftRoundedSwiGLU<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        (const BF16 *)gateUp.cudaData, (BF16 *)output.cudaData, dims.back(), count);
+    CheckLaunch();
+}
+
+bool FastllmCudaNaiveDraftKV(const std::vector<const fastllm::Data *> &raw,
+        const std::vector<const fastllm::Data *> &norm, int start,
+        std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
+        int heads, int dim, int window, int reserve, float eps, float theta) {
+    using namespace fastllm;
+    if (raw.empty() || raw.size() > INT_MAX || raw.size() != norm.size() ||
+        heads <= 0 || dim <= 0 || dim > 256 || dim % 2 || window <= 1 ||
+        reserve < 0 || start < 0 || (int64_t)heads * dim > INT_MAX / 2 ||
+        !std::isfinite(eps) || eps < 0 || !std::isfinite(theta) || theta <= 0) return false;
+    const int layers = (int)raw.size(), columns = 2 * heads * dim;
+    int rows = 0;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (!raw[i] || !norm[i] || !DraftDense(*raw[i], BFLOAT16) ||
+            !DraftDense(*norm[i], FLOAT32) || norm[i]->dims != std::vector<int>{dim} ||
+            raw[i]->dims.size() != 3 || raw[i]->dims[0] != 1 || raw[i]->dims[2] != columns ||
+            (i && raw[i]->dims[1] != rows)) return false;
+        rows = raw[i]->dims[1];
+    }
+    const std::vector<int> devices{FastllmCudaGetDevice()};
+    auto resident = [&](const Data &data, DataType type) {
+        return data.dataType == type && data.dataDevice == DataDevice::CUDA &&
+            data.dataDeviceIds == devices && data.cudaData && !data.multiDeviceData;
+    };
+    if ((int64_t)start + rows > INT_MAX ||
+        (int64_t)std::min(layers, kDraftKVLayersPerLaunch) * rows * heads > INT_MAX ||
+        (!kv.empty() && kv.size() != raw.size())) return false;
+    const int width = heads * dim;
+    // Validate every layer before resizing any cache; rejected calls are safe to
+    // fall back to the separate projections and ordinary append operations.
+    for (const auto &pair : kv) {
+        if (pair.first.dims != pair.second.dims) return false;
+        for (const Data *cache : {&pair.first, &pair.second}) {
+            if (cache->dims.empty()) {
+                if (!cache->expansionDims.empty()) return false;
+                continue;
+            }
+            if (!resident(*cache, BFLOAT16) || cache->dims.size() != 3 ||
+                cache->dims[0] != 1 || cache->dims[2] != width || cache->dims[1] < 0 ||
+                (int64_t)cache->dims[1] + rows > INT_MAX ||
+                cache->strides.size() != 3 || cache->strides[2] != 1 || cache->strides[1] != width ||
+                (!cache->expansionDims.empty() && (cache->expansionDims.size() != 3 ||
+                    cache->expansionDims[0] != 1 || cache->expansionDims[2] != width))) return false;
+        }
+    }
+    kv.resize(layers);
+    // Pass a bounded pointer table by value; models with more layers use multiple
+    // launches, without a per-call host-to-device pointer upload or fixed layer cap.
+    for (int first = 0; first < layers; first += kDraftKVLayersPerLaunch) {
+        DraftKVDestinations dst{};
+        int count = std::min(kDraftKVLayersPerLaunch, layers - first);
+        for (int i = 0; i < count; ++i) {
+            auto &pair = kv[first + i];
+            int old = pair.first.dims.empty() ? 0 : pair.first.dims[1];
+            dst.raw[i] = (const BF16 *)raw[first + i]->cudaData;
+            dst.norm[i] = (const float *)norm[first + i]->cudaData;
+            dst.length[i] = old;
+            for (Data *cache : {&pair.first, &pair.second}) {
+                cache->dataType = BFLOAT16;
+                cache->UpdateUnitSize();
+                cache->ToDevice(DataDevice::CUDA, devices);
+                int64_t wanted = std::max(old + rows, reserve);
+                if (cache->expansionDims.empty() || cache->expansionDims[1] < wanted)
+                    cache->Expansion({1, (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128), width});
+                cache->Resize({1, old + rows, width});
+                cache->isKVCache = true;
+            }
+            dst.key[i] = (BF16 *)pair.first.cudaData;
+            dst.value[i] = (BF16 *)pair.second.cudaData;
+        }
+        DraftNormRopeWrite<<<count * rows * heads, 256, 0, cudaStreamPerThread>>>(
+            dst, rows, heads, dim, start, eps, theta);
+        CheckLaunch();
+    }
+    for (auto &pair : kv) FastllmCudaNaiveTrimCache(pair.first, pair.second, window - 1);
+    return true;
 }
 
 void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep) {
@@ -951,29 +1852,18 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         return;
     }
     int count = queryStart + 1;
-    Data encoded, sorted, workspace;
+    int blocks = CooperativeTopKBlocks(count, topK);
+    if (blocks) {
+        CooperativeTopK((const float *)scores.cudaData, count, blocks, indices);
+        return;
+    }
+    Data encoded;
     Output(encoded, INT32, {count, 2});
-    Output(sorted, INT32, {count, 2});
-    Output(indices, INT32, {1, topK});
     auto *input = (unsigned *)encoded.cudaData;
-    auto *output = (unsigned *)sorted.cudaData;
     auto *inputPositions = (int *)encoded.cudaData + count;
-    auto *outputPositions = (int *)sorted.cudaData + count;
-    size_t bytes = 0;
-    // Stability retains ascending position order for equal score bits. This
-    // gives the same total order as the batched 64-bit key with half the bits.
-    // CCCL's driver launcher needs the per-thread stream explicitly.
-    auto status = cub::DeviceRadixSort::SortPairsDescending(nullptr, bytes,
-        input, output, inputPositions, outputPositions, count, 0, 32, cudaStreamPerThread);
-    AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
-        "Naive-N0.5 TopK workspace query failed.");
-    Output(workspace, INT32, {(int)((bytes + 3) / 4)});
     EncodeTopKPairs<<<(count + 255) / 256, 256>>>(
         (const float *)scores.cudaData, input, inputPositions, count);
-    status = cub::DeviceRadixSort::SortPairsDescending(workspace.cudaData, bytes,
-        input, output, inputPositions, outputPositions, count, 0, 32, cudaStreamPerThread);
-    AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 GPU TopK failed.");
-    DecodeTopKPairs<<<(topK + 255) / 256, 256>>>(outputPositions, (int *)indices.cudaData, count, topK);
+    SortTopKPairs(input, inputPositions, count, topK, indices);
     CheckLaunch();
 }
 
@@ -990,7 +1880,7 @@ void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
 void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
         fastllm::Data &v, const fastllm::Data &positions,
         int heads, int kvHeads, int dim, int valueDim,
-        int rotaryDim, float theta, float valueScale) {
+        int rotaryDim, float theta, float valueScale, const fastllm::Data *packedQkv) {
     using namespace fastllm;
     AssertInFastLLM(heads > 0 && kvHeads > 0 && dim > 0 && valueDim > 0 &&
         rotaryDim > 0 && rotaryDim % 2 == 0 && rotaryDim <= dim &&
@@ -1008,11 +1898,80 @@ void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
         q.dataDeviceIds == positions.dataDeviceIds &&
         q.cudaData && k.cudaData && v.cudaData && positions.cudaData,
         "Invalid Naive-N0.5 fused Q/K RoPE and V scale input.");
-    RopeQKScaleV<<<(uint64_t)q.dims[1] * (heads + 2 * kvHeads), 128>>>(
+    if (packedQkv) {
+        const auto &x = *packedQkv;
+        AssertInFastLLM(x.dims == std::vector<int>({1, q.dims[1], (heads + kvHeads) * dim + kvHeads * valueDim}) &&
+            x.dataType == BFLOAT16 && x.dataDevice == DataDevice::CUDA && x.dataDeviceIds == q.dataDeviceIds &&
+            x.cudaData && x.strides.size() == 3 && x.strides[2] == 1 && x.strides[1] == x.dims[2],
+            "Invalid Naive-N0.5 packed QKV input.");
+    }
+    auto kernel = packedQkv ? RopeQKScaleV<true> : RopeQKScaleV<false>;
+    kernel<<<(uint64_t)q.dims[1] * (heads + 2 * kvHeads), 128>>>(
         (BF16 *)q.cudaData, (BF16 *)k.cudaData, (BF16 *)v.cudaData,
         (const float *)positions.cudaData, heads, kvHeads, dim, valueDim,
-        rotaryDim, theta, __float2bfloat16_rn(valueScale));
+        rotaryDim, theta, __float2bfloat16_rn(valueScale), packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr);
     CheckLaunch();
+}
+
+bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indexKey,
+        const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv) {
+    using namespace fastllm;
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    const bool dynamicLength = !liveKeys.dims.empty();
+    auto resident = [&](const Data &x, DataType type) {
+        return x.dataType == type && x.dataDevice == DataDevice::CUDA &&
+            x.dataDeviceIds == device && x.cudaData;
+    };
+    auto matrix = [&](const Data &x, int64_t columns) {
+        return resident(x, BFLOAT16) && x.dims.size() == 3 && x.dims[0] == 1 &&
+            x.dims[1] >= 0 && x.dims[2] == columns && x.strides.size() == 3 &&
+            x.strides[2] == 1 && x.strides[1] == columns;
+    };
+    if (heads <= 0 || kvHeads <= 0 || dim <= 0 || valueDim <= 0 ||
+        rotaryDim <= 0 || rotaryDim % 2 || rotaryDim > dim || window < 0 ||
+        !std::isfinite(theta) || theta <= 0 || !std::isfinite(valueScale) ||
+        !matrix(q, (int64_t)heads * dim) || q.dims[1] <= 0 ||
+        !matrix(k, (int64_t)kvHeads * dim) || k.dims[1] != q.dims[1] ||
+        !matrix(v, (int64_t)kvHeads * valueDim) || v.dims[1] != q.dims[1] ||
+        !resident(positions, FLOAT32) || positions.Count(0) < (uint64_t)q.dims[1] ||
+        (dynamicLength && (!resident(liveKeys, INT32) || liveKeys.Count(0) < 1))) return false;
+    const int rows = q.dims[1];
+    if (packedQkv && (!matrix(*packedQkv, (int64_t)(heads + kvHeads) * dim + (int64_t)kvHeads * valueDim) ||
+                     packedQkv->dims[1] != rows)) return false;
+    int indexDim = 0;
+    if (!indexKey.dims.empty()) {
+        if (indexKey.dims.size() != 3 || indexKey.dims[2] < rotaryDim ||
+            !matrix(indexKey, indexKey.dims[2]) || indexKey.dims[1] != rows) return false;
+        indexDim = indexKey.dims[2];
+    }
+    const int64_t kc = (int64_t)kvHeads * dim + indexDim, vc = (int64_t)kvHeads * valueDim;
+    if (kc > INT_MAX || vc > INT_MAX ||
+        (int64_t)rows * ((int64_t)heads + 2LL * kvHeads + (indexDim != 0)) > INT_MAX ||
+        !matrix(key, kc) || !matrix(value, vc)) return false;
+    auto reservedRows = [](const Data &x) {
+        if (x.expansionDims.empty()) return x.dims[1];
+        return x.expansionDims.size() == 3 && x.expansionDims[0] == 1 &&
+            x.expansionDims[2] == x.dims[2] ? x.expansionDims[1] : 0;
+    };
+    int keyRows = reservedRows(key), valueRows = reservedRows(value);
+    if (keyRows < rows || valueRows < rows ||
+        (window && (int64_t)window - 1 + rows > std::min(keyRows, valueRows))) return false;
+    const int cachePast = key.dims[1];
+    if (!dynamicLength && (cachePast != value.dims[1] ||
+        (int64_t)cachePast + rows > std::min(keyRows, valueRows))) return false;
+    auto kernel = packedQkv ? RopeAppendCache<true> : RopeAppendCache<false>;
+    kernel<<<rows * (heads + 2 * kvHeads + (indexDim != 0)), 128>>>(
+        (BF16 *)q.cudaData, (const BF16 *)k.cudaData, (const BF16 *)v.cudaData,
+        indexDim ? (const BF16 *)indexKey.cudaData : nullptr,
+        (const float *)positions.cudaData, (BF16 *)key.cudaData, (BF16 *)value.cudaData,
+        dynamicLength ? (const int *)liveKeys.cudaData : nullptr, heads, kvHeads, dim, valueDim, indexDim,
+        rotaryDim, theta, __float2bfloat16_rn(valueScale), window, keyRows, valueRows, cachePast,
+        packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr);
+    CheckLaunch();
+    return true;
 }
 
 bool FastllmCudaNaiveQuantizeIndexer(const fastllm::Data &input,
@@ -1055,8 +2014,12 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         "Invalid Naive-N0.5 Indexer layout (requires 128-element BF16 blocks).");
     int queries = query.dims[1], keys = packedKeys.dims[1];
     int stride = packedKeys.dims[2];
-    Data q, k, scores;
-    Output(scores, DataType::FLOAT32, {queries, keys});
+    bool decodeTopK = queries == 1 && heads == 16;
+    int selectBlocks = decodeTopK ? CooperativeTopKBlocks(queryStart + 1, topK) : 0;
+    Data q, k, scores, positions;
+    Output(scores, decodeTopK ? INT32 : FLOAT32, {queries, keys});
+    if (decodeTopK && !selectBlocks) Output(positions, INT32, {keys});
+    IndexerTopKOutput topKOutput{(unsigned *)scores.cudaData, (int *)positions.cudaData};
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using naive_dsa_mma::kKeys;
     using naive_dsa_mma::kThreads;
@@ -1075,7 +2038,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
             naive_dsa_mma::IndexerDecodeScores<<<(keys + kKeys - 1) / kKeys, kThreads>>>(
                 (const BF16 *)q.cudaData, (const BF16 *)packedKeys.cudaData,
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, stride, keys, queryStart);
+                topKOutput, stride, keys, queryStart);
         } else {
             naive_dsa_mma::IndexerScores<<<dim3((keys + kKeys - 1) / kKeys,
                 (queries + kKeys - 1) / kKeys), kThreads>>>(
@@ -1089,10 +2052,10 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         Output(q, DataType::FLOAT32, {queries, heads, dim});
         RoundIndexer<<<queries * heads, 128>>>((const BF16 *)query.cudaData,
             (float *)q.cudaData, dim, 0, fp8Query);
-        if (queries == 1 && heads == 16) {
+        if (decodeTopK) {
             IndexScoresDecode<<<(keys + 7) / 8, 256>>>((const float *)q.cudaData,
                 (const BF16 *)packedKeys.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, stride, keys, queryStart);
+                topKOutput, stride, keys, queryStart);
         } else {
             Output(k, DataType::FLOAT32, {keys, dim});
             RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
@@ -1119,8 +2082,98 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         }
     }
     CheckLaunch();
-    // Stable GPU selection for decode and every row of a prefill chunk.
-    FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
+    // The selector derives positions directly; CUB's fallback uses emitted positions.
+    if (selectBlocks) {
+        CooperativeTopK((const unsigned *)scores.cudaData, queryStart + 1, selectBlocks, indices);
+        return;
+    }
+    if (decodeTopK) {
+        SortTopKPairs((const unsigned *)scores.cudaData, (const int *)positions.cudaData,
+            queryStart + 1, topK, indices);
+        CheckLaunch();
+    } else {
+        FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
+    }
+}
+
+void FastllmCudaNaiveVerifyIndexer(const fastllm::Data &query,
+        const fastllm::Data &weights, const fastllm::Data &packedKeys,
+        int heads, int dim, int queryStart, int topK, bool fp8Query,
+        fastllm::Data &indices) {
+    using namespace fastllm;
+    const int rows = query.dims[1];
+    AssertInFastLLM(rows > 0 && rows <= 8 && queryStart >= 0 &&
+        queryStart + rows <= packedKeys.dims[1], "Invalid Naive verification block.");
+    Output(indices, INT32, {rows, topK});
+    for (int row = 0; row < rows; ++row) {
+        Data q(BFLOAT16, {1, 1, heads * dim}), w(BFLOAT16, {1, 1, heads});
+        Data keys(BFLOAT16, {1, queryStart + row + 1, packedKeys.dims[2]});
+        Data out(INT32, {1, topK});
+        q.FakeFrom(query, (size_t)row * heads * dim * sizeof(BF16));
+        w.FakeFrom(weights, (size_t)row * heads * sizeof(BF16));
+        keys.FakeFrom(packedKeys, 0);
+        out.FakeFrom(indices, (size_t)row * topK * sizeof(int));
+        FastllmCudaNaiveIndexer(q, w, keys, heads, dim, queryStart + row, topK, fp8Query, out);
+    }
+}
+
+void FastllmCudaNaiveVerifyAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, const fastllm::Data &sink,
+        int heads, int kvHeads, int dim, int valueDim, int pastLength,
+        int window, fastllm::Data &output) {
+    using namespace fastllm;
+    const int rows = query.dims[1];
+    AssertInFastLLM(rows > 0 && rows <= 8 && pastLength >= 0 &&
+        pastLength + rows <= key.dims[1], "Invalid Naive verification attention block.");
+    Output(output, BFLOAT16, {1, rows, heads * valueDim});
+    // Full-window, large-head eager attention may use FlashInfer. Preserve
+    // that arithmetic; the compact decode kernel is exact for its own path.
+    const bool compactWindow = window == kSwaWindow &&
+        (heads < 64 || heads / kvHeads != 8 || pastLength + rows < kSwaWindow);
+    if (dim == kSwaQkDim && valueDim == kSwaValueDim && indices.dims.empty() &&
+        (compactWindow || (!window && pastLength + rows <= 256))) {
+        const int first = window ? std::min(pastLength + 1, window) : pastLength + 1;
+        auto *q = (const BF16 *)query.cudaData;
+        auto *k = (const BF16 *)key.cudaData;
+        auto *v = (const BF16 *)value.cudaData;
+        auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        auto *out = (BF16 *)output.cudaData;
+        // An eager caller can retain more than window-1 old rows.
+        const int begin = window ? std::max(0, pastLength + 1 - window) : 0;
+        k += (size_t)begin * key.dims[2];
+        v += (size_t)begin * kvHeads * valueDim;
+        dim3 grid(heads, rows, kSwaValueDim / kSwaOutputTile);
+        if (window)
+            AttentionShortDecode<kSwaWindow, int, true><<<grid, kSwaThreads>>>(
+                q, k, v, bias, out, heads, kvHeads, key.dims[2], first);
+        else
+            AttentionShortDecode<256, int, true><<<grid, kSwaThreads>>>(
+                q, k, v, bias, out, heads, kvHeads, key.dims[2], first);
+        CheckLaunch();
+        return;
+    }
+    for (int row = 0; row < rows; ++row) {
+        const int end = pastLength + row + 1;
+        const int begin = window ? std::max(0, end - window) : 0;
+        const int length = end - begin;
+        Data q(BFLOAT16, {1, 1, heads * dim});
+        Data k(BFLOAT16, {1, length, key.dims[2]});
+        Data v(BFLOAT16, {1, length, value.dims[2]});
+        Data out(BFLOAT16, {1, 1, heads * valueDim}), selected;
+        q.FakeFrom(query, (size_t)row * heads * dim * sizeof(BF16));
+        k.FakeFrom(key, (size_t)begin * key.dims[2] * sizeof(BF16));
+        v.FakeFrom(value, (size_t)begin * value.dims[2] * sizeof(BF16));
+        out.FakeFrom(output, (size_t)row * heads * valueDim * sizeof(BF16));
+        // Crossing the dense/sparse boundary inside a block must not change
+        // the PV reduction tree of the earlier, still-dense positions.
+        if (!indices.dims.empty() && end > indices.dims[1]) {
+            selected.Resize({1, indices.dims[1]});
+            selected.FakeFrom(indices, (size_t)row * indices.dims[1] * sizeof(int));
+        }
+        FastllmCudaNaiveAttention(q, k, v, selected, sink, heads, kvHeads, dim,
+                                 valueDim, length - 1, window, out);
+    }
 }
 
 void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,
@@ -1156,11 +2209,22 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     if (queries == 1 && window == kSwaWindow && causal && !selected &&
         keys > 0 && keys <= kSwaWindow && pastLength == keys - 1 &&
         dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] == kvHeads * dim) {
-        AttentionSwaDecode<<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+        AttentionShortDecode<kSwaWindow><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
             (const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
-            (BF16 *)output.cudaData, heads, kvHeads, keys);
+            (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys);
+        CheckLaunch();
+        return;
+    }
+    if (queries == 1 && window == 0 && causal && !selected &&
+        keys > 0 && keys <= 256 && pastLength == keys - 1 &&
+        dim == kSwaQkDim && valueDim == kSwaValueDim) {
+        AttentionShortDecode<256><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+            (const BF16 *)query.cudaData,
+            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+            (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys);
         CheckLaunch();
         return;
     }
@@ -1172,6 +2236,11 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         CheckLaunch();
         return;
     }
+    // Sequence-split PV also matters for TP shards: a handful of local
+    // heads otherwise leaves the long serial PV loop almost un-parallelized.
+    const bool splitDecode = queries == 1 && window == 0 && count == kDecodePVKeys && heads >= 4;
+    const bool groupedDecode = splitDecode && heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
+    const bool sharedDecode = groupedDecode && (heads / kvHeads) % kDecodeSharedHeads == 0;
     Data scores;
     Output(scores, DataType::FLOAT32, {queries, heads, count});
 #ifdef FASTLLM_NAIVE_DSA_MMA
@@ -1190,6 +2259,19 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             heads, kvHeads, key.dims[2], keys, count, pastLength, causal);
     } else
 #endif
+    // Each shared tile must stay within one KV head and have aligned vector loads.
+    if (sharedDecode && dim == kDecodeQkDim && key.dims[2] % 8 == 0 &&
+        (size_t)key.cudaData % 16 == 0) {
+        AttentionScoresDecodeShared<<<dim3(heads / kDecodeSharedHeads, count / kDecodeQkKeyTile), kDecodeSharedThreads>>>(
+            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected,
+            (float *)scores.cudaData, heads, kvHeads, dim, key.dims[2],
+            keys, count, pastLength, causal);
+    } else if (groupedDecode && dim <= kDecodeQkDim) {
+        AttentionScoresDecodeGrouped<4, kDecodeQkDim><<<dim3(heads / 4, count / 32), 128>>>(
+            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected,
+            (float *)scores.cudaData, heads, kvHeads, dim, key.dims[2],
+            keys, count, pastLength, causal);
+    } else
     // Small query blocks need the original per-head CTA count for occupancy.
     if (queries >= 32 && dim <= 192 && heads / kvHeads >= 2) {
         AttentionScoresPrefillGrouped<<<dim3(kvHeads, queries, (heads / kvHeads + 1) / 2), 128>>>(
@@ -1205,8 +2287,13 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
             heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
     }
-    AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
-        sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
+    if (sharedDecode) {
+        AttentionSoftmaxDecode<<<heads, kDecodeSharedThreads>>>((float *)scores.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData);
+    } else {
+        AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
+    }
 #ifdef FASTLLM_NAIVE_DSA_MMA
     if (useMma) {
         naive_dsa_mma::Values<<<dim3(queries, heads / naive_dsa_mma::kHeads), naive_dsa_mma::kThreads>>>(
@@ -1214,13 +2301,23 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             heads, kvHeads, keys, count, pastLength, causal);
     } else
 #endif
-    if (queries == 1 && window == 0 && count == kDecodePVKeys &&
-        valueDim == kDecodePVValueDim && heads >= 32) {
+    if (splitDecode && valueDim == kDecodePVValueDim) {
         Data partial;
         Output(partial, FLOAT32, {heads, kDecodePVParts, kDecodePVValueDim});
-        AttentionValuesDecodePartial<<<dim3(heads, kDecodePVParts), kDecodePVValueDim>>>((const float *)scores.cudaData,
-            (const BF16 *)value.cudaData, selected, (float *)partial.cudaData,
-            heads, kvHeads, keys, pastLength, causal);
+        if (sharedDecode && (size_t)value.cudaData % 16 == 0) {
+            AttentionValuesDecodeShared<<<dim3(heads / kDecodeSharedHeads, kDecodePVParts,
+                kDecodePVValueDim / kDecodeValueTile), kDecodeSharedThreads>>>(
+                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
+        } else if (groupedDecode) {
+            AttentionValuesDecodeGrouped<4><<<dim3(heads / 4, kDecodePVParts), kDecodePVValueDim>>>(
+                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
+        } else {
+            AttentionValuesDecodePartial<<<dim3(heads, kDecodePVParts), kDecodePVValueDim>>>(
+                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
+        }
         AttentionValuesDecodeReduce<<<(heads * kDecodePVValueDim + 255) / 256, 256>>>(
             (const float *)partial.cudaData, (BF16 *)output.cudaData, heads);
     } else if (queries == 1) {
@@ -1237,4 +2334,787 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
     }
     CheckLaunch();
+}
+
+namespace {
+// Preserve AddTo's BF16 residual rounding and KimiK3RMSNorm's two BF16
+// rounding steps, including the same 256-thread reduction tree.
+template <int Channels = 0>
+__global__ void AddDecodeRMSNorm(BF16 *hidden, const BF16 *branch,
+        const float *weight, BF16 *output, int channels, float eps) {
+    if constexpr (Channels) channels = Channels;
+    hidden += (size_t)blockIdx.x * channels;
+    branch += (size_t)blockIdx.x * channels;
+    output += (size_t)blockIdx.x * channels;
+    __shared__ float sums[8];
+    float cached[Channels ? Channels / 256 : 1];
+    float affine[Channels ? Channels / 256 : 1];
+    float partial = 0;
+    if constexpr (Channels) {
+        // Load the entire row before reduction, as the eager 4096-wide kernel
+        // does. Loading affine weights after the reduction serializes memory
+        // latency on this one-CTA decode workload.
+        #pragma unroll
+        for (int part = 0; part < Channels / 256; ++part) {
+            int c = threadIdx.x + part * 256;
+            cached[part] = RoundBF16((float)hidden[c] + (float)branch[c]);
+            affine[part] = weight[c];
+        }
+        #pragma unroll
+        for (int part = 0; part < Channels / 256; ++part) {
+            hidden[threadIdx.x + part * 256] = __float2bfloat16(cached[part]);
+            partial += cached[part] * cached[part];
+        }
+    } else {
+        for (int c = threadIdx.x; c < channels; c += 256) {
+            float value = RoundBF16((float)hidden[c] + (float)branch[c]);
+            hidden[c] = __float2bfloat16(value);
+            partial += value * value;
+        }
+    }
+    partial = WarpSum(partial);
+    if (threadIdx.x % 32 == 0) sums[threadIdx.x / 32] = partial;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float total = WarpSum(threadIdx.x < 8 ? sums[threadIdx.x] : 0);
+        if (threadIdx.x == 0) sums[0] = total;
+    }
+    __syncthreads();
+    float scale = rsqrtf(sums[0] / channels + eps);
+    if constexpr (Channels) {
+        #pragma unroll
+        for (int part = 0; part < Channels / 256; ++part)
+            output[threadIdx.x + part * 256] =
+                __float2bfloat16(RoundBF16(cached[part] * scale) * affine[part]);
+    } else {
+        for (int c = threadIdx.x; c < channels; c += 256)
+            output[c] = __float2bfloat16(RoundBF16((float)hidden[c] * scale) * weight[c]);
+    }
+}
+
+__global__ void DraftInput(const float *id, const BF16 *embedding, const BF16 *mask,
+        const int *length, BF16 *hidden, float *positions, int channels) {
+    int row = blockIdx.y, column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column < channels)
+        hidden[(size_t)row * channels + column] = row ? mask[column]
+            : embedding[(size_t)(int)*id * channels + column];
+    if (column == 0) positions[row] = *length - 1 + row;
+}
+
+__global__ void AppendDecodeKV(BF16 *key, BF16 *value, const BF16 *newKey,
+        const BF16 *newValue, const int *length, int keyColumns, int valueColumns,
+        int window) {
+    int column = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = *length - 1;
+    if (window) row = min(row, window - 1);
+    if (column < keyColumns) key[(size_t)row * keyColumns + column] = newKey[column];
+    else if ((column -= keyColumns) < valueColumns)
+        value[(size_t)row * valueColumns + column] = newValue[column];
+}
+
+__global__ void AppendVerifyKV(BF16 *key, BF16 *value, const BF16 *newKey,
+        const BF16 *newValue, const int *length, int kc, int vc, int window) {
+    int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int query = blockIdx.y;
+    const int past = window ? min(*length - 1, window - 1) : *length - 1;
+    const int row = past + query;
+    if (column < kc) key[(size_t)row * kc + column] = newKey[(size_t)query * kc + column];
+    else if ((column -= kc) < vc)
+        value[(size_t)row * vc + column] = newValue[(size_t)query * vc + column];
+}
+
+__global__ void CopyVerifyWindow(const BF16 *key, const BF16 *value,
+        BF16 *outKey, BF16 *outValue, const int *length, int query,
+        int kc, int vc, int window) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int end = min(*length - 1, window - 1) + query + 1;
+    const int begin = max(0, end - window), rows = min(end, window);
+    if (index < rows * kc) outKey[index] = key[(size_t)begin * kc + index];
+    else if ((index -= rows * kc) < rows * vc)
+        outValue[index] = value[(size_t)begin * vc + index];
+}
+
+int DecodeTopKBlocks() {
+    static thread_local std::map<int, int> cache;
+    int device = FastllmCudaGetDevice();
+    auto it = cache.find(device);
+    if (it != cache.end()) return it->second;
+    cudaDeviceProp prop;
+    int resident = 0;
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess || !prop.cooperativeLaunch ||
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident,
+            naive_topk::Select<unsigned, DecodeKeys>, naive_topk::kThreads, 0) != cudaSuccess) {
+        cudaGetLastError();
+        return cache[device] = 0;
+    }
+    return cache[device] = std::min(naive_topk::kMaxBlocks, resident * prop.multiProcessorCount);
+}
+}
+
+bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    if (RouterRows(input, weight, output) != 1) return false;
+    auto dims = input.dims;
+    dims.back() = weight.dims[0];
+    Output(output, FLOAT32, dims);
+    RouterSigmoid4096<<<weight.dims[0], 256>>>((const BF16 *)input.cudaData,
+        (const float *)weight.cudaData, (float *)output.cudaData);
+    CheckLaunch();
+    return true;
+}
+
+bool FastllmCudaNaiveRouterVerify(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    const int rows = RouterRows(input, weight, output);
+    if (rows < 2 || rows >= FastllmCudaGetLinearExactBatchThreshold()) return false;
+    auto dims = input.dims;
+    dims.back() = weight.dims[0];
+    Output(output, FLOAT32, dims);
+    const int experts = weight.dims[0];
+    if (rows >= 4)
+        VerifyRouter4096<4><<<dim3(experts, (rows + 3) / 4), 256>>>(
+            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
+            (float *)output.cudaData, rows, experts);
+    else
+        VerifyRouter4096<2><<<dim3(experts, (rows + 1) / 2), 256>>>(
+            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
+            (float *)output.cudaData, rows, experts);
+    CheckLaunch();
+    return true;
+}
+
+bool FastllmCudaNaiveDecodeGraphSupported() { return DecodeTopKBlocks() > 0; }
+
+void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
+        const fastllm::Data &branch, const fastllm::Data &weight,
+        float eps, fastllm::Data &output) {
+    Output(output, fastllm::BFLOAT16, hidden.dims);
+    int channels = hidden.dims.back();
+    auto kernel = channels == 4096 ? AddDecodeRMSNorm<4096> : AddDecodeRMSNorm<>;
+    kernel<<<hidden.Count(0) / channels, 256>>>((BF16 *)hidden.cudaData, (const BF16 *)branch.cudaData,
+        (const float *)weight.cudaData, (BF16 *)output.cudaData, channels, eps);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
+        const fastllm::Data &newKey, const fastllm::Data &newValue,
+        const fastllm::Data &liveKeys, int window) {
+    int kc = key.dims[2], vc = value.dims[2];
+    AppendDecodeKV<<<(kc + vc + 255) / 256, 256>>>((BF16 *)key.cudaData,
+        (BF16 *)value.cudaData, (const BF16 *)newKey.cudaData,
+        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
+        const fastllm::Data &liveKeys, int window) {
+    constexpr int columns = kTrimTileBytes / sizeof(BF16);
+    int kc = key.dims[2], vc = value.dims[2];
+    int blocks = (kc + columns - 1) / columns + (vc + columns - 1) / columns;
+    TrimCachePairTiled<BF16, true><<<blocks, 256>>>((BF16 *)key.cudaData,
+        (BF16 *)value.cudaData, kc, vc, 1, window - 1, (const int *)liveKeys.cudaData);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
+        const fastllm::Data &weights, const fastllm::Data &packedKeys,
+        const fastllm::Data &liveKeys, int capacity, bool fp8Query,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices) {
+    using namespace fastllm;
+    DecodeKeys keys{(const int *)liveKeys.cudaData, 0};
+    const int stride = packedKeys.dims[2];
+    Output(scratch.indexScores, INT32, {capacity});
+    IndexerTopKOutput scoreOutput{(unsigned *)scratch.indexScores.cudaData, nullptr};
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    if (fp8Query && FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) {
+        Output(scratch.indexQuery, BFLOAT16, {16, 128});
+        Output(scratch.indexScale, FLOAT32, {16});
+        naive_dsa_mma::QuantizeIndexer<<<16, 128>>>((const BF16 *)query.cudaData,
+            (BF16 *)scratch.indexQuery.cudaData, (float *)scratch.indexScale.cudaData, 128, 0);
+        naive_dsa_mma::IndexerDecodeScores<<<(capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys,
+            naive_dsa_mma::kThreads>>>((const BF16 *)scratch.indexQuery.cudaData,
+            (const BF16 *)packedKeys.cudaData, (const float *)scratch.indexScale.cudaData,
+            (const BF16 *)weights.cudaData, scoreOutput, stride, keys, capacity - 1);
+    } else
+#endif
+    {
+        Output(scratch.indexQuery, FLOAT32, {16, 128});
+        RoundIndexer<<<16, 128>>>((const BF16 *)query.cudaData,
+            (float *)scratch.indexQuery.cudaData, 128, 0, fp8Query);
+        IndexScoresDecode<<<(capacity + 7) / 8, 256>>>((const float *)scratch.indexQuery.cudaData,
+            (const BF16 *)packedKeys.cudaData, (const BF16 *)weights.cudaData,
+            scoreOutput, stride, keys, capacity - 1);
+    }
+    Output(scratch.topk, INT32, {(int)(sizeof(naive_topk::Workspace) / sizeof(int))});
+    Output(indices, INT32, {1, naive_topk::kTopK});
+    auto *workspace = (naive_topk::Workspace *)scratch.topk.cudaData;
+    auto *scores = (const unsigned *)scratch.indexScores.cudaData;
+    auto *histograms = workspace->partials;
+    auto *ties = workspace->ties;
+    auto *state = &workspace->state;
+    auto *candidates = &workspace->candidates;
+    void *args[] = {&scores, &keys, &histograms, &ties, &state, &candidates};
+    auto status = cudaLaunchCooperativeKernel((void *)naive_topk::Select<unsigned, DecodeKeys>,
+        DecodeTopKBlocks(), naive_topk::kThreads, args, 0, cudaStreamPerThread);
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        if (!FastllmCudaGraphIsCapturingFast())
+            AssertInFastLLM(false, "Naive decode graph TopK launch failed.");
+    }
+    naive_topk::Sort<<<1, naive_topk::kThreads>>>(candidates, state, (int *)indices.cudaData);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, const fastllm::Data &sink,
+        const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
+        int dim, int valueDim, int window,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+    using namespace fastllm;
+    DecodeKeys keys{(const int *)liveKeys.cudaData, window};
+    auto *q = (const BF16 *)query.cudaData;
+    auto *k = (const BF16 *)key.cudaData;
+    auto *v = (const BF16 *)value.cudaData;
+    auto *selected = indices.dims.empty() ? nullptr : (const int *)indices.cudaData;
+    auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+    Output(output, BFLOAT16, {1, 1, heads * valueDim});
+    auto *out = (BF16 *)output.cudaData;
+    if (dim == kSwaQkDim && valueDim == kSwaValueDim &&
+        (window == kSwaWindow || (!window && !selected && capacity > 0 && capacity <= 256))) {
+        // Bound the live length to the capacity captured for this graph.
+        DecodeKeys shortKeys{(const int *)liveKeys.cudaData, window ? window : capacity};
+        LaunchShortAttention<false>(q, k, v, bias, out, 1, heads, kvHeads,
+            key.dims[2], shortKeys, window != 0);
+    } else if (window || capacity <= 256) {
+        int count = window ? window : capacity;
+        AttentionShort<<<heads, 256>>>(q, k, v, selected, bias, out, heads, kvHeads,
+            dim, valueDim, key.dims[2], keys, count, count - 1, window, true);
+    } else {
+        int count = selected ? kDecodePVKeys : capacity;
+        Output(scratch.attentionScores, FLOAT32, {heads, count});
+        auto *scores = (float *)scratch.attentionScores.cudaData;
+        if (!selected) {
+            // Keep the live row stride and exact eager softmax reduction tree.
+            AttentionScores<<<dim3(heads, 1, (capacity + 63) / 64), 256>>>(
+                q, k, selected, scores, heads, kvHeads, dim, key.dims[2],
+                keys, keys, capacity - 1, 0, true);
+            AttentionSoftmax<<<heads, 256>>>(scores, bias, heads, keys);
+            AttentionValuesTiled<<<dim3(heads, 1, (valueDim + 31) / 32), 256>>>(
+                scores, v, selected, out, heads, kvHeads, valueDim,
+                keys, keys, capacity - 1, 0, true);
+        } else {
+            bool split = heads >= 4 && valueDim == kDecodePVValueDim;
+            bool grouped = heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
+            bool shared = grouped && (heads / kvHeads) % kDecodeSharedHeads == 0;
+            if (shared && dim == kDecodeQkDim && key.dims[2] % 8 == 0 && (size_t)k % 16 == 0) {
+                AttentionScoresDecodeShared<<<dim3(heads / kDecodeSharedHeads, count / kDecodeQkKeyTile), kDecodeSharedThreads>>>(
+                    q, k, selected, scores, heads, kvHeads, dim, key.dims[2], keys, count, capacity - 1, true);
+            } else if (grouped && dim <= kDecodeQkDim) {
+                AttentionScoresDecodeGrouped<4, kDecodeQkDim><<<dim3(heads / 4, count / 32), 128>>>(
+                    q, k, selected, scores, heads, kvHeads, dim, key.dims[2], keys, count, capacity - 1, true);
+            } else {
+                AttentionScores<<<dim3(heads, 1, count / 64), 256>>>(q, k, selected, scores,
+                    heads, kvHeads, dim, key.dims[2], keys, count, capacity - 1, 0, true);
+            }
+            if (shared) AttentionSoftmaxDecode<<<heads, kDecodeSharedThreads>>>(scores, bias);
+            else AttentionSoftmax<<<heads, 256>>>(scores, bias, heads, count);
+            if (split) {
+                Output(scratch.attentionPartial, FLOAT32, {heads, kDecodePVParts, valueDim});
+                auto *partial = (float *)scratch.attentionPartial.cudaData;
+                if (shared && (size_t)v % 16 == 0) {
+                    AttentionValuesDecodeShared<<<dim3(heads / kDecodeSharedHeads, kDecodePVParts, 2), kDecodeSharedThreads>>>(
+                        scores, v, selected, partial, heads, kvHeads, keys, capacity - 1, true);
+                } else if (grouped) {
+                    AttentionValuesDecodeGrouped<4><<<dim3(heads / 4, kDecodePVParts), kDecodePVValueDim>>>(
+                        scores, v, selected, partial, heads, kvHeads, keys, capacity - 1, true);
+                } else {
+                    AttentionValuesDecodePartial<<<dim3(heads, kDecodePVParts), kDecodePVValueDim>>>(
+                        scores, v, selected, partial, heads, kvHeads, keys, capacity - 1, true);
+                }
+                AttentionValuesDecodeReduce<<<(heads * valueDim + 255) / 256, 256>>>(partial, out, heads);
+            } else {
+                AttentionValuesTiled<<<dim3(heads, 1, (valueDim + 31) / 32), 256>>>(scores, v,
+                    selected, out, heads, kvHeads, valueDim, keys, count, capacity - 1, 0, true);
+            }
+        }
+    }
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
+        const fastllm::Data &newKey, const fastllm::Data &newValue,
+        const fastllm::Data &liveKeys, int window) {
+    const int kc = key.dims[2], vc = value.dims[2], rows = newKey.dims[1];
+    AppendVerifyKV<<<dim3((kc + vc + 255) / 256, rows), 256>>>((BF16 *)key.cudaData,
+        (BF16 *)value.cudaData, (const BF16 *)newKey.cudaData,
+        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window);
+    CheckLaunch();
+}
+
+namespace {
+__global__ void DraftEmbedding(const float *ids, int step, const BF16 *weight,
+                               BF16 *latent, int width) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < width) latent[col] = weight[(size_t)(int)ids[step] * width + col];
+}
+
+__device__ void Top1WarpMax(float &score, int &id) {
+    for (int offset = 16; offset; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffffu, score, offset);
+        int otherId = __shfl_down_sync(0xffffffffu, id, offset);
+        if ((threadIdx.x & 31) + offset < 32 && FastllmNaiveTop1Better(other, otherId, score, id)) {
+            score = other; id = otherId;
+        }
+    }
+}
+__device__ void Top1BlockMax(float &score, int &id) {
+    __shared__ float scores[8];
+    __shared__ int ids[8];
+    Top1WarpMax(score, id);
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    if (!lane) { scores[warp] = score; ids[warp] = id; }
+    __syncthreads();
+    if (!warp) {
+        score = lane < 8 ? scores[lane] : -INFINITY;
+        id = lane < 8 ? ids[lane] : INT_MAX;
+        Top1WarpMax(score, id);
+    }
+}
+__global__ void DraftArgmaxPartial(const BF16 *base, const BF16 *bias,
+                                  float2 *partial, int vocab) {
+    float best = -INFINITY;
+    int bestId = INT_MAX;
+    for (int i = blockIdx.x * 1024 + threadIdx.x;
+         i < min((int)(blockIdx.x + 1) * 1024, vocab); i += 256) {
+        float score = RoundBF16(__bfloat162float(base[i]) + __bfloat162float(bias[i]));
+        // Like the original per-lane scan, ignore NaN and -infinity.
+        if (score > -INFINITY && FastllmNaiveTop1Better(score, i, best, bestId)) {
+            best = score; bestId = i;
+        }
+    }
+    Top1BlockMax(best, bestId);
+    if (!threadIdx.x) partial[blockIdx.x] = make_float2((float)bestId, best);
+}
+__global__ void DraftArgmaxFinish(const float2 *partial, int count,
+                                 float *ids, int step) {
+    float best = -INFINITY;
+    int bestId = INT_MAX;
+    for (int i = threadIdx.x; i < count; i += 256) {
+        float2 item = partial[i];
+        // INT_MAX is not exactly representable as float; empty tiles use
+        // their score to avoid converting that sentinel back to int.
+        if (item.y > -INFINITY && FastllmNaiveTop1Better(item.y, (int)item.x, best, bestId)) {
+            best = item.y; bestId = (int)item.x;
+        }
+    }
+    Top1BlockMax(best, bestId);
+    if (!threadIdx.x) ids[step + 1] = bestId == INT_MAX ? 0.0f : (float)bestId;
+}
+
+__global__ void LogitsTop1Partial(const float *logits, float2 *partial, int vocab, int offset) {
+    float best = -INFINITY;
+    int bestId = INT_MAX;
+    for (int i = blockIdx.x * 1024 + threadIdx.x;
+         i < min((int)(blockIdx.x + 1) * 1024, vocab); i += 256) {
+        float score = logits[(size_t)blockIdx.y * vocab + i];
+        int id = offset + i;
+        if (score > -INFINITY && FastllmNaiveTop1Better(score, id, best, bestId)) {
+            best = score; bestId = id;
+        }
+    }
+    Top1BlockMax(best, bestId);
+    if (!threadIdx.x)
+        partial[(size_t)blockIdx.y * gridDim.x + blockIdx.x] =
+            make_float2(bestId == INT_MAX ? -1.0f : (float)bestId, best);
+}
+__global__ void LogitsTop1Finish(const float2 *partial, float2 *output, int count) {
+    float best = -INFINITY;
+    int bestId = INT_MAX;
+    for (int i = threadIdx.x; i < count; i += 256) {
+        float2 item = partial[(size_t)blockIdx.x * count + i];
+        if (item.y > -INFINITY && FastllmNaiveTop1Better(item.y, (int)item.x, best, bestId)) {
+            best = item.y; bestId = (int)item.x;
+        }
+    }
+    Top1BlockMax(best, bestId);
+    if (!threadIdx.x)
+        output[blockIdx.x] = make_float2(bestId == INT_MAX ? -1.0f : (float)bestId, best);
+}
+// A tile sorts 1024 scores, retaining only its first K. The second stage
+// merges sorted tile heads; no vocabulary-sized host transfer or allocation.
+__global__ void LogitsTopKPartial(const float *logits, float2 *partial,
+                                  int vocab, int offset, int count, float scale) {
+    using Sort = cub::BlockRadixSort<unsigned long long, 256, 4>;
+    __shared__ typename Sort::TempStorage storage;
+    unsigned long long keys[4];
+    for (int j = 0; j < 4; ++j) {
+        int column = blockIdx.x * 1024 + threadIdx.x * 4 + j;
+        keys[j] = 0;
+        if (column < vocab) {
+            float value = logits[(size_t)blockIdx.y * vocab + column] * scale;
+            // Canonicalize signed zero for the CPU sampler's equality rule.
+            unsigned bits = __float_as_uint(value == 0 ? 0.0f : value);
+            unsigned ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+            if (!isnan(value))
+                keys[j] = ((unsigned long long)ordered << 32) | (0xffffffffu - (offset + column));
+        }
+    }
+    Sort(storage).SortDescending(keys);
+    for (int j = 0; j < 4; ++j) {
+        int index = threadIdx.x * 4 + j;
+        if (index < count) {
+            auto key = keys[j];
+            unsigned ordered = key >> 32;
+            unsigned bits = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
+            partial[((size_t)blockIdx.y * gridDim.x + blockIdx.x) * count + index] =
+                key ? make_float2((float)(0xffffffffu - (unsigned)key), __uint_as_float(bits)) :
+                      make_float2(-1.0f, -INFINITY);
+        }
+    }
+}
+__device__ bool SamplingBetter(float score, int id, float best, int bestId) {
+    return score > best || (score == best && id < bestId);
+}
+__global__ void LogitsTopKFinish(const float2 *partial, float2 *output, int blocks, int count) {
+    // Each lane owns one sorted tile. 256 tiles cover vocabularies up to 262144.
+    __shared__ float scores[8];
+    __shared__ int ids[8];
+    __shared__ int winner;
+    int head = 0, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    const float2 *tile = partial + ((size_t)blockIdx.x * blocks + threadIdx.x) * count;
+    for (int k = 0; k < count; ++k) {
+        float2 value = threadIdx.x < blocks && head < count ? tile[head] : make_float2(-1, -INFINITY);
+        float score = value.y;
+        int id = value.x >= 0 ? (int)value.x : INT_MAX;
+        for (int delta = 16; delta; delta >>= 1) {
+            float other = __shfl_down_sync(0xffffffffu, score, delta);
+            int otherId = __shfl_down_sync(0xffffffffu, id, delta);
+            if (lane + delta < 32 && SamplingBetter(other, otherId, score, id)) { score = other; id = otherId; }
+        }
+        if (!lane) { scores[warp] = score; ids[warp] = id; }
+        __syncthreads();
+        if (!warp) {
+            score = lane < 8 ? scores[lane] : -INFINITY;
+            id = lane < 8 ? ids[lane] : INT_MAX;
+            for (int delta = 16; delta; delta >>= 1) {
+                float other = __shfl_down_sync(0xffffffffu, score, delta);
+                int otherId = __shfl_down_sync(0xffffffffu, id, delta);
+                if (lane + delta < 32 && SamplingBetter(other, otherId, score, id)) { score = other; id = otherId; }
+            }
+            if (!lane) {
+                winner = id;
+                output[(size_t)blockIdx.x * count + k] = make_float2(id == INT_MAX ? -1.0f : (float)id, score);
+            }
+        }
+        __syncthreads();
+        if (value.x >= 0 && (int)value.x == winner) ++head;
+        // No lane may overwrite winner before every lane consumes it.
+        __syncthreads();
+    }
+}
+struct DraftHiddenInputs { const BF16 *ptr[32]; };
+__global__ void DraftConcat(DraftHiddenInputs inputs, BF16 *output,
+                            int rows, int width, int count) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)rows * width * count;
+    if (index < total) {
+        int column = index % width;
+        int layer = (index / width) % count;
+        int row = index / ((size_t)width * count);
+        output[index] = inputs.ptr[layer][(size_t)row * width + column];
+    }
+}
+}
+
+void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
+    int count, bool greedy, float invTemperature,
+    fastllm::Data &partial, fastllm::Data &output) {
+    using namespace fastllm;
+    AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
+        !logits.dims.empty() && logits.cudaData &&
+        FastllmNaiveCanSelectLogits(logits.dims.back(), vocabOffset, count, greedy) &&
+        (greedy || (std::isfinite(invTemperature) && invTemperature > 0)),
+        "Invalid Naive vocabulary shard for logits selection.");
+    const int vocab = logits.dims.back(), rows = logits.Count(0) / vocab;
+    const int blocks = (vocab + 1023) / 1024;
+    Output(partial, FLOAT32, {rows, blocks, count, 2});
+    Output(output, FLOAT32, {rows, count * 2});
+    if (greedy) {
+        LogitsTop1Partial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
+            (float2 *)partial.cudaData, vocab, vocabOffset);
+        LogitsTop1Finish<<<rows, 256>>>((const float2 *)partial.cudaData,
+            (float2 *)output.cudaData, blocks);
+    } else {
+        LogitsTopKPartial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
+            (float2 *)partial.cudaData, vocab, vocabOffset, count, invTemperature);
+        LogitsTopKFinish<<<rows, 256>>>((const float2 *)partial.cudaData,
+            (float2 *)output.cudaData, blocks, count);
+    }
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveDraftEmbedding(const fastllm::Data &ids, int step,
+    const fastllm::Data &weight, fastllm::Data &latent) {
+    const int width = weight.dims[1];
+    Output(latent, fastllm::BFLOAT16, {1, 1, width});
+    DraftEmbedding<<<(width + 255) / 256, 256>>>((const float *)ids.cudaData,
+        step, (const BF16 *)weight.cudaData, (BF16 *)latent.cudaData, width);
+    CheckLaunch();
+}
+void FastllmCudaNaiveDraftArgmax(const fastllm::Data &base,
+    const fastllm::Data &bias, int step, fastllm::Data &partial, fastllm::Data &ids) {
+    const int vocab = base.dims.back(), blocks = (vocab + 1023) / 1024;
+    Output(partial, fastllm::FLOAT32, {blocks, 2});
+    DraftArgmaxPartial<<<blocks, 256>>>((const BF16 *)base.cudaData + (size_t)step * vocab,
+        (const BF16 *)bias.cudaData, (float2 *)partial.cudaData, vocab);
+    DraftArgmaxFinish<<<1, 256>>>((const float2 *)partial.cudaData, blocks,
+        (float *)ids.cudaData, step);
+    CheckLaunch();
+}
+bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
+    int rows, fastllm::Data &output) {
+    if (inputs.empty() || inputs.size() > 32 || rows <= 0) return false;
+    int width = inputs[0]->dims.empty() ? 0 : inputs[0]->dims.back();
+    if (width <= 0) return false;
+    const std::vector<int> deviceIds{FastllmCudaGetDevice()};
+    DraftHiddenInputs pointers{};
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto &x = *inputs[i];
+        if (x.dataType != fastllm::BFLOAT16 || x.dims.size() != 3 || x.dims[0] != 1 ||
+            x.dims[1] < rows || x.dims[2] != width || x.dataDevice != fastllm::DataDevice::CUDA ||
+            x.dataDeviceIds != deviceIds || !x.cudaData || x.strides.size() != 3 ||
+            x.strides[1] != width || x.strides[2] != 1) return false;
+        pointers.ptr[i] = (const BF16 *)x.cudaData;
+    }
+    Output(output, fastllm::BFLOAT16, {1, rows, width * (int)inputs.size()});
+    size_t total = (size_t)rows * width * inputs.size();
+    DraftConcat<<<(total + 255) / 256, 256>>>(pointers, (BF16 *)output.cudaData,
+        rows, width, inputs.size());
+    CheckLaunch();
+    return true;
+}
+
+void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,
+        const fastllm::Data &mask, const fastllm::Data &liveKeys, int rows,
+        fastllm::Data &hidden, fastllm::Data &positions) {
+    using namespace fastllm;
+    int channels = embedding.dims.back();
+    Output(hidden, BFLOAT16, {1, rows, channels});
+    Output(positions, FLOAT32, {1, rows});
+    DraftInput<<<dim3((channels + 255) / 256, rows), 256>>>((const float *)id.cudaData,
+        (const BF16 *)embedding.cudaData, (const BF16 *)mask.cudaData,
+        (const int *)liveKeys.cudaData, (BF16 *)hidden.cudaData,
+        (float *)positions.cudaData, channels);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveDraftAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int window,
+        bool shortAttention, fastllm::Data &scores, fastllm::Data &output) {
+    using namespace fastllm;
+    int rows = query.dims[1];
+    AssertInFastLLM(rows > 1 && rows < 32 && dim > 0 && dim <= 256 && dim % 4 == 0,
+                    "Unsupported Naive draft graph attention shape.");
+    Output(output, BFLOAT16, {1, rows, heads * dim});
+    DraftLength keys{(const int *)liveKeys.cudaData, window, rows};
+    DraftLength past{(const int *)liveKeys.cudaData, window, 0};
+    auto *q = (const BF16 *)query.cudaData, *k = (const BF16 *)key.cudaData;
+    auto *v = (const BF16 *)value.cudaData;
+    auto *out = (BF16 *)output.cudaData;
+    if (shortAttention) {
+        AttentionShort<<<dim3(heads, rows), 256>>>(q, k, v, nullptr, nullptr, out,
+            heads, kvHeads, dim, dim, key.dims[2], keys, 256, past, window, false);
+    } else {
+        Output(scores, FLOAT32, {rows, heads, window + rows - 1});
+        auto kernel = dim <= 192 ? AttentionScoresPrefill<192, DraftLength, DraftLength>
+                                : AttentionScoresPrefill<256, DraftLength, DraftLength>;
+        kernel<<<dim3(heads, rows), 128>>>(q, k, nullptr, (float *)scores.cudaData,
+            heads, kvHeads, dim, key.dims[2], keys, keys, past, window, false);
+        AttentionSoftmax<<<rows * heads, 256>>>((float *)scores.cudaData, nullptr, heads, keys);
+        AttentionValuesPrefill<<<dim3((heads + 3) / 4, rows), 128>>>((float *)scores.cudaData,
+            v, nullptr, out, heads, kvHeads, dim, keys, keys, past, window, false);
+    }
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
+        const fastllm::Data &weights, const fastllm::Data &packedKeys,
+        const fastllm::Data &liveKeys, int capacity, bool fp8Query,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices) {
+    using namespace fastllm;
+    const int rows = query.dims[1];
+    if (rows == 1) {
+        FastllmCudaNaiveDecodeIndexer(query, weights, packedKeys, liveKeys,
+            capacity, fp8Query, scratch, indices);
+        return;
+    }
+    // Score every causal row together, retaining each row's exact decode MMA
+    // and head accumulation. Cooperative selection stays within its original
+    // resident grid; independent workspaces let the final sorts run together.
+    Output(indices, INT32, {rows, naive_topk::kTopK});
+    Output(scratch.indexScores, INT32, {rows, capacity});
+    Output(scratch.topk, INT32, {rows, (int)(sizeof(naive_topk::Workspace) / sizeof(int))});
+    DecodeKeys keys{(const int *)liveKeys.cudaData, 0};
+    const int stride = packedKeys.dims[2];
+    IndexerTopKOutput scoreOutput{(unsigned *)scratch.indexScores.cudaData, nullptr};
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    if (fp8Query && FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) {
+        Output(scratch.indexQuery, BFLOAT16, {rows * 16, 128});
+        Output(scratch.indexScale, FLOAT32, {rows * 16});
+        naive_dsa_mma::QuantizeIndexer<<<rows * 16, 128>>>((const BF16 *)query.cudaData,
+            (BF16 *)scratch.indexQuery.cudaData, (float *)scratch.indexScale.cudaData, 128, 0);
+        naive_dsa_mma::IndexerDecodeScores<IndexerTopKOutput, DecodeKeys, true>
+            <<<dim3((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, rows), naive_dsa_mma::kThreads>>>(
+                (const BF16 *)scratch.indexQuery.cudaData, (const BF16 *)packedKeys.cudaData,
+                (const float *)scratch.indexScale.cudaData, (const BF16 *)weights.cudaData,
+                scoreOutput, stride, keys, capacity - 1);
+    } else
+#endif
+    {
+        Output(scratch.indexQuery, FLOAT32, {rows * 16, 128});
+        RoundIndexer<<<rows * 16, 128>>>((const BF16 *)query.cudaData,
+            (float *)scratch.indexQuery.cudaData, 128, 0, fp8Query);
+        IndexScoresDecode<IndexerTopKOutput, DecodeKeys, true><<<dim3((capacity + 7) / 8, rows), 256>>>(
+            (const float *)scratch.indexQuery.cudaData, (const BF16 *)packedKeys.cudaData,
+            (const BF16 *)weights.cudaData, scoreOutput, stride, keys, capacity - 1);
+    }
+    auto *workspaces = (naive_topk::Workspace *)scratch.topk.cudaData;
+    for (int row = 0; row < rows; ++row) {
+        auto *workspace = workspaces + row;
+        auto *scores = (const unsigned *)scratch.indexScores.cudaData + (size_t)row * capacity;
+        DecodeKeys count{(const int *)liveKeys.cudaData + row, 0};
+        auto *histograms = workspace->partials;
+        auto *ties = workspace->ties;
+        auto *state = &workspace->state;
+        auto *candidates = &workspace->candidates;
+        void *args[] = {&scores, &count, &histograms, &ties, &state, &candidates};
+        auto status = cudaLaunchCooperativeKernel((void *)naive_topk::Select<unsigned, DecodeKeys>,
+            DecodeTopKBlocks(), naive_topk::kThreads, args, 0, cudaStreamPerThread);
+        if (status != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            if (!FastllmCudaGraphIsCapturingFast())
+                AssertInFastLLM(false, "Naive verify TopK launch failed.");
+        }
+    }
+    naive_topk::Sort<<<rows, naive_topk::kThreads>>>(&workspaces->candidates, &workspaces->state,
+        (int *)indices.cudaData, sizeof(naive_topk::Workspace));
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, const fastllm::Data &sink,
+        const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
+        int dim, int valueDim, int window,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+    using namespace fastllm;
+    const int rows = query.dims[1];
+    Output(output, BFLOAT16, {1, rows, heads * valueDim});
+    if (dim == kSwaQkDim && valueDim == kSwaValueDim &&
+        (window == kSwaWindow || (!window && indices.dims.empty() && capacity > 0 && capacity <= 256))) {
+        DecodeKeys keys{(const int *)liveKeys.cudaData, window ? window : capacity};
+        auto *q = (const BF16 *)query.cudaData;
+        auto *k = (const BF16 *)key.cudaData;
+        auto *v = (const BF16 *)value.cudaData;
+        auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        auto *out = (BF16 *)output.cudaData;
+        LaunchShortAttention<true>(q, k, v, bias, out, rows, heads, kvHeads,
+            key.dims[2], keys, window != 0);
+        CheckLaunch();
+        return;
+    }
+    const bool grouped = heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
+    const bool shared = grouped && (heads / kvHeads) % kDecodeSharedHeads == 0;
+    if (rows > 1 && !window && !indices.dims.empty() && grouped && !shared &&
+        dim <= kDecodeQkDim && valueDim == kDecodePVValueDim) {
+        // The grouped decode kernels keep their per-row arithmetic and causal
+        // lengths, with independent score/partial slices indexed by grid.z.
+        constexpr int count = kDecodePVKeys;
+        Output(scratch.attentionScores, FLOAT32, {rows, heads, count});
+        Output(scratch.attentionPartial, FLOAT32, {rows, heads, kDecodePVParts, valueDim});
+        auto *scores = (float *)scratch.attentionScores.cudaData;
+        auto *partial = (float *)scratch.attentionPartial.cudaData;
+        auto *selected = (const int *)indices.cudaData;
+        auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        DecodeKeys keys{(const int *)liveKeys.cudaData, 0};
+        AttentionScoresDecodeGrouped<4, kDecodeQkDim, 32, DecodeKeys, true>
+            <<<dim3(heads / 4, count / 32, rows), 128>>>((const BF16 *)query.cudaData,
+                (const BF16 *)key.cudaData, selected, scores, heads, kvHeads, dim,
+                key.dims[2], keys, count, capacity - 1, true);
+        AttentionSoftmax<<<rows * heads, 256>>>(scores, bias, heads, count);
+        AttentionValuesDecodeGrouped<4, DecodeKeys, true>
+            <<<dim3(heads / 4, kDecodePVParts, rows), kDecodePVValueDim>>>(scores,
+                (const BF16 *)value.cudaData, selected, partial, heads, kvHeads, keys, capacity - 1, true);
+        AttentionValuesDecodeReduce<<<dim3((heads * valueDim + 255) / 256, rows), 256>>>(
+            partial, (BF16 *)output.cudaData, heads);
+        CheckLaunch();
+        return;
+    }
+    if (window) {
+        Output(scratch.windowKey, BFLOAT16, {1, window, key.dims[2]});
+        Output(scratch.windowValue, BFLOAT16, {1, window, value.dims[2]});
+    }
+    for (int row = 0; row < rows; ++row) {
+        Data q(BFLOAT16, {1, 1, heads * dim}), live(INT32, {1});
+        Data out(BFLOAT16, {1, 1, heads * valueDim}), selected;
+        q.FakeFrom(query, (size_t)row * heads * dim * sizeof(BF16));
+        live.FakeFrom(liveKeys, row * sizeof(int));
+        out.FakeFrom(output, (size_t)row * heads * valueDim * sizeof(BF16));
+        if (!indices.dims.empty()) {
+            selected.Resize({1, 2048});
+            selected.FakeFrom(indices, (size_t)row * 2048 * sizeof(int));
+        }
+        if (window) {
+            int kc = key.dims[2], vc = value.dims[2];
+            CopyVerifyWindow<<<(window * (kc + vc) + 255) / 256, 256>>>(
+                (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+                (BF16 *)scratch.windowKey.cudaData, (BF16 *)scratch.windowValue.cudaData,
+                (const int *)liveKeys.cudaData, row, kc, vc, window);
+        }
+        FastllmCudaNaiveDecodeAttention(q, window ? scratch.windowKey : key,
+            window ? scratch.windowValue : value, selected, sink, live, capacity,
+            heads, kvHeads, dim, valueDim, window, scratch, out);
+    }
+}
+
+namespace {
+struct DraftTPGroup { std::vector<int> devices; std::vector<ncclComm_t> comms; };
+}
+void *FastllmCudaNaiveDraftTPCreate(const std::vector<int> &devices) {
+    if (devices.size() < 2 || devices.size() > (size_t)FastllmCudaGetDeviceCount()) return nullptr;
+    for (size_t i = 0; i < devices.size(); ++i)
+        if (devices[i] < 0 || std::find(devices.begin(), devices.begin() + i, devices[i]) != devices.begin() + i)
+            return nullptr;
+    auto *group = new DraftTPGroup{devices, std::vector<ncclComm_t>(devices.size())};
+    int previous = FastllmCudaGetDevice();
+    if (ncclCommInitAll(group->comms.data(), devices.size(), devices.data()) != ncclSuccess) {
+        for (auto comm : group->comms) if (comm) ncclCommAbort(comm);
+        delete group; group = nullptr;
+    }
+    FastllmCudaSetDevice(previous);
+    return group;
+}
+void FastllmCudaNaiveDraftTPDestroy(void *opaque) {
+    if (!opaque) return;
+    auto *group = (DraftTPGroup *)opaque;
+    int previous = FastllmCudaGetDevice();
+    for (size_t i = 0; i < group->comms.size(); ++i) {
+        FastllmCudaSetDevice(group->devices[i]);
+        cudaDeviceSynchronize();
+        ncclCommDestroy(group->comms[i]);
+    }
+    FastllmCudaSetDevice(previous);
+    delete group;
+}
+void FastllmCudaNaiveDraftTPReduce(void *opaque, int rank, fastllm::Data &data) {
+    auto *group = (DraftTPGroup *)opaque;
+    fastllm::AssertInFastLLM(group && rank >= 0 && rank < (int)group->devices.size() &&
+        data.dataType == fastllm::BFLOAT16 && data.dataDeviceIds == std::vector<int>{group->devices[rank]},
+        "Invalid draft TP reduction.");
+    fastllm::AssertInFastLLM(ncclAllReduce(data.cudaData, data.cudaData, data.Count(0), ncclBfloat16,
+        ncclSum, group->comms[rank], cudaStreamPerThread) == ncclSuccess, "Draft TP reduction failed.");
 }

@@ -7,10 +7,12 @@
 #include "utils.h"
 
 #include "fastllm.h"
+#include "kvmem.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
 #endif
 #include "contextconfig.h"
+#include "moe_cache_config.h"
 #include "devices/disk/diskdevice.h"
 
 #include "executor.h"
@@ -119,7 +121,10 @@ namespace fastllm {
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
             if (data.isModelWeight && !data.directMemory) {
-                return FastllmCudaMallocModelWeight(bytes, data.name);
+                // TP NVFP4 sources are retired after each layer is repacked.
+                bool transientExpert = data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
+                    (data.tpLinearType == TP_LINEAR_ROW || data.tpLinearType == TP_LINEAR_COLUMN);
+                return FastllmCudaMallocModelWeightGrouped(bytes, data.name, transientExpert);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
@@ -560,6 +565,22 @@ namespace fastllm {
 
     uint64_t GetMoeCudaCacheBytes() {
         return moeCudaCacheBytes;
+    }
+
+    namespace {
+        std::mutex moeCacheConfigMutex;
+        MoeCacheConfig moeCacheConfig;
+    }
+
+    void SetMoeCacheConfig(const MoeCacheConfig &config) {
+        config.Validate();
+        std::lock_guard<std::mutex> lock(moeCacheConfigMutex);
+        moeCacheConfig = config;
+    }
+
+    MoeCacheConfig GetMoeCacheConfig() {
+        std::lock_guard<std::mutex> lock(moeCacheConfigMutex);
+        return moeCacheConfig;
     }
 
     void SetMoeCpuCacheBytes(uint64_t bytes) {
@@ -1222,7 +1243,23 @@ namespace fastllm {
         CopyFrom(ori);
     }
 
+    bool ReleaseKvMemCache(Data &cache) {
+        if (!cache.kvMemConfig) {
+            return false;
+        }
+        cache.pageIndex.clear();
+        cache.pagedKVCacheData = nullptr;
+        cache.lastPageLen = 0;
+        cache.isPagedKVCache = false;
+        cache.kvMemCache.reset();
+        cache.kvMemConfig.reset();
+        return true;
+    }
+
     void Data::FakeFrom(const Data &ori, size_t offset) {
+        if (ori.kvMemConfig || kvMemConfig) {
+            throw std::runtime_error("KVMem cache views require an explicit backend implementation");
+        }
         AssertInFastLLM(!ori.cudaNativeNvfp4Layout, "Native NVFP4 weight views require restoring the source layout first.");
         this->cudaNativeNvfp4Layout = false;
         this->dataType = ori.dataType;
@@ -1244,6 +1281,9 @@ namespace fastllm {
 
     void Data::CopyFrom(const Data &ori) {
         if (this == &ori) return;
+        if (ori.kvMemConfig || kvMemConfig) {
+            throw std::runtime_error("KVMem cache snapshots require an explicit backend implementation");
+        }
 #ifdef USE_CUDA
         if (this->cudaNativeNvfp4Layout) FastllmCudaRestoreNativeNvfp4(*this);
         // A clone belongs to the source device. The executor may currently
@@ -2598,7 +2638,7 @@ namespace fastllm {
         if (isFake) {
             return;
         }
-        if (this->isPagedKVCache && !this->pageIndex.empty()) {
+        if (!this->kvMemCache && this->isPagedKVCache && !this->pageIndex.empty()) {
             this->pagedKVCacheData->ReleasePageIndices(this->pageIndex);
         }
         if (this->multiDeviceData) {

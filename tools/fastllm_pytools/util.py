@@ -30,6 +30,36 @@ def _probability(value: str) -> float:
         raise argparse.ArgumentTypeError("must be a probability in [0, 1]")
     return result
 
+def _moe_cache_int(value: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be an integer in [0, 2147483647]")
+    if not 0 <= result <= (1 << 31) - 1:
+        raise argparse.ArgumentTypeError("must be an integer in [0, 2147483647]")
+    return result
+
+def _moe_cache_interval(value: str) -> int:
+    result = _moe_cache_int(value)
+    if result == 0:
+        raise argparse.ArgumentTypeError("MoE cache update interval must be positive")
+    return result
+
+def _moe_cache_float(value: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a finite non-negative float32 value")
+    if not 0 <= result <= 3.4028234663852886e38:
+        raise argparse.ArgumentTypeError("must be a finite non-negative float32 value")
+    return result
+
+def _moe_cache_factor(value: str) -> float:
+    result = _moe_cache_float(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("MoE cache replacement factor must be >= 1")
+    return result
+
 def _memory_size_bytes(value) -> int:
     """Parse a non-negative binary memory size such as 3g or 512m."""
     maximum = (1 << 64) - 1
@@ -852,6 +882,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
+    parser.add_argument('--kvmem', type=str, default=None,
+                        help='启用稀疏主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭；单卡单请求，Qwen3/3.5 普通解码及 Qwen3.5 DFlash/MTP')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
@@ -874,6 +906,23 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = 'moe_cuda_cache', type = _memory_size_bytes,
                         default = 0,
                         help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
+    cache_policy = parser.add_argument_group('GGUF/NVFP4/FP8混合decode缓存更新（加载模型前设置）')
+    for name, kind, default, help_text in (
+        ('half_life', _moe_cache_float, 128., 'decode热度半衰期，单位解码步（可验证多个推测token）；0不衰减，默认128'),
+        ('update_interval', _moe_cache_interval, 1, '每多少个decode步更新一次，默认1'),
+        ('max_replacements', _moe_cache_int, 96, '每次更新跨层换入专家数上限；0关闭decode换入，默认96'),
+        ('max_bytes', _memory_size_bytes, 0, '每次更新换入字节上限，如30m；0不另设字节上限'),
+        ('min_heat', _moe_cache_float, 1., '候选专家最低热度，默认1'),
+        ('margin', _moe_cache_float, 1., '候选热度必须超过驻留热度乘factor再加此值，默认1'),
+        ('factor', _moe_cache_factor, 1., '驻留热度的替换保护倍数，至少1，默认1'),
+        ('min_residence', _moe_cache_int, 0, '换入后最少驻留decode步数，默认0'),
+        ('prefill_prior', _probability, 0., 'decode继承的归一化prefill热度比例[0,1]；默认0，保留缓存内容'),
+    ):
+        option = 'moe_cache_' + name
+        cache_policy.add_argument('--' + option, '--' + option.replace('_', '-'),
+                                  dest=option, type=kind, default=default, help=help_text)
+    cache_policy.add_argument('--moe_cache_rank_by_bytes', '--moe-cache-rank-by-bytes',
+                              action='store_true', help='按热度收益/换入字节排序；默认按热度收益排序')
     parser.add_argument('--moe_cpu_cache', '--moe-cpu-cache',
                         dest = 'moe_cpu_cache', type = _memory_size_bytes,
                         default = 0,
@@ -913,7 +962,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "CUDA模型权重slab大小（MiB）；默认按模型选择，0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
     parser.add_argument("--mtp_min_p", "--mtp-min-p", type = _probability, default = None,
-                        help = "Qwen4 贪心 MTP 草稿概率阈值；低于阈值时停止草稿链，0 关闭（默认），--mtp 指定最大草稿数")
+                        help = "Qwen4 / GLM-5.3 贪心 MTP 草稿概率阈值；低于阈值时停止草稿链，0 关闭（默认），--mtp 指定最大草稿数")
     parser.add_argument("--mtp_fp8_draft_head", "--mtp-fp8-draft-head",
                         type = int, choices = [0, 1], default = None,
                         help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
@@ -1280,8 +1329,10 @@ def make_normal_llm_model(args, startup_progress = None):
     is_deepseek_v41_model = False
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
+    is_naive_n05_model = False
     is_qwen35_model = False
     is_qwen38_flash_next_model = False
+    is_glm5_next_model = False
     is_deepseek_v4_model = False
     is_dots3_note_model = False
     if (os.path.exists(config_path) or gguf_config is not None):
@@ -1294,6 +1345,9 @@ def make_normal_llm_model(args, startup_progress = None):
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
+            is_naive_n05_model = model_type == "naive_n05_flash"
+            if is_naive_n05_model:
+                is_thread_tp_moe_model = True
             is_laguna_model = (architecture == 'LagunaForCausalLM' or
                                 model_type == 'laguna')
             is_dots3_note_model = (
@@ -1316,6 +1370,13 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type in ("qwen3_8_flash_next", "qwen4_exp") or
                 text_model_type in ("qwen3_8_flash_next_text", "qwen4_exp_text")
             )
+            is_glm5_next_model = (
+                architecture == "Glm5NextForConditionalGeneration" or
+                model_type == "glm5_next" or
+                text_model_type == "glm5_next_text"
+            )
+            if is_glm5_next_model:
+                is_thread_tp_moe_model = True
             is_deepseek_v4_model = (
                 architecture in ("DeepseekV4ForCausalLM",
                                  "DeepSeekV4ForCausalLM") or
@@ -1414,9 +1475,14 @@ def make_normal_llm_model(args, startup_progress = None):
                         "embedded DSpark draft weights.",
                         flush=True,
                     )
+                elif is_glm5_next_model:
+                    if speculative_draft_path:
+                        raise ValueError(
+                            "GLM-5.3 MTP uses the checkpoint's embedded "
+                            "next-token prediction layer and does not accept an external draft")
                 elif not (is_qwen35_model or is_qwen38_flash_next_model):
                     raise ValueError(
-                        "MTP currently requires a Qwen3.5 or Qwen3.8-Flash-Next target, got "
+                        "MTP currently requires a Qwen3.5, Qwen3.8-Flash-Next or GLM-5.3 target, got "
                         "architecture=%s model_type=%s" %
                         (architecture, model_type))
                 if (not is_deepseek_v4_model and speculative_draft_path and not (
@@ -1552,6 +1618,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 args.device = (cuda_spec or tp_device) if is_qwen38_flash_next_model else tp_device
             if (not user_set_moe_device):
                 args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
+    if (is_naive_n05_model and _uses_thread_tp(getattr(args, "tp", "")) and
+            _thread_tp_cuda_device_count(args.tp) > 1 and cuda_slab_auto):
+        # TP produces thousands of small expert shards per GPU. Keep compact
+        # NVFP4 sources in slabs that Marlin can release one layer at a time.
+        args.cuda_slab = 16
     if ((is_multicuda_tp_model or is_laguna_hybrid_tp_model) and
             _uses_multicuda_device(args.moe_device)):
         # Large MoE checkpoints have tens of thousands of routed-expert tensors.
@@ -1584,6 +1655,13 @@ def make_normal_llm_model(args, startup_progress = None):
         # dense GPU weights instead: their many 6.25 MiB and smaller allocations
         # otherwise waste hundreds of MiB at the CUDA allocation granularity.
         # A 64 MiB slab retains 256-byte alignment and the existing compute paths.
+        args.cuda_slab = 64
+    if (is_glm5_next_model and gguf_config is not None and cuda_slab_auto and
+            _uses_thread_tp(getattr(args, "tp", "")) and
+            (args.moe_device_layers >= 0 or _uses_cuda_device(args.moe_device))):
+        # Resident expert TP doubles the number of small packed allocations.
+        # Pack them into the existing weight slabs instead of paying CUDA's
+        # allocation granularity for each shard. Explicit --cuda_slab wins.
         args.cuda_slab = 64
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
@@ -1656,7 +1734,7 @@ def make_normal_llm_model(args, startup_progress = None):
             if (atype_was_auto and not is_deepseek_v41_model):
                 # DeepSeek-V4.1 的 SetDataType 只接受 float32（推理精度由模型内部
                 # 自己按 BF16 走），--tp 不能像其它模型那样把 atype 改成 float16。
-                args.atype = "bfloat16" if is_laguna_model else "float16"
+                args.atype = "bfloat16" if (is_laguna_model or is_naive_n05_model) else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
@@ -1685,6 +1763,17 @@ def make_normal_llm_model(args, startup_progress = None):
     llm.set_moe_device_layers(-1)
     llm.set_moe_cuda_cache(
         _memory_size_bytes(getattr(args, "moe_cuda_cache", 0)))
+    llm.set_moe_cache_policy(
+        half_life=getattr(args, "moe_cache_half_life", 128.),
+        update_interval=getattr(args, "moe_cache_update_interval", 1),
+        max_replacements=getattr(args, "moe_cache_max_replacements", 96),
+        max_bytes=_memory_size_bytes(getattr(args, "moe_cache_max_bytes", 0)),
+        min_heat=getattr(args, "moe_cache_min_heat", 1.),
+        margin=getattr(args, "moe_cache_margin", 1.),
+        factor=getattr(args, "moe_cache_factor", 1.),
+        min_residence=getattr(args, "moe_cache_min_residence", 0),
+        prefill_prior=getattr(args, "moe_cache_prefill_prior", 0.),
+        rank_by_bytes=getattr(args, "moe_cache_rank_by_bytes", False))
     llm.set_moe_cpu_cache(
         _memory_size_bytes(getattr(args, "moe_cpu_cache", 0)))
     llm.set_ngram_device(args.ngram_device)
@@ -1758,9 +1847,10 @@ def make_normal_llm_model(args, startup_progress = None):
     mtp_min_p = getattr(args, "mtp_min_p", None)
     if mtp_min_p is not None:
         mtp_min_p = _probability(mtp_min_p)
-        if mtp_min_p > 0 and (not is_qwen38_flash_next_model or mtp <= 0):
-            raise ValueError("--mtp_min_p requires Qwen4 with --mtp enabled")
-        os.environ["FASTLLM_QWEN4_MTP_MIN_P"] = str(mtp_min_p)
+        if mtp_min_p > 0 and (not (is_qwen38_flash_next_model or is_glm5_next_model) or mtp <= 0):
+            raise ValueError("--mtp_min_p requires Qwen4 or GLM-5.3 with --mtp enabled")
+        name = "FASTLLM_GLM5_NEXT_MTP_MIN_P" if is_glm5_next_model else "FASTLLM_QWEN4_MTP_MIN_P"
+        os.environ[name] = str(mtp_min_p)
     os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"] = str(mtp)
     graph = None
     if (args.custom != ""):
@@ -1832,6 +1922,15 @@ def make_normal_llm_model(args, startup_progress = None):
             slot_mb = args.moe_pinned_slot_mb if args.moe_pinned_slot_mb > 0 else 4
             if hasattr(llm, "set_moe_pinned_staging"):
                 llm.set_moe_pinned_staging(slots, slot_mb)
+        if getattr(args, "kvmem", None) is not None:
+            kvmem_options = json.loads(args.kvmem)
+            if not isinstance(kvmem_options, dict):
+                raise ValueError("--kvmem must be a JSON object")
+            if args.kv_cache_limit not in ("", "auto"):
+                raise ValueError("Use KVMem resident_tokens instead of --kv_cache_limit")
+            if args.chunked_prefill_size > 0:
+                kvmem_options.setdefault("prefill_tokens", args.chunked_prefill_size)
+            model.set_kvmem(**kvmem_options)
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()

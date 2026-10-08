@@ -53,6 +53,250 @@ public:
     }
 };
 
+// Resident experts stay on the GPU. Only misses are split between NUMA and
+// temporary GPU storage; this policy never admits or evicts a cache entry.
+// Keep one instance per layer: quantization, dimensions and CPU cost can vary.
+class MoeDecodeOverlapScheduler {
+public:
+    using Estimate = MoeDecodeScheduler::Estimate;
+    Estimate cpuExpert, residentExpert, copiedExpert, stagedExpert, dispatch;
+    // Decode submits CUDA work while the CPU workers are already active.
+    // Only the delay before DMA starts is serialized with the GPU pipeline;
+    // the full host submission time is a separate completion bound.
+    Estimate decodeLaunch, gateCopy, gateCompute;
+    std::array<Estimate, MoeDecodeScheduler::maxExperts + 1> decodeCpu;
+    uint64_t calls = 0;
+
+    void ObserveDecodeCpu(int routes, double us) {
+        if (routes <= 0 || routes >= int(decodeCpu.size()) || us <= 0) return;
+        decodeCpu[routes].Observe(us);
+        cpuExpert.Observe(us / routes);
+    }
+
+    double DecodeCpuUs(int routes) const {
+        if (routes <= 0) return 0;
+        if (routes < int(decodeCpu.size()) && decodeCpu[routes].initialized)
+            return decodeCpu[routes].us;
+        int lower = 0, upper = 0;
+        for (int n = 1; n < int(decodeCpu.size()); ++n) if (decodeCpu[n].initialized) {
+            if (n < routes) lower = n;
+            else { upper = n; break; }
+        }
+        if (lower && upper)
+            return decodeCpu[lower].us + (decodeCpu[upper].us - decodeCpu[lower].us) *
+                double(routes - lower) / (upper - lower);
+        return routes * cpuExpert.us;
+    }
+
+    // Single-row CPU cost is not linear in the number of experts. Measure
+    // the no-upload path before comparing splits, and refresh it sparsely.
+    // This remains distinct from the verifier's route-reuse cost model.
+    int SelectDecodeMisses(int misses, int hits) const {
+        if (misses <= 0) return 0;
+        if (misses >= int(decodeCpu.size())) return SelectMisses(misses, hits);
+        if (!decodeCpu[misses].initialized) return 0;
+        if (!copiedExpert.initialized || !stagedExpert.initialized)
+            return std::max(1, misses / 2);
+        double gpu = hits * residentExpert.us;
+        double best = std::max(DecodeCpuUs(misses), gpu);
+        int selected = 0;
+        for (int n = 1; n <= misses; ++n) {
+            if (gateCopy.initialized && gateCompute.initialized) {
+                gpu = std::max(gpu, (n - 1) * copiedExpert.us + gateCopy.us) + gateCompute.us;
+                gpu = std::max(gpu, n * copiedExpert.us) + std::max(0.0, stagedExpert.us - gateCompute.us);
+            } else {
+                gpu = std::max(gpu, n * copiedExpert.us) + stagedExpert.us;
+            }
+            const double finish = decodeLaunch.initialized
+                ? std::max(dispatch.us, decodeLaunch.us + gpu) : dispatch.us + gpu;
+            const double cost = std::max(DecodeCpuUs(misses - n), finish);
+            if (cost < best * .97) { best = cost; selected = n; }
+        }
+        if (calls % 127 == 126) return selected ? 0 : 1;
+        return selected;
+    }
+
+    // routeCounts describes reuse of each unique missed expert in a verifier.
+    // Copies are charged once per expert; CPU/GPU arithmetic once per route.
+    int SelectMisses(int misses, int hits, const int *routeCounts = nullptr) const {
+        if (misses <= 0) return 0;
+        // Measure useful work during warmup instead of running extra experts.
+        // A single miss needs two calls to observe both CPU and transfer costs.
+        if (!cpuExpert.initialized) return misses / 2;
+        if (!copiedExpert.initialized || !stagedExpert.initialized)
+            return std::max(1, misses / 2);
+        const double resident = hits * residentExpert.us;
+        int remaining = 0;
+        for (int i = 0; i < misses; ++i) remaining += routeCounts ? routeCounts[i] : 1;
+        double best = std::max(remaining * cpuExpert.us, resident);
+        int selected = 0;
+        double gpu = resident;
+        for (int n = 1; n <= misses; ++n) {
+            // Each expert can run as soon as its own DMA and the preceding
+            // GPU work finish, overlapping transfers of subsequent experts.
+            const int routes = routeCounts ? routeCounts[n - 1] : 1;
+            remaining -= routes;
+            gpu = std::max(gpu, n * copiedExpert.us) + routes * stagedExpert.us;
+            const double cost = dispatch.us + std::max(remaining * cpuExpert.us, gpu);
+            if (cost < best * .97) { best = cost; selected = n; }
+        }
+        // Refresh an unused path occasionally, so a change in CPU/PCIe speed
+        // can recover from an all-CPU or all-GPU choice without permanent bias.
+        if (calls % 127 == 126) {
+            if (!selected) return 1;
+            if (selected == misses) return selected - 1;
+        }
+        return selected;
+    }
+
+    struct RankPlan {
+        const MoeDecodeOverlapScheduler *timing = nullptr;
+        int hits = 0, misses = 0;
+        const int *routeCounts = nullptr;
+        int selected = 0;
+    };
+
+    struct SharedRankPlan {
+        const MoeDecodeOverlapScheduler *timing = nullptr;
+        int hits = 0, capacity = 0;
+        // Activation distribution and result gathering, including host staging.
+        double handoffUs = 0;
+    };
+
+    // Unlike EP's fixed expert ownership, every unique miss can run on any GPU.
+    // The caller orders misses by cross-row reuse and keeps one owner per expert.
+    static std::vector<int> AssignSharedMisses(const std::vector<SharedRankPlan> &plans,
+            const Estimate &cpu, const std::vector<int> &reuse, uint64_t calls,
+            const MoeDecodeOverlapScheduler *decodeCpu = nullptr) {
+        std::vector<int> result(reuse.size(), -1), current(reuse.size(), -1);
+        std::vector<int> counts(plans.size(), 0);
+        std::vector<double> gpu(plans.size(), 0);
+        int remaining = 0;
+        for (int n : reuse) remaining += n;
+        // A decode baseline must measure the actual CPU subset, excluding
+        // GPU submission/waits. Multiple CPU experts need not cost linearly.
+        if (decodeCpu && remaining > 0 && remaining < int(decodeCpu->decodeCpu.size()) &&
+            !decodeCpu->decodeCpu[remaining].initialized) return result;
+        auto cpuCost = [&](int n) { return decodeCpu ? decodeCpu->DecodeCpuUs(n) : n * cpu.us; };
+        double bound = 0;
+        bool calibrating = !cpu.initialized;
+        for (size_t r = 0; r < plans.size(); ++r) {
+            const auto &p = plans[r];
+            if (!p.timing) continue;
+            gpu[r] = p.hits * p.timing->residentExpert.us;
+            if (p.hits) bound = std::max(bound, gpu[r] + p.handoffUs);
+            calibrating |= p.capacity > 0 &&
+                (!p.timing->copiedExpert.initialized || !p.timing->stagedExpert.initialized);
+        }
+        if (reuse.empty() || plans.empty()) return result;
+        if (calibrating) {
+            // Keep some real CPU work, and rotate the probes when a batch has
+            // fewer unique misses than devices. Never synthesize extra experts.
+            const int probes = reuse.size() == 1 ? int(calls % 2) : std::max(1, int(reuse.size()) / 2);
+            for (int i = 0; i < probes; ++i) {
+                for (size_t offset = 0; offset < plans.size(); ++offset) {
+                    const int r = (i + (reuse.size() == 1 ? calls / 2 : calls) + offset) % plans.size();
+                    if (plans[r].timing && counts[r] < plans[r].capacity) {
+                        result[i] = r; ++counts[r]; break;
+                    }
+                }
+            }
+            return result;
+        }
+        double best = std::max(cpuCost(remaining), bound);
+        for (size_t i = 0; i < reuse.size(); ++i) {
+            int selected = -1;
+            double finish = 0, compute = 0;
+            for (size_t r = 0; r < plans.size(); ++r) {
+                const auto &p = plans[r];
+                if (!p.timing || counts[r] >= p.capacity) continue;
+                const double next = std::max(gpu[r], (counts[r] + 1) * p.timing->copiedExpert.us) +
+                    reuse[i] * p.timing->stagedExpert.us;
+                const double end = next + p.timing->dispatch.us + p.handoffUs;
+                if (selected < 0 || end < finish) { selected = r; finish = end; compute = next; }
+            }
+            if (selected < 0) break;
+            current[i] = selected; ++counts[selected];
+            gpu[selected] = compute; bound = std::max(bound, finish);
+            remaining -= reuse[i];
+            const double cost = std::max(cpuCost(remaining), bound);
+            if (cost < best * .97) { best = cost; result = current; }
+        }
+        // Probe an unused device occasionally after the workload/link changes.
+        if (calls % 127 == 126) {
+            if (decodeCpu && std::find_if(result.begin(), result.end(), [](int r) { return r >= 0; }) != result.end())
+                return std::vector<int>(reuse.size(), -1);
+            const int r = (calls / 127) % plans.size();
+            if (plans[r].timing && plans[r].capacity > 0 &&
+                std::find(result.begin(), result.end(), r) == result.end()) {
+                auto miss = std::find(result.begin(), result.end(), -1);
+                if (miss != result.end()) *miss = r;
+            }
+        }
+        return result;
+    }
+
+    // All ranks share one CPU worker pool. Account for its entire remaining
+    // subset while each GPU has its own resident work and measured DMA cost.
+    // A null timing leaves this rank's misses on CPU (e.g. no staging buffer).
+    static void SelectParallelMisses(std::vector<RankPlan> &plans, const Estimate &cpu) {
+        int remaining = 0;
+        bool calibrating = !cpu.initialized;
+        for (auto &p : plans) {
+            p.selected = 0;
+            for (int i = 0; i < p.misses; ++i)
+                remaining += p.routeCounts ? p.routeCounts[i] : 1;
+            calibrating |= p.timing && p.misses &&
+                (!p.timing->copiedExpert.initialized || !p.timing->stagedExpert.initialized);
+        }
+        if (!remaining) return;
+        if (calibrating) {
+            for (auto &p : plans) if (p.timing && p.misses)
+                p.selected = cpu.initialized ? std::max(1, p.misses / 2) : p.misses / 2;
+            return;
+        }
+        std::vector<int> current(plans.size(), 0);
+        std::vector<double> gpu(plans.size(), 0);
+        double gpuBound = 0;
+        for (size_t r = 0; r < plans.size(); ++r) if (plans[r].timing) {
+            gpu[r] = plans[r].hits * plans[r].timing->residentExpert.us;
+            gpuBound = std::max(gpuBound, gpu[r]);
+        }
+        double best = std::max(remaining * cpu.us, gpuBound);
+        // Sweep increasing GPU completion-time limits. At each limit, taking
+        // every affordable prefix minimizes the common CPU remainder. This
+        // avoids enumerating every combination of per-rank expert counts.
+        while (true) {
+            int next = -1;
+            double finish = 0, compute = 0;
+            for (size_t r = 0; r < plans.size(); ++r) {
+                const auto &p = plans[r];
+                if (!p.timing || current[r] == p.misses) continue;
+                const int routes = p.routeCounts ? p.routeCounts[current[r]] : 1;
+                const double cost = std::max(gpu[r], (current[r] + 1) * p.timing->copiedExpert.us) +
+                    routes * p.timing->stagedExpert.us;
+                const double end = p.timing->dispatch.us + cost;
+                if (next < 0 || end < finish) { next = r; finish = end; compute = cost; }
+            }
+            if (next < 0) break;
+            const auto &p = plans[next];
+            remaining -= p.routeCounts ? p.routeCounts[current[next]] : 1;
+            ++current[next];
+            gpu[next] = compute;
+            gpuBound = std::max(gpuBound, finish);
+            const double cost = std::max(remaining * cpu.us, gpuBound);
+            if (cost < best * .97) {
+                best = cost;
+                for (size_t r = 0; r < plans.size(); ++r) plans[r].selected = current[r];
+            }
+        }
+        for (auto &p : plans) if (p.timing && p.misses && p.timing->calls % 127 == 126) {
+            if (!p.selected) p.selected = 1;
+            else if (p.selected == p.misses) --p.selected;
+        }
+    }
+};
+
 // Observe every routed expert, including CPU work, in a payload-free LRU with
 // the real capacity and record-size partitions. This estimates reuse without copying cold weights
 // into a small cache just to find out that they will be evicted immediately.

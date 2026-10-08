@@ -123,7 +123,7 @@ static MarlinMoeKernelFn GetNvfp4E4M3MarlinMoeKernelImpl(
         128, 2, 8, 4, false, Stages, 1, false>;
 }
 
-template <bool Gate>
+template <bool Gate, bool FullK = false>
 static MarlinMoeKernelFn GetBf16Nvfp4MarlinMoeKernel(
         bool smallBatch, bool narrowPrefill, int &threads) {
     threads = (smallBatch || narrowPrefill) ? 256 : 128;
@@ -131,7 +131,7 @@ static MarlinMoeKernelFn GetBf16Nvfp4MarlinMoeKernel(
         return marlin_kernel::Marlin<
             marlin_types::kBFloat16.id(), marlin_types::kFE2M1f.id(),
             marlin_types::kBFloat16.id(), marlin_types::kFE4M3fn.id(),
-            256, 1, 8, 8, true, 4, 1, false, Gate>;
+            256, 1, 8, 8, true, 4, 1, false, Gate, FullK>;
     }
     if (narrowPrefill) {
         return marlin_kernel::Marlin<
@@ -281,13 +281,16 @@ static bool PrepareNvfp4E4M3MarlinMoeKernels(int device, bool bf16 = false) {
         maxSharedMemory <= 0) {
         return false;
     }
-    for (int configuration = 0; configuration < (bf16 ? 3 : 2); ++configuration) {
-        const bool smallBatch = configuration == 0;
+    for (int configuration = 0; configuration < (bf16 ? 4 : 2); ++configuration) {
+        const bool smallBatch = configuration == 0 || configuration == 3;
         const bool narrowPrefill = configuration == 2;
         for (bool gate : {true, false}) {
             int threads = 0;
             MarlinMoeKernelFn kernel = GetNvfp4E4M3MarlinMoeKernel(
                 gate, smallBatch, threads, bf16, narrowPrefill);
+            if (configuration == 3)
+                kernel = gate ? GetBf16Nvfp4MarlinMoeKernel<true, true>(true, false, threads)
+                              : GetBf16Nvfp4MarlinMoeKernel<false, true>(true, false, threads);
             int sharedMemory = GetNvfp4E4M3MarlinMoeSharedMemorySize(
                 gate, smallBatch, bf16, narrowPrefill);
             if (kernel == nullptr || sharedMemory > maxSharedMemory ||
@@ -379,10 +382,15 @@ static bool LaunchNvfp4E4M3MarlinMoe(
         const int32_t *numTokensPadded, const float *topkWeights,
         int topk, bool multiplyTopkWeights, int rows, int outputColumns,
         int inputColumns, int *workspace, cudaStream_t stream, int sms,
-        bool bf16, bool narrowPrefill) {
+        bool bf16, bool narrowPrefill, bool singleToken,
+        bool groupedRows = false) {
     int threads = 0;
     MarlinMoeKernelFn kernel = GetNvfp4E4M3MarlinMoeKernel(
         gate, smallBatch, threads, bf16, narrowPrefill);
+    if (groupedRows) {
+        kernel = gate ? GetBf16Nvfp4MarlinMoeKernel<true, true>(true, false, threads)
+                      : GetBf16Nvfp4MarlinMoeKernel<false, true>(true, false, threads);
+    }
     if (kernel == nullptr || activation == nullptr || weight == nullptr ||
         output == nullptr || temporaryOutput == nullptr || scales == nullptr ||
         globalScale == nullptr || sortedTokenIds == nullptr ||
@@ -394,7 +402,19 @@ static bool LaunchNvfp4E4M3MarlinMoe(
     }
 
     const int blocksPerSm = narrowPrefill ? 2 : (gate ? 1 : 2);
-    kernel<<<sms * blocksPerSm, threads,
+    int blocks = sms * blocksPerSm;
+    if (bf16 && smallBatch && singleToken) {
+        // Each route owns one padded 8-row block; the selected kernel has
+        // 128-column tiles. Give each tile its full K range when there are
+        // enough tiles to fill the device, avoiding cross-CTA FP32 reduction.
+        // Keep split-K for smaller grids and respect the workspace capacity.
+        const int64_t tiles =
+            (int64_t)(outputColumns / 128) * (gate ? topk : rows);
+        if (tiles >= sms && tiles <= (int64_t)sms * 4) {
+            blocks = (int)tiles;
+        }
+    }
+    kernel<<<blocks, threads,
              GetNvfp4E4M3MarlinMoeSharedMemorySize(
                  gate, smallBatch, bf16, narrowPrefill),
              stream>>>(
@@ -660,6 +680,50 @@ __global__ void BuildEpMetadataRowsKernel(
         ++activeBlocks;
     }
     numTokensPadded[0] = activeBlocks * 8;
+}
+
+// Stable compact routing for at most 8 rows and top-k <= 16. Each expert
+// tile contains up to eight real routes. Original flattened route ids preserve
+// output scatter and the subsequent per-token weighted reduction order.
+__global__ void BuildGroupedMoeRowsKernel(
+        const int32_t *indices, int32_t *sortedTokenIds,
+        int32_t *gateExpertIds, int32_t *downExpertIds,
+        int32_t *numTokensPadded, int routes) {
+    __shared__ int experts[128], blocks[128], warpCounts[4];
+    const int route = threadIdx.x;
+    const int expert = route < routes ? indices[route] : -1;
+    experts[route] = expert;
+    __syncthreads();
+    int count = 0, leader = route;
+    for (int i = 0; i < route; ++i) {
+        if (experts[i] == expert) {
+            if (count % 8 == 0) leader = i;
+            ++count;
+        }
+    }
+    const bool first = route < routes && count % 8 == 0;
+    if (first) leader = route;
+    int prefix = first;
+    const int lane = route % 32, warp = route / 32;
+    for (int offset = 1; offset < 32; offset *= 2) {
+        int previous = __shfl_up_sync(0xffffffff, prefix, offset);
+        if (lane >= offset) prefix += previous;
+    }
+    if (lane == 31) warpCounts[warp] = prefix;
+    __syncthreads();
+    for (int i = 0; i < warp; ++i) prefix += warpCounts[i];
+    if (route == 127) numTokensPadded[0] = prefix * 8;
+    if (first) {
+        const int block = prefix - 1;
+        blocks[route] = block;
+        gateExpertIds[block] = downExpertIds[block] = expert;
+        reinterpret_cast<int4 *>(sortedTokenIds + block * 8)[0] =
+            make_int4(routes, routes, routes, routes);
+        reinterpret_cast<int4 *>(sortedTokenIds + block * 8)[1] =
+            make_int4(routes, routes, routes, routes);
+    }
+    __syncthreads();
+    if (route < routes) sortedTokenIds[blocks[leader] * 8 + count % 8] = route;
 }
 
 __global__ void ClearAwqMoeRouteCountsKernel(
@@ -2895,7 +2959,8 @@ static bool ValidateNvfp4E4M3Weight(
            (weight->dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
             weight->scales.size() == (size_t)globalScales) &&
            weight->GetBytes() >= packedBytes + scaleBytes &&
-           weight->cudaData != nullptr && weight->directMemory &&
+           weight->cudaData != nullptr && !weight->isFake &&
+           (weight->directMemory || FastllmCudaIsWeightSlabPointer(weight->cudaData)) &&
            !weight->cudaDataBorrowed;
 }
 
@@ -3003,12 +3068,15 @@ static bool BuildNvfp4E4M3LayerCache(
     const size_t downScaleValues =
         (size_t)hidden * (intermediate / 16);
     const size_t temporaryFloats = (size_t)sms * 4 * 8 * 256 * 2;
+    // The launcher uses at most 4*SM blocks; grouped rows share one grid
+    // instead of requiring separate per-row lock segments.
+    const size_t workspaceBytes = (size_t)sms * 4 * sizeof(int);
     const size_t persistentBytes =
         (gateWeightBytes + downWeightBytes) * experts +
         (gateScaleValues + downScaleValues) * experts +
         (size_t)experts * (bf16 ? 3 : 2) * sizeof(float) +
         temporaryFloats * sizeof(float) +
-        (size_t)sms * 4 * sizeof(int) +
+        workspaceBytes +
         (size_t)experts * 3 * sizeof(int32_t);
     const size_t gateSourceBytes = weights[2]->GetBytes();
     const size_t downSourceBytes = weights[3]->GetBytes();
@@ -3104,8 +3172,7 @@ static bool BuildNvfp4E4M3LayerCache(
         (size_t)experts * sizeof(int32_t));
     cache.expertStarts = (int32_t *)AllocateDirect(
         (size_t)experts * sizeof(int32_t));
-    cache.workspace = (int *)AllocateDirect(
-        (size_t)sms * 4 * sizeof(int));
+    cache.workspace = (int *)AllocateDirect(workspaceBytes);
     cache.temporaryOutput = (float *)AllocateDirect(
         temporaryFloats * sizeof(float));
     if (cache.gateWeight == nullptr || cache.downWeight == nullptr ||
@@ -3133,8 +3200,7 @@ static bool BuildNvfp4E4M3LayerCache(
     cudaStream_t stream = cudaStreamPerThread;
     constexpr int threads = 256;
     bool success =
-        cudaMemsetAsync(cache.workspace, 0,
-                        (size_t)sms * 4 * sizeof(int), stream) ==
+        cudaMemsetAsync(cache.workspace, 0, workspaceBytes, stream) ==
         cudaSuccess;
     for (int expert = 0; expert < experts && success; ++expert) {
         fastllm::Data &gate = *weights[2 + expert * 2];
@@ -3403,7 +3469,7 @@ static bool RunNvfp4E4M3MarlinMoe(
         fastllm::Data &activation, fastllm::Data &output,
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
-        int batch, int topk, float swigluLimit) {
+        int batch, int topk, float swigluLimit, bool groupedRows = false) {
     if (input.dataDevice != fastllm::DataDevice::CUDA ||
         (input.dataType != fastllm::DataType::FLOAT16 &&
          input.dataType != fastllm::DataType::FLOAT32 &&
@@ -3442,7 +3508,8 @@ static bool RunNvfp4E4M3MarlinMoe(
     cudaStream_t stream = cudaStreamPerThread;
 
     const int routes = batch * topk;
-    const bool smallBatch = routes <= cache->experts * (bf16 ? 4 : 16);
+    if (groupedRows && (!bf16 || batch < 2 || batch > 8)) return false;
+    const bool smallBatch = groupedRows || routes <= cache->experts * (bf16 ? 4 : 16);
     // Sparse prefill routing wastes rows in the 32-row tile. The 16x256x64
     // tile reduces padding and reuses each activation across more columns.
     // Each gate/up half must be 256-column aligned because it has its own
@@ -3461,6 +3528,15 @@ static bool RunNvfp4E4M3MarlinMoe(
             "route-buffer allocation", cache.get());
     }
 
+    if (groupedRows) {
+        // Serial layer placement reuses scratch across GPUs. This direct
+        // entry bypasses Executor's placement, so migrate before assigning
+        // device metadata; otherwise an existing allocation stays on the
+        // previous layer's GPU. Scratch contents need not be copied.
+        gateOutput.ToDevice(input.dataDevice, input.dataDeviceIds, false);
+        activation.ToDevice(input.dataDevice, input.dataDeviceIds, false);
+        output.ToDevice(input.dataDevice, input.dataDeviceIds, false);
+    }
     gateOutput.dataType = bf16 ? fastllm::DataType::BFLOAT16 : fastllm::DataType::FLOAT16;
     gateOutput.dataDevice = fastllm::DataDevice::CUDA;
     gateOutput.dataDeviceIds = input.dataDeviceIds;
@@ -3499,7 +3575,17 @@ static bool RunNvfp4E4M3MarlinMoe(
         }
         marlinInput = activation.cudaData;
     }
-    if (smallBatch && batch <= 9) {
+    // Reuse weights across ordinary BF16 decode rows that select an expert
+    // in common. The existing stable scatter preserves route order. Below
+    // four rows its metadata overhead often outweighs the saved GEMM work;
+    // exact verification retains the batch-1 tensor-core row layout.
+    const bool groupedDecode = bf16 && batch >= 4 && batch <= 8 &&
+        batch >= fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    if (groupedRows) {
+        BuildGroupedMoeRowsKernel<<<1, 128, 0, stream>>>(
+            indices, routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
+            routeStorage->downExpertIds, routeStorage->numTokensPadded, routes);
+    } else if (smallBatch && batch <= 9 && !groupedDecode) {
         // Give each route a dedicated padded Marlin row. Besides matching
         // the batch-1 reduction layout, this avoids the nondeterministic
         // atomic scatter order when several top-k routes select one expert.
@@ -3529,7 +3615,8 @@ static bool RunNvfp4E4M3MarlinMoe(
             routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
             routeStorage->numTokensPadded, scores, topk, false,
             batch, cache->intermediate * 2, cache->hidden,
-            cache->workspace, stream, cache->sms, bf16, narrowPrefill)) {
+            cache->workspace, stream, cache->sms,
+            bf16, narrowPrefill, batch == 1, groupedRows)) {
         FailNvfp4E4M3MarlinAfterRepack(
             "gate/up Marlin launch", cache.get());
     }
@@ -3555,7 +3642,8 @@ static bool RunNvfp4E4M3MarlinMoe(
             routeStorage->sortedTokenIds, routeStorage->downExpertIds,
             routeStorage->numTokensPadded, scores, 1, !bf16,
             routes, cache->hidden, cache->intermediate,
-            cache->workspace, stream, cache->sms, bf16, narrowPrefill)) {
+            cache->workspace, stream, cache->sms,
+            bf16, narrowPrefill, batch == 1, groupedRows)) {
         FailNvfp4E4M3MarlinAfterRepack(
             "down Marlin launch", cache.get());
     }
@@ -3842,6 +3930,21 @@ bool FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
     return fastllm_marlin_moe::RunAwqMarlinMoe(
         input, gateOutput, activation, output, weights, weightsBatch,
         indices, scores, batch, topk);
+}
+
+bool FastllmCudaMergeMOENVFP4E4M3MarlinRows(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &activation, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int batch, int topk) {
+    if (input.dataType != fastllm::BFLOAT16 || batch < 2 || batch > 8 ||
+        weights == nullptr || weightsBatch < 4 || weights[2] == nullptr ||
+        weights[2]->dataType != fastllm::NVFP4_BLOCK_16_E4M3_PACKED)
+        return false;
+    return fastllm_marlin_moe::RunNvfp4E4M3MarlinMoe(
+        input, gateOutput, activation, output, weights, weightsBatch,
+        indices, scores, batch, topk, 0.0f, true);
 }
 
 bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(

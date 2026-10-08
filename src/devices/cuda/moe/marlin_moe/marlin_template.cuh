@@ -49,7 +49,8 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const int thread_n_blocks, const int thread_k_blocks,
           const bool m_block_size_8, const int stages,
           const int group_blocks, const bool is_zp_float,
-          const bool nvfp4_gate_up = false>
+          const bool nvfp4_gate_up = false,
+          const bool full_k = false>
 __global__ void Marlin(
     const int4 *__restrict__ A, const int4 *__restrict__ B,
     int4 *__restrict__ C, int4 *__restrict__ C_tmp,
@@ -241,7 +242,8 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,  // A ScalarTy
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
-          const bool nvfp4_gate_up = false  // independent gate/up global scales
+          const bool nvfp4_gate_up = false,  // independent gate/up global scales
+          const bool full_k = false
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -402,6 +404,14 @@ __global__ void Marlin(
     part2_mn_tiles = global_mn_tiles % gridDim.x;
     if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+  }
+
+  if constexpr (full_k) {
+    // Keep each output tile's entire K reduction in one CTA. Its arithmetic
+    // must not depend on later tokens' expert choices during verification.
+    if (blockIdx.x >= global_mn_tiles) return;
+    part1_mn_iters = div_ceil(global_mn_tiles - blockIdx.x, gridDim.x);
+    part2_mn_tiles = 0;
   }
 
   int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
@@ -645,6 +655,11 @@ __global__ void Marlin(
   };
 
   auto init_slice = [&]() {
+    if constexpr (full_k) {
+      if (part1_mn_iters) init_part1_slice();
+      else slice_iters = 0;
+      return;
+    }
     if (!in_part2 && !part1_mn_iters) {
       in_part2 = true;
       slice_col_par = (iters * blockIdx.x) / k_tiles;
@@ -2067,9 +2082,8 @@ __global__ void Marlin(
 
       cp_async_wait<0>();
       if constexpr (a_type == fastllm_marlin_moe_types::kBFloat16 &&
-                    s_type == fastllm_marlin_moe_types::kFE4M3fn &&
-                    !m_block_size_8) {
-        // Grouped BF16 NVFP4 reduction can overlap the last B-fragment
+                    s_type == fastllm_marlin_moe_types::kFE4M3fn) {
+        // BF16 NVFP4 reduction can overlap the last B-fragment
         // fetch in shared memory. cp_async_wait is per-thread: wait for
         // every warp before reusing the storage for reduction.
         __syncthreads();

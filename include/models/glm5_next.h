@@ -12,8 +12,17 @@
 #include <vector>
 
 namespace fastllm {
+    class CudaChunkedPrefillPipeline;
+
+    struct Glm5NextIndexerCheckpoint {
+        Data tailKeys, tailGates;
+        int tokens = 0;
+    };
+
     struct Glm5NextIndexerCache {
         Data keys, tailKeys, tailGates;
+        Data replayKeys, replayGates;
+        bool captureReplay = false;
         Data hadamard; // immutable workspace, not part of prefix snapshots
         Data pageTable; // derived GPU page map; rebuild after page/history changes
         std::vector<int> pageTableIds;
@@ -32,6 +41,12 @@ namespace fastllm {
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
 
         void OnModelWeightsLoaded() override;
+        int GetWeightLoadPriority(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        bool ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+        void OnWeightLoadGroupFinished() override;
 
         void SetDataType(DataType dataType) override;
 
@@ -49,6 +64,8 @@ namespace fastllm {
 
         bool RetainCudaWorkspace() const override { return true; }
 
+        bool ShouldDelaySpecialWeightCudaMove(const std::string &) const override;
+
         int Forward(
                 const Data &inputIds,
                 const Data &attentionMask,
@@ -58,7 +75,25 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector<float> *logits = nullptr) override;
 
+        std::vector<int> ForwardBatch(
+                int batch, const Data &inputIds,
+                const std::vector<Data*> &attentionMasks,
+                const std::vector<Data*> &positionIds,
+                const std::vector<int> &seqLens,
+                std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+                const std::vector<GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector<std::vector<float>*> *logits = nullptr) override;
+
         bool NeedAttentionMask(int qlen, int klen) override;
+
+        bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) override;
 
         std::string MakeInput(
                 const std::string &history,
@@ -72,6 +107,27 @@ namespace fastllm {
                 const std::string &output) override;
 
     private:
+        friend struct Glm5NextGGUFTestAccess;
+        struct ThreadTpState;
+        std::unique_ptr<ThreadTpState> threadTpState;
+        ThreadTpState *threadTpOwner = nullptr;
+        int threadTpRank = -1;
+        void InitThreadTp();
+        int ThreadTpExpertLayer(const std::string &name) const;
+        int StreamingThreadTpLayer(const std::string &name) const;
+        void StageThreadTpWeight(const std::string &name);
+        void PrepareThreadTp();
+        void ThreadTpAllReduce(Data &data);
+        void RemoveThreadTpRequest(const std::vector<std::pair<Data, Data>> *key);
+        struct KdaReplayCapture;
+        Data &OutputHead();
+        int ForwardThreadTp(const Data &inputIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens, std::vector<float> *logits,
+                bool sampleOutput = true, Data *targetHiddenStates = nullptr,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr);
+
         struct KdaReplayCapture {
             Data qProjected;
             Data kProjected;
@@ -86,6 +142,8 @@ namespace fastllm {
             std::vector<Data> kdaFirst;
             std::vector<Data> kdaSecond;
             std::vector<int> sparseLengths;
+            std::vector<Glm5NextIndexerCheckpoint> indexer;
+            std::vector<TargetRuntimeCheckpoint> ranks;
             bool ready = false;
         };
 
@@ -99,6 +157,8 @@ namespace fastllm {
             int targetTokensConsumed = 0;
             int activeDraftLimit = 0;
             int consecutiveFullAccepts = 0;
+            uint64_t verifiedDrafts = 0, acceptedDrafts = 0, verifySteps = 0;
+            uint64_t confidenceChecks = 0, confidenceStops = 0;
             bool disabled = false;
             TargetRuntimeCheckpoint targetCheckpoint;
             std::vector<KdaReplayCapture> kdaReplay;
@@ -136,6 +196,24 @@ namespace fastllm {
                 std::vector<float> *logits,
                 MtpRuntimeState &state);
 
+        void ForwardEmbedding(const Data &inputIds, Data &hiddenStates);
+
+        void ForwardLayers(
+                Data &hiddenStates, int firstLayer, int endLayer,
+                const std::vector<std::vector<std::pair<Data, Data>>*>
+                    &requestCaches,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr,
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr);
+
+        int ForwardOutput(
+                Data &hiddenStates,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, bool sampleOutput,
+                Data *targetHiddenStates = nullptr);
+
+        std::pair<Data &, Data &> PrepareMlaWeights(int layerIndex);
+
         bool MtpSupportsGenerationConfig(
                 const GenerationConfig &generationConfig) const;
 
@@ -147,13 +225,13 @@ namespace fastllm {
                 const std::vector<int> &inputTokens,
                 const std::vector<int> &positions,
                 Data *nextHiddenStates,
-                bool sampleToken);
+                bool sampleToken, float *topProbability = nullptr);
 
         void GenerateMtpProposalChain(
                 MtpRuntimeState &state,
                 const Data &targetHiddenStates,
                 const std::vector<int> &inputTokens,
-                const std::vector<int> &positions);
+                const std::vector<int> &positions, float minProbability = 0);
 
         void CaptureTargetRuntimeCheckpoint(
                 const std::vector<std::pair<Data, Data>> &pastKeyValues,
@@ -191,19 +269,19 @@ namespace fastllm {
 
         void RunKdaAttention(
                 int layerIndex, Data &input, int sequence,
-                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
                 Data &output,
                 KdaReplayCapture *replayCapture = nullptr);
 
         void RunSparseAttention(
                 int layerIndex, Data &input, int sequence,
                 std::vector<std::pair<Data, Data>> &pastKeyValues,
-                Data &output);
+                Data &output, Glm5NextIndexerCache *indexer = nullptr);
 
         void RunCompressedMlaAttention(
                 int layerIndex, Data &input, int sequence,
-                std::vector<std::pair<Data, Data>> &pastKeyValues,
-                Data &output);
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+                Data &output, Glm5NextIndexerCache *indexer = nullptr);
 
         void RunExpandedSparseAttention(
                 int layerIndex, Data &input, int sequence,
@@ -225,6 +303,12 @@ namespace fastllm {
 
         int Sample(
                 Data &hiddenStates,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits);
+
+        int SampleLogits(
+                Data &outputLogits,
                 const GenerationConfig &generationConfig,
                 const LastTokensManager &lastTokens,
                 std::vector<float> *logits);
@@ -263,6 +347,9 @@ namespace fastllm {
         std::map<const std::vector<std::pair<Data, Data>> *,
                  std::vector<Glm5NextIndexerCache>> indexerCaches;
         std::mutex indexerCachesMutex;
+#ifdef USE_CUDA
+        std::unique_ptr<CudaChunkedPrefillPipeline> prefillPipeline;
+#endif
         // DSA history is retained by page reference rather than copied.  This
         // limit covers KDA recurrent state and the pooled Indexer cache;
         // larger state snapshots are tiered to host memory.
@@ -283,6 +370,7 @@ namespace fastllm {
         bool mtpEnabled = false;
         bool mtpWeightsReady = false;
         int mtpDraftsPerStep = 0;
+        float mtpMinProbability = 0;
         std::map<const std::vector<std::pair<Data, Data>> *,
                  std::shared_ptr<MtpRuntimeState>> mtpStates;
         std::mutex mtpStatesMutex;

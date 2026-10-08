@@ -42,6 +42,11 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 void FastllmCudaCustomAllReduceReset();
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// Reduce a block with the rank-ordered FP32 arithmetic selected for one row.
+// Uses the existing single-row enable policy and registers the complete block.
+// False means the caller must reduce rows separately with its ordinary path.
+bool FastllmCudaCustomAllReduceRows(void* data, void* dest, int count,
+                                    int rowElements, int dataType, int deviceId);
 // Reduces two independent rank-local tensors, rounds each reduction to the
 // destination type, then adds the rounded values into dest.  Keeping the two
 // reduction accumulators separate preserves the result of
@@ -67,6 +72,9 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 // Multi-rank eager calls rendezvous before and after NCCL host submission;
 // callers do not need another pair of host barriers. Capture bypasses both.
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
+// Bounded host spin for callers with spare submission cores (nonpositive uses the default wait).
+void FastllmNcclAllReduceNoCustomWithSpin(void* data, void* dest, int count, int dataType,
+                                       int deviceId, int hostSpinMicroseconds);
 // Requires an initialized TP communicator and matching submissions on every rank.
 bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.

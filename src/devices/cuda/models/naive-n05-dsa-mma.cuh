@@ -187,9 +187,19 @@ __device__ __forceinline__ void LoadIndexerKeys(
 // One query: a warp scores eight BF16 keys against all sixteen E4M3 Q heads.
 // Keep FP32 MMA accumulation and ascending weighted-head order. Applying the
 // unchanged Q scales after MMA can change FP32 rounding relative to SIMT.
+template <typename ScoreOutput, typename Length = int, bool Verify = false>
 __global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
-        const float *qscale, const BF16 *weights, float *scores,
-        int stride, int keys, int past) {
+        const float *qscale, const BF16 *weights, ScoreOutput scores,
+        int stride, Length liveKeys, int past) {
+    if constexpr (Verify) {
+        const int row = blockIdx.y;
+        q += (size_t)row * kHeads * kIndexerDim;
+        qscale += row * kHeads;
+        weights += row * kHeads;
+        liveKeys.length += row;
+        scores.scoreBits += (size_t)row * (past + 1);
+    }
+    int keys = liveKeys;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
     __shared__ float scale[kHeads], weight[kHeads];
@@ -232,7 +242,7 @@ __global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
             int key = first + warp * 8 + lane * 2 + i;
-            if (key < keys) scores[key] = key <= past ? score[i] : -INFINITY;
+            if (key < keys) scores.Store(key, key <= past ? score[i] : -INFINITY);
         }
     }
 #endif

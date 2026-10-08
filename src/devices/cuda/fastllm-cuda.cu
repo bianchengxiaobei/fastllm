@@ -4555,7 +4555,7 @@ static size_t FastllmCudaAlignBytes(size_t size, size_t align) {
     return ((size + align - 1) / align) * align;
 }
 
-static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
+static std::string FastllmCudaWeightSlabGroup(const std::string &name, bool transientExpert) {
     // Expert-parallel source tensors are consolidated and released one layer
     // at a time during the first ForwardGPU call.  Do not mix different layers
     // in the same slab, otherwise one live tensor from a later layer pins all
@@ -4567,10 +4567,18 @@ static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
             return name.substr(0, pos + std::strlen(marker));
         }
     }
+    if (transientExpert) {
+        size_t pos = name.find(".mlp.experts.");
+        if (pos != std::string::npos) return name.substr(0, pos + std::strlen(".mlp.experts."));
+    }
     return "";
 }
 
 void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
+    return FastllmCudaMallocModelWeightGrouped(size, name, false);
+}
+
+void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name, bool transientExpert) {
     size_t slabBytes = FastllmCudaGetWeightSlabBytes();
     if (slabBytes == 0 || size == 0 || size > slabBytes / 2) {
         return FastllmCudaMalloc(size);
@@ -4582,7 +4590,7 @@ void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
 
     const size_t align = 256;
     size_t aligned = FastllmCudaAlignBytes(size, align);
-    std::string group = FastllmCudaWeightSlabGroup(name);
+    std::string group = FastllmCudaWeightSlabGroup(name, transientExpert);
     std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
 
     auto &slabs = fastllmCudaWeightSlabs[id];
@@ -4632,6 +4640,12 @@ void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
     fastllmCudaWeightSlabPtrs[ret] = {id, slab.base};
     fastllmCudaWeightSlabPtrCount.fetch_add(1, std::memory_order_relaxed);
     return ret;
+}
+
+bool FastllmCudaIsWeightSlabPointer(const void *pointer) {
+    if (!pointer || fastllmCudaWeightSlabPtrCount.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
+    return fastllmCudaWeightSlabPtrs.count(const_cast<void *>(pointer)) != 0;
 }
 
 static bool FastllmCudaTryFreeWeightSlabPtr(void *ret) {
@@ -8788,7 +8802,8 @@ namespace {
     __global__ void KimiK3CausalConv1DKernel(
             const __nv_bfloat16 *input, const float *weight,
             const __nv_bfloat16 *cache, __nv_bfloat16 *output,
-            int batch, int sequence, int channels, int kernelSize) {
+            int batch, int sequence, int channels, int kernelSize,
+            __nv_bfloat16 *const *cachePointers = nullptr) {
         int item = blockIdx.x * blockDim.x + threadIdx.x;
         if (item >= batch * channels) {
             return;
@@ -8796,6 +8811,8 @@ namespace {
         int batchIndex = item / channels;
         int channel = item % channels;
         int history = kernelSize - 1;
+        if (cachePointers) cache = cachePointers[batchIndex];
+        else if (cache) cache += (size_t)batchIndex * history * channels;
         // Each output reads only the input and the initial history. Split tokens
         // across blocks while preserving the original tap accumulation order.
         for (int token = blockIdx.y; token < sequence; token += gridDim.y) {
@@ -8811,8 +8828,7 @@ namespace {
                 } else if (cache != nullptr) {
                     int cacheToken = history + sourceToken;
                     size_t cacheIndex =
-                        ((size_t)batchIndex * history + cacheToken) *
-                        channels + channel;
+                        (size_t)cacheToken * channels + channel;
                     sourceValue = __bfloat162float(cache[cacheIndex]);
                 }
                 value += sourceValue *
@@ -8859,7 +8875,7 @@ namespace {
             const __nv_bfloat16 *q, const __nv_bfloat16 *k,
             const __nv_bfloat16 *v, __nv_bfloat16 *cache,
             int batch, int sequence, int channels, int history,
-            int tokens) {
+            int tokens, __nv_bfloat16 *const *cachePointers = nullptr) {
         int item = blockIdx.x * blockDim.x + threadIdx.x;
         if (item >= 3 * batch * channels) {
             return;
@@ -8872,6 +8888,10 @@ namespace {
             (stream == 1 ? k : v);
         size_t cacheBase =
             ((size_t)stream * batch + batchIndex) * history * channels;
+        if (cachePointers) {
+            cache = cachePointers[stream * batch + batchIndex];
+            cacheBase = 0;
+        }
         // `tokens` is positive, so any retained cache slot is read from a
         // strictly higher index.  Ascending writes are therefore safe in
         // place and need no temporary history buffer.
@@ -9288,6 +9308,96 @@ bool FastllmCudaKimiK3UpdatePackedConvCache(
         "KimiK3UpdatePackedConvCache CUDA kernel failed.");
 }
 
+bool FastllmCudaKimiK3KdaBatchDecode(
+        const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &rawGate, const fastllm::Data &rawBeta,
+        const fastllm::Data &qWeight, const fastllm::Data &kWeight,
+        const fastllm::Data &vWeight, const fastllm::Data &aLog,
+        const fastllm::Data &dtBias,
+        const std::vector<fastllm::Data*> &convCaches,
+        const std::vector<fastllm::Data*> &states,
+        int heads, int dimension, int kernelSize, float lowerBound,
+        fastllm::Data &output) {
+#ifdef USE_ROCM
+    return false;
+#else
+    const int batch = (int)states.size();
+    const int channels = heads * dimension, history = kernelSize - 1;
+    if (batch <= 1 || heads <= 0 || dimension != KIMI_K3_KDA_DIMENSION ||
+        history <= 0 || convCaches.size() != states.size() ||
+        q.dims != std::vector<int>({1, batch, channels}) ||
+        k.dims != q.dims || v.dims != q.dims || rawGate.dims != q.dims ||
+        rawBeta.dims != std::vector<int>({1, batch, heads}) ||
+        aLog.Count(0) != (uint64_t)heads || dtBias.Count(0) != (uint64_t)channels ||
+        FastllmCudaGraphIsCapturing()) return false;
+    auto ready = [&](const fastllm::Data &data, fastllm::DataType type) {
+        return KimiK3CudaDataReady(data, type) && data.dataDeviceIds == q.dataDeviceIds;
+    };
+    for (const auto *data : {&q, &k, &v, &rawGate})
+        if (!ready(*data, fastllm::DataType::BFLOAT16)) return false;
+    for (const auto *data : {&rawBeta, &aLog, &dtBias})
+        if (!ready(*data, fastllm::DataType::FLOAT32)) return false;
+    for (const auto *weight : {&qWeight, &kWeight, &vWeight})
+        if (!ready(*weight, fastllm::DataType::FLOAT32) ||
+            weight->dims != std::vector<int>({channels, 1, kernelSize})) return false;
+    std::vector<void*> pointers(4 * batch);
+    for (int row = 0; row < batch; ++row) {
+        const auto *conv = convCaches[row];
+        const auto *state = states[row];
+        if (!conv || !state || conv->lockInCPU || state->lockInCPU ||
+            !ready(*conv, fastllm::DataType::BFLOAT16) ||
+            !ready(*state, fastllm::DataType::FLOAT32) ||
+            conv->dims != std::vector<int>({3, history, channels}) ||
+            state->dims != std::vector<int>({1, heads, dimension, dimension})) return false;
+        for (int stream = 0; stream < 3; ++stream)
+            pointers[stream * batch + row] = (uint8_t*)conv->cudaData +
+                (size_t)stream * history * channels * sizeof(__nv_bfloat16);
+        pointers[3 * batch + row] = state->cudaData;
+    }
+    // Only pointer metadata is gathered. Request-owned states stay in place
+    // through batch growth, shrinking, reordering and history-cache snapshots.
+    const size_t tableBytes = pointers.size() * sizeof(void*);
+    const size_t convBytes = (size_t)batch * channels * sizeof(__nv_bfloat16);
+    const size_t scanOffset = (tableBytes + 3 * convBytes + 255) & ~size_t(255);
+    const size_t scratchBytes = scanOffset +
+        (size_t)batch * heads * (3 * dimension + 1) * sizeof(float);
+    size_t borrowedBytes = 0;
+    bool own = false;
+    void *scratch = FastllmBorrowCudaTempBuffer(scratchBytes, &borrowedBytes, &own);
+    if (!scratch || borrowedBytes < scratchBytes) {
+        FastllmReleaseCudaTempBuffer(scratch, own);
+        return false;
+    }
+    output.dataType = fastllm::DataType::BFLOAT16;
+    output.Resize({1, batch, heads, dimension});
+    output.ToDevice(q.dataDevice, q.dataDeviceIds, false);
+    output.Allocate();
+    checkCudaErrors("KDA cache pointer upload", cudaMemcpyAsync(scratch, pointers.data(),
+        tableBytes, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    auto cachePointers = (__nv_bfloat16**)scratch;
+    __nv_bfloat16 *convolved[3];
+    const fastllm::Data *inputs[] = {&q, &k, &v};
+    const fastllm::Data *weights[] = {&qWeight, &kWeight, &vWeight};
+    const int blocks = (batch * channels + KIMI_K3_CUDA_THREADS - 1) / KIMI_K3_CUDA_THREADS;
+    for (int stream = 0; stream < 3; ++stream) {
+        convolved[stream] = (__nv_bfloat16*)((uint8_t*)scratch + tableBytes + stream * convBytes);
+        KimiK3CausalConv1DKernel<<<blocks, KIMI_K3_CUDA_THREADS, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)inputs[stream]->cudaData, (const float*)weights[stream]->cudaData,
+            nullptr, convolved[stream], batch, 1, channels, kernelSize, cachePointers + stream * batch);
+    }
+    KimiK3UpdatePackedConvCacheKernel<<<3 * blocks, KIMI_K3_CUDA_THREADS, 0, cudaStreamPerThread>>>(
+        (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)k.cudaData,
+        (const __nv_bfloat16*)v.cudaData, nullptr, batch, 1, channels, history, 1, cachePointers);
+    KimiK3LaunchKdaPrefill(convolved[0], convolved[1], convolved[2], rawGate.cudaData,
+        (const float*)rawBeta.cudaData, (const float*)aLog.cudaData, (const float*)dtBias.cudaData,
+        nullptr, output.cudaData, (float*)((uint8_t*)scratch + scanOffset),
+        batch, 1, heads, dimension, lowerBound, (float**)(cachePointers + 3 * batch));
+    bool success = KimiK3CudaLastError("KimiK3 batched KDA decode failed.");
+    FastllmReleaseCudaTempBuffer(scratch, own);
+    return success;
+#endif
+}
+
 bool FastllmCudaKimiK3RecurrentKDA(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &rawGate,
@@ -9341,10 +9451,10 @@ bool FastllmCudaKimiK3RecurrentKDA(
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
     }
 #ifndef USE_ROCM
-    // Ordinary decode and prefill reuse register scan with shared CUDA scratch.
+    // Decode, multi-row verification and prefill share the exact register scan.
     // Auxiliary/state replay and graph capture keep the allocation-free path.
     if (dimension == KIMI_K3_KDA_DIMENSION && batch > 0 && heads > 0 &&
-        (sequence == 1 || sequence >= 64) && !stateOnly && !outputAux &&
+        sequence > 0 && !stateOnly && !outputAux &&
         normalizeQKInFp32 && roundBetaToBfloat16 &&
         aLog.Count(0) == (uint64_t)heads && !FastllmCudaGraphIsCapturing()) {
         size_t rows = (size_t)batch * sequence * heads;
@@ -11144,7 +11254,7 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
 // merge tree so both instantiations remain compatible with the legacy path.
-template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK>
+template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK, bool APPLY_SIGMOID = false>
 __global__ void FastllmSelectExpertFixedTopKKernel(
         const float *logits, const float *bias, int32_t *index, float *score,
         int hasBias, int needNorm, float routeScale) {
@@ -11191,6 +11301,15 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
             softmaxProbabilities[expert] /= denominator;
         }
         __syncthreads();
+        probabilityLogits = softmaxProbabilities;
+    }
+    if constexpr (APPLY_SIGMOID) {
+        // Match the standalone FP32 sigmoid, including its double division.
+        for (int expert = tid; expert < EXPERTS; expert += 32) {
+            float x = tokenLogits[expert];
+            softmaxProbabilities[expert] = 1.0 / (1.0 + expf(-x));
+        }
+        __syncwarp();
         probabilityLogits = softmaxProbabilities;
     }
     if (tid >= 32) {
@@ -12244,7 +12363,11 @@ static bool FastllmCudaFusedSelectExpert256(
     int biasType = !hasBias || gateBias->dataType == fastllm::DataType::FLOAT32 ? 0 :
                    (gateBias->dataType == fastllm::DataType::FLOAT16 ? 1 : 2);
 #ifndef USE_ROCM
-    if constexpr (ROUTER_SIGMOID) {
+    if constexpr (ROUTER_SIGMOID && ROUTER_TOPK == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 256, 8, true><<<tokens, 32>>>(
+            (const float *)cudaLogits, (const float *)cudaBias, cudaIndex, cudaScore,
+            hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+    } else if constexpr (ROUTER_SIGMOID) {
         if (logits.dataType == fastllm::DataType::FLOAT16) {
             FastllmFusedSigmoidSelectExpert256Top10Kernel<half><<<tokens, 32>>>(
                 (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
@@ -12398,6 +12521,16 @@ bool FastllmCudaFusedSigmoidSelectExpert(
         const fastllm::Data &logits, const fastllm::Data *gateBias,
         fastllm::Data &index, fastllm::Data &score,
         int topk, bool needNorm, float routeScale) {
+#ifndef USE_ROCM
+    if (topk == 8 && !logits.dims.empty() && logits.dims.back() == 256 &&
+        logits.Count(0) > 0 && logits.dataType == fastllm::DataType::FLOAT32) {
+        if (gateBias && !gateBias->dims.empty() &&
+            (gateBias->Count(0) != 256 || gateBias->dataType != fastllm::DataType::FLOAT32))
+            return false;
+        return FastllmCudaFusedSelectExpert256<8, true>(
+            logits, gateBias, index, score, needNorm, routeScale);
+    }
+#endif
     if (topk != 10 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
         (logits.dataType != fastllm::DataType::FLOAT16 &&
          logits.dataType != fastllm::DataType::BFLOAT16 &&
@@ -12567,12 +12700,12 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
         topk, hasBias, needNorm, routeScale);
 #else
-    if (n == 1 && numExperts == 256 && topk == 8) {
-        FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<1, 32>>>(
+    if (n <= 8 && numExperts == 256 && topk == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
-    } else if (n == 1 && numExperts == 288 && topk == 8) {
-        FastllmSelectExpertFixedTopKKernel<false, 288, 8><<<1, 32>>>(
+    } else if (n <= 8 && numExperts == 288 && topk == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 288, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
     } else if (n <= 9 && numExperts == 512 && topk == 10) {
@@ -12914,6 +13047,62 @@ bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data 
     }
 
     DeviceSync();
+    return true;
+}
+
+bool FastllmCudaBatchMatMulSingleRows(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output, bool transposeWeight, float alpha) {
+    auto denseCuda = [](const fastllm::Data &data) {
+        return data.dataDevice == fastllm::DataDevice::CUDA && data.cudaData &&
+            !data.multiDeviceData && data.dims.size() == 3 && data.strides.size() == 3 &&
+            data.dims[0] > 0 && data.dims[1] > 0 && data.dims[2] > 0 &&
+            data.strides[2] == 1 && data.strides[1] == data.dims[2] &&
+            data.strides[0] == (uint64_t)data.dims[1] * data.dims[2];
+    };
+    if (!denseCuda(input) || !denseCuda(weight) || &output == &input || &output == &weight ||
+        input.dataDeviceIds != weight.dataDeviceIds || input.dataType != weight.dataType ||
+        input.dims[0] != weight.dims[0] ||
+        input.dims[2] != weight.dims[transposeWeight ? 2 : 1] ||
+        (input.dataType != fastllm::DataType::FLOAT32 &&
+         input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16)) return false;
+
+    const int batch = input.dims[0], rows = input.dims[1], m = input.dims[2];
+    const int k = weight.dims[transposeWeight ? 1 : 2];
+    if (!input.dataDeviceIds.empty()) FastllmCudaSetDevice(input.dataDeviceIds[0]);
+    output.dataType = input.dataType;
+    output.ToDevice(fastllm::DataDevice::CUDA, input.dataDeviceIds, false);
+    output.Resize({batch, rows, k});
+    output.Allocate();
+    auto handle = getFastllmCublasHandle();
+    const auto operation = transposeWeight ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const int weightStride = transposeWeight ? m : k;
+    const long long inputSpatial = (long long)rows * m;
+    const long long weightSpatial = (long long)m * k;
+    const long long outputSpatial = (long long)rows * k;
+    const float beta = 0;
+    for (int row = 0; row < rows; ++row) {
+        const void *x = (const char *)input.cudaData + (size_t)row * m * input.unitSize;
+        void *y = (char *)output.cudaData + (size_t)row * k * output.unitSize;
+        cublasStatus_t status;
+        if (input.dataType == fastllm::DataType::BFLOAT16) {
+            status = cublasGemmStridedBatchedEx(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &alpha, weight.cudaData, CUDA_R_16BF, weightStride, weightSpatial,
+                x, CUDA_R_16BF, m, inputSpatial, &beta, y, CUDA_R_16BF, k, outputSpatial,
+                batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        } else if (input.dataType == fastllm::DataType::FLOAT16) {
+            const half halfAlpha = __float2half(alpha), halfBeta = __float2half(beta);
+            status = cublasHgemmStridedBatched(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &halfAlpha, (const half *)weight.cudaData, weightStride, weightSpatial,
+                (const half *)x, m, inputSpatial, &halfBeta, (half *)y, k, outputSpatial, batch);
+        } else {
+            status = cublasSgemmStridedBatched(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &alpha, (const float *)weight.cudaData, weightStride, weightSpatial,
+                (const float *)x, m, inputSpatial, &beta, (float *)y, k, outputSpatial, batch);
+        }
+        fastllm::AssertInFastLLM(status == CUBLAS_STATUS_SUCCESS,
+            "CUDA single-row batched MatMul failed.");
+    }
     return true;
 }
 
@@ -15123,7 +15312,7 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     uint64_t seed = rng();
 
     cudaError_t samplingState =
-        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0>(
         cudaProbs, cudaTopKArr, cudaTopPArr, cudaOutput,
         cudaSamplingValid,
         (int *)nullptr,
@@ -16013,7 +16202,8 @@ bool FastllmCudaDFlashTopK(
     cudaError_t state = cudaMemsetAsync(
         scratch.cudaData, 0, scratchBytes, cudaStreamPerThread);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::TopKDispatch<float, int>(
+        // This entry accepts topk <= 50, deterministic results, and no tie-break mode.
+        state = flashinfer::sampling::TopKDispatch<float, int, 1, true, 128>(
             (float*)logits.cudaData, candidateIds, candidateScores,
             (uint32_t)rows, (uint32_t)topk, (uint32_t)channels,
             rowStates, true, true,
@@ -16294,7 +16484,7 @@ bool FastllmCudaDFlashRejectionSampling(
     if (state == cudaSuccess) {
         static thread_local std::mt19937 rng(std::random_device{}());
         uint64_t seed = ((uint64_t)rng() << 32) | rng();
-        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int, 1>(
             draftProbs, cudaDraftTokens, targetProbs, cudaOutput,
             cudaAccepted, cudaEmitted, (uint32_t)batch,
             (uint32_t)draftTokens, (uint32_t)vocabSize,
@@ -16373,7 +16563,7 @@ bool FastllmCudaTopKTopPSamplingToDevice(
     static thread_local std::mt19937 rng(std::random_device{}());
     uint64_t seed = rng();
     cudaError_t samplingState =
-        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0>(
         probs, topKArr, topPArr, output,
         (bool *)floatOutput,
         (int *)nullptr,
@@ -16509,7 +16699,7 @@ bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
     cudaError_t state = cudaMemcpyAsync(proposalProbs, ws.a,
         (size_t)batch * vocabSize * sizeof(float), cudaMemcpyDeviceToDevice, stream);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::SamplingFromProb<float, int>(
+        state = flashinfer::sampling::SamplingFromProb<float, int, 1>(
             proposalProbs, ws.output, ws.valid, nullptr, batch, vocabSize, true,
             nullptr, FastllmMtpSamplingSeed(), nullptr, 0, stream);
     }
@@ -16540,7 +16730,7 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
     if (state == cudaSuccess)
         state = cudaMemsetAsync(ws.emitted, 0, batch * sizeof(int), stream);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int, 1>(
             proposalProbs, ws.draftIds, ws.a, ws.output, ws.accepted, ws.emitted,
             batch, draftTokens, vocabSize, true, nullptr, FastllmMtpSamplingSeed(),
             nullptr, 0, stream);
@@ -18775,7 +18965,12 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
         !FastllmCudaDataCanShareDevice(first, output)) {
         return false;
     }
-    if (batch == 1 && tokenMajorInput && numTokenCaches > 0 &&
+    // A short eager sequence can pass its one cache pointer as a launch
+    // argument and update the cache in the convolution kernel. Graph pointer
+    // scopes keep their refreshable device tables for the snapshot-free path.
+    const bool inlineSingleCache = numTokenCaches > 0 ||
+        (fastllmCudaGraphPointerTableScopes.empty() && !FastllmCudaGraphIsCapturingFast());
+    if (batch == 1 && tokenMajorInput && inlineSingleCache &&
         numTokens <= FASTLLM_CUDA_MTP_FAST_SEQ_MAX && pointers.size() <= 8) {
         FastllmInlineConvCachePointers inlinePointers = {};
         for (size_t i = 0; i < pointers.size(); ++i) {
@@ -21320,7 +21515,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     half **snapshotPointers, int numSnaps,
     void **prefixLengths = nullptr, half **initialStates = nullptr,
     const float *preparedQk = nullptr, const float *preparedBa = nullptr,
-    half **outputStates = nullptr) {
+    half **outputStates = nullptr, half *singleOutputState = nullptr) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
@@ -21509,8 +21704,9 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
         }
         // Verification can keep its original state intact and write the final
         // state to a second owned buffer. No preliminary matrix copy is needed.
-        half *finalRow = outputStates != nullptr ?
-            outputStates[batchIndex] + stateHeadBase + (size_t)v_col * headKDim : state_row;
+        half *finalState = outputStates != nullptr ? outputStates[batchIndex] : singleOutputState;
+        half *finalRow = finalState != nullptr ?
+            finalState + stateHeadBase + (size_t)v_col * headKDim : state_row;
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             finalRow[lane_id + j * 32] = stateValues[j];
@@ -22150,9 +22346,18 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         }
         pointers.push_back(state->cudaData);
     }
-    void **devicePointers = FastllmCudaStagePointers(pointers);
-    half **outputPointers = outputStates.empty() ? nullptr :
+    // Single-request compact verification needs only an input and optional
+    // output state pointer. Pass them directly instead of uploading a table
+    // every layer; graph scopes retain their dynamically refreshed tables.
+    const bool inlineSingleState = batch == 1 && numTokenStates == 0 &&
+        fastllmCudaGraphPointerTableScopes.empty() && !FastllmCudaGraphIsCapturingFast();
+    void **devicePointers = inlineSingleState ? nullptr : FastllmCudaStagePointers(pointers);
+    half **outputPointers = inlineSingleState || outputStates.empty() ? nullptr :
         (half**)(devicePointers + batch * (1 + numTokenStates));
+    half **snapshotPointers = devicePointers == nullptr ? nullptr : (half**)(devicePointers + batch);
+    half *singleInputState = inlineSingleState ? (half*)first.cudaData : nullptr;
+    half *singleOutputState = inlineSingleState && !outputStates.empty() ?
+        (half*)outputStates[0]->cudaData : nullptr;
 
     coreAttnOut.dataType = first.dataType;
     coreAttnOut.Resize({batch, seqLen, numVHeads, headVDim});
@@ -22211,12 +22416,12 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             (const float*)normWeight.cudaData,
             (const float*)aLog.cudaData,
             (const float*)dtBias.cudaData,
-            nullptr, (half**)devicePointers,
+            singleInputState, (half**)devicePointers,
             (half*)coreAttnOut.cudaData,
             seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            (half**)(devicePointers + batch), numTokenStates,
-            nullptr, nullptr, nullptr, nullptr, outputPointers);
+            snapshotPointers, numTokenStates,
+            nullptr, nullptr, nullptr, nullptr, outputPointers, singleOutputState);
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors(

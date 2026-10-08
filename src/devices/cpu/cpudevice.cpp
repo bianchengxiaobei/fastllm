@@ -53,6 +53,9 @@ namespace fastllm {
     void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
     void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len);
     extern bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len);
+    extern bool FastllmGemmBFloat16IQ4XS_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
     extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end, bool planar);
@@ -2989,9 +2992,13 @@ namespace fastllm {
                         LinearBFloat16_AWQ4BIT128_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                     } */ 
                 } else if (BType >= DataType::DATA_GGUF_FORMAT && BType < DataType::DATA_GGUF_FORMAT_END) {
+                    const ggml_type weightType = (ggml_type)((int)BType - (int)DataType::DATA_GGUF_FORMAT);
+                    if (weightType == GGML_TYPE_IQ4_XS && cpuInstructInfo.hasAVX512BF16 &&
+                        FastllmGemmBFloat16IQ4XS_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        return;
+                    }
                     std::vector <float> fp32B_temp((end - st) * m);
                     std::vector <uint16_t> bf16B_temp((end - st) * m);
-                    ggml_type weightType = (ggml_type)((int)BType - (int)DataType::DATA_GGUF_FORMAT);
 
                     auto toFloat = ggml_type_to_float(weightType);
                     AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight (type " + std::string(ggml_type_name(weightType)) + ") can't convert to fp32.");
@@ -6346,7 +6353,12 @@ ops += (long long)lines * inputDim * interDim * 2;
         AssertInFastLLM(weight.dims.size() == 2, "Embedding's weight's dim should be 2.\n");
         AssertInFastLLM(weight.dataType == DataType::FLOAT32 ||
                         weight.dataType == DataType::FLOAT16 ||
-                        weight.dataType == DataType::BFLOAT16, "Embedding's weight's type should be float32 or float16 or bfloat16.\n");
+                        weight.dataType == DataType::BFLOAT16 ||
+                        (weight.dataType == DataType::DATA_GGUF_FORMAT &&
+                         !weight.IsRepacked && weight.ggmlType >= 0 &&
+                         weight.ggmlType < GGML_TYPE_COUNT &&
+                         ggml_type_to_float((ggml_type)weight.ggmlType) != nullptr),
+                        "Embedding requires floating-point or unpacked GGUF weights.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, 
                         "Embedding's input's type should be float32 or float16.\n");
@@ -6455,7 +6467,25 @@ ops += (long long)lines * inputDim * interDim * 2;
             return token;
         };
 
-        if (GetLowMemMode() && !weight.fileName.empty()) {
+        if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+            const auto type = (ggml_type)weight.ggmlType;
+            AssertInFastLLM(weight.cpuData != nullptr &&
+                            embSize % ggml_blck_size(type) == 0,
+                            "Embedding requires resident, block-aligned GGUF rows.\n");
+            const size_t rowBytes = ggml_row_size(type, embSize);
+            const auto toFloat = ggml_type_to_float(type);
+            // Keep the same FP32 values as full-table import, with only one
+            // row of scratch when the output requires a subsequent cast.
+            std::vector<float> row(output.dataType == DataType::FLOAT32 ? 0 : embSize);
+            for (int i = 0; i < inputLen; ++i) {
+                const int token = getToken(i);
+                float *destination = output.dataType == DataType::FLOAT32
+                    ? reinterpret_cast<float *>(output.cpuData) + (uint64_t)i * embSize
+                    : row.data();
+                toFloat(weight.cpuData + (uint64_t)token * rowBytes, destination, embSize);
+                if (output.dataType != DataType::FLOAT32) writeFloatOutputRow(i, destination);
+            }
+        } else if (GetLowMemMode() && !weight.fileName.empty()) {
             FILE *fi = fopen(weight.fileName.c_str(), "rb");
             if (fi == nullptr) {
                 ErrorInFastLLM("Embedding error: failed to open low-memory weight file " + weight.fileName + ".\n");

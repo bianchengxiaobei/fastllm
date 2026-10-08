@@ -105,6 +105,10 @@ namespace fastllm {
         virtual void WarmUp(); // 预热
         void Prepare() override; // 在 KV cache 定容前预分配视觉工作区
 
+        bool SupportsKvMem() const override { return true; }
+        uint64_t KvMemLayerBytesPerToken(int) const override { return 4ULL * num_key_value_heads * head_dim; }
+        bool KvMemLayerEligible(int layer) const override;
+        void ValidateKvMemModel(const KvMemConfig &config) const override;
         virtual bool CanUseGPUForward() const override;
 
         virtual void OnAutoWarmupFinished() override;
@@ -426,7 +430,7 @@ namespace fastllm {
         bool dflashEnabled = false;
         bool dflashWeightsPrepared = false;
         Data dflashNvfp4DraftLmHead;
-        std::unordered_map<int, Data> dflashNvfp4TpLmHeads;
+        std::unordered_map<int, Data> dflashDraftLmHeads;
         // Logical IDs only: aligned duplicate rows are removed before top-k.
         std::unordered_map<int, std::vector<int>> dflashDraftTokenIds;
         std::unordered_map<std::string, Data> dflashNvfp4ViewWeights;

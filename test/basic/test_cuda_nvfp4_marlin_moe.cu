@@ -29,13 +29,18 @@ struct Fixture {
     std::vector<std::vector<float>> decoded;
     Fixture(int seed, bool invalid = false, bool planar = false,
             int hidden = 256, int intermediate = 128, int experts = 16,
-            bool directMemory = true)
+            bool directMemory = true, bool variedScales = false, bool slab = false)
         : hidden(hidden), intermediate(intermediate), experts(experts), weights(2 + experts * 2, nullptr) {
         const int H=hidden,I=intermediate,E=experts;
         for (int e = 0; e < E; ++e) for (int matrix = 0; matrix < 2; ++matrix) {
             int n = matrix ? H : 2 * I, k = matrix ? I : H, stride = 4 + k / 16 * 9;
             auto d = std::make_unique<Data>(planar ? DataType::NVFP4_BLOCK_16_E4M3 : DataType::NVFP4_BLOCK_16_E4M3_PACKED);
             d->blockK = 1; d->blockM = 16; d->directMemory = directMemory;
+            if (slab) {
+                d->isModelWeight = true;
+                d->tpLinearType = matrix ? TP_LINEAR_COLUMN : TP_LINEAR_ROW;
+                d->name = "test.mlp.experts." + std::to_string(e);
+            }
             d->Resize({n, k}); d->Allocate(false);
             auto *bytes = reinterpret_cast<unsigned char *>(d->cpuData);
             std::vector<float> full(n * k);
@@ -46,13 +51,19 @@ struct Fixture {
                     if (r == 0 || (!matrix && r == I)) d->scales.push_back(global);
                 } else std::memcpy(bytes + r * stride, &global, 4);
                 for (int g = 0; g < k / 16; ++g) {
-                    bytes[planar ? n * k / 2 + r * (k / 16) + g : r * stride + 12 + g * 9] = (invalid && r == 0 && g == 0) ? 1 : 56; // E4M3 1
+                    // Exercise unequal group scales as well as the uniform-scale fixtures.
+                    int exponent = variedScales
+                        ? int(Mix(r * (k / 16) + g + e * 719) % 7) - 3 : 0;
+                    float groupScale = std::ldexp(1.0f, exponent);
+                    // E4M3: biased exponent 7 and zero mantissa encode 1.0.
+                    bytes[planar ? n * k / 2 + r * (k / 16) + g : r * stride + 12 + g * 9] =
+                        (invalid && r == 0 && g == 0) ? 1 : 56 + exponent * 8;
                     for (int j = 0; j < 8; ++j) {
                         int c0 = Mix(r * k + g * 16 + j * 2 + e * n * k + seed * 719) % 16;
                         int c1 = Mix(r * k + g * 16 + j * 2 + 1 + e * n * k + seed * 719) % 16;
                         bytes[planar ? r * (k / 2) + g * 8 + j : r * stride + 4 + g * 9 + j] = c0 | (c1 << 4);
-                        full[r * k + g * 16 + j * 2] = global * Code(c0);
-                        full[r * k + g * 16 + j * 2 + 1] = global * Code(c1);
+                        full[r * k + g * 16 + j * 2] = global * groupScale * Code(c0);
+                        full[r * k + g * 16 + j * 2 + 1] = global * groupScale * Code(c1);
                     }
                 }
             }
@@ -200,6 +211,148 @@ static void CheckActivation() {
     std::puts("Activation boundary/dtype PASS");
 }
 
+static void CheckGroupedRows(Fixture &f, int rows, int topk, bool foreignScratch = false, bool duplicateRoutes = false) {
+    const int H = f.hidden;
+    Data x(BFLOAT16, {rows, H}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk});
+    x.Allocate();
+    ids.Allocate();
+    scores.Allocate();
+    for (int i = 0; i < rows * H; ++i)
+        ((__nv_bfloat16 *)x.cpuData)[i] = __float2bfloat16_rn(.3f * std::sin(i * .031f));
+    for (int i = 0; i < rows * topk; ++i) {
+        ((int *)ids.cpuData)[i] = duplicateRoutes ? 0 : (i / topk * 3 + i % topk * 7) % f.experts;
+        ((float *)scores.cpuData)[i] = (1.f + i % topk * .07f) / topk;
+    }
+    Move(x);
+    Move(ids);
+    Move(scores);
+    Data gate(BFLOAT16), act(BFLOAT16), actual(BFLOAT16), reference(BFLOAT16, {rows, H});
+    reference.dataDevice = DataDevice::CUDA;
+    reference.dataDeviceIds = {0};
+    reference.Allocate(false);
+    auto single = [&]() {
+        for (int r = 0; r < rows; ++r) {
+            Data in(BFLOAT16, {1, H}), out(BFLOAT16, {1, H});
+            in.FakeFrom(x, (size_t)r * H * 2);
+            out.FakeFrom(reference, (size_t)r * H * 2);
+            Check(FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
+                      in, gate, act, out, f.weights.data(), f.weights.size(),
+                      (int32_t *)ids.cudaData + r * topk, (float *)scores.cudaData + r * topk, 1,
+                      topk),
+                  "single-row path rejected");
+        }
+    };
+    auto multi = [&]() {
+        Check(FastllmCudaMergeMOENVFP4E4M3MarlinRows(x, gate, act, actual, f.weights.data(),
+                                                     f.weights.size(), (int32_t *)ids.cudaData,
+                                                     (float *)scores.cudaData, rows, topk),
+              "grouped rows rejected");
+    };
+    single();
+    Cuda(cudaDeviceSynchronize());
+    if (foreignScratch) {
+        // Reproduce serial layer placement: workspace storage belongs to the
+        // previous GPU, while the next invocation's input and weights are on 0.
+        actual.Resize({rows, H});
+        for (Data *d : {&gate, &act, &actual}) {
+            d->ToDevice(DataDevice::CUDA, std::vector<int>{1}, false);
+            d->Allocate(false);
+        }
+        FastllmCudaSetDevice(0);
+    }
+    multi();
+    Cuda(cudaDeviceSynchronize());
+    for (Data *d : {&gate, &act, &actual}) {
+        cudaPointerAttributes attributes{};
+        Cuda(cudaPointerGetAttributes(&attributes, d->cudaData));
+        Check(attributes.device == 0, "grouped-row workspace stayed on another GPU");
+    }
+    std::vector<uint16_t> a(rows * H), b(rows * H);
+    double largestRelative = 0;
+    auto compare = [&]() {
+        Cuda(cudaMemcpy(a.data(), reference.cudaData, a.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(b.data(), actual.cudaData, b.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        // Grouping changes the reduction layout versus single-token GEMM.
+        // Keep the existing MoE FP64 reference's 1% relative error bound and
+        // additionally reject nonfinite values and large isolated errors.
+        double error = 0, norm = 0, maximum = 0, scale = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            double expected = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16 *>(&a[i]));
+            double value = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16 *>(&b[i]));
+            Check(std::isfinite(expected) && std::isfinite(value), "nonfinite grouped output");
+            error += (expected - value) * (expected - value);
+            norm += expected * expected;
+            maximum = std::max(maximum, std::abs(expected - value));
+            scale = std::max(scale, std::abs(expected));
+        }
+        double relative = std::sqrt(error / std::max(norm, 1e-30));
+        largestRelative = std::max(largestRelative, relative);
+        Check(relative <= .01 && maximum <= 1e-6 + .02 * scale,
+              "grouped rows numerical error");
+    };
+    compare();
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    multi();
+    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Cuda(cudaGraphInstantiate(&exec, graph, 0));
+    std::vector<int> changedIds(rows * topk);
+    std::vector<__nv_bfloat16> changedInput(rows * H);
+    for (int iteration = 0; iteration < 4; ++iteration) {
+        // New routing and activations must be consumed by the same graph.
+        for (int i = 0; i < rows * topk; ++i)
+            changedIds[i] = duplicateRoutes ? iteration : (iteration * 5 + i / topk * 3 + i % topk * 7) % f.experts;
+        for (int i = 0; i < rows * H; ++i)
+            changedInput[i] = __float2bfloat16_rn(.3f * std::sin(i * .031f + iteration));
+        Cuda(cudaMemcpyAsync(ids.cudaData, changedIds.data(), ids.GetBytes(),
+                             cudaMemcpyHostToDevice, cudaStreamPerThread));
+        Cuda(cudaMemcpyAsync(x.cudaData, changedInput.data(), x.GetBytes(), cudaMemcpyHostToDevice,
+                             cudaStreamPerThread));
+        single();
+        multi();
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        std::vector<uint16_t> eager(rows * H);
+        Cuda(cudaMemcpy(eager.data(), actual.cudaData, eager.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        compare();
+        Check(eager == b, "grouped eager and graph differ");
+    }
+    // Later routes cannot affect any retained prefix. Check all prefix
+    // lengths, including routes that merge with earlier experts' tiles.
+    const auto prior = b;
+    const auto originalIds = changedIds;
+    for (int keep = 1; keep < rows; ++keep) {
+        changedIds = originalIds;
+        for (int i = keep * topk; i < rows * topk; ++i)
+            changedIds[i] = (changedIds[i] + 3) % f.experts;
+        Cuda(cudaMemcpyAsync(ids.cudaData, changedIds.data(), ids.GetBytes(),
+                             cudaMemcpyHostToDevice, cudaStreamPerThread));
+        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        Cuda(cudaMemcpy(b.data(), actual.cudaData, b.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        Check(std::equal(prior.begin(), prior.begin() + keep * H, b.begin()),
+              "suffix routes changed prefix");
+        auto replay = b;
+        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        Cuda(cudaMemcpy(b.data(), actual.cudaData, b.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        Check(replay == b, "grouped graph replay differs");
+    }
+    Cuda(cudaGraphExecDestroy(exec));
+    Cuda(cudaGraphDestroy(graph));
+    std::printf("grouped_rows H=%d I=%d rows=%d topk=%d relative_max=%g eager/graph/prefix/replay=bitwise_equal\n", H,
+                f.intermediate, rows, topk, largestRelative);
+}
+
 int main(int argc, char **argv) { try {
     int devices = 0; cudaDeviceProp prop{};
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 ||
@@ -207,6 +360,61 @@ int main(int argc, char **argv) { try {
         prop.sharedMemPerBlockOptin < 71680) return 77;
     FastllmCudaSetDevice(0); SetThreads(4);
     CheckActivation();
+    if (argc == 2 && std::strcmp(argv[1], "--grouped-decode") == 0) {
+        Fixture f(17);
+        // CPU FP64 reference, clipping and graph replay with changing routes
+        // cover grouped batches, shrinking batches and exact verification.
+        for (int threshold : {0, 10}) {
+            FastllmCudaSetLinearExactBatchThreshold(threshold);
+            for (int m : {8, 7, 6, 5, 4, 3, 2, 1, 9, 8}) {
+                Run(f, m, 8, 10.0f, 15.0f, true, true);
+            }
+        }
+        FastllmCudaSetLinearExactBatchThreshold(0);
+        std::puts("Grouped decode PASS"); return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--cross-device-rows") == 0) {
+            if (devices < 2)
+                return 77;
+            Fixture f(59, false, false, 4096, 2048, 16, true, true);
+            for (int rows : {2, 8})
+                for (int topk : {1, 8})
+                    CheckGroupedRows(f, rows, topk, true);
+            std::puts("Cross-device grouped rows PASS");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--grouped-rows") == 0) {
+            for (auto shape :
+                 std::vector<std::pair<int, int>>{{256, 128}, {4096, 256}, {4096, 2048}}) {
+                Fixture f(53, false, false, shape.first, shape.second, 16, true, true);
+                for (int rows : {2, 3, 4, 5, 6, 7, 8})
+                    for (int topk : {1, 8, 16})
+                        CheckGroupedRows(f, rows, topk);
+            }
+            {
+                Fixture f(61, false, false, 4096, 256, 16, true, true);
+                CheckGroupedRows(f, 8, 16, false, true);
+            }
+            std::puts("Grouped rows PASS");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--tp-slab") == 0) {
+        FastllmCudaSetWeightSlabBytes(16ULL << 20);
+        Fixture f(47, false, false, 4096, 256, 8, false, true, true);
+        for (auto &w : f.owned) Check(FastllmCudaIsWeightSlabPointer(w->cudaData), "expected slab source");
+        for (int m : {1, 9, 512}) Run(f, m, 8, 0.0f, .15f, true, true);
+        for (auto &w : f.owned) Check(w->cudaData == nullptr, "slab source was not released");
+        std::puts("TP slab source PASS"); return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--decode-tiles") == 0) {
+        // Keep the single-token reduction checks small enough for Sanitizer.
+        Fixture f(43, false, false, 1536, 768, 16, true, true);
+        Run(f, 1, 1, 0.0f, .15f, true, true);
+        Run(f, 1, 16, 0.0f, .15f, true, true);
+        Run(f, 1, 16, 10.0f, 15.0f, true, true);
+        std::puts("Decode tile scheduling PASS");
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--narrow-prefill") == 0) {
         Fixture narrow(19,false,false,256,256,16,true);
         for (int m : {9,32,33,32}) Run(narrow,m,8,0.0f,.15f,true,true);
@@ -235,6 +443,19 @@ int main(int argc, char **argv) { try {
     { Fixture clamped(17); for (int m : {1,8,9,10,32,33,129,1024}) Run(clamped,m,8,10.0f,15.0f); }
     { Fixture clampedHalf(17,false,true); Run(clampedHalf,33,8,10.0f,15.0f); }
     { Fixture glm(19,false,false,4096,2048,8); Run(glm,1,8,10.0f,15.0f); }
+    // Single-token tile scheduling: both projections, asymmetric widths,
+    // routing changes under Graph replay, and ordinary/clamped SwiGLU.
+    {
+        Fixture decode(37, false, false, 4096, 2048, 8, true, true);
+        for (int topk : {1, 5, 6, 8})
+            Run(decode, 1, topk, 0.0f, .15f, true, true);
+        Run(decode, 1, 8, 10.0f, 15.0f, true, true);
+    }
+    {
+        Fixture asymmetric(41, false, false, 4096, 1024, 8, true, true);
+        Run(asymmetric, 1, 8, 0.0f, .15f, true, true);
+    }
+
     { Fixture fallback(23,false,false,128,64,8); Run(fallback,33,8,10.0f,30.0f,false); }
     { Fixture narrow(19,false,false,256,256,256,true);
       for (int m : {128,129,255,256,511,512,513,1024}) Run(narrow,m,8,0.0f,.15f,true,true); }

@@ -312,6 +312,8 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
 | `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
 
+Qwen4 单卡 CUDA 推理默认将 MTP 草稿专家常驻 GPU，独立于 `--moe_cuda_cache` 的目标模型专家缓存预算，需要额外的草稿专家显存。显存紧张时，可在启动前设置 `FASTLLM_QWEN4_MTP_GPU_EXPERTS=0`，让草稿专家继续使用 MoE 设备配置；TP、多设备流水线和 CPU 推理沿用原有放置策略。
+
 Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草稿算法后，兼容路径默认使用 NVFP4；环境变量可在启动前覆盖默认值：
 
 | 环境变量 | 默认值 | 说明 |
@@ -325,7 +327,7 @@ Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草�
 | `FASTLLM_MTP_FP8_MARLIN` | `1` | Qwen3.5 TP MTP 在初始化时为符合已有 Marlin 条件的 FP8 草稿分片准备计算布局，避免多行草稿首次调用错过布局转换。不改变权重量化格式，保留现有架构/后端选择；`0` 恢复延迟准备。已在 SM75/TP2 验证 |
 | `FASTLLM_CUDA_GDN_SEQUENCE_PREPARE` | `1` | 批量短序列 GDN 在 K/V 维度均为 128、batch≥4 的 eager 路径预计算 Q/K 归一化与门控系数，避免各状态分块重复计算。保留逐 token FP16 状态舍入及前缀快照；小批量、其他 V 维度和 Graph 保留旧路径。`0` 关闭；已在 SM75/TP2 验证 |
 | `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的单卡或多卡 MTP 草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。多卡按原词表分片筛选并映射回全局 token ID，对齐填充只重复已有候选。筛选词表只用于贪心草稿，随机采样使用完整输出头，目标模型仍使用完整词表验证 |
-| `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | 未设置 | 多卡 DFlash2 的可选 NVFP4 草稿词表清单，仅用于贪心请求；要求每个连续词表分片至少有 selector top-k 个候选。top-k 前移除对齐填充，选择后恢复原 token ID。随机采样使用完整原始头；非法或不支持的清单回退完整词表 |
+| `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | 未设置 | DFlash2 贪心请求的可选 token ID 文本清单（空白分隔）。单卡支持原编码 GGUF 或 NVFP4 草稿头，多卡支持 NVFP4；每个连续词表分片至少需有 selector top-k 个候选。对齐填充在 top-k 前移除，选择后恢复原 token ID。完整目标头保留，缩表额外占用草稿头显存，覆盖不足可能降低接受率；启用前应验证任务速度与输出一致性。随机采样使用完整词表；非法或不支持的清单回退完整词表。`FASTLLM_DRAFT_QUANT=off` 时不启用 |
 | `FASTLLM_DFLASH_ATTENTION` | 未设置：SM75 开，其余关 | DFlash FP16 融合滑窗 attention 的统一开关：`0` 关闭，`1` 在支持的设备上开启。要求 head_dim=128、query 数 1～16、query 数×GQA 分组数≤64、query 数≤窗口≤4096，且 FlashInfer 可用；不匹配时回退原路径。SM80 及以上的 Q64 路径尚无实机正确性或速度验证；SM70 及以下始终保持原路径 |
 
 DFlash2 的动态卷积、QKV 和 Gateup 准备会根据设备、类型和形状自动选择融合实现，不支持时回退到常规算子；TP selector 投影固定在 rank 0 输出头工作流中提前提交。旧开关 `FASTLLM_CUDA_DFLASH_FUSED_CONV`、`FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE`、`FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE` 和 `FASTLLM_DFLASH_TP_EARLY_SELECTOR` 已移除，设置它们不再影响执行路径。
@@ -463,6 +465,7 @@ FastLLM 的实现参考或使用了以下开源项目与文章中的思路或代
 - [PyTorch](https://github.com/pytorch/pytorch)：底层算子实现思路。
 - [Transformers](https://github.com/huggingface/transformers)：模型结构与参考实现。
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) 和 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)：GGUF 量化格式与 kernel。
+- [KVMem / kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp)：分层 KV 缓存与内容检索的设计参考，包括固定 GPU 工作集、主机 KV 备份和 pre-RoPE mean-K 检索。FastLLM 接入说明见 [KVMem 文档](docs/kvmem.md)。
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)：Attention、MLA 等算子。
 - [TurboMind / LMDeploy 的 GEMM 内核](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm)：仓内 `third_party/turbomind` 的 SM70 s884（`SM70_MMA_884` / HMMA 8x8x4）核心由其源码移植，并在其上接入 AWQ INT4、块缩放 FP8 与 NVFP4 Linear。
 - [1Cat-vLLM 的 SM70 TurboMind 适配](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind)：AWQ 接入及 FP8/NVFP4 类型、布局和小批量 tactic 的参考来源；FastLLM 侧另行实现了无 Torch 的原始指针桥接、模型权重格式转换、非对齐 padding、回退和调度。

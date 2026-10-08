@@ -64,6 +64,37 @@ static void TestTopK() {
         ++checks;
     }
 }
+// Explicit ranks specify the existing score-bit order without a float comparator
+// (NaNs have no numeric ordering). Signed zeros share a rank and retain position order.
+static void TestTopKSpecialValues() {
+    const uint32_t bits[] = {0x7fc00002u, 0x7fc00001u, 0x7f800000u, 0x3f800000u,
+        0x00000001u, 0x00000000u, 0x80000000u, 0x80000001u, 0xbf800000u,
+        0xff800000u, 0xffc00001u, 0xffffffffu};
+    const int ranks[] = {0, 1, 2, 3, 4, 5, 5, 6, 7, 8, 9, 10};
+    for (int valid : {4099, 8192, 131073}) for (bool sparse : {false, true}) {
+        Data scores(FLOAT32), result;
+        scores.Resize({1, valid + 64}); scores.Allocate();
+        // Future scores outrank all valid scores and must be excluded.
+        std::vector<uint32_t> values(valid + 64, 0x7fffffffu);
+        std::vector<int> rank(valid), expected(valid);
+        for (int i = 0; i < valid; ++i) {
+            // Sparse rows also select the lowest ordered key, which equals
+            // the candidate sort's padding key. Its real positions must win.
+            int pattern = sparse && i >= 1536 ? 11 : (i * 5 + 3) % 12;
+            values[i] = bits[pattern]; rank[i] = ranks[pattern];
+        }
+        std::iota(expected.begin(), expected.end(), 0);
+        std::stable_sort(expected.begin(), expected.end(),
+            [&](int a, int b) { return rank[a] < rank[b]; });
+        expected.resize(2048);
+        std::memcpy(scores.cpuData, values.data(), values.size() * sizeof(uint32_t));
+        scores.ToDevice(DataDevice::CUDA, {0}, true);
+        FastllmCudaNaiveTopK(scores, valid - 1, 2048, result);
+        Require(Read<int>(result) == expected, "TopK special-value order or padding differs");
+        ++checks;
+    }
+}
+
 static std::vector<int> BatchedReference(const std::vector<float> &scores, int rows,
                                         int keys, int past, int top) {
     std::vector<int> result((size_t)rows * top, -1), order(keys);
@@ -123,7 +154,13 @@ static void TestBatchedTopK() {
     }
     // Change score contents between graph replays to catch stale host selection.
     for (const auto &s : {Shape{3,2049,1000,2048}, Shape{33,8192,8159,2048},
-                          Shape{17,32769,32752,2048}}) {
+                          Shape{17,32769,32752,2048},
+                          // Single-query selection: padding, truncation,
+                          // partial causal ranges, and changed scores on replay.
+                          Shape{1,2049,1023,2048}, Shape{1,2049,2048,2048},
+                          Shape{1,32769,32704,2048}, Shape{1,131073,131008,2048},
+                          Shape{1,8193,8190,2048}, Shape{1,8193,8191,2048},
+                          Shape{1,262144,262143,2048}, Shape{1,262145,262144,2048}}) {
         Data scores(FLOAT32), output; auto values=BatchedScores(s.rows,s.keys,s.past,2,19);
         scores.Resize({s.rows,s.keys});scores.Allocate();
         std::memcpy(scores.cpuData,values.data(),values.size()*sizeof(float));scores.ToDevice(DataDevice::CUDA,{0},true);
@@ -179,8 +216,8 @@ static void TestCache() {
 
 // Cover overlapping moves, the tiled/serial boundary, and non-vector rows.
 static void TestCacheEdges() {
-    for (auto dims : {std::pair<int, int>{1536, 1024}, {7, 13}, {8, 16}, {200, 56}})
-    for (int keep : {0, 1, 127, 128, 129, 511}) for (int drop : {1, 7, 128, 513}) {
+    for (auto dims : {std::pair<int, int>{1536, 1024}, {7, 13}, {8, 16}, {200, 56}, {512, 512}})
+    for (int keep : {0, 1, 127, 128, 129, 511, 1023}) for (int drop : {1, 7, 128, 513}) {
         if (quick && (keep < 127 || keep > 129 || drop != 1)) continue;
         Data key(BFLOAT16), value(BFLOAT16);
         Upload(key, {1, keep + drop, dims.first}, 817);
@@ -349,6 +386,40 @@ static void TestAttentionWidths() {
     }
 }
 
+// Identity indices force the original generic short-attention path. Compare
+// nonzero Q/K against it so that dot, softmax and PV rounding all matter.
+static void TestAttentionShortDecode() {
+    struct Shape { int heads, kvHeads, keys, padding; };
+    for (auto s : {Shape{1,1,1,0}, Shape{3,1,31,1}, Shape{8,1,32,128},
+                   Shape{8,1,80,0}, Shape{8,1,127,128}, Shape{8,1,128,128},
+                   Shape{8,1,129,128}, Shape{8,1,255,128}, Shape{8,1,256,128},
+                   Shape{4,2,129,1}, Shape{16,2,256,0}, Shape{32,4,129,128},
+                   Shape{64,4,129,128}, Shape{64,4,256,128}})
+    for (int mode = 0; mode < 3; ++mode) {
+        Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), sink(FLOAT32);
+        Data indices(INT32), empty, actual, expected;
+        Upload(q, {1,1,s.heads*192}, 71 + mode);
+        Upload(k, {1,s.keys,s.kvHeads*192+s.padding}, 113 + mode);
+        Upload(v, {1,s.keys,s.kvHeads*128}, 157 + mode);
+        if (mode) {
+            sink.Resize({s.heads}); sink.Allocate();
+            for (int h = 0; h < s.heads; ++h)
+                ((float *)sink.cpuData)[h] = (h % 3 - 1) * (mode == 2 ? 80.f : 1.3f);
+            sink.ToDevice(DataDevice::CUDA, {0}, true);
+        }
+        indices.Resize({1,s.keys}); indices.Allocate();
+        std::iota((int *)indices.cpuData, (int *)indices.cpuData + s.keys, 0);
+        indices.ToDevice(DataDevice::CUDA, {0}, true);
+        FastllmCudaNaiveAttention(q, k, v, empty, sink, s.heads, s.kvHeads,
+                                 192, 128, s.keys - 1, 0, actual);
+        FastllmCudaNaiveAttention(q, k, v, indices, sink, s.heads, s.kvHeads,
+                                 192, 128, s.keys - 1, 0, expected);
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected),
+                "Short decode differs bitwise from generic attention");
+        ++checks;
+    }
+}
+
 static void TestAttentionSelectedValues() {
     struct Shape { int queries, heads, kvHeads, dim, valueDim, keys, selected; };
     for (auto s : {Shape{2,1,1,64,4,257,257}, Shape{5,3,1,129,132,513,511},
@@ -401,10 +472,15 @@ static void TestAttentionSelectedValues() {
 static void TestAttentionGroupedScores() {
     struct Shape { int queries, heads, kvHeads, dim, valueDim, keys, selected; };
     for (auto s : {Shape{32,4,2,64,8,513,511}, Shape{33,14,2,192,128,1027,2051},
-                   Shape{32,8,2,129,132,513,0}, Shape{31,8,2,192,128,513,512}})
+                   Shape{32,8,2,129,132,513,0}, Shape{31,8,2,192,128,513,512},
+                   // Single-query GQA reuse and adjacent dimension/group fallbacks.
+                   Shape{1,32,8,64,8,4099,2048}, Shape{1,64,4,192,8,4099,2048},
+                   Shape{1,48,4,129,132,4099,2048}, Shape{1,32,4,193,8,4099,2048},
+                   Shape{1,31,1,192,8,4099,2048},
+                   Shape{1,8,1,192,8,4099,2048}, Shape{1,4,1,129,132,4099,2048}})
     for (bool causal : {false, true}) for (bool withSink : {false, true}) {
         Data query(BFLOAT16),key(BFLOAT16),value(BFLOAT16),sink(FLOAT32),indices(INT32),output;
-        int keyStride = s.kvHeads * s.dim + 128, past = s.keys - s.queries;
+        int keyStride = s.kvHeads * s.dim + 128, past = s.keys - s.queries - (s.queries == 1 ? 64 : 0);
         Upload(query,{1,s.queries,s.heads*s.dim},53);
         Upload(key,{1,s.keys,keyStride},71);
         Upload(value,{1,s.keys,s.kvHeads*s.valueDim},113);
@@ -414,7 +490,7 @@ static void TestAttentionGroupedScores() {
             auto *p = (int *)indices.cpuData;
             for (int q=0;q<s.queries;++q) for (int slot=0;slot<s.selected;++slot) {
                 int k = (slot*137+q*13)%s.keys;
-                if (slot%97==0 || q==0) k=-1;
+                if (slot%97==0 || (q==0 && s.queries>1)) k=-1;
                 else if (slot%193==1) k=s.keys+3;
                 p[q*s.selected+slot]=k;
             }
@@ -463,7 +539,15 @@ static void TestAttentionGlobalMma() {
                    // Decode split-PV dispatch and adjacent serial fallbacks.
                    Shape{1,2048,2048,64,4,128,false}, Shape{1,32768,2048,64,4,128,true},
                    Shape{1,4099,2048,32,1,0,true}, Shape{1,4099,2048,31,1,0,true},
-                   Shape{1,4099,2047,64,4,128,true}, Shape{1,4099,2049,64,4,128,true}})
+                   Shape{1,4099,2047,64,4,128,true}, Shape{1,4099,2049,64,4,128,true},
+                   // Unaligned K stride uses grouped QK; aligned GQA16 uses shared K/V.
+                   Shape{1,4099,2048,64,4,1,true}, Shape{1,4099,2048,32,2,128,true},
+                   // TP shards: GQA4/8/16 and the adjacent head-count fallback.
+                   Shape{1,4099,2048,4,1,128,true}, Shape{1,4099,2048,8,1,128,true},
+                   Shape{1,4099,2048,16,1,128,true}, Shape{1,4099,2048,3,1,128,true},
+                   // Short decode and the neighboring long-attention dispatch.
+                   Shape{1,1,1,8,1,128,false}, Shape{1,129,129,8,1,128,false},
+                   Shape{1,256,256,8,1,128,false}, Shape{1,257,257,8,1,128,false}})
     for (bool causal : {false,true}) for (int mode=0;mode<5;++mode) {
         constexpr int dim=192,valueDim=128;
         int past = s.rows == 1 && s.padding == 0 ? s.keys - 67 : s.keys - s.rows;
@@ -646,7 +730,8 @@ static void TestIndexer() {
         {65,16387,16,896,true}, {512,2051,16,896,true},
         {64,16384,8,896,true}, {64,16384,16,896,false},
         {1,4099,16,897,true}, {1,32768,16,896,true}, {1,131073,16,897,true},
-        {1,4099,8,896,true}, {1,4099,16,896,false}};
+        {1,4099,8,896,true}, {1,4099,16,896,false},
+        {1,32768,16,897,false}};
     for (const auto &s : shapes) for (int mode = 0; mode < 5; ++mode) {
         if (quick && s.rows != 33 && s.rows != 1) continue;
         Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), out;
@@ -788,14 +873,15 @@ static void TestDecodeGraphs() {
         }
         cudaGraphExecDestroy(graph);
     }
-    for (int keys : {4099, 32768}) {
+    // Both scoring backends must preserve ordering across changed-input replays.
+    for (int keys : {4099, 32768, 131073}) for (bool fp8Query : {false, true}) {
         constexpr int heads = 16, stride = 897;
         Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), actual, expected;
         Upload(q, {1, 1, heads * 128}, 751);
         Upload(k, {1, keys, stride}, 757);
         Upload(w, {1, 1, heads}, 761);
         auto call = [&](Data &out) {
-            FastllmCudaNaiveIndexer(q, w, k, heads, 128, keys - 65, 2048, true, out);
+            FastllmCudaNaiveIndexer(q, w, k, heads, 128, keys - 65, 2048, fp8Query, out);
         };
         call(actual);
         Require(cudaDeviceSynchronize() == cudaSuccess, "Indexer graph warmup");
@@ -817,6 +903,57 @@ static void TestDecodeGraphs() {
     }
 }
 
+static void TestVerifyBlocks() {
+    for (int past : {3, 124, 127, 253, 2045, 2048, 4095, 32768, 131064})
+    for (int rows : {2, 4, 8}) for (int heads : {8, 64}) for (int window : {0, 128}) {
+        if (quick && past != 127 && past != 2045) continue;
+        const int kvHeads = heads == 8 ? 1 : 4;
+        const int localPast = window ? std::min(past, window - 1) : past;
+        const int keys = localPast + rows;
+        const int stride = kvHeads * 192 + (window ? 0 : 128);
+        Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), sink(FLOAT32);
+        Upload(q, {1, rows, heads * 192}, 911);
+        Upload(k, {1, keys, stride}, 919);
+        Upload(v, {1, keys, kvHeads * 128}, 929);
+        Upload(iq, {1, rows, 16 * 128}, 937);
+        Upload(iw, {1, rows, 16}, 941);
+        Upload(sink, {heads}, 947);
+        Data indices, actual;
+        if (!window && keys > 2048)
+            FastllmCudaNaiveVerifyIndexer(iq, iw, k, 16, 128, past, 2048, true, indices);
+        FastllmCudaNaiveVerifyAttention(q, k, v, indices, sink, heads, kvHeads,
+                                       192, 128, localPast, window, actual);
+        auto block = Read<uint16_t>(actual);
+        std::vector<int> blockIndices;
+        if (!indices.dims.empty()) blockIndices = Read<int>(indices);
+        for (int row = 0; row < rows; ++row) {
+            // Materialize each ordinary decode input and its committed KV
+            // independently, including the already-trimmed sliding prefix.
+            const int visible = localPast + row + 1;
+            const int begin = window ? std::max(0, visible - window) : 0;
+            Data qr, kr, vr, iqr, iwr, selected, expected;
+            Split(q, 1, row, row + 1, qr);
+            Split(k, 1, begin, visible, kr);
+            Split(v, 1, begin, visible, vr);
+            if (!window && visible > 2048) {
+                Split(iq, 1, row, row + 1, iqr);
+                Split(iw, 1, row, row + 1, iwr);
+                FastllmCudaNaiveIndexer(iqr, iwr, kr, 16, 128, past + row, 2048, true, selected);
+                auto one = Read<int>(selected);
+                Require(std::equal(one.begin(), one.end(), blockIndices.begin() + row * 2048),
+                        "verification Indexer differs from sequential decode");
+                ++checks;
+            }
+            FastllmCudaNaiveAttention(qr, kr, vr, selected, sink, heads, kvHeads,
+                                      192, 128, visible - begin - 1, window, expected);
+            auto one = Read<uint16_t>(expected);
+            Require(std::equal(one.begin(), one.end(), block.begin() + (size_t)row * heads * 128),
+                    "verification attention differs from sequential decode");
+            ++checks;
+        }
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     if (argc == 2 && std::strcmp(argv[1], "--invalid-indexer") == 0) {
@@ -831,10 +968,12 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick|--decode-graphs]");
         SetThreads(4);
         if (!graphsOnly) {
-            TestTopK(); TestBatchedTopK(); TestIndexer();
+            TestTopK(); TestTopKSpecialValues(); TestBatchedTopK(); TestIndexer();
             TestCache(); TestCacheEdges(); TestCacheReservation(); TestRopeWidths();
-            TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores();
+            TestAttentionWidths(); TestAttentionShortDecode();
+            TestAttentionSelectedValues(); TestAttentionGroupedScores();
             TestAttentionGlobalMma(); TestAttentionSwa();
+            TestVerifyBlocks();
         }
         TestDecodeGraphs();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");

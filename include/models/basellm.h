@@ -3,6 +3,7 @@
 #define FASTLLM_BASELLM_H
 
 #include "fastllm.h"
+#include "kvmem.h"
 #include "contextconfig.h"
 #include "baseblock.h"
 #include "template.h"
@@ -259,6 +260,19 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <float> *logits = nullptr);
 
+        // Called before the scheduler slices a single text prompt. Returning
+        // false must leave request state untouched; true means all chunks have
+        // completed and outputToken contains the first generated token.
+        virtual bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) {
+            return false;
+        }
+
         virtual std::vector <int> ForwardBatch(
                 int batch,
                 const Data &inputIds,
@@ -426,6 +440,18 @@ namespace fastllm {
         // AutoWarmup 时将实际放在 NUMA 上的 MoE 专家权重全部注册，
         // 避免未命中的专家在正式解码路径中触发首次分配和拷贝。
         void WarmupNumaMoeWeights();
+
+        KvMemConfig kvMemConfig;
+        bool kvMemLocked = false;
+        void WarmupKvMem();
+        void ConfigureKvMem(const KvMemConfig &config);
+        virtual bool SupportsKvMem() const { return false; }
+        virtual bool KvMemLayerEligible(int layer) const { return GetKVCacheRetainedTokens(layer) < 0; }
+        // Models provide the actual per-layer KV geometry; derived models may
+        // shadow legacy head-count fields on basellm.
+        virtual uint64_t KvMemLayerBytesPerToken(int layer) const { return 0; }
+        virtual void ValidateKvMemModel(const KvMemConfig &config) const {}
+        void PrepareKvMemCaches(int batch, int devices, const std::vector<std::pair<Data*, Data*>> &caches);
 
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 

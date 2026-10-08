@@ -5554,6 +5554,12 @@ namespace fastllm {
                     floatParams.find("scale")->second, output)) {
                 return;
             }
+            if (FastllmCudaQwen4SparsePrefill(
+                    query, key, value, indices, output,
+                    intParams.find("group")->second,
+                    floatParams.find("scale")->second)) {
+                return;
+            }
             output.Allocate(false);
             const int tileRows = std::min(
                 sequence, kQwen4SparsePrefillTileRows);
@@ -6096,7 +6102,8 @@ namespace fastllm {
     }
 
     bool CudaEmbedding::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        if (GetLowMemMode() || !GetCudaEmbedding() || datas.at("weight")->lockInCPU) {
+        if (GetLowMemMode() || !GetCudaEmbedding() || datas.at("weight")->lockInCPU ||
+            datas.at("weight")->dataType == DataType::DATA_GGUF_FORMAT) {
             return false;
         }
         Data &input = *(datas.find("input")->second);
@@ -8211,9 +8218,15 @@ namespace fastllm {
             logits.dataType == DataType::FLOAT16 ||
             logits.dataType == DataType::BFLOAT16 ||
             logits.dataType == DataType::FLOAT32;
+#ifdef USE_ROCM
+        const bool sigmoidTop8 = false;
+#else
+        const bool sigmoidTop8 = sigmoid && topk == 8 &&
+            logits.dataType == DataType::FLOAT32;
+#endif
         const bool supported256 =
             !logits.dims.empty() && logits.dims.back() == 256 &&
-            topk == (sigmoid ? 10 : 8) && validType;
+            (topk == (sigmoid ? 10 : 8) || sigmoidTop8) && validType;
         const bool supportedQwen4 =
             !sigmoid && !logits.dims.empty() &&
             logits.dims.back() == 512 && topk == 10 &&
@@ -8226,7 +8239,7 @@ namespace fastllm {
         auto biasIt = datas.find("gateBias");
         if (biasIt != datas.end() && biasIt->second != nullptr && !biasIt->second->dims.empty()) {
             const Data &bias = *biasIt->second;
-            const bool validBiasType = supportedQwen4
+            const bool validBiasType = (supportedQwen4 || sigmoidTop8)
                 ? bias.dataType == DataType::FLOAT32
                 : (bias.dataType == DataType::FLOAT32 ||
                    bias.dataType == DataType::FLOAT16 ||
@@ -8887,7 +8900,7 @@ namespace fastllm {
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
         MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit,
-        int activationQuantBlock, bool quantizeSharedExpert) {
+        int activationQuantBlock, bool quantizeSharedExpert, bool cacheAdmission) {
         const bool deepSeekV41Mode = deepSeekV4Mode && activationQuantBlock == 32;
         int curDeviceId = FastllmCudaGetDevice();
         CudaMergeMoeFromCpuWorkspace &workspace =
@@ -8938,11 +8951,14 @@ namespace fastllm {
         int m = maxExpert + 1; // 专家数量
 
 #ifndef USE_ROCM
-        if (setZero && !deepSeekV4Mode && gateType == MoeGateSwiglu &&
+        // The host adapter checks the quantized formats, activation layout and
+        // model math together before allocating or launching grouped MMQ.
+        if (setZero && gateType == MoeGateSwiglu &&
             output.dataType == input.dataType && output.dims == input.dims &&
             FastllmCudaMergeMOEGGUFHost(input, workspace.ggufGate,
                 workspace.ggufWorkspace, output, weights, m, indexData,
-                scoreData, topk, experts, isCrossSwiglu)) {
+                scoreData, topk, experts, isCrossSwiglu, deepSeekV4Mode,
+                swigluLimit, activationQuantBlock)) {
             input.FreeCudaTemporary({}, false);
             return;
         }
@@ -8958,6 +8974,60 @@ namespace fastllm {
                 expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
             }
         }
+
+        // The existing multi-row GLM kernels consume the same compact NUMA
+        // layout as decode. Borrow resident/admission records without changing
+        // the source weights shared by CPU and CUDA assist workers.
+        Data **sourceWeights = weights;
+        std::vector<Data *> cachedWeights;
+        std::vector<std::unique_ptr<Data>> cacheAliases;
+#ifndef USE_ROCM
+        FastllmCudaMoePrefillPlan admission;
+        FastllmCudaMoePrefillResidents resident;
+        if (setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
+            deepSeekV4Mode && activationQuantBlock == 128 &&
+            input.dataType == BFLOAT16 && output.dataType == BFLOAT16 &&
+            weights[2] && (weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED ||
+                           weights[2]->dataType == DATA_GGUF_FORMAT) &&
+            FastllmCudaGetMoePrefillResidents(weights, m, resident, cacheAdmission) &&
+            resident.nativeGlm) {
+            // Layer-partitioned models admit only on the root GPU. With
+            // expert ownership, every GPU admits its own experts instead.
+            if (cacheAdmission || resident.ownerCount > 1) FastllmCudaPlanMoePrefill(weights, m, indexData,
+                scoreData, batch, topk, experts, admission);
+            cachedWeights.assign(weights, weights + 2 * (m + 1));
+            for (int e : experts) {
+                if (e <= 0 || e > m || expertTasks[e].empty()) continue;
+                for (int part = 0; part < 2; ++part) {
+                    const int at = 2 * (e - 1) + part;
+                    const void *pointer = resident.weights[at];
+                    if (!pointer && at < int(admission.weights.size())) pointer = admission.weights[at];
+                    if (!pointer) continue;
+                    const Data &source = *weights[2 * e + part];
+                    auto alias = std::make_unique<Data>(source.dataType);
+                    alias->isFake = true;
+                    alias->dims = source.dims;
+                    alias->strides = source.strides;
+                    alias->ggmlType = source.ggmlType;
+                    alias->ggmlTensor = source.ggmlTensor;
+                    alias->isGGUFData = source.isGGUFData;
+                    alias->IsRepacked = source.IsRepacked;
+                    alias->disableGGUFRepack = source.disableGGUFRepack;
+                    alias->forceGGUFFp32Dequant = source.forceGGUFFp32Dequant;
+                    alias->expansionSize = source.Count(0);
+                    alias->UpdateUnitSize();
+                    alias->dataDevice = DataDevice::CUDA;
+                    alias->cudaData = const_cast<void *>(pointer);
+                    alias->cudaDataBorrowed = true;
+                    alias->dataDeviceIds = {curDeviceId};
+                    alias->blockK = source.blockK; alias->blockM = source.blockM;
+                    cachedWeights[2 * e + part] = alias.get();
+                    cacheAliases.push_back(std::move(alias));
+                }
+            }
+            weights = cachedWeights.data();
+        }
+#endif
 
         // Match the NUMA CPU path's FP32 projection outputs and expert
         // reduction only for the ordinary packed-FP8 BF16 MoE path.
@@ -9186,7 +9256,26 @@ namespace fastllm {
             profileMoeStream ? FastllmCudaRealMallocBytes() : 0;
         // allocSeconds 只在开归因时非空: 延迟释放把 cudaData 清回 nullptr, 每次上传
         // 都要重新向池子要一块显存, 这段开销原本混在 upload 里看不出来.
-        auto doUploadWeight = [&](Data *weight, void *stream, double *allocSeconds) {
+        auto doUploadWeight = [&](int slot, void *stream, double *allocSeconds) {
+            Data *weight = weights[slot];
+#ifndef USE_ROCM
+            // 别名权重指向共享的 GLM prefill 缓存, 源数据在固定内存的 NUMA 分片里,
+            // 只能按节点异步拷进去, 不能走 host->device 中转.
+            if (weight != sourceWeights[slot]) {
+                if (slot - 2 < int(admission.weights.size()) && admission.weights[slot - 2]) {
+                    const auto &source = *sourceWeights[slot];
+                    const size_t bytes = source.GetBytes() / source.numasData.size();
+                    for (size_t node = 0; node < source.numasData.size(); ++node) {
+                        auto *target = static_cast<uint8_t *>(weight->cudaData) + node * bytes;
+                        if (stream) FastllmCudaCopyFromPinnedHostToDeviceAsync(
+                            target, source.numasData[node], bytes, stream);
+                        else AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+                            target, source.numasData[node], bytes), "GLM prefill cache upload failed.");
+                    }
+                }
+                return;
+            }
+#endif
             if (!(weight->cpuData || !weight->numasData.empty())) {
                 return;
             }
@@ -9206,15 +9295,15 @@ namespace fastllm {
             }
             weight->ToCudaTemporary({}, true, stream);
         };
-        auto uploadWeight = [&](Data *weight, void *stream = nullptr) {
+        auto uploadWeight = [&](int slot, void *stream = nullptr) {
             if (!profileMoeStream) {
-                doUploadWeight(weight, stream, nullptr);
+                doUploadWeight(slot, stream, nullptr);
                 return;
             }
             double start = profileNow();
-            doUploadWeight(weight, stream, &profileAlloc);
+            doUploadWeight(slot, stream, &profileAlloc);
             profileUpload += profileNow() - start;
-            profileUploadBytes += (double)weight->GetBytes();
+            profileUploadBytes += (double)weights[slot]->GetBytes();
             profileUploads++;
         };
         // 延迟释放: 池里对 reusePending 的块用 cudaEventQuery 挡住复用, 复用要等
@@ -9255,9 +9344,18 @@ namespace fastllm {
         const bool eventOrderedPrefetch = pinnedUpload || asyncPrefetch;
         bool prefetchPending = false;
         int curExpert = findNextValidExpert(-1);
+
+#ifndef USE_ROCM
+        // GGUF cache admission belongs to the packed host-prefill backend.
+        // Its generic fallback does not have the native NUMA byte layout.
+        if (setZero && isCrossSwiglu && !deepSeekV4Mode && gateType == MoeGateSwiglu &&
+            weights[2]->dataType != DATA_GGUF_FORMAT && !weights[2]->isGGUFData)
+            FastllmCudaPlanMoePrefill(weights, m, indexData, scoreData, batch, topk, experts, admission);
+#endif
+
         if (curExpert >= 0) {
-            uploadWeight(weights[curExpert * 2]);
-            uploadWeight(weights[curExpert * 2 + 1]);
+            uploadWeight(curExpert * 2);
+            uploadWeight(curExpert * 2 + 1);
         }
 
         int prevExpert = -1;
@@ -9277,8 +9375,8 @@ namespace fastllm {
             int nextExpert = findNextValidExpert(curExpert);
 
             if (nextExpert >= 0) {
-                uploadWeight(weights[nextExpert * 2], copyStream);
-                uploadWeight(weights[nextExpert * 2 + 1], copyStream);
+                uploadWeight(nextExpert * 2, copyStream);
+                uploadWeight(nextExpert * 2 + 1, copyStream);
                 if (eventOrderedPrefetch) {
                     FastllmCudaEventRecord(prefetchDoneEvent, copyStream);
                     prefetchPending = true;
@@ -9343,7 +9441,8 @@ namespace fastllm {
                             tempMiddle, tempSwiglu,
                             cudaScales + startIdx[i], swigluLimit,
                             IsDeepSeekV4CudaQuantizedWeight(*weights[i * 2 + 1]) ||
-                                (i == 0 && quantizeSharedExpert), activationQuantBlock),
+                                (i == 0 && quantizeSharedExpert) ||
+                                (i != 0 && deepSeekV41Mode), activationQuantBlock),
                         "DeepSeek-V4 failed to prepare its CUDA MoE down input.");
                 } else {
                     ApplyCudaMoeGate(
@@ -9385,6 +9484,10 @@ namespace fastllm {
             if (profileMoeStream) {
                 profileCompute += profileNow() - computeStart;
             }
+#ifndef USE_ROCM
+            if (!resident.nativeGlm)
+                FastllmCudaStoreMoePrefillExpert(admission, i - 1, *weights[i * 2], *weights[i * 2 + 1]);
+#endif
             FastllmCudaEventRecord(computeDoneEvent);
             // 非中转路径保留旧的保守排序: 副本流排在本次计算之后, 预取的下一份权重
             // 不会早于本次计算落地. 中转路径上面已经改成延迟释放, 池会用事件挡住
@@ -9442,6 +9545,12 @@ namespace fastllm {
                 fflush(stdout);
             }
         }
+#ifndef USE_ROCM
+        FastllmCudaPublishMoePrefill(admission);
+        // DoCudaMergeMOEFromCPU also serves short-lived prefill workers. Their
+        // per-thread stream must publish residency before the worker exits.
+        if (!admission.keys.empty()) FastllmCudaSyncCurrentThreadStream();
+#endif
         if (accurateFp8Moe || deepSeekV41Mode) {
             FastllmFloatToBF16(
                 floatOutput.cudaData, output.cudaData,

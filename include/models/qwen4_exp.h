@@ -6,6 +6,7 @@
 #define FASTLLM_QWEN4_EXP_H
 
 #include "qwen3_next.h"
+#include "devices/disk/diskdevice.h"
 
 #include <atomic>
 #include <cstdint>
@@ -31,10 +32,18 @@ namespace fastllm {
         void OnWeightLoaded(const std::string &weightName,
                             const std::set<std::string> &finishedWeightNames) override;
         void OnModelWeightsLoaded() override;
+        int GetWeightLoadPriority(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        bool ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+        void OnWeightLoadGroupFinished() override;
         bool ShouldDelaySpecialWeightNumaRegistration(
                 const std::string &weightName) const override;
         bool ShouldDelaySpecialWeightCudaMove(
                 const std::string &weightName) const override;
+        std::string SelectSpecialWeightDevice(const std::string &weightName,
+                int layerId) const override;
 
         int Forward(
                 const Data &inputIds,
@@ -91,6 +100,8 @@ namespace fastllm {
         ThreadTpState *threadTpOwner = nullptr;
         int threadTpRank = -1;
         void InitThreadTp();
+        int StreamingThreadTpExpertLayer(const std::string &weightName) const;
+        int StreamingThreadTpReplicaLayer(const std::string &weightName) const;
         void PrepareThreadTp();
         void ThreadTpAllReduce(Data &data);
         bool ThreadTpAllTrue(bool value);
@@ -161,6 +172,9 @@ namespace fastllm {
                                     std::shared_ptr<PagedCacheManager>>;
             std::vector<Pools> layers;
             Pools mtp;
+            // One warmup allocation per layer, moved into the first request
+            // that needs it. Mutable QSA history is never shared by requests.
+            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> qsaHostMirrors;
         };
         std::shared_ptr<ServingCache> servingCache;
         void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);
@@ -320,6 +334,7 @@ namespace fastllm {
         bool ggufWeightsRestored = false;
         void RestoreGgufWeights();
         void RestoreGdnOutputWeight(Data &weight, int tpSize);
+        bool GdnOutputUsesTiledLayout(const Data &projection) const;
         void RunGdnOutputProjection(Data &input, Data &weight, Data &output);
         std::atomic<int> mtpWeightsStatus{-1};
         std::mutex prepareMutex;
@@ -344,6 +359,7 @@ namespace fastllm {
         // Logical concatenation of the lazy shard metadata used by the
         // standard disk EmbeddingDirect operation.
         Data pleNgramDiskWeight;
+        std::shared_ptr<DiskEmbeddingRowReader> pleDiskReader;
         // Host QSA compression must not move the device normalization weights.
         std::map<int, std::vector<float>> qsaKeyNormValues;
         std::vector<Data *> mtpMoeWeights;
@@ -402,12 +418,15 @@ namespace fastllm {
                                  Data &normalized,
                                  Data *normalizedStorage = nullptr);
 
+        int64_t PLEHashRow(const int *shifted, int head) const;
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
-                    const std::vector<int> *hostInputTokens = nullptr);
+                    const std::vector<int> *hostInputTokens = nullptr,
+                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr);
         void RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
-                    const std::vector<int> *hostInputTokens);
+                    const std::vector<int> *hostInputTokens,
+                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr);
         void MaterializePLEHostHistory(RequestState &state);
         void BuildQSAMask(int layer, const std::string &attentionPrefix,
                           const Data &input,

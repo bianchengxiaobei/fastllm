@@ -8,7 +8,6 @@ import threading
 import asyncio
 import copy
 import json
-import math
 import importlib.util
 import importlib.metadata as importlib_metadata
 import logging
@@ -375,6 +374,12 @@ fastllm_lib.create_llm_model_fromhf_with_config.restype = ctypes.c_int
 fastllm_lib.create_llm_model_from_gguf.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 fastllm_lib.create_llm_model_from_gguf.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_context"):
+    fastllm_lib.create_llm_model_from_gguf_with_context.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.create_llm_model_from_gguf_with_context.restype = ctypes.c_int
+
 if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
     fastllm_lib.create_llm_model_from_gguf_with_mtp.argtypes = [
         ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
@@ -465,14 +470,27 @@ fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
+if hasattr(fastllm_lib, "set_moe_cache_policy"):
+    fastllm_lib.set_moe_cache_policy.argtypes = [
+        ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        ctypes.c_float, ctypes.c_bool]
+    fastllm_lib.set_moe_cache_policy.restype = ctypes.c_bool
 if hasattr(fastllm_lib, "fastllm_moe_cuda_cache_stats"):
     fastllm_lib.fastllm_moe_cuda_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_bool]
     fastllm_lib.fastllm_moe_cuda_cache_stats.restype = ctypes.c_bool
 fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
 fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+    fastllm_lib.get_disk_moe_cache_stats_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_int]
+    fastllm_lib.get_disk_moe_cache_stats_v2.restype = ctypes.c_int
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
+
+fastllm_lib.set_kvmem_llm_model.argtypes = (
+    [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 6 + [ctypes.c_uint64, ctypes.c_int])
+fastllm_lib.set_kvmem_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int64]
 
@@ -643,10 +661,44 @@ def set_moe_cuda_cache(bytes_: int):
         raise ValueError("MoE CUDA cache size must fit in uint64")
     fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
 
-def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
-    """Synchronize a CUDA device and read expert-cache counters outside inference timing.
+def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
+                         max_bytes=0, min_heat=1., margin=1., factor=1.,
+                         min_residence=0, prefill_prior=0., rank_by_bytes=False):
+    """Configure GGUF/NVFP4/FP8 hybrid decode admission before model loading.
 
-    Reset clears route counters only; cached weights and LRU residency are retained.
+    Counts and byte limits apply per device/update, across all layers. max_bytes=0
+    imposes no byte cap; max_replacements=0 disables decode admission.
+    One decode step may verify several speculative tokens. half_life=0 disables
+    decay. prefill_prior weights rescaled prompt heat and
+    does not discard resident payloads. Existing cache policies keep their config.
+    """
+    for name, value, minimum in (("update_interval", update_interval, 1),
+                                  ("max_replacements", max_replacements, 0),
+                                  ("min_residence", min_residence, 0)):
+        if not isinstance(value, int) or not minimum <= value <= (1 << 31) - 1:
+            raise ValueError(f"{name} must be an integer in [{minimum}, 2147483647]")
+    if not isinstance(max_bytes, int) or not 0 <= max_bytes <= (1 << 64) - 1:
+        raise ValueError("max_bytes must fit in uint64")
+    for name, value, minimum in (("half_life", half_life, 0), ("min_heat", min_heat, 0),
+                                  ("margin", margin, 0), ("factor", factor, 1),
+                                  ("prefill_prior", prefill_prior, 0)):
+        if not math.isfinite(value) or value < minimum:
+            raise ValueError(f"{name} must be finite and >= {minimum}")
+    if prefill_prior > 1:
+        raise ValueError("prefill_prior must be in [0, 1]")
+    native = getattr(fastllm_lib, "set_moe_cache_policy", None)
+    if native is None:
+        raise RuntimeError("MoE cache policy configuration requires an updated native library")
+    if not native(half_life, update_interval, max_replacements, max_bytes,
+                  min_heat, margin, factor, min_residence, prefill_prior, rank_by_bytes):
+        raise ValueError("Invalid MoE cache policy configuration")
+
+def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
+    """Synchronize a CUDA device and read expert-cache query counters outside inference timing.
+
+    Hits/misses include GPU-assigned queries and prefetch, excluding CPU-only
+    routes. Use get_moe_cuda_cache_route_stats for full hybrid route residency.
+    Reset clears these query counters only; cached weights and LRU residency are retained.
     Byte and slot counts cover all prepared expert tables on the selected device.
     """
     query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_stats", None)
@@ -660,6 +712,29 @@ def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
     result["hit_rate"] = result["hits"] / routes if routes else None
     return result
 
+def get_moe_cuda_cache_route_stats(device: int = 0):
+    """Read cumulative single-GPU hybrid decode/verifier counters between requests.
+
+    Residency is measured across all routed experts before CPU/GPU dispatch,
+    excluding prefetch lookups. Prefill, multi-GPU EP and pure-GPU mode are
+    not counted. Host inference must be idle; this also synchronizes the GPU.
+    Subtract snapshots for per-request counts; cache and scheduler are retained.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_route_stats", None)
+    if query is None:
+        raise RuntimeError("Full-route expert-cache statistics require an updated CUDA build")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 8)()
+    if not query(int(device), values):
+        raise RuntimeError("Could not read full-route expert-cache statistics")
+    result = dict(zip(("calls", "routes", "resident_routes", "nonresident_routes",
+                       "gpu_routes", "cpu_routes", "resident_gpu_routes", "prefetched_experts"), values))
+    routes = result["routes"]
+    result["hit_rate"] = result["resident_routes"] / routes if routes else None
+    result["gpu_fraction"] = result["gpu_routes"] / routes if routes else None
+    return result
+
 def set_moe_cpu_cache(bytes_: int):
     bytes_ = int(bytes_)
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
@@ -668,10 +743,16 @@ def set_moe_cpu_cache(bytes_: int):
 
 def get_disk_moe_cache_stats():
     """Process-wide cumulative route counts and resident expert payload bytes."""
+    names = ("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
+             "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
+             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes")
+    if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+        values = (ctypes.c_uint64 * len(names))()
+        count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
+        return dict(zip(names[:count], values))
     values = (ctypes.c_uint64 * 9)()
     fastllm_lib.get_disk_moe_cache_stats(values)
-    return dict(zip(("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
-                     "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions"), values))
+    return dict(zip(names[:9], values))
 
 def disable_cuda_malloc():
     fastllm_lib.disable_cuda_malloc();
@@ -1264,9 +1345,13 @@ class model:
         if not isinstance(rope_scaling, str):
             raise ValueError("rope_scaling must be yarn or a JSON object")
         context_requested = max_context_length > 0 or bool(rope_scaling)
-        if context_requested and (id != -99999 or graph is not None or model_json or not os.path.isdir(path)):
-            raise ValueError("Context options currently require a Hugging Face model directory")
-        if context_requested and not hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
+        is_gguf = os.path.isfile(path) and str(path).lower().endswith(".gguf")
+        if context_requested and (id != -99999 or graph is not None or model_json or
+                                  not (os.path.isdir(path) or is_gguf)):
+            raise ValueError("Context options require a Hugging Face model directory or GGUF file")
+        context_loader = ("create_llm_model_from_gguf_with_context" if is_gguf else
+                          "create_llm_model_fromhf_with_context")
+        if context_requested and not hasattr(fastllm_lib, context_loader):
             raise RuntimeError("The native FastLLM library must be rebuilt to support context options")
         self.context_config = None
         if (graph != None):
@@ -1357,7 +1442,16 @@ class model:
                 if external_mtp_path and mmproj_path:
                     raise ValueError(
                         "external MTP and mmproj cannot be used together")
-                if external_mtp_path:
+                if context_requested:
+                    self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
+                        path.encode(), ori_model_path.encode(),
+                        external_mtp_path.encode(), mmproj_path.encode(),
+                        max_context_length, rope_scaling.encode())
+                    if self.model < 0:
+                        raise ValueError(fastllm_lib.get_llm_context_result().decode("utf-8", errors="replace"))
+                    if mmproj_path:
+                        self.mmproj_path = mmproj_path
+                elif external_mtp_path:
                     if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
                         raise RuntimeError(
                             "the loaded FastLLM library does not support "
@@ -2041,6 +2135,8 @@ class model:
                             tool_choice = None, chat_template_kwargs = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        if getattr(self, "kvmem_enabled", False) and (images or videos):
+            raise ValueError("KVMem currently supports text-only requests")
         multimodal_images = list(images or [])
         multimodal_videos = list(videos or [])
         if multimodal_images or multimodal_videos:
@@ -3158,16 +3254,22 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
+        if getattr(self, "kvmem_enabled", False) and save:
+            raise ValueError("KVMem does not support history caching")
         self.save_history = bool(save)
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
+        if getattr(self, "kvmem_enabled", False):
+            raise ValueError("Set compute dtype before configuring KVMem")
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
 
     def set_moe_atype(self, moe_atype: str):
         fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
 
     def set_kv_cache_dtype(self, kv_cache_dtype: str):
+        if getattr(self, "kvmem_enabled", False):
+            raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
     def warmup(self):
@@ -3181,6 +3283,35 @@ class model:
     
     def set_cuda_shared_expert(self, cuda_shared_expert: bool):
         fastllm_lib.set_cuda_shared_expert(cuda_shared_expert)
+
+    def set_kvmem(self, *, enabled=True, max_tokens=32768, resident_tokens=8192,
+                  sink_tokens=128, recent_tokens=2048, retrieval_tokens=4096,
+                  prefill_tokens=512, host_mib=8192, retrieval_interval=64):
+        """Opt into sparse, host-backed KV before warmup (single-GPU Qwen3/3.5).
+
+        This changes attention once the resident budget is exceeded. Prefix
+        caching and batching are disabled; Qwen3.5 also supports DFlash/MTP.
+        Token budgets except max_tokens must align to the configured KV page.
+        retrieval_interval controls speculative score reuse in committed tokens;
+        it need not be page aligned. Use 1 to refresh every verification round.
+        """
+        values = (max_tokens, resident_tokens, sink_tokens, recent_tokens,
+                  retrieval_tokens, prefill_tokens)
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be bool")
+        if any(type(value) is not int or not 0 <= value <= 2147483647 for value in values):
+            raise ValueError("KVMem token budgets must be nonnegative 32-bit integers")
+        if type(host_mib) is not int or not 0 < host_mib < (1 << 44):
+            raise ValueError("host_mib must be a positive integer below 2**44")
+        if type(retrieval_interval) is not int or not 1 <= retrieval_interval <= 2147483647:
+            raise ValueError("retrieval_interval must be a positive 32-bit integer")
+        error = fastllm_lib.set_kvmem_llm_model(
+            self.model, enabled, *values, host_mib << 20, retrieval_interval)
+        if error:
+            raise ValueError(error.decode("utf-8", errors="replace"))
+        self.kvmem_enabled = enabled
+        if enabled:
+            self.save_history = False
 
     def set_kv_cache_limit(self, limit: str):
         limit_bytes = 0
@@ -3200,6 +3331,8 @@ class model:
         fastllm_lib.set_kv_cache_limit_llm_model(self.model, ctypes.c_int64(limit_bytes))
     
     def set_max_batch(self, batch: int):
+        if getattr(self, "kvmem_enabled", False) and batch != 1:
+            raise ValueError("KVMem currently requires max_batch=1")
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
 
     def get_max_batch(self):

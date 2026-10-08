@@ -41,7 +41,9 @@ or BF16 activations. The V4.1 adapter has a separate BF16 contract:
 | `NVFP4_BLOCK_16_E4M3` | Packed E2M1 weights, planar E4M3 block scales, global scales | Existing compact NVFP4 adapter |
 | `FP8_E4M3` | Original E4M3 bytes and FP32 block-scale arrays for gate/up and down | Hidden/intermediate widths and column scale blocks divisible by 4 |
 | `FP8_E4M3_BLOCK_128` | Original interleaved 128-byte weight blocks and FP32 scales | Hidden/intermediate widths divisible by 128 |
+| GLM 5.3 `NVFP4_BLOCK_16_E4M3_PACKED` | Native NUMA gate/up row pairs, packed E2M1 values, inline E4M3 block scales and per-row global scales | BF16 decode, 2–9-row verification and NUMA-assisted multi-row prefill; hidden/intermediate widths divisible by 128 |
 | DeepSeek V4.1 `NVFP4_BLOCK_32_E8M0` | 16 packed E2M1 bytes and one UE8M0 scale per 32 weights | BF16 decode and 2–8-row verification; NUMA weights and widths divisible by 32 |
+| DeepSeek V4.1 Q2_K gate/up + Q4_K down | Registered NUMA Q2_K_R4/Q4_K_R4 blocks, retaining cross-interleaved gate/up rows | BF16 decode and 2–8-row verification; widths divisible by 256 |
 
 The generic GGUF adapter accepts Q2_0, Q4_0/Q4_1, Q5_0/Q5_1,
 Q8_0/Q8_1, Q2_K–Q6_K, IQ1_S/IQ1_M, IQ2_XXS/IQ2_XS/IQ2_S,
@@ -51,6 +53,18 @@ stride, while each layer retains its own shapes, types and down offset.
 Experts within a layer must have matching projection layouts. Gate/up rows
 use ordinary concatenated `[gate, up]` order. CPU R4/interleaved layouts are
 not admitted as ordinary GGUF blocks.
+
+Temporary streamed experts can instead retain NUMA's gate/up row interleave
+and IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS R4 packing. The projection kernels read these
+layouts directly, without a separate restoration kernel or a second weight
+copy in host memory. Quantized values and projection arithmetic are unchanged.
+Selection uses each projection's type, shape and batch dispatch; unsupported
+R4 formats or batches retain lossless restoration. Persistent cache entries
+remain canonical: promotion from a temporary NUMA record restores it in VRAM
+without transferring the expert over PCIe again. GLM GGUF also reads its
+IQ2_XXS/IQ2_S gate and IQ3_XXS/IQ4_XS down NUMA layouts directly, using its
+own Q8_K/BF16 projections, clamp and score placement. V4.1 retains its
+specialized path.
 
 The GGUF fast path quantizes input and SwiGLU activations to Q8_1 and uses
 DP4A integer dots for Q2_0, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S projections.
@@ -66,8 +80,8 @@ quantization changes numerical results and can change generated tokens.
 
 Both paths accumulate in FP32 and round projection/SwiGLU results to the
 activation type. With registered NUMA weights, GGUF also uses the existing
-hybrid decode scheduler: resident experts run on CUDA and CPU workers compute
-cache misses concurrently. Tensor parallel decode assigns expert ownership
+hybrid decode scheduler: resident experts run on CUDA, while misses can be
+split between CPU workers and streamed CUDA execution. Tensor parallel decode assigns expert ownership
 across its GPUs and reduces unweighted per-expert results once. Each GPU has
 its own cache budget; for example, `--moe_cuda_cache 2g` with two GPUs allows
 approximately 4 GiB of expert records in total.
@@ -100,6 +114,208 @@ record stride, in addition to CPU expert storage. Pure GPU expert execution
 with on-demand refills remains available through the cache operator without
 NUMA registration. Decode and verification batches of up to nine rows use
 the cache; larger prefill batches retain the configured CPU/NUMA backend.
+
+## GGUF dynamic decode and verification
+
+Ordinary GGUF experts registered with NUMA can overlap resident GPU work,
+PCIe copies of uncached experts, and CPU work. The scheduler uses per-layer
+measurements of CPU time, resident/staged GPU time, transfer time and host
+submission cost; occasional probes refresh a path that has stopped receiving
+work. No fixed-split environment variable is needed. A staged expert executes
+as soon as its own transfer and preceding GPU work finish. Staging uses
+separate temporary records and does not admit or evict cache entries.
+
+Single-row decode first measures the no-upload CPU baseline, keeps observed
+CPU costs by route count, and periodically refreshes that baseline. CPU worker
+completion timestamps separate CPU preparation/compute from callback-only
+GPU submission stalls; submission cost overlaps the active CPU workers in
+the planner. Scored GGUF decode uses the ordinary NUMA row workers with an
+output-route map, preserving BF16 rounding, clamp and route-score boundaries
+without constructing the multi-row verifier's per-expert task lists. Unscored
+GGUF decode, including Qwen Flash-Next, keeps its specialized subset workers
+and uses the same corrected timing and single-row planner. Small scored GGUF
+verification batches with per-route output (up to 32 rows, subject to decode
+kernel support) reuse these exact workers one input row at a time. The first
+CPU row launches its workers before submitting GPU work; all-GPU batches still
+submit once. Both scored and unscored GGUF verification measure worker CPU
+time without callback-only stalls. Verification retains separate estimates
+for each layer and row count and charges uploads per unique expert. Other
+formats and larger batches retain their grouped path.
+
+Single-GPU FP32 verification accepts two to nine rows. It groups misses by
+expert identity, gives all routes of one expert the same CPU/GPU owner, and
+copies each staged expert once even when several tokens select it. Experts
+with more reused routes are considered first. Transfer cost is charged per
+unique expert; compute cost per route. Estimates are kept separately for each
+layer and verifier row count. CPU expert arithmetic and cache admission retain
+their existing paths. Shared NUMA record layouts and multi-GPU verification
+keep their previous resident-GPU/CPU routing.
+
+Single-row decode reuses the Q8 input prepared by resident GPU experts when
+computing staged experts. Verifier rows only reuse that scratch for consecutive
+routes of the same input row. Qwen's independent shared expert is submitted
+while the single-row NUMA jobs and expert transfers are active. GLM GGUF
+ordinary decode starts and ends its frequency policy once per CUDA device per
+token; speculative/replay calls retain their existing routing.
+
+A zero per-device budget also supports this streamed path for ordinary GGUF
+with registered NUMA experts. It allocates metadata and temporary staging
+buffers, but zero resident slots and zero resident expert payload. The global
+CLI/API budget must still enable preparation; `--moe_cuda_cache 0` by itself
+retains its existing behavior of disabling the cache backend. For example:
+
+```sh
+FASTLLM_MOE_CUDA_CACHE_BYTES_0=0 \
+ftllm server /path/to/model --device cuda --moe_device numa --moe_cuda_cache 2g
+```
+
+Check `llm.get_moe_cuda_cache_stats(0)` for actual `payload_bytes` and `slots`.
+For the execution split, subtract snapshots from
+`llm.get_moe_cuda_cache_route_stats(0)` taken between requests. Those counters
+include single-GPU hybrid decode, ordinary GGUF and compact GLM batched verification,
+including CPU routes; they exclude prefill, multi-GPU expert parallelism and
+pure-GPU mode. Reading them synchronizes the device. A temporary GPU expert
+counts as GPU execution, but not as a resident cache hit.
+
+### Global frequency admission for single-token decode
+
+The ordinary Qwen4/GLM GGUF and GLM 5.3 compact NVFP4 hybrid paths observe all layers before
+selecting admissions at the end of a token or GLM verification batch. Candidates compete for a global
+budget by their heat gain over an eligible resident in the same physical slot
+partition. There is no rotating layer eligibility or one-admission-per-layer
+limit. Copies run on an admission stream after current cache readers finish;
+subsequent cache users wait for the payload and residency publication together.
+Candidate and resident ordering is maintained incrementally in indexed heaps.
+Decode does not sort all candidates or rebuild resident indices every token.
+Scores retain the same float decay and cutoff; in-place heap repairs preserve
+expert/slot tie ordering when decay rounds previously different scores together.
+Prefill uses its bulk admission path. Compact GLM MTP verification uses the same
+global frequency policy; ordinary GGUF verification, thread-TP expert parallelism
+and other non-GGUF adapters keep their existing admission policies.
+
+GLM 5.3 NVFP4 uses the same per-layer measured CPU/GPU miss split and per-expert
+DMA pipeline as GGUF decode. Resident and temporary records both keep NUMA's
+compact gate/up interleave, so DMA copies the original row shards without a
+restoration kernel, expanded weights or another host weight snapshot. Its
+existing BF16 rounding, routed scores, clamping and block-128 activation
+quantization remain in the GLM adapter. Global admissions use this native DMA
+path after current readers finish. Layer-partitioned dual-GPU inference advances
+and closes the policy once per device per ordinary decode token.
+
+GLM's NUMA backend also prepares streaming when `--moe_cuda_cache 0`, keeping
+temporary uploads available without resident slots. Per-device zero-budget
+overrides have the same effect. Compact GLM verification can use this path too.
+
+Compact GLM verification supports two to nine rows through the common batched
+hybrid dispatcher. A repeated expert has one CPU/GPU owner across rows and is
+uploaded once; each temporary expert begins computation after its own DMA.
+Resident experts stay on GPU. Per-layer, per-row-count CPU, resident GPU,
+temporary GPU and PCIe timings select the missed experts to offload. The CPU
+retains grouped expert GEMMs; GPU submission overlaps its gate/up worker queue.
+GLM's BF16 boundaries, score placement, block-128 activation quantization and
+expert-ordered reduction are retained. Larger batches keep the prefill path.
+
+When MTP is enabled, a compatible compact draft expert table joins the existing
+cache budget. Target verification and compatible draft calls advance the global
+frequency policy, with admissions after readers complete. BF16 draft expert
+weights keep their existing execution path; the GLM NVFP4 checkpoint used in
+testing has BF16 draft experts. This covers one GPU per layer, including
+layer-partitioned dual-GPU models; GLM thread-TP expert parallelism is unchanged.
+GLM's DSA backend currently rejects MTP, so MTP requires the existing dense
+attention backend (`FASTLLM_GLM5_NEXT_DSA_BACKEND=dense`).
+
+With frequency caching active, compact GLM verification can also use the other
+GPUs whose caches have already been initialized for the same model. This applies
+to 2–9 rows in a layer-partitioned model; attention placement and single-token
+decode retain their existing paths. Resident routes prefer the origin GPU and
+then another GPU holding that expert. Each unique miss has one CPU/GPU owner,
+chosen from measured NUMA, GPU, PCIe and host-staged activation/result costs.
+Uploads and kernels run on each GPU while the shared NUMA worker pool runs its
+subset. P2P is not required. Per-expert results are gathered before the existing
+ordered BF16 reduction, rather than reducing GPU-local partial sums.
+
+The helper reuses the model's original pinned NUMA records and existing cache;
+it does not admit foreign-layer experts or duplicate host weights. One reusable
+temporary workspace is kept per GPU across origin-device changes. Cache
+frequency observation/admission remains on the layer's origin GPU. Cooperative
+route counters charge GPU work to its executing device and CPU work/call count
+to the origin, so summing devices counts every route and layer exactly once.
+Single-GPU and unsupported layouts keep their previous dispatchers.
+
+For greedy GLM MTP, `--mtp_min_p` (0–1, default 0) optionally truncates a draft
+chain before admitting a candidate whose full-vocabulary probability is below
+the threshold. The existing acceptance-based depth limit still applies; the
+threshold itself stays fixed. A rejected first candidate leaves the next step
+on ordinary target decode, while later truncation restores the draft KV cache
+to its committed prefix. Zero disables the confidence reduction, and sampled
+generation keeps its existing behavior. Verbose request completion reports
+verified/accepted draft counts and confidence checks/stops; accepted counts
+include the final verified batch even if the output limit truncates its delivery.
+
+GLM NVFP4 NUMA-assisted prefill reuses the resident compact records with the
+existing multi-row projection and activation kernels. Selected admissions are
+uploaded directly into cache slots; other misses retain temporary uploads and
+next-expert prefetch. Active resident experts are protected from eviction until
+their readers finish. For a layer-partitioned model, only the GPU owning that
+layer's output admits new experts, so assist GPUs do not spend their decode
+cache budget on another GPU's layers. Prefill fills use the same global heat
+policy as GGUF and remain resident when ordinary decode begins.
+
+This prefill path also estimates CPU/GPU placement from normal layer execution,
+including transfer and compute overlap. It starts with a small CPU subset and
+GPU work from the same layer, without rebuilding synthetic CPU/GPU calibration
+curves as successive layers increase the busiest expert's row count. This
+placement policy also applies with no expert cache; explicit `FT_EXPERT_LIMIT`
+continues to override automatic placement. No new tuning variable is required.
+
+Configure before loading a model. These options have both underscore and hyphen
+spellings, and are applied to newly created cache policies:
+
+| CLI option | Default | Meaning |
+| --- | ---: | --- |
+| `--moe_cache_half_life` | `128` | Heat half-life in decode steps; `0` disables decay |
+| `--moe_cache_update_interval` | `1` | Update every N decode steps; decay accounts for N steps |
+| `--moe_cache_max_replacements` | `96` | Maximum admissions per update across all layers, including empty-slot fills; `0` disables decode admission |
+| `--moe_cache_max_bytes` | `0` | Additional byte limit per update, such as `30m`; `0` means unlimited bytes within the expert-count limit |
+| `--moe_cache_min_heat` | `1` | Minimum candidate heat |
+| `--moe_cache_margin` | `1` | Require candidate heat > resident heat × factor + margin |
+| `--moe_cache_factor` | `1` | Resident heat multiplier, at least 1 |
+| `--moe_cache_min_residence` | `0` | Minimum decode steps before an admitted expert may be evicted |
+| `--moe_cache_prefill_prior` | `0` | Fraction of rescaled prefill heat retained at decode start, in [0,1]; resident weights remain cached |
+| `--moe_cache_rank_by_bytes` | off | Rank by heat gain divided by the candidate's actual record bytes |
+
+The byte limit applies to each update, not each token when the update interval
+exceeds one. It charges the compact record copied, including when a tiny cache
+uses oversized shared slots. Empty slots do not require a positive replacement
+gain, but still consume the count and byte budgets. A slot is replaced at most
+once per update. Limits do not apply to prefill fills or temporary GPU execution
+of uncached experts, which are separate from admission.
+
+For a hard 30 MiB update limit:
+
+```sh
+ftllm server /path/to/model.gguf --device cuda --moe_device numa \
+  --moe_cuda_cache 10g --moe_cache_max_bytes 30m --moe_cache_rank_by_bytes
+```
+
+The Python API exposes the same settings without environment variables:
+
+```python
+from ftllm import llm
+llm.set_moe_cuda_cache(10 << 30)
+llm.set_moe_cache_policy(
+    half_life=128, update_interval=1, max_replacements=96,
+    max_bytes=0, min_heat=1, margin=1, factor=1,
+    min_residence=0, prefill_prior=0, rank_by_bytes=False,
+)
+# Load the model after configuration.
+```
+
+C++ callers can include `moe_cache_config.h` and use
+`SetMoeCacheConfig(MoeCacheConfig{...})`. Existing caches retain their configuration.
+The effective policy is logged when a cache is initialized. Higher admission
+budgets can improve hit rate while increasing PCIe traffic; benchmark decode
+throughput as well as resident-route hit rate when tuning these settings.
 
 ## GPU-resident GGUF experts
 
@@ -155,7 +371,8 @@ pointer tables share one allocation before capture: two weight tables for
 packed block128, plus two scale tables for native E4M3. The existing indexed
 gate/up/down kernels read them. Cache lookup and refill produce slot IDs on the GPU, so
 changing routes do not require a per-token host pointer upload. All dependent
-work runs on `cudaStreamPerThread`.
+computation runs on `cudaStreamPerThread`; asynchronous admission streams publish
+an event dependency before subsequent cache reads.
 
 Model integration is available in DeepSeek V4.1 (described below) and the
 Qwen4-Exp backbone used by Qwen3.8-Flash-Next. Qwen4-Exp snapshots host experts
@@ -254,8 +471,9 @@ addition to storage used by the fallback backend.
 
 ## DeepSeek V4.1
 
-Use CUDA for the main model and shared experts, and NUMA for the NVFP4 routed
-experts. A dual-GPU configuration with 8 GiB of cache on each device is:
+Use CUDA for the main model and shared experts, and NUMA for the routed experts.
+Both original NVFP4 and the Q2_K/Q4_K mixed export support this cache. A dual-GPU
+configuration with 8 GiB of cache on each device is:
 
 ```sh
 FT_NUMAS=1 numactl -C 0-31 -m 0 \
@@ -264,8 +482,8 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
   --moe_cuda_cache 8g
 ```
 
-The cache borrows registered, pinned NUMA block-32 weights, without a separate
-host snapshot. The shared scheduler measures CPU/GPU compute and refill costs
+The cache borrows registered, pinned NUMA block-32 or Q2_K_R4/Q4_K_R4 weights,
+without a separate host weight snapshot. The shared scheduler measures CPU/GPU compute and refill costs
 to choose disjoint expert subsets, preferring resident experts. Resident experts
 can remain on CPU when that gives a better split. A cache is not a guaranteed
 speedup: route reuse, capacity and PCIe transfers matter.
@@ -307,6 +525,12 @@ Expert math preserves V4.1 block-32 FP8 activation quantization, SwiGLU clipping
 route weighting before down-input quantization and per-expert BF16 rounding.
 Results accumulate in ascending expert-ID order in FP32 before final BF16
 rounding. CPU/GPU reduction can still introduce floating-point differences.
+For Q2_K/Q4_K, the GPU reads the existing R4 packing directly and encodes FP8-rounded
+activations as GGML Q8_K using the signed maximum. Gate/up rows retain their NUMA
+interleaving, and route scores are applied before the intermediate FP8/Q8 boundary.
+The single-row CPU subset reuses the grouped GGML V4.1 preparation used by verification.
+The `cuda_v41_q2_moe_cache` test covers top-6 routes, eviction, CPU/GPU splits,
+zero inputs and scores, and SwiGLU clipping against NUMA and a scalar reference.
 The block-32 GPU prefill GEMM also accumulates into FP32 before its BF16 cast,
 preventing reduced-precision cuBLAS partial reductions. Source NVFP4 experts
 are registered before their first GPU prefill use, including when startup
@@ -363,6 +587,16 @@ entries. On glibc, retired buffers are periodically returned to the OS.
 
 CUDA residency supports compact NVFP4 with block-32 UE8M0 scales, block-128
 FP8 (native or packed), FP32, FP16 and BF16. Other formats use CPU execution.
+GLM GGUF also supports canonical IQ2_XXS/IQ2_S gate/up with IQ3_XXS/IQ4_XS
+down projections and BF16 activations. Disk and RAM retain the original IQ
+blocks; CPU execution does not copy or R4-repack them. IQ2/IQ3 use native
+Q8_K dots, while IQ4_XS preserves the model's BF16 down-input arithmetic.
+This path prefetches up to two missing experts. For batches whose per-route
+FP32 output fits in 64 MiB, resident GPU experts are submitted together,
+overlap CPU computation, and return their results in one transfer. Reduction
+keeps expert-ID order and duplicate routes. Larger batches retain bounded
+streaming execution. GPU replacement waits until borrowed records finish;
+the frequency policy and per-layer admission limit remain unchanged.
 `KimiK3RoutedExperts` does not use this cache. V4.1 retains its quantization,
 route-weight placement and ordered reduction; CPU/CUDA matrix products can
 have floating-point rounding differences.
@@ -610,8 +844,37 @@ IQ2_XXS/XS/S. IQ1_M retains per-expert GEMM for host prefill: the current
 grouped IQ1_M gate kernel uses per-route DP4A and loses batch weight reuse.
 FP32, FP16 and BF16 activations are accepted on NVIDIA SM75 or newer.
 
-Scratch includes the current worker's uploaded and restored packed weights,
-route metadata, grouped MMQ products and activations. It is reused across
+DeepSeek-V4.1's BF16 Q2_K gate/up + Q4_K down pair also uses this streamed
+path, including Q2_K_R4/Q4_K_R4 NUMA weights. Admission checks the model's
+block-32 activation contract, formats, shapes and workspace capacity instead
+of excluding every V4 model. The adapter retains BF16 projection rounding,
+SwiGLU clipping, route scores before the down-input BF16/FP8 boundary, and
+ascending expert-ID reduction. Both projections use signed-max GGML Q8_K
+quants with FP32 scales. The shared MMQ tile loop uses V4.1 loaders and MMA
+fragments that form integer activation sums instead of rounding scale/sum
+metadata to half precision. Matrix accumulation can still change rounding
+relative to the NUMA scalar oracle; bitwise CPU/GPU equality is not promised.
+V4 block-128, shared experts inside this operator,
+and other format/activation combinations retain the per-expert fallback.
+The V4.1 GGUF fallback also applies the required down-input FP8 boundary.
+
+V4.1 CPU input preparation fuses source conversion, FP8 quantization and
+GGML encoding across the existing worker pool with reusable per-row scratch.
+It skips the redundant pre-FP8 Q8 encoding when no unquantized shared expert
+needs it. This preserves CPU/GPU expert scheduling and adds no environment
+switch. `cuda_v41_q2_moe_prefill` checks both GPUs at 33, 65, 128, 408, 1023,
+1024, 1041 and 4096 rows against NUMA and independent scalar references, including zeros,
+negative/zero route scores, clipping, selected subsets, canonical/R4 weights,
+NUMA shards, immutable inputs and rejection of unsupported math/shapes.
+The `_small` and `_model_shape` tests cover cancellation-sensitive 256-wide
+inputs and the model's 5120 × 2304 expert dimensions, respectively.
+
+Scratch includes the current worker's restored packed weights, projection upload
+staging, route metadata, grouped MMQ products and activations. V4.1 uses two staging
+buffers so a high-priority stream can upload/restore down weights during gate/up
+MMQ; an event gates the down projection. Other formats use one staging buffer.
+V4.1 batches of at least 1024 rows use 64-row compute tiles while retaining
+16-row route padding, with guarded reads for each expert's last tile. Scratch is reused across
 layers on the same device, separately from the expert-cache payload budget.
 Admission checks the entire selected subset, workspace size and available
 memory before uploading weights. Shared experts inside the operator,
@@ -638,3 +901,157 @@ decode (+0.85%) on two 22 GiB RTX 2080 Ti cards, with MTP off and Graph on.
 `cuda_gguf_moe_host` checks the CPU R4 repacker against an independent decoded
 weight oracle, cross/non-cross gate/up layouts, selected subset changes,
 NUMA row shards, both GPUs, three activation types and immutable host storage.
+
+### GLM compact NVFP4 disk hierarchy
+
+With `--moe_device disk`, a GLM compact E4M3 NVFP4 checkpoint retains only
+file offsets, raw scale locations and tensor multipliers during loading.
+Routed experts are read with the disk backend's bounded direct-I/O buffers;
+only requested experts are packed into the native compact NUMA/CUDA layout.
+No full-model NUMA registration or expert warmup snapshot is created.
+This path requires the NUMA backend and BF16 activations. Existing disk
+fallbacks remain available for other weight formats.
+
+`--moe_cpu_cache` bounds resident compact RAM payload **including the small
+staging cache**, while `--moe_cuda_cache` remains a per-GPU payload budget.
+Active CPU/GPU work, two read-ahead experts, non-MoE weights, activations and
+runtime allocations are additional. These are not process RSS limits; leave
+headroom and measure loading, prefill and decode high-water marks together.
+For a 64 GiB process target, start with a 40 GiB RAM payload budget and validate
+the complete workload before increasing it. CUDA allocations are independently
+releasable on eviction. The input checkpoint is never modified.
+
+Both tiers use `MoeFrequencyPolicy` and the existing `--moe_cache_*` controls
+(half-life, update interval, replacement count/bytes, heat threshold, margin,
+factor, minimum residence, prefill prior and byte ranking). Both tiers observe
+all routes, preserving an expert's heat while it moves between RAM and CUDA.
+Persistent host and CUDA payloads are exclusive: promotion removes the host
+copy, and RAM candidates exclude CUDA residents. Decode admissions occur after
+all registered MoE layers have been observed. CUDA plans first; evicted CUDA
+records are copied back only if selected by the RAM frequency policy. Prefill
+uses the same ownership rule with histogram admission and bounded lookahead.
+Payloads are leased until arithmetic and transfers finish; changing a budget
+invalidates the old tier state before it is rebuilt.
+
+The bounded host staging area retains hot already-read candidates across
+layers. When the RAM budget holds at least one expert, decode updates admit
+only available RAM/staging records or selected CUDA victims, without initiating
+disk reads merely to populate a cache. Candidate availability does not discard
+frequency history, and updating it does not rebuild the policy's heaps. A RAM
+budget smaller than one expert retains bounded disk-read fallback for CUDA
+admission so that disabling RAM caching still allows the CUDA hot set to adapt.
+
+A CUDA hit needs no disk or RAM payload. On a CUDA miss, RAM hits and demand
+reads supply compact weights to NUMA or temporary CUDA execution selected by
+the measured overlap scheduler. Resident CUDA work is submitted before disk
+reads. The disk path currently uses the calling layer's GPU; it does not use
+the separate multi-GPU verifier dispatcher. `get_disk_moe_cache_stats()` reports
+RAM/CUDA hits, two-tier misses, source bytes read, uploads, evictions and retained
+payload bytes. `disk_bytes` includes admission reads as well as demand reads;
+use process I/O counters to measure physical reads and alignment overhead.
+For the compact hierarchy, `cpu_cuda_overlap_bytes` measures retained duplicate
+host/CUDA payloads; `cuda_demotions` and `cuda_demotion_bytes` count selected
+CUDA-to-RAM transfers. Active call leases are not persistent cache ownership.
+The original nine-value C statistics ABI is retained; the capacity-bounded v2
+API adds the hierarchy counters and is used by the Python wrapper when present.
+
+### GLM-5.3 GGUF hybrid tensor parallelism
+
+GLM-5.3 GGUF supports `--device cuda:0 --tp 0,1 --moe_device disk`.
+The TP degree must divide the KDA and MLA head counts, and shard widths must
+respect the quantization-block alignment. Each rank owns its
+attention heads, recurrent state and KV pages. Attention output, dense-FFN
+and shared-expert down projections reduce their rank-local partial sums.
+Routing executes on the owner rank. Routed host
+experts are evaluated once, using a single process-wide RAM cache; TP does not
+load a full host expert copy per rank. MTP is currently unsupported in this
+path and must remain disabled; `--cuda_shared_expert true` is required.
+Prefix/history reuse is bypassed for TP. As with ordinary BF16 tensor
+parallelism, partitioning changes floating-point accumulation and can change
+generated tokens; it does not promise bitwise agreement with serial execution.
+
+With `--moe_device numa`, single-token TP decode overlaps the owner rank's
+shared expert with CPU routed experts and streamed GPU misses. Other ranks
+submit their own shared projections and meet the owner at the FFN reduction.
+CUDA submission threads use available cores outside the pinned NUMA expert
+workers when the process CPU affinity allows it. Disk experts and multi-row
+GPU assistance retain their pre-MoE coordination because they can use peer
+GPUs; the cache policy and dynamic miss-allocation policy are unchanged.
+
+For single-row TP reductions, successfully placed submission threads spin
+for at most 1 ms before sleeping at the NCCL host rendezvous. This avoids
+scheduler wakeups after short CPU MoE work without taking cores from the
+expert workers. Both pre/post submission boundaries, error propagation and
+timeouts remain active. Multi-row work and ranks without spare cores use
+the default short spin followed by a condition-variable wait.
+
+For the native GLM GGUF disk adapter, the TP owner searches resident experts
+across all participating GPUs and launches their work before CPU misses.
+Promotions select available capacity or the coldest eligible victim across
+those GPUs, keeping the existing frequency admission policy. `--moe_cuda_cache`
+still specifies the budget **per GPU**, while `--moe_cpu_cache` specifies one
+shared RAM budget. For example, `--moe_cuda_cache 8g --moe_cpu_cache 48g` uses
+16 GiB of CUDA expert payload across two ranks and 48 GiB of host payload.
+Attention weights, KV state and workspaces are outside those budgets.
+GGUF expert records retain their original IQ layout on disk, in RAM and in
+the GPU cache; this path does not introduce R4 repacking.
+
+The ordinary GGUF disk cache maintains frequency/recency min-heaps for RAM
+and each GPU. Touches update resident keys incrementally; aging rebuilds a
+heap once per epoch. This removes a full-model victim scan from repeated
+promotions without changing admission or eviction order. GPU buffers are
+released only after all resident expert work has been collected.
+An admission can reuse an evicted GGUF record of exactly the same byte size
+on the same device, avoiding a synchronous CUDA free/allocation pair. The
+record is handed directly to its replacement; trimming and unloading still
+release storage, and there is no additional GPU buffer pool outside the budget.
+
+Native GLM GGUF CUDA expert projection accepts batches of input rows without
+changing Q8_K quantization, BF16 rounding or expert-ID accumulation order.
+Disk prefill submits all rows assigned to one temporary expert together;
+resident-cache calls use bounded 32-row tiles (a tiling choice, not a model
+batch-size limit). Both serial and TP execution use this path. The disk-cache
+test compares batched per-route output bitwise against individual-row calls
+for all four supported IQ gate/down pairs, on both GPUs, including absent
+experts and zero/negative routing scores.
+
+For GLM with `--moe_device numa`, `--moe_cuda_cache 0` disables resident
+expert payloads while retaining the measured decode split between NUMA and
+temporary GPU uploads. The same scheduler runs for serial layer placement
+and on the host-expert owner of TP. CPU compute, PCIe transfer and staged GPU
+compute timings determine the split; it is not a fixed number of experts.
+Temporary upload/workspace buffers still use VRAM, but have zero persistent
+expert slots and perform no cache admission. Supported GGUF layouts borrow
+the registered NUMA weight shards; any required GPU layout restoration uses
+bounded staging storage rather than a full host snapshot.
+
+GLM GGUF NUMA hybrid inference with multiple TP devices distributes complete
+cached experts across those devices by default for IQ2_XXS/IQ2_S gate/up and IQ3_XXS/IQ4_XS
+down. Expert `e` belongs to `devices[e % devices.size()]`, using the configured
+TP device order. Each GPU has its own frequency policy and cache budget, and
+admits only its assigned experts. Replacement-count and upload-byte limits
+apply per GPU. Different per-device capacities are allowed. No additional mode
+flag or environment variable is needed when `--moe_cuda_cache` is enabled.
+
+Both projections keep the native NUMA/R4 layout. A cache hit runs entirely on
+its owner GPU, without exchanging intermediate gate/up activations between
+cards. Each route's FP32 output is gathered for the existing ordered BF16
+reduction; GPU-local partial reductions are not substituted. Cache misses
+retain the CPU/multi-GPU dynamic dispatcher and may execute on any participating
+GPU regardless of permanent cache ownership.
+
+Decode and small-batch verify (up to 9 rows) observe routes on their owner and
+update caches after the step. Large prefill uses the same ownership when
+assigning GPU experts, fills native records during upload, and reuses them in
+later chunks and decode. The GLM TP device list is also passed to the NUMA
+prefill workers, so every owner GPU participates. Prefill cache publication
+waits for the payload to be ready. Ordinary GGUF profiling calls on these same
+weights fall back from the canonical-record streaming adapter; they must not
+read native records as canonical data or overwrite native slots with restored
+payloads. Zero-cache execution keeps dynamic miss offload without persistent slots.
+
+Logical route counters count each expert invocation once.
+`fastllm_moe_cuda_cache_ep_stats(device, values)` reports device count, local
+slots, occupied local slots, local payload bytes, locally computed cache-hit
+routes and cumulative whole-expert upload bytes. Hit routes can be summed across
+GPUs; the per-device totals need not match.

@@ -4,6 +4,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "fastllm-bf16-lt.cuh"
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -82,7 +83,7 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     float diff[PART];
 #pragma unroll
     for (int x = 0; x < PART; x++) diff[x] = 0.0f;
-    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s >= (PART > 1 ? 32 : 1); s >>= 1) {
         if (tid < s) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
@@ -93,6 +94,29 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
             }
         }
         __syncthreads();
+    }
+
+    if constexpr (PART > 1) {
+        // Complete the same compensated binary tree within warp zero. The
+        // 128/64/32 stages above preserve both each lane's sum and correction;
+        // shuffles replace only the remaining shared-memory exchanges.
+        if (tid < 32) {
+            #pragma unroll
+            for (int x = 0; x < PART; ++x) {
+                float value = sdata[x][tid], correction = diff[x];
+                #pragma unroll
+                for (int step = 16; step; step >>= 1) {
+                    float peer = __shfl_down_sync(0xffffffffu, value, step);
+                    if (tid < step) {
+                        float other = peer - correction;
+                        float sum = value + other;
+                        correction = (sum - value) - other;
+                        value = sum;
+                    }
+                }
+                if (tid == 0) sdata[x][0] = value;
+            }
+        }
     }
 
     if (tid == 0) {
@@ -107,6 +131,39 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
         }
     }
     __syncthreads();
+}
+
+// At K=256 the vectorized GEMV has only one active warp per output. Pack
+// eight outputs into a CTA while preserving its per-lane products and
+// compensated reduction tree. No vocabulary size or GPU model is assumed.
+__global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
+        const __nv_bfloat16 *weight, __nv_bfloat16 *output,
+        const __nv_bfloat16 *bias, int outputs) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= outputs) return;
+    union_bf16_8 a, b;
+    a.in = *reinterpret_cast<const uint4 *>(input + lane * 8);
+    b.in = *reinterpret_cast<const uint4 *>(weight + (size_t)row * 256 + lane * 8);
+    float value = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        value += __bfloat162float(a.out[i]) * __bfloat162float(b.out[i]);
+    float correction = 0.0f;
+#pragma unroll
+    for (int step = 16; step; step >>= 1) {
+        float peer = __shfl_down_sync(0xffffffffu, value, step);
+        if (lane < step) {
+            float other = peer - correction;
+            float sum = value + other;
+            correction = (sum - value) - other;
+            value = sum;
+        }
+    }
+    if (lane == 0) {
+        if (bias) value += __bfloat162float(bias[row]);
+        output[row] = __float2bfloat16_rn(value);
+    }
 }
 
 // FP16 input × BF16 weight -> FP16 output (用于 FastllmCudaHalfMatMulBFloat16)
@@ -610,29 +667,38 @@ void LaunchFastllmGemmFp16Bf16(half *input, __nv_bfloat16 *weight, half *output,
     }
 }
 
-void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+template <int THREADS>
+static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
     // PART=2..8 reuses the weights without changing the per-row reduction.
-    if (n == 1 && m > 0 && m <= 256 && m % 8 == 0) {
-        // At most 32 lanes load data; the original extra zero reductions do
-        // not contribute to these short, aligned projections.
-        FastllmGemvBf16Bf16Kernel2MultiRow<32, 1>
-            <<<k, 32>>>(input, weight, output, bias, m, k);
+    if (n == 1 && m == 256) {
+        FastllmGemvBf16SmallK<<<(k + 7) / 8, 256>>>(input, weight, output, bias, k);
     } else if (n == 1) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 1> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 2> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 2> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 3) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 3> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 3> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 4) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 4> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 4> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 5) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 5> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 5> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 6) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 6> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 6> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 7) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 7> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 7> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 8) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 8> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 8> <<<k, THREADS>>>(input, weight, output, bias, m, k);
+    }
+}
+
+void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+    if (n >= 1 && n <= 8) {
+        if (m > 0 && m <= 256 && m % 8 == 0) {
+            // Only one warp loads data in these short, aligned projections.
+            LaunchFastllmGemmBf16Bf16SmallBatch<32>(input, weight, output, bias, n, m, k);
+        } else {
+            LaunchFastllmGemmBf16Bf16SmallBatch<256>(input, weight, output, bias, n, m, k);
+        }
     } else if (n > 8 && n <= 65535 &&
                n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
         // Larger exact batches use independent rows, within grid.y's limit.
@@ -844,39 +910,35 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
     __nv_bfloat16 *cudaBiasData = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *)weight.extraCudaData[1];
     __nv_bfloat16 *weightPtr = (__nv_bfloat16 *)weight.cudaData;
 
-    bool exactRows = n > 1 &&
-        n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
-    if (n < 8 || exactRows) {
+    if (n < 8) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
-    } else if (n == 8 && k <= 1024) {
+    } else if (n == 8 && m > 0 && m <= 256 && m % 8 == 0) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, nullptr, n, m, k);
         // Match the GEMM branch: round the dot product before adding bias.
         if (bias.dims.size() > 0) {
             FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, cudaBiasData, k);
         }
     } else {
+        // Warm the fallback handle before a later graph capture can miss the
+        // Lt cache. Handle/workspace creation during capture is not safe.
         auto fastllmCublasHandle = getFastllmCublasHandle();
-        cublasStatus_t status;
-        float h_alpha = 1.0f, h_beta = 0.0f;
-        cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
-
-        status = cublasGemmEx(fastllmCublasHandle,
-                              CUBLAS_OP_T, CUBLAS_OP_N,
-                              k, n, m,
-                              &h_alpha, weightPtr, AType,
-                              m, cudaInput, BType,
-                              m, &h_beta,
-                              cudaOutput, CType,
-                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error (BFloat16MatMulBFloat16).\n");
-            throw("cublas error");
-            exit(0);
+        // Small batches use a cached Lt algorithm; unsupported shapes retain
+        // GemmEx. Both paths accumulate in FP32 and round to BF16 before bias.
+        if (!fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
+            float alpha = 1.0f, beta = 0.0f;
+            cublasStatus_t status = cublasGemmEx(fastllmCublasHandle,
+                CUBLAS_OP_T, CUBLAS_OP_N, k, n, m,
+                &alpha, weightPtr, CUDA_R_16BF, m,
+                cudaInput, CUDA_R_16BF, m, &beta,
+                cudaOutput, CUDA_R_16BF, k, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("Error: cublas error (BFloat16MatMulBFloat16).\n");
+                throw("cublas error");
+            }
         }
 
         if (bias.dims.size() > 0) {
-            FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, (__nv_bfloat16 *)weight.extraCudaData[1], k);
+            FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, cudaBiasData, k);
         }
     }
 

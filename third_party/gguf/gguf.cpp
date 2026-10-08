@@ -184,8 +184,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
         {GGML_TYPE_IQ3_XXS, ggml_type_traits{/* type_name */"iq3_xxs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq3_xxs),/* is_quantized */  true,
-            /* vec_dot */ nullptr,
-            /* vec_dot_type */ GGML_TYPE_F32,
+            /* vec_dot */ ggml_vec_dot_iq3_xxs_q8_K,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
             /* to_float */ (ggml_to_float_t) dequantize_row_iq3_xxs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_xxs_ref,
         }},
@@ -198,8 +198,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
         {GGML_TYPE_IQ2_S, ggml_type_traits{/* type_name */"iq2_s", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq2_s),/* is_quantized */  true,
-            /* vec_dot */ nullptr,
-            /* vec_dot_type */ GGML_TYPE_F32,
+            /* vec_dot */ ggml_vec_dot_iq2_s_q8_K,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
             /* to_float */ (ggml_to_float_t) dequantize_row_iq2_s,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq2_s_ref,
         }},
@@ -499,6 +499,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq3_xxs),
             .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_iq3_xxs_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_xxs_ref,
         }},
@@ -528,7 +530,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq2_s),
             .is_quantized             = true,
-            .vec_dot                  = nullptr,
+            .vec_dot                  = ggml_vec_dot_iq2_s_q8_K,
             .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_iq2_s,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq2_s_ref,
@@ -1034,6 +1036,14 @@ namespace fastllm {
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
                                 it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+                        // CPU embedding can decode individual GGUF rows for
+                        // models that keep the imported lookup table unchanged.
+                        // Preserve floating-point imports and the CUDA embedding
+                        // path, which still require the original dense layout.
+                        const bool packedEmbedding = (arch == "qwen4_exp" || arch == "glm5_next") &&
+                            name == "token_embd.weight" &&
+                            (GetLowMemMode() || !GetCudaEmbedding()) &&
+                            ggml_is_quantized(tensors[i].first.type);
                         name = std::regex_replace(name, it.pattern, it.names[0]);
                         if (name == "ignore") {
                             break;
@@ -1041,7 +1051,7 @@ namespace fastllm {
                         tasks.push_back (
                             ReadGGUFTask (
                                 name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second, 
-                                it.type
+                                packedEmbedding ? GGUFWeightReplaceRule::GGUFWeightReplaceDirect : it.type
                             )
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplacePacked) {

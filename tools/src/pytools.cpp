@@ -4,6 +4,7 @@
 
 #include "model.h"
 #include "devices/disk/diskdevice.h"
+#include "moe_cache_config.h"
 
 #include <cstring>
 #include <csignal>
@@ -105,6 +106,28 @@ extern "C" {
         fastllm::SetMoeCudaCacheBytes(bytes);
     }
 
+    DLL_EXPORT bool set_moe_cache_policy(float halfLife, int updateInterval,
+            int maxReplacements, uint64_t maxBytes, float minHeat, float margin,
+            float factor, int minimumResidence, float prefillPrior, bool rankByBytes) {
+        fastllm::MoeCacheConfig config;
+        config.halfLife = halfLife;
+        config.updateInterval = updateInterval;
+        config.maxReplacements = maxReplacements;
+        config.maxBytes = maxBytes;
+        config.minHeat = minHeat;
+        config.replacementMargin = margin;
+        config.replacementFactor = factor;
+        config.minimumResidence = minimumResidence;
+        config.prefillPrior = prefillPrior;
+        config.rankByBytes = rankByBytes;
+        try {
+            fastllm::SetMoeCacheConfig(config);
+            return true;
+        } catch (const std::invalid_argument &) {
+            return false;
+        }
+    }
+
     DLL_EXPORT void set_moe_cpu_cache(uint64_t bytes) {
         fastllm::SetMoeCpuCacheBytes(bytes);
     }
@@ -114,6 +137,16 @@ extern "C" {
         uint64_t result[] = {s.cpuBytes, s.cudaBytes, s.cpuHits, s.cudaHits, s.misses,
             s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions};
         std::copy(result, result + 9, values);
+    }
+
+    DLL_EXPORT int get_disk_moe_cache_stats_v2(uint64_t *values, int capacity) {
+        auto s = fastllm::GetDiskMoeCacheStats();
+        const uint64_t result[] = {s.cpuBytes, s.cudaBytes, s.cpuHits, s.cudaHits, s.misses,
+            s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions,
+            s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes};
+        const int count = sizeof(result) / sizeof(result[0]);
+        if (values && capacity > 0) std::copy_n(result, std::min(capacity, count), values);
+        return count;
     }
 
     DLL_EXPORT void disable_cuda_malloc() {
@@ -487,6 +520,29 @@ extern "C" {
             auto model = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType,
                 groupCnt, skipTokenizer, "", lora, false, useMoe, (fastllm::DataType)moeDataType,
                 moeGroupCnt, dtypeConfigString, {maxLength, ropeScaling == nullptr ? "" : ropeScaling});
+            int id = models.models.size();
+            models.models[id] = std::move(model);
+            return id;
+        } catch (const std::exception &error) {
+            fastllmPytoolsContextResult = error.what();
+        } catch (const char *error) {
+            fastllmPytoolsContextResult = error == nullptr ? "unknown model initialization error" : error;
+        } catch (...) {
+            fastllmPytoolsContextResult = "unknown model initialization error";
+        }
+        return -1;
+    }
+
+    DLL_EXPORT int create_llm_model_from_gguf_with_context(
+            char *path, char *oriPath, char *mtpPath, char *mmprojPath,
+            int maxLength, char *ropeScaling) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            std::lock_guard<std::mutex> guard(models.locker);
+            auto model = fastllm::CreateLLMModelFromGGUFFile(
+                path, oriPath, mtpPath == nullptr ? "" : mtpPath,
+                mmprojPath == nullptr ? "" : mmprojPath,
+                {maxLength, ropeScaling == nullptr ? "" : ropeScaling});
             int id = models.models.size();
             models.models[id] = std::move(model);
             return id;
@@ -1134,6 +1190,28 @@ extern "C" {
         }
         auto model = models.GetModel(modelId);
         model->AddPromptCache(input);
+    }
+
+    DLL_EXPORT const char *set_kvmem_llm_model(int modelId, bool enabled, int maxTokens,
+            int residentTokens, int sinkTokens, int recentTokens, int retrievalTokens,
+            int prefillTokens, unsigned long long hostBytes, int retrievalInterval) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            fastllm::KvMemConfig config;
+            config.enabled = enabled;
+            config.maxTokens = maxTokens;
+            config.residentTokens = residentTokens;
+            config.sinkTokens = sinkTokens;
+            config.recentTokens = recentTokens;
+            config.retrievalTokens = retrievalTokens;
+            config.prefillTokens = prefillTokens;
+            config.retrievalInterval = retrievalInterval;
+            config.hostBytes = hostBytes;
+            models.GetModel(modelId)->ConfigureKvMem(config);
+        } catch (const std::exception &error) {
+            fastllmPytoolsContextResult = error.what();
+        }
+        return fastllmPytoolsContextResult.c_str();
     }
 
     DLL_EXPORT void set_kv_cache_limit_llm_model(int modelId, long long bytes) {
