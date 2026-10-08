@@ -437,6 +437,24 @@ namespace fastllm {
                 this->moePinnedStagingSlotMb = value;
             }
         }
+
+        // 主机侧钉住专家权重的默认值同样可以先从环境变量给; 命令行参数
+        // (--moe_pin_host_weights) 会通过 SetMoePinHostWeights 覆盖.
+        const char *moePinHostEnv = std::getenv("FASTLLM_MOE_PIN_HOST_WEIGHTS_MB");
+        if (moePinHostEnv != nullptr) {
+            int value = atoi(moePinHostEnv);
+            if (value > 0) {
+                this->moePinHostWeightsMb = value;
+            }
+        }
+
+        // prefill 走 GPU 的开关也能从环境变量给; 给了就等同于显式指定, 没给保持 -1
+        // (自动), 命令行参数 --prefill_moe_gpu 会通过 SetPrefillMoeGpu 覆盖.
+        const char *prefillMoeGpuEnv = std::getenv("FASTLLM_PREFILL_MOE_GPU");
+        if (prefillMoeGpuEnv != nullptr) {
+            this->prefillMoeGpu =
+                (prefillMoeGpuEnv[0] != '\0' && prefillMoeGpuEnv[0] != '0') ? 1 : 0;
+        }
     }
 
     const FastllmEnv &GetFastllmEnv() {
@@ -502,6 +520,22 @@ namespace fastllm {
         }
         fastllmEnv.moePinnedStagingSlots = clampedSlots;
         fastllmEnv.moePinnedStagingSlotMb = clampedSlotMb;
+    }
+
+    // 主机侧钉住 MoE 专家权重的额度(MB). 钉住之后 DMA 直接从权重下发, 主机不做
+    // 那次"写中转槽"的拷贝, 但代价是这块内存不可换出, 所以要显式给额度, 默认 0.
+    void SetMoePinHostWeights(int mb) {
+        fastllmEnv.moePinHostWeightsMb = mb < 0 ? 0 : (mb > 65536 ? 65536 : mb);
+    }
+
+    // prefill 阶段把主机专家搬上卡算的开关: 0 关, 1 开, 其余(含负数)保持"自动".
+    void SetPrefillMoeGpu(int v) {
+        fastllmEnv.prefillMoeGpu = v == 0 ? 0 : (v > 0 ? 1 : -1);
+    }
+
+    // basellm::SetChunkedPrefillSize 会调这里, 记下用户显式要的 chunk 大小.
+    void SetRequestedChunkedPrefillSize(int size) {
+        fastllmEnv.requestedChunkedPrefillSize = size > 0 ? size : -1;
     }
 
     void PrintInstructionInfo() {

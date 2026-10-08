@@ -4349,6 +4349,22 @@ namespace fastllm {
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);
+        const int ggufFileType = params["general.file_type"].int_value();
+        // The new mixed-GGUF MMQ/MMVQ CUDA fast paths are not numerically
+        // correct yet for these primary quantization families. Mark this
+        // model's GGUF weights for the established dequant + cuBLAS path;
+        // higher-bit models stay on the low-memory fast path.
+        const bool forceSafeGgufDequant =
+            arch == "qwen3_5" &&
+            (ggufFileType == 10 || // Q2_K
+             (ggufFileType >= 11 && ggufFileType <= 13) || // Q3_K S/M/L
+             ggufFileType == 23 || // IQ3_XXS
+             ggufFileType == 26 || // IQ3_S
+             ggufFileType == 30);  // IQ4_XS
+        if (forceSafeGgufDequant) {
+            printf("[Fastllm] Qwen3.5 GGUF file type %d: use safe CUDA dequant path.\n",
+                   ggufFileType);
+        }
         // Preserve the source-format marker with --ori too: GLM's GGUF
         // decay and split MLA projections still need layout restoration.
         if (arch == "glm5_next") {

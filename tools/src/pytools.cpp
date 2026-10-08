@@ -98,6 +98,14 @@ extern "C" {
         fastllm::SetMoePinnedStaging(slots, slot_mb);
     }
 
+    DLL_EXPORT void set_moe_pin_host_weights(int mb) {
+        fastllm::SetMoePinHostWeights(mb);
+    }
+
+    DLL_EXPORT void set_prefill_moe_gpu(int v) {
+        fastllm::SetPrefillMoeGpu(v);
+    }
+
     DLL_EXPORT void set_cuda_slab(int mb) {
         fastllm::SetCudaSlabMB(mb);
     }

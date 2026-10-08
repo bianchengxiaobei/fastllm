@@ -2724,12 +2724,15 @@ namespace fastllm {
         // copyStream 预取下一个专家 + PickInput gather + CUDA GEMM)。
         // 这里传 isCrossSwiglu=false, 权重保持 checkpoint 原始行序、不做行重排,
         // 所以 CPU/GPU 两条路径可以共存: decode 仍走原来的 CPU MergeMOE。
-        static bool Qwen35PrefillMoeGpuFromHostEnabled() {
-            static const bool enabled = []() {
-                const char *env = std::getenv("FASTLLM_PREFILL_MOE_GPU");
-                return env != nullptr && env[0] != '\0' && env[0] != '0';
-            }();
-            return enabled;
+        // prefill 走 GPU 的开关: --prefill_moe_gpu / FASTLLM_PREFILL_MOE_GPU 可以显式
+        // 给 0/1; 不设置时按配置自动决定 —— 只有专家在 cpu 内存里时才默认打开,
+        // numa/disk 各自有自己的快路径, 不替它们做决定.
+        static bool Qwen35PrefillMoeGpuFromHostEnabled(const std::string &moeDevice) {
+            const int configured = GetFastllmEnv().prefillMoeGpu;
+            if (configured >= 0) {
+                return configured != 0;
+            }
+            return moeDevice.find("cpu") != std::string::npos;
         }
 
         static int Qwen35PrefillMoeGpuFromHostMinTokens() {
@@ -2747,7 +2750,7 @@ namespace fastllm {
                 std::vector <Data*> &weights, std::vector <Data*> &biass,
                 Data &w1, Data &w2, Data &w3, Data &output,
                 int numExperts, int gpuId, int layer) {
-            if (!Qwen35PrefillMoeGpuFromHostEnabled() || numExperts <= 0 ||
+            if (numExperts <= 0 ||
                 weights.size() < (size_t)(2 + numExperts * 2) || biass.size() != weights.size()) {
                 return false;
             }
@@ -5028,7 +5031,17 @@ namespace fastllm {
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
             int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
             pages = std::max(1, pages);
-            return pages * fastllm::GetPageLen();
+            const int pageLen = std::max(1, fastllm::GetPageLen());
+            // 没显式设间隔时, 让间隔跟着 --chunked_prefill_size 走: 一个 chunk 正好落在
+            // 一个快照边界上. 否则 GetChunkedPrefillSize() 会把 chunk 静默钳回间隔,
+            // 用户设的 --chunked_prefill_size 就没效果了.
+            const fastllm::FastllmEnv &env = fastllm::GetFastllmEnv();
+            if (env.requestedChunkedPrefillSize > 0 &&
+                std::getenv("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES") == nullptr) {
+                pages = std::max(
+                    pages, (env.requestedChunkedPrefillSize + pageLen - 1) / pageLen);
+            }
+            return pages * pageLen;
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
@@ -8346,7 +8359,17 @@ namespace fastllm {
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
             int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
             pages = std::max(1, pages);
-            return pages * fastllm::GetPageLen();
+            const int pageLen = std::max(1, fastllm::GetPageLen());
+            // 没显式设间隔时, 让间隔跟着 --chunked_prefill_size 走: 一个 chunk 正好落在
+            // 一个快照边界上. 否则 GetChunkedPrefillSize() 会把 chunk 静默钳回间隔,
+            // 用户设的 --chunked_prefill_size 就没效果了.
+            const fastllm::FastllmEnv &env = fastllm::GetFastllmEnv();
+            if (env.requestedChunkedPrefillSize > 0 &&
+                std::getenv("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES") == nullptr) {
+                pages = std::max(
+                    pages, (env.requestedChunkedPrefillSize + pageLen - 1) / pageLen);
+            }
+            return pages * pageLen;
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
@@ -16094,8 +16117,10 @@ namespace fastllm {
             }
 
             bool layerMappedNonCudaMoe = Qwen35LayerUsesMappedNonCudaMoe(this, i);
-            // 原型: prefill 时把内存里的路由专家逐专家搬上卡交给GPU算(env开关, 默认关)
+            const std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
+            // 原型: prefill 时把内存里的路由专家逐专家搬上卡交给GPU算(默认自动开)
             bool prefillMoeOnGpu = layerMappedNonCudaMoe && !tensorParallel &&
+                                   Qwen35PrefillMoeGpuFromHostEnabled(selectedMoeDevice) &&
                                    Qwen35TryPrefillMoeGpuFromHost(
                                        attenInput, expertIndex, expertScore,
                                        weights[i], biass[i],
@@ -16105,7 +16130,6 @@ namespace fastllm {
                 if (prefillMoeOnGpu) {
                     // 已在 Qwen35TryPrefillMoeGpuFromHost 里用GPU算完, moeFinal 就绪
                 } else if (!tensorParallel || firstTensorParallelRank) {
-                    std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
                     Qwen35ResetCpuScratch(moeFinal);
                     FastllmCudaSetDevice(gpuId);
                     Qwen35ScopedGenericExecutor scopedExecutor(selectedMoeDevice);

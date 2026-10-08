@@ -1473,7 +1473,7 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
                               m, cudaFp16Input, BType,
                               m, &h_beta,
                               cudaFp16Output, CType,
-                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 #endif
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("Error: cublas error.\n");
@@ -1573,7 +1573,7 @@ static bool FastllmCudaMatMulFloat16PairSharedInput(
             &alpha, (half*)weight.cudaData, CUDA_R_16F, m,
             cudaFp16Input, CUDA_R_16F, m, &beta,
             cudaFp16Output, CUDA_R_16F, k, CUDA_R_16F,
-            static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         if (status == CUBLAS_STATUS_SUCCESS) {
             const int outputLength = n * k;
             const int outputThreads = std::min(256, outputLength);
@@ -2060,11 +2060,15 @@ namespace {
                               : __float2half_rn(0.0f);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F;
         cudaDataType_t CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+        // prefill 的大 M(数千行)必须显式要张量核: cublasGemmEx 的
+        // CUBLAS_GEMM_DEFAULT 不保证挑 TC 内核, Turing 上会落到 SIMT fp16,
+        // 同样的形状差一个数量级. NVFP4/FP8 的 prefill 路径一直用的就是
+        // CUBLAS_GEMM_DEFAULT_TENSOR_OP, 这里对齐.
         status = cublasGemmEx(
             fastllmCublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
             k, n, m, &h_alpha, weight, AType, m, input, BType, m,
             &h_beta, output, CType, k, ComputeType,
-            static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 #endif
         if (status != CUBLAS_STATUS_SUCCESS) {
             fprintf(stderr,

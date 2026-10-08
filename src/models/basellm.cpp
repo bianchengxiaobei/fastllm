@@ -3675,6 +3675,8 @@ namespace fastllm {
 
     void basellm::SetChunkedPrefillSize(int size) {
         this->chunkedPrefillSize = size;
+        // 线性注意力的前缀快照间隔要跟着这个值走(见 Qwen35LinearPrefixSnapshotIntervalTokens)
+        fastllm::SetRequestedChunkedPrefillSize(size);
     }
 
     int basellm::GetChunkedPrefillSize() {

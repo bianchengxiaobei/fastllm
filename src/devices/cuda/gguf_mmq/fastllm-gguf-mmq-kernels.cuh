@@ -7,7 +7,13 @@
 namespace fastllm_gguf_mmq {
 #include "mmq.cuh"
 // Defined only in the IQ1 instantiation unit; other types discard the call.
+// MSVC still wants a definition for a discarded `if constexpr` branch, so the
+// other instantiation units take an empty stub instead of the declaration.
+#ifdef FASTLLM_GGUF_MMQ_IQ1_GRID
 static void ensure_iq1s_grid(cudaStream_t stream);
+#else
+static void ensure_iq1s_grid(cudaStream_t) {}
+#endif
 constexpr int kBlackwellDirectTileThreshold = 1000;
 
 template <ggml_type type, int mmq_x, int nwarps, bool need_check>

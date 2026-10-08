@@ -1,3 +1,5 @@
+// This unit owns the IQ1 grid table, so it declares the real initializer.
+#define FASTLLM_GGUF_MMQ_IQ1_GRID
 #include "fastllm-gguf-mmq-kernels.cuh"
 
 namespace fastllm_gguf_mmq {

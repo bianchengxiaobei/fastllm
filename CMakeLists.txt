@@ -814,6 +814,14 @@ find_package(Threads REQUIRED)
 add_executable(mem_bw test/basic/mem_bw.cpp)
 target_link_libraries(mem_bw PRIVATE Threads::Threads)
 
+# INT4_GROUP 专家 GEMM 的三条路（SM70-AWQ / Marlin / 反量化+cuBLAS）微基准，
+# 按 per-expert batch 分别计时，用来判断 MoE 走哪条路。
+if (USE_CUDA AND NOT USE_ROCM)
+    add_executable(cuda_int4group_expert_gemm_test test/basic/test_cuda_int4group_expert_gemm.cpp)
+    target_link_libraries(cuda_int4group_expert_gemm_test PRIVATE fastllm)
+    target_include_directories(cuda_int4group_expert_gemm_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+endif()
+
 if (UNIT_TEST)
     enable_testing()
     add_executable(moe_expert_partition_test test/basic/test_moe_expert_partition.cpp)

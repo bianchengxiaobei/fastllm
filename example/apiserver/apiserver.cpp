@@ -483,6 +483,8 @@ struct APIConfig {
     int chunkedPrefillSize = -1; // 分块prefill切片大小
     int moePinnedStagingSlots = -1; // MoE专家流式的中转槽数
     int moePinnedStagingSlotMb = -1; // MoE专家流式的中转单槽宽(MB)
+    int moePinHostWeights = -1; // 主机侧钉住MoE专家权重的额度(MB)，0关闭
+    int prefillMoeGpu = -1; // prefill把主机专家搬上卡用GPU算，1开/0关/-1自动
     int maxContextLength = -1; // 单会话输入+输出最大token数
     std::string ropeScaling = ""; // RoPE扩展配置(yarn或JSON)
     int pageSize = -1; // paged cache每页token数
@@ -3003,6 +3005,10 @@ void Usage() {
     std::cout << "  --chunked_prefill_size <args>: 分块prefill的切片大小，如8192" << std::endl;
     std::cout << "  --moe_pinned_slots <args>:    MoE专家权重流式的中转槽数，如32" << std::endl;
     std::cout << "  --moe_pinned_slot_mb <args>:  MoE专家权重流式的中转单槽宽(MB)，如8" << std::endl;
+    std::cout << "  --moe_pin_host_weights <args>:在主机侧钉住MoE专家权重的额度(MB)，钉住后DMA直接从权重下发；"
+                 "这块内存不可换出，默认0关闭" << std::endl;
+    std::cout << "  --prefill_moe_gpu <args>:     prefill阶段把主机上的路由专家搬上卡用GPU算，1开/0关；"
+                 "默认-1按配置自动（专家在cpu内存里就开）" << std::endl;
     std::cout << "  --max_context_length <args>: 单会话输入和输出合计的最大token数" << std::endl;
     std::cout << "  --rope_scaling <args>:       RoPE扩展配置(yarn或JSON)" << std::endl;
     std::cout << "  --cache_history <true/false>: 缓存历史对话(前缀KV复用)" << std::endl;
@@ -3112,6 +3118,10 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             config.moePinnedStagingSlots = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "--moe_pinned_slot_mb") {
             config.moePinnedStagingSlotMb = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--moe_pin_host_weights") {
+            config.moePinHostWeights = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--prefill_moe_gpu") {
+            config.prefillMoeGpu = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "--max_context_length" || sargv[i] == "--max-context-length") {
             config.maxContextLength = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "--rope_scaling" || sargv[i] == "--rope-scaling") {
@@ -3413,6 +3423,12 @@ int main(int argc, char** argv) {
         fastllm::SetMoePinnedStaging(
             config.moePinnedStagingSlots > 0 ? config.moePinnedStagingSlots : 16,
             config.moePinnedStagingSlotMb > 0 ? config.moePinnedStagingSlotMb : 4);
+    }
+    if (config.moePinHostWeights > 0) {
+        fastllm::SetMoePinHostWeights(config.moePinHostWeights);
+    }
+    if (config.prefillMoeGpu >= 0) {
+        fastllm::SetPrefillMoeGpu(config.prefillMoeGpu);
     }
     if (!isHFDir && config.maxContextLength > 0 && config.ropeScaling.empty()) {
         // 非HF加载器只支持"只缩小"的上下文限制，与pytools的set_max_context_length_llm_model一致

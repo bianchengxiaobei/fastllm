@@ -6146,12 +6146,41 @@ bool FastllmCudaUploadHostToDevicePinnedStaged(
         return false;
     }
     if (slots.empty()) {
+        // 环本身用"malloc + cudaHostRegister"而不是 cudaHostAlloc: cudaHostAlloc 给的
+        // 是 WC 映射, 主机写要绕 cache(实测 4.78 GB/s); 注册的普通堆内存仍是回写
+        // (6.88 GB/s, 4 线程 7.52), 而 DMA 侧两者几乎一样(9.83 vs 10.04 GB/s) ——
+        // 主机写正是这里卡住的那一步, 所以这份便宜是白拿的.
+        // FASTLLM_MOE_RING_HOSTALLOC=1 可以退回来做对照.
+        static const bool useHostAllocRing = []() {
+            const char *env = std::getenv("FASTLLM_MOE_RING_HOSTALLOC");
+            return env != nullptr && env[0] != '\0' && env[0] != '0';
+        }();
         slots.assign(config.slotCount, nullptr);
         slotCopied.assign(config.slotCount, nullptr);
         slotUsed.assign(config.slotCount, false);
+        std::vector<char> slotRegistered(config.slotCount, false);
         for (int i = 0; i < config.slotCount; i++) {
-            cudaError_t state = cudaHostAlloc(
-                (void**)&slots[i], config.slotBytes, cudaHostAllocDefault);
+            cudaError_t state = cudaSuccess;
+            if (!useHostAllocRing) {
+                slots[i] = (uint8_t*)malloc(config.slotBytes);
+                if (slots[i] != nullptr) {
+                    state = cudaHostRegister(
+                        slots[i], config.slotBytes, cudaHostRegisterDefault);
+                    if (state == cudaSuccess) {
+                        slotRegistered[i] = true;
+                    } else {
+                        free(slots[i]);
+                        slots[i] = nullptr;
+                    }
+                } else {
+                    state = cudaErrorMemoryAllocation;
+                }
+            }
+            if (slots[i] == nullptr) {
+                state = cudaHostAlloc(
+                    (void**)&slots[i], config.slotBytes, cudaHostAllocDefault);
+                slotRegistered[i] = false;
+            }
             if (state == cudaSuccess) {
                 state = cudaEventCreateWithFlags(
                     &slotCopied[i], cudaEventDisableTiming);
@@ -6159,7 +6188,12 @@ bool FastllmCudaUploadHostToDevicePinnedStaged(
             if (state != cudaSuccess) {
                 for (int j = 0; j < i; j++) {
                     cudaEventDestroy(slotCopied[j]);
-                    cudaFreeHost(slots[j]);
+                    if (slotRegistered[j]) {
+                        cudaHostUnregister(slots[j]);
+                        free(slots[j]);
+                    } else {
+                        cudaFreeHost(slots[j]);
+                    }
                 }
                 slots.clear();
                 slotCopied.clear();

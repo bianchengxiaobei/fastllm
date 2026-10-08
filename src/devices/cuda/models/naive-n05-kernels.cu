@@ -14,6 +14,12 @@
 #include <cmath>
 #include <vector>
 
+#ifdef _MSC_VER
+// windows.h 里的 "typedef signed int INT32" 会和 DataType::INT32 在非限定名字
+// 查找下冲突, nvcc/MSVC 直接报 ambiguous. 本单元统一按 DataType 使用该名字.
+#define INT32 ::fastllm::DataType::INT32
+#endif
+
 #if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
 #define FASTLLM_NAIVE_SWA_FLASHINFER
 #include "naive-n05-swa-flashinfer.cuh"

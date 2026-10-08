@@ -351,6 +351,14 @@ if hasattr(fastllm_lib, "set_moe_pinned_staging"):
     fastllm_lib.set_moe_pinned_staging.argtypes = [ctypes.c_int, ctypes.c_int]
     fastllm_lib.set_moe_pinned_staging.restype = None
 
+if hasattr(fastllm_lib, "set_moe_pin_host_weights"):
+    fastllm_lib.set_moe_pin_host_weights.argtypes = [ctypes.c_int]
+    fastllm_lib.set_moe_pin_host_weights.restype = None
+
+if hasattr(fastllm_lib, "set_prefill_moe_gpu"):
+    fastllm_lib.set_prefill_moe_gpu.argtypes = [ctypes.c_int]
+    fastllm_lib.set_prefill_moe_gpu.restype = None
+
 fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
@@ -650,6 +658,20 @@ def set_moe_pinned_staging(slots, slot_mb):
     if native_setter is None:
         return False
     native_setter(ctypes.c_int(int(slots)), ctypes.c_int(int(slot_mb)))
+    return True
+
+def set_moe_pin_host_weights(mb):
+    native_setter = getattr(fastllm_lib, "set_moe_pin_host_weights", None)
+    if native_setter is None:
+        return False
+    native_setter(ctypes.c_int(int(mb)))
+    return True
+
+def set_prefill_moe_gpu(v):
+    native_setter = getattr(fastllm_lib, "set_prefill_moe_gpu", None)
+    if native_setter is None:
+        return False
+    native_setter(ctypes.c_int(int(v)))
     return True
 
 def set_cuda_slab(mb: int):

@@ -3461,7 +3461,7 @@ bool FastllmCudaQwen4SelectBlocks(const fastllm::Data &scores,
         scores.dims[1] != 1 || scores.dims[2] <= 0 || selectedK <= 0 ||
         compressRatio <= 0 || queryStart < 0 ||
         (queryStart + 1) / compressRatio > scores.dims[2]) return false;
-    selected.dataType = INT32;
+    selected.dataType = fastllm::DataType::INT32;
     selected.UpdateUnitSize();
     selected.Resize({1, selectedK});
     selected.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
@@ -3475,17 +3475,17 @@ bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
         int keyLength, int queryStart, int compressRatio, fastllm::Data &indices,
         const fastllm::Data *pageTable, int pageLen) {
     using namespace fastllm;
-    if (selected.dataDevice != DataDevice::CUDA || selected.dataType != INT32 ||
+    if (selected.dataDevice != DataDevice::CUDA || selected.dataType != fastllm::DataType::INT32 ||
         !selected.cudaData || selected.dims.size() != 2 || selected.dims[0] <= 0 ||
         selected.dims[1] <= 0 || compressRatio <= 0 || queryStart < 0 ||
         (int64_t)queryStart + selected.dims[0] > keyLength) return false;
     if (pageTable != nullptr && (pageLen <= 0 ||
-        pageTable->dataDevice != DataDevice::CUDA || pageTable->dataType != INT32 ||
+        pageTable->dataDevice != DataDevice::CUDA || pageTable->dataType != fastllm::DataType::INT32 ||
         !pageTable->cudaData || pageTable->Count(0) < (uint64_t)(keyLength + pageLen - 1) / pageLen ||
         pageTable->dataDeviceIds != selected.dataDeviceIds)) return false;
     const int rows = selected.dims[0], count = selected.dims[1];
     const int width = count * compressRatio + compressRatio - 1;
-    indices.dataType = INT32;
+    indices.dataType = fastllm::DataType::INT32;
     indices.Resize({rows, width});
     indices.ToDevice(DataDevice::CUDA, selected.dataDeviceIds, false);
     indices.Allocate(false);
@@ -4861,7 +4861,7 @@ bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Da
 #else
     using namespace fastllm;
     if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
-        output.dataType != FLOAT16 || indices.dataType != INT32 || query.dims.size() != 3 ||
+        output.dataType != FLOAT16 || indices.dataType != fastllm::DataType::INT32 || query.dims.size() != 3 ||
         key.dims.size() != 3 || value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 ||
         int64_t(query.dims[0]) != int64_t(key.dims[0]) * groups || query.dims[1] != indices.dims[0] ||
         query.dims[2] != key.dims[2] || query.dims[2] % 16 || query.dims[2] <= 0 ||

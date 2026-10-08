@@ -1861,10 +1861,10 @@ bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &
     output.dataType = FLOAT32;
     output.Resize({rows, hidden});
     output.ToDevice(CUDA, input.dataDeviceIds, false); output.Allocate(false);
-    cuda::glm5_cache::Gate<<<dim3(inter / 128, rows), 1024, 0, cudaStreamPerThread>>>(
+    fastllm::cuda::glm5_cache::Gate<<<dim3(inter / 128, rows), 1024, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)input.cudaData, nullptr, (const uint8_t*)gate.cudaData,
         (const float*)scores.cudaData, (__nv_bfloat16*)activation.cudaData, hidden, inter, 0, limit, 1);
-    cuda::glm5_cache::Down<<<dim3(hidden / 16, rows), 128, 0, cudaStreamPerThread>>>(
+    fastllm::cuda::glm5_cache::Down<<<dim3(hidden / 16, rows), 128, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)activation.cudaData, nullptr, (const uint8_t*)down.cudaData,
         (float*)output.cudaData, hidden, inter, 0, 0);
     checkCudaErrors("Disk compact GLM experts", cudaGetLastError());

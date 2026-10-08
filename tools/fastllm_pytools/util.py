@@ -891,6 +891,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = 'MoE专家权重流式的固定内存中转槽数（越大主机越能跑到DMA前面；0表示用默认16）')
     parser.add_argument('--moe_pinned_slot_mb', type = int, default = -1,
                         help = 'MoE专家权重流式的中转单槽宽(MB)；超过槽宽的权重块会自动分片（0表示用默认4）')
+    parser.add_argument('--moe_pin_host_weights', type = int, default = 0,
+                        help = '在主机侧钉住MoE专家权重的额度(MB)：钉住后DMA直接从权重下发，省掉写中转槽的主机拷贝，'
+                               '但这块内存不可换出；0表示关闭（默认）')
+    parser.add_argument('--prefill_moe_gpu', type = int, default = -1,
+                        help = 'prefill阶段把主机上的路由专家搬上卡用GPU算：1开/0关；默认-1按配置自动'
+                               '（专家在cpu内存里就开）')
     parser.add_argument('--fast_prefill', '--fast-prefill', action = 'store_true',
                         help = '启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；默认关闭')
     parser.add_argument('--device', type = str, help = '使用的设备')
@@ -1931,6 +1937,12 @@ def make_normal_llm_model(args, startup_progress = None):
             if args.chunked_prefill_size > 0:
                 kvmem_options.setdefault("prefill_tokens", args.chunked_prefill_size)
             model.set_kvmem(**kvmem_options)
+        if args.moe_pin_host_weights > 0:
+            if hasattr(llm, "set_moe_pin_host_weights"):
+                llm.set_moe_pin_host_weights(args.moe_pin_host_weights)
+        if args.prefill_moe_gpu >= 0:
+            if hasattr(llm, "set_prefill_moe_gpu"):
+                llm.set_prefill_moe_gpu(args.prefill_moe_gpu)
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()

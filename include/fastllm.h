@@ -53,11 +53,24 @@ namespace fastllm {
         // SetMoePinnedStaging(--moe_pinned_slots / --moe_pinned_slot_mb).
         int moePinnedStagingSlots = 16;
         int moePinnedStagingSlotMb = 4;
+        // 直接在主机侧钉住 MoE 专家权重(上限 MB). 钉住之后 DMA 从权重本身直发,
+        // 省掉"把权重写进中转槽"那次主机拷贝(实测占 upload 的 85~95%). 0 = 关闭.
+        // 这块内存是不可换出的, 参数入口见 SetMoePinHostWeights(--moe_pin_host_weights).
+        int moePinHostWeightsMb = 0;
+        // prefill 阶段把主机上的路由专家搬上卡用 GPU 算: 1 开, 0 关, -1 自动
+        // (专家在 cpu 内存里时默认开). 参数入口见 SetPrefillMoeGpu(--prefill_moe_gpu).
+        int prefillMoeGpu = -1;
+        // 用户显式要的分块 prefill 大小(-1 表示没显式给). 线性注意力的前缀快照间隔
+        // 会跟着它走, 免得 --chunked_prefill_size 被间隔静默钳小.
+        int requestedChunkedPrefillSize = -1;
     };
 
     const FastllmEnv &GetFastllmEnv();
     void SetCudaGraph(bool v);
     void SetMoePinnedStaging(int slots, int slotMb);
+    void SetMoePinHostWeights(int mb);
+    void SetPrefillMoeGpu(int v);
+    void SetRequestedChunkedPrefillSize(int size);
 
     struct ModelLoadProgress {
         std::string stage;

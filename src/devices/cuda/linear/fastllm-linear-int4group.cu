@@ -6,7 +6,11 @@
 #include "fastllm.h"
 #include "devices/cuda/fastllm-awq-sm70.cuh"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cuda_bf16.h>
 #include <type_traits>
 #include <unordered_map>
@@ -680,7 +684,7 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
                                   m, cudaFp16Input, BType,
                                   m, &h_beta,
                                   cudaFp16Output + kOff, CType,
-                                  k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                                  k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 #endif
             if (status != CUBLAS_STATUS_SUCCESS) {
                 printf("Error: cublas error. status = %d\n", status);
@@ -905,6 +909,68 @@ static bool FastllmCudaInt4GroupMarlinEnabled(int n, int m, int k, int groupCnt)
 #endif
 }
 
+// INT4_GROUP 的 prefill: 大 M 上"整块反量化成 fp16 再交给 cuBLAS"要快过 Marlin。
+// Marlin 在权重上做反量化, 每 16 行一批, 解码向的小 M 是它的强项; prefill 的
+// 大 M(数千行)下它的有效算力明显低于 cuBLAS 的 fp16 张量核。NVFP4/FP8 已经按
+// 这个结论分流(NVFP4_PREFILL_MIN_ROWS / FP8_PREFILL_MIN_ROWS, 注释里的实测就是
+// 在 SM75 上做的), INT4_GROUP 之前只有 Marlin 一条路, 于是大 prefill 的 dense
+// 层一直跑在解码内核上。
+//
+// 这个判定必须在第一次调用时定死, 不能等"这次 n 很大"再决定: 走 Marlin 会把
+// 权重重排成 Marlin 布局并释放 AWQ 源, 之后就再也回不到反量化这条路(把 Marlin
+// 缓冲当 AWQ 读会得到垃圾结果)。warmup 的 n 很小, 所以这里用形状预测。
+// 反量化 + cuBLAS 这条 prefill 路的阶段耗时探针, 由
+// FASTLLM_CUDA_INT4_GROUP_PREFILL_PROBE=1 打开(会插 cudaDeviceSynchronize,
+// 只用来定位, 不要常开)。
+static bool Int4GroupPrefillProbeOn() {
+    static const bool on = []() {
+        const char *value = std::getenv("FASTLLM_CUDA_INT4_GROUP_PREFILL_PROBE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+static double Int4GroupProbeNow() {
+    return (double)std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+               .count() / 1e6;
+}
+
+static bool FastllmCudaInt4GroupPrefillCublasPreferred(
+        const fastllm::Data &weight, int m, int k, int groupCnt) {
+    static const int mode = []() {
+        const char *value = std::getenv("FASTLLM_CUDA_INT4_GROUP_PREFILL_CUBLAS");
+        if (value == nullptr || value[0] == '\0') {
+            return 0;
+        }
+        return (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+                std::strcmp(value, "FALSE") == 0 || std::strcmp(value, "off") == 0 ||
+                std::strcmp(value, "OFF") == 0) ? -1 : 1;
+    }();
+    if (mode < 0) {
+        return false;
+    }
+    if (weight.dataType != fastllm::DataType::INT4_GROUP ||
+        weight.cudaData == nullptr || FastllmCudaInt4GroupHasMarlinOnDevice(weight)) {
+        return false;
+    }
+    if (groupCnt != 32 && groupCnt != 128) {
+        return false;
+    }
+    // 只接管层内投影这种规整矩阵: 太窄的输入反量化不划算(交给 Marlin 的 gemv),
+    // 超宽输出(lm_head 之类)的 n 恒为 1, 也留给 Marlin。
+    if (m < 512 || k < 1024 || k > 32768) {
+        return false;
+    }
+    if (mode == 1) {
+        return true;
+    }
+    // 自动模式默认关: 在 2060 SUPER(SM75) 上实测过一轮, 相对 Marlin 是持平
+    // (dense 的 int4 权重只占少数层), 没必要默认改掉别人的解码路径。要试
+    // 就用 FASTLLM_CUDA_INT4_GROUP_PREFILL_CUBLAS=1 显式打开。
+    return false;
+}
+
 static void FastllmBuildMarlinPermutedScalesAndZeros(const fastllm::Data &weight,
                                                       std::vector<half> &scales,
                                                       std::vector<uint32_t> &zeros,
@@ -1078,6 +1144,8 @@ bool FastllmCudaPrepareInt4GroupWeight(fastllm::Data &weight) {
 
     bool prepared = FastllmCudaInt4GroupHasMarlinOnDevice(weight);
     if (!prepared && weight.cudaData != nullptr && hasZeroPoints &&
+        !FastllmCudaInt4GroupPrefillCublasPreferred(
+            weight, m, k, weight.groupCnt) &&
         FastllmCudaInt4GroupMarlinEnabled(1, m, k, weight.groupCnt)) {
         prepared = FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
     }
@@ -1983,16 +2051,22 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
     // device-side expert pointer table needed by the fused path.
     bool routedMoeWeight = weight.name.find(".mlp.experts.") != std::string::npos ||
                            weight.name.find(".block_sparse_moe.experts.") != std::string::npos;
+    const bool prefillCublas =
+        FastllmCudaInt4GroupPrefillCublasPreferred(weight, m, k, groupCnt);
     const bool hasMarlin = FastllmCudaInt4GroupHasMarlinOnDevice(weight);
+    // 已经重排成 Marlin 的权重只能用 Marlin(重排释放了 AWQ 源); 其余按
+    // prefillCublas 决定要不要重排, 见 FastllmCudaInt4GroupPrefillCublasPreferred。
     bool useMarlin = !routedMoeWeight &&
                      (hasMarlin ||
-                      (weight.zeros.size() == (size_t)k * group &&
+                      (!prefillCublas &&
+                       weight.zeros.size() == (size_t)k * group &&
                        FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
                        FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k)));
     const bool hasSm70Awq = FastllmCudaInt4GroupHasSm70AwqOnDevice(weight);
     bool useSm70Awq = !useMarlin &&
                       (hasSm70Awq ||
-                       (weight.zeros.size() == (size_t)k * group &&
+                       (!prefillCublas &&
+                        weight.zeros.size() == (size_t)k * group &&
                         FastllmCudaInt4GroupSm70AwqEnabled(n, m, k, groupCnt) &&
                         FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k)));
     if (!useMarlin && !useSm70Awq) {
@@ -2002,8 +2076,19 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
         FastllmCudaInt4GroupEnsureHalfBiasOnDevice(weight, bias, k);
     }
 
+    const bool prefillProbe =
+        Int4GroupPrefillProbeOn() && prefillCublas && !routedMoeWeight;
+    double probeT0 = 0.0, probeT1 = 0.0;
+    if (prefillProbe) {
+        cudaDeviceSynchronize();
+        probeT0 = Int4GroupProbeNow();
+    }
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
+    if (prefillProbe) {
+        cudaDeviceSynchronize();
+        probeT1 = Int4GroupProbeNow();
+    }
 
     if (useSm70Awq) {
         bool ok = fastllm::awq_sm70::Gemm(g_sm70AwqHandles[&weight], cudaInput, cudaOutput, n, 0);
@@ -2036,6 +2121,17 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
         half *cudaScales = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX];
         half *cudaMins = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX];
         auto fastllmCublasHandle = getFastllmCublasHandle();
+        // 一眼看出哪些权重被新分流接走了: 只打前几条, 不当日志用。
+        // 路由专家本来就不走 Marlin, 这里只关心 dense/共享专家那几条。
+        if (prefillCublas && !routedMoeWeight) {
+            static std::atomic<int> prefillCublasLog(0);
+            if (prefillCublasLog.fetch_add(1) < 8) {
+                printf("[INT4_GROUP prefill cuBLAS] %s: rows=%d N=%d K=%d, "
+                       "AWQ dequant + FP16 cuBLAS.\n",
+                       weight.name.c_str(), n, k, m);
+                fflush(stdout);
+            }
+        }
 
         // 借用 FlashInfer 的 d_float_workspace 作为 INT4 -> FP16 的反量化临时缓冲；
         // 两次 attention 之间该 workspace 内容是无效的（attention 入口会重新 plan 覆盖）。
@@ -2045,6 +2141,12 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
         half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(half), &wsBytes, &ownScratch);
         size_t bytesPerRow = (size_t)m * sizeof(half);
         int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
+        double probeBorrow = 0.0, probeDequant = 0.0, probeGemm = 0.0, probeMark = 0.0;
+        if (prefillProbe) {
+            cudaDeviceSynchronize();
+            probeBorrow = Int4GroupProbeNow();
+            probeMark = probeBorrow;
+        }
 
 #ifdef CUDA_NO_TENSOR_CORE
         float *cudaFp32Output = (float *) FastllmCudaMalloc((size_t)n * k * sizeof(float));
@@ -2059,11 +2161,21 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
         for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
             int kc = std::min(maxRowsPerChunk, k - kOff);
 
+            if (prefillProbe) {
+                cudaDeviceSynchronize();
+                probeMark = Int4GroupProbeNow();
+            }
             FastllmCudaInt4Group2HalfKernel <<< kc, 256 >>>(
                 (uint8_t*)weight.cudaData + (size_t)kOff * m / 2,
                 cudaScales + (size_t)kOff * group,
                 cudaMins + (size_t)kOff * group,
                 cudaFp16Weight, kc, m, group, groupCnt, useZeroPoint);
+            if (prefillProbe) {
+                cudaDeviceSynchronize();
+                const double probeNow = Int4GroupProbeNow();
+                probeDequant += probeNow - probeMark;
+                probeMark = probeNow;
+            }
 
 #ifdef CUDA_NO_TENSOR_CORE
             // 子矩阵写入 cudaFp32Output 的 [kOff:kOff+kc, :] 行段，ldc 仍为 k
@@ -2076,6 +2188,9 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
                                     cudaFp32Output + kOff, CType,
                                     k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #else
+            // 反量化之后的 GEMM 要显式要张量核: cublasGemmEx 的
+            // CUBLAS_GEMM_DEFAULT 在 Turing 上会落到 SIMT fp16, prefill 的大 M
+            // 下差一个数量级(NVFP4/FP8 的 prefill 路径一直用 _TENSOR_OP)。
             status = cublasGemmEx(fastllmCublasHandle,
                                     CUBLAS_OP_T, CUBLAS_OP_N,
                                     kc, n, m,
@@ -2083,8 +2198,27 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
                                     m, cudaInput, BType,
                                     m, &h_beta,
                                     cudaOutput + kOff, CType,
-                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 #endif
+            if (prefillProbe) {
+                cudaDeviceSynchronize();
+                const double probeNow = Int4GroupProbeNow();
+                probeGemm += probeNow - probeMark;
+                probeMark = probeNow;
+                if (kOff + maxRowsPerChunk >= k) {
+                    static std::atomic<int> prefillProbeLog(0);
+                    if (prefillProbeLog.fetch_add(1) < 6) {
+                        printf("[INT4_GROUP prefill probe] %s rows=%d N=%d K=%d "
+                               "ws=%.1f MB rowsPerChunk=%d iters=%d prep=%.4f s "
+                               "borrow=%.4f s dequant=%.4f s gemm=%.4f s\n",
+                               weight.name.c_str(), n, k, m, wsBytes / 1048576.0,
+                               maxRowsPerChunk, (k + maxRowsPerChunk - 1) / maxRowsPerChunk,
+                               probeT1 - probeT0, probeBorrow - probeT1,
+                               probeDequant, probeGemm);
+                        fflush(stdout);
+                    }
+                }
+            }
             if (status != CUBLAS_STATUS_SUCCESS) {
                 printf("Error: cublas error. status = %d\n", status);
                 throw("cublas error");
@@ -2459,6 +2593,9 @@ bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm:
                                     cudaFp32Output + kOff, CType,
                                     k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #else
+            // 反量化之后的 GEMM 要显式要张量核: cublasGemmEx 的
+            // CUBLAS_GEMM_DEFAULT 在 Turing 上会落到 SIMT fp16, prefill 的大 M
+            // 下差一个数量级(NVFP4/FP8 的 prefill 路径一直用 _TENSOR_OP)。
             status = cublasGemmEx(fastllmCublasHandle,
                                     CUBLAS_OP_T, CUBLAS_OP_N,
                                     kc, n, m,
@@ -2466,7 +2603,7 @@ bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm:
                                     m, cudaInput, BType,
                                     m, &h_beta,
                                     cudaOutput + kOff, CType,
-                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 #endif
             if (status != CUBLAS_STATUS_SUCCESS) {
                 printf("Error: cublas error. status = %d\n", status);

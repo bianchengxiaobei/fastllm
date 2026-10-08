@@ -63,6 +63,11 @@ double FastllmCudaPinnedStagedEnqueueSeconds();
 unsigned long long FastllmCudaRealMallocCount();
 unsigned long long FastllmCudaRealMallocBytes();
 
+// 主机侧钉住 MoE 专家权重的额度与已用量(全局, 跨层累计). 额度 -1 表示还没从
+// FastllmEnv 读出来; 用尽或注册失败就退回中转路径.
+static std::atomic<long long> gMoePinHostBudgetBytes(-1);
+static std::atomic<long long> gMoePinHostPinnedBytes(0);
+
 namespace fastllm {
     // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
     static thread_local bool cudaMergeMOEUsedGraphUnsafeFallback = false;
@@ -9240,6 +9245,14 @@ namespace fastllm {
         double profileUpload = 0.0, profileCompute = 0.0, profileRelease = 0.0;
         double profileUploadBytes = 0.0;
         double profileAlloc = 0.0;
+        double profileWait = 0.0;
+        // 主机不开拷贝之后, 剩下的成本会落到"哪个入队调用被设备堵住"上: 设备消化不了
+        // 主机的入队速度时, 阻塞点就在这几个未计时的 enqueue 里.
+        double profileFind = 0.0, profileEvPrefetch = 0.0, profileEvCompute = 0.0;
+        // computeEnqueue 内部还没拆开: 每个专家都要重建输入、两次专家 GEMM、再把结果
+        // 散回. 各自计时才能看出大 chunk 时这 7~8s 落在哪一步.
+        double profileResize = 0.0, profilePickIn = 0.0, profileGemmUp = 0.0;
+        double profileGate = 0.0, profileGemmDown = 0.0, profilePickOut = 0.0;
         int profileUploads = 0;
         auto profileNow = []() {
             return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -9254,6 +9267,35 @@ namespace fastllm {
             profileMoeStream ? FastllmCudaRealMallocCount() : 0;
         const unsigned long long realMallocBytesBefore =
             profileMoeStream ? FastllmCudaRealMallocBytes() : 0;
+        // 主机侧钉住权重: 钉住之后 DMA 直接从权重本身下发, 主机一次拷贝都不用做.
+        // 探针实测这一步的差别很大: 写中转槽 186 us/1.18MB(无争用), 被 DMA 抢时
+        // 会掉到 350 us; 直发只要 106 us. 额度按字节全局扣减, 用尽就退回中转.
+        auto tryPinHostWeight = [](Data *weight) {
+            if (weight->isPinned || !weight->isModelWeight ||
+                weight->cpuData == nullptr || !weight->numasData.empty()) {
+                return;
+            }
+            if (gMoePinHostBudgetBytes.load(std::memory_order_relaxed) < 0) {
+                gMoePinHostBudgetBytes.store(
+                    (long long)GetFastllmEnv().moePinHostWeightsMb * 1024LL * 1024LL,
+                    std::memory_order_relaxed);
+            }
+            const long long bytes = (long long)weight->GetBytes();
+            long long left = gMoePinHostBudgetBytes.load(std::memory_order_relaxed);
+            while (left >= bytes) {
+                if (gMoePinHostBudgetBytes.compare_exchange_weak(
+                        left, left - bytes, std::memory_order_relaxed)) {
+                    if (FastllmCudaHostRegister(weight->cpuData, weight->GetBytes())) {
+                        weight->isPinned = true;
+                        gMoePinHostPinnedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    } else {
+                        // 锁页失败(额度不够/对齐等): 直接关掉这条路, 免得每块都刷警告
+                        gMoePinHostBudgetBytes.store(0, std::memory_order_relaxed);
+                    }
+                    return;
+                }
+            }
+        };
         // allocSeconds 只在开归因时非空: 延迟释放把 cudaData 清回 nullptr, 每次上传
         // 都要重新向池子要一块显存, 这段开销原本混在 upload 里看不出来.
         auto doUploadWeight = [&](int slot, void *stream, double *allocSeconds) {
@@ -9277,6 +9319,27 @@ namespace fastllm {
             }
 #endif
             if (!(weight->cpuData || !weight->numasData.empty())) {
+                return;
+            }
+            if (weight->cpuData != nullptr) {
+                tryPinHostWeight(weight);
+            }
+            if (weight->cpuData != nullptr && weight->isPinned) {
+                if (weight->cudaData == nullptr) {
+                    const double allocStart = allocSeconds != nullptr ? profileNow() : 0.0;
+                    weight->ToCudaTemporary({}, false);
+                    if (allocSeconds != nullptr) {
+                        *allocSeconds += profileNow() - allocStart;
+                    }
+                }
+                // 固定内存上跑 cudaMemcpyAsync 才是真异步, 主机只入队不等数据.
+                if (stream != nullptr) {
+                    FastllmCudaCopyFromPinnedHostToDeviceAsync(
+                        weight->cudaData, weight->cpuData, weight->GetBytes(), stream);
+                } else {
+                    FastllmCudaCopyFromPinnedHostToDevice(
+                        weight->cudaData, weight->cpuData, weight->GetBytes());
+                }
                 return;
             }
             if (pinnedUpload && weight->cpuData != nullptr) {
@@ -9366,26 +9429,44 @@ namespace fastllm {
         while (curExpert >= 0) {
             loopExperts++;
             // 等待要放在本轮预取之前: 完成事件会被下一次记录覆盖, 放后面就变成等
-            // "下一份"拷贝, 计算和拷贝又串起来了.
+            // "下一份"拷贝, 计算和拷贝又串起来了. 主机不拷贝(权重已钉住)时, 这里
+            // 会变成主要成本: 它等的就是 DMA 本身.
             if (eventOrderedPrefetch && prefetchPending) {
+                const double waitStart = profileMoeStream ? profileNow() : 0.0;
                 FastllmCudaCurrentThreadStreamWaitEvent(prefetchDoneEvent);
+                if (profileMoeStream) {
+                    profileWait += profileNow() - waitStart;
+                }
                 prefetchPending = false;
             }
 
+            const double findStart = profileMoeStream ? profileNow() : 0.0;
             int nextExpert = findNextValidExpert(curExpert);
+            if (profileMoeStream) {
+                profileFind += profileNow() - findStart;
+            }
 
             if (nextExpert >= 0) {
                 uploadWeight(nextExpert * 2, copyStream);
                 uploadWeight(nextExpert * 2 + 1, copyStream);
                 if (eventOrderedPrefetch) {
+                    const double evStart = profileMoeStream ? profileNow() : 0.0;
                     FastllmCudaEventRecord(prefetchDoneEvent, copyStream);
+                    if (profileMoeStream) {
+                        profileEvPrefetch += profileNow() - evStart;
+                    }
                     prefetchPending = true;
                 }
             }
 
             const double computeStart = profileMoeStream ? profileNow() : 0.0;
             int i = curExpert;
+            const double resizeStart = profileMoeStream ? profileNow() : 0.0;
             tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
+            if (profileMoeStream) {
+                profileResize += profileNow() - resizeStart;
+            }
+            const double pickInStart = profileMoeStream ? profileNow() : 0.0;
             FastllmCudaPickInput (
                 (uint8_t*)input.cudaData, 
                 (uint8_t*)tempInput.cudaData, 
@@ -9393,6 +9474,9 @@ namespace fastllm {
                 GetDataBytes(input.dataType, 1, input.dims[1]), 
                 cudaIndex + startIdx[i]
             );
+            if (profileMoeStream) {
+                profilePickIn += profileNow() - pickInStart;
+            }
             if (deepSeekV41Mode && (i != 0 || quantizeSharedExpert)) {
                 AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(tempInput, tempInput),
                                 "V4.1 GPU prefill input quantization failed.");
@@ -9429,11 +9513,15 @@ namespace fastllm {
                         expertBatch, inter, outputDim),
                     "CUDA NUMA MoE failed its FP32 down projection.");
             } else {
+                const double gemmUpStart = profileMoeStream ? profileNow() : 0.0;
                 DoCudaLinearReshape(
                     tempInput, *weights[i * 2], tempMiddle);
                 DoCudaLinear(
                     tempInput, *weights[i * 2],
                     *GetEmptyData(), tempMiddle);
+                if (profileMoeStream) {
+                    profileGemmUp += profileNow() - gemmUpStart;
+                }
 
                 if (deepSeekV4Mode) {
                     AssertInFastLLM(
@@ -9445,15 +9533,23 @@ namespace fastllm {
                                 (i != 0 && deepSeekV41Mode), activationQuantBlock),
                         "DeepSeek-V4 failed to prepare its CUDA MoE down input.");
                 } else {
+                    const double gateStart = profileMoeStream ? profileNow() : 0.0;
                     ApplyCudaMoeGate(
                         tempMiddle, tempSwiglu,
                         gateType, isCrossSwiglu);
+                    if (profileMoeStream) {
+                        profileGate += profileNow() - gateStart;
+                    }
                 }
+                const double gemmDownStart = profileMoeStream ? profileNow() : 0.0;
                 DoCudaLinearReshape(
                     tempSwiglu, *weights[i * 2 + 1], tempOutput);
                 DoCudaLinear(
                     tempSwiglu, *weights[i * 2 + 1],
                     *GetEmptyData(), tempOutput);
+                if (profileMoeStream) {
+                    profileGemmDown += profileNow() - gemmDownStart;
+                }
             }
 
             if (deepSeekV41Mode) {
@@ -9469,6 +9565,7 @@ namespace fastllm {
                     cudaIndex + startIdx[i],
                     cudaScales + startIdx[i]);
             } else {
+                const double pickOutStart = profileMoeStream ? profileNow() : 0.0;
                 FastllmCudaPickOutput (
                     (uint8_t*)tempOutput.cudaData,
                     (uint8_t*)output.cudaData,
@@ -9479,6 +9576,9 @@ namespace fastllm {
                         startIdx[i],
                     tempOutput.dataType
                 );
+                if (profileMoeStream) {
+                    profilePickOut += profileNow() - pickOutStart;
+                }
             }
 
             if (profileMoeStream) {
@@ -9488,7 +9588,11 @@ namespace fastllm {
             if (!resident.nativeGlm)
                 FastllmCudaStoreMoePrefillExpert(admission, i - 1, *weights[i * 2], *weights[i * 2 + 1]);
 #endif
+            const double evComputeStart = profileMoeStream ? profileNow() : 0.0;
             FastllmCudaEventRecord(computeDoneEvent);
+            if (profileMoeStream) {
+                profileEvCompute += profileNow() - evComputeStart;
+            }
             // 非中转路径保留旧的保守排序: 副本流排在本次计算之后, 预取的下一份权重
             // 不会早于本次计算落地. 中转路径上面已经改成延迟释放, 池会用事件挡住
             // 复用, 所以副本流不必再等计算 —— DMA 不等计算, 主机才不会被槽位事件
@@ -9533,15 +9637,24 @@ namespace fastllm {
                                      profileRelease - slotWait;
                 printf("[fastllm-moe-stream] call=%d experts=%d upload=%.4f s (%d calls, "
                        "%.2f GB, %.2f GB/s) alloc=%.4f s stageMemcpy=%.4f s "
-                       "stageEnqueue=%.4f s cudaMalloc=%llu (%.1f MB) "
-                       "computeEnqueue=%.4f s release=%.4f s "
-                       "slotWait=%.4f s other=%.4f s loop=%.4f s\n",
+                       "stageEnqueue=%.4f s cudaMalloc=%llu (%.1f MB) pinHost=%.0f/%.0f MB "
+                       "computeEnqueue=%.4f s release=%.4f s waitCur=%.4f s "
+                       "find=%.4f s evPrefetch=%.4f s evCompute=%.4f s "
+                       "slotWait=%.4f s other=%.4f s loop=%.4f s "
+                       "[compute: resize=%.4f pickIn=%.4f gemmUp=%.4f gate=%.4f "
+                       "gemmDown=%.4f pickOut=%.4f]\n",
                        profilePrintCounter.load() - 1, loopExperts, profileUpload,
                        profileUploads, profileUploadBytes / 1e9,
                        loopSeconds > 0.0 ? profileUploadBytes / loopSeconds / 1e9 : 0.0,
                        profileAlloc, stageMemcpy, stageEnqueue,
                        realMalloc, realMallocBytes / 1048576.0,
-                       profileCompute, profileRelease, slotWait, other, loopSeconds);
+                       gMoePinHostPinnedBytes.load(std::memory_order_relaxed) / 1048576.0,
+                       (double)GetFastllmEnv().moePinHostWeightsMb,
+                       profileCompute, profileRelease, profileWait,
+                       profileFind, profileEvPrefetch, profileEvCompute,
+                       slotWait, other, loopSeconds,
+                       profileResize, profilePickIn, profileGemmUp, profileGate,
+                       profileGemmDown, profilePickOut);
                 fflush(stdout);
             }
         }

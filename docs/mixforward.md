@@ -2,6 +2,9 @@
 
 这个文档以`DeepSeek-V4-Flash`模型为例，介绍如何使用混合推理来榨干硬件
 
+专家放在主机内存（`--moe_device cpu`）时的长输入 prefill 调参，见
+[MoE 主机专家流式 prefill 调优](moe-prefill-tuning.md)。
+
 ## 基本用法
 
 假设我们在一台有两张48G的显卡上部署`DeepSeek-V4-Flash`模型，一般用法是这样的

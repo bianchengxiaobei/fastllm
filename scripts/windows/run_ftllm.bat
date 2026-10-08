@@ -2,7 +2,15 @@
 setlocal
 set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..\..") do set "REPO=%%~fI"
-if "%FTLLM_BUILD%"=="" set "FTLLM_BUILD=cpu"
+rem 没显式指定就挑已经编好的产物: 有 gpu 物料就用 gpu, 否则退回 cpu,
+rem 省得每次开窗口都要先 set FTLLM_BUILD
+if "%FTLLM_BUILD%"=="" (
+    if exist "%REPO%\build-vs-gpu\tools\ftllm\fastllm_tools.dll" (
+        set "FTLLM_BUILD=gpu"
+    ) else (
+        set "FTLLM_BUILD=cpu"
+    )
+)
 
 set "TOOLS=%REPO%\build-vs-%FTLLM_BUILD%\tools"
 set "VENV=%REPO%\.venv"

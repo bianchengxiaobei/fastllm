@@ -94,11 +94,14 @@ cmake --build build-vs-gpu --config Release --target main -- /m
 ## 第三步：运行
 
 ```bat
-set FTLLM_BUILD=gpu
 scripts\windows\run_ftllm.bat server <模型路径> --port 8080 --device cuda
 ```
 
-`FTLLM_BUILD` 决定用哪份产物（`cpu` / `gpu`，默认 `cpu`）。脚本首次运行会：
+GPU 主计算 + 专家在主机内存（`--moe_device cpu`）的长输入场景，推荐参数见
+[MoE 主机专家流式 prefill 调优](moe-prefill-tuning.md)。
+
+`FTLLM_BUILD` 决定用哪份产物（`cpu` / `gpu`）。不设置时会自动挑：存在
+`build-vs-gpu\tools\ftllm\fastllm_tools.dll` 就用 `gpu`，否则用 `cpu`。脚本首次运行会：
 
 1. 用 `uv` 在仓库根目录建 `.venv`（已加入 `.gitignore`）；
 2. 按 `scripts\windows\ftllm_deps.txt` 安装依赖；
@@ -128,7 +131,10 @@ scripts\windows\run_ftllm.bat server <模型路径> --port 8080 --device cuda
 | `--moe_device_layers` | 仅最后 N 层 MoE 用 `--moe_device`，`-1` 表示全部 |
 | `--dtype` / `--kv_cache_dtype` | 权重与 KV cache 类型，如 `float16`、`fp8_e4m3` |
 | `--max_batch` | 单次最大并发请求数 |
+| `--chunked_prefill_size` | 分块 prefill 的切片大小，如 `4096`；前缀快照间隔会自动跟着它抬起来，不用再单独设 `--prefix_cache_snapshot_interval_pages` |
 | `--moe_pinned_slots` / `--moe_pinned_slot_mb` | MoE 权重流式上传的固定内存中转环槽数与单槽宽(MB)，默认 16 × 4MB |
+| `--moe_pin_host_weights` | 在主机侧钉住 MoE 专家权重的额度(MB)，默认 0 关闭；钉住后 DMA 直接从权重下发，省掉写中转槽的主机拷贝，但这块内存不可换出 |
+| `--prefill_moe_gpu` | prefill 把主机上的路由专家搬上卡用 GPU 算，`1` 开 / `0` 关；默认 `-1` 按配置自动（专家在 cpu 内存里就开） |
 
 服务参数：`--host`（默认 `0.0.0.0`）、`--port`（默认 8080）、`--api_key`、`--model_name`。
 
@@ -144,8 +150,9 @@ KV cache 类型用 `--kv_dtype`，且 `--moe_device` 必须与 `--device` 同时
 | `FASTLLM_MOE_ASYNC_PREFETCH=1` | 单独启用"计算流按事件等拷贝"的预取排序 |
 | `FASTLLM_PROFILE_MOE_STREAM=1` | 打印专家流式循环的 upload / compute / release / slotWait 耗时构成 |
 | `FASTLLM_PRINT_PROFILE=1` | 打开慢算子、numas-linear、CPU 分配探针等归因日志 |
-| `FASTLLM_PREFILL_MOE_GPU=1` | 原型：`--moe_device cpu` 时 prefill 把专家搬到显存用 GPU 算（默认关） |
+| `FASTLLM_PREFILL_MOE_GPU` | 原型：`--moe_device cpu` 时 prefill 把专家搬到显存用 GPU 算；不设置时按配置自动（专家在 cpu 内存里就开），可用 `--prefill_moe_gpu 0/1` 显式覆盖 |
 | `FASTLLM_PREFILL_MOE_GPU_MIN_TOKENS` | 上述原型生效的最小 token 数，默认 1024 |
+| `FASTLLM_CUDA_INT4_GROUP_PREFILL_CUBLAS` | int4 group 权重在 prefill 大 M 上改走「反量化 + cuBLAS」而不是 Marlin（Marlin 是解码向内核）。默认关；`1` 打开。2060 SUPER 上实测与 Marlin 持平，属于可选的 A/B 开关，见 [MoE 主机专家流式 prefill 调优](moe-prefill-tuning.md) 第 6 节 |
 
 ## 验证
 

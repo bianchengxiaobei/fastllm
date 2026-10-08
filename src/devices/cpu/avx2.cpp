@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <chrono>
 #include <cstdio>
@@ -712,26 +713,10 @@ namespace fastllm {
     //    every weight row (the old kernel re-converted A per output column);
     //  - two weight rows are interleaved into four independent FMA chains so
     //    the 5-cycle vfmaddps latency cannot stall the weight stream;
-    //  - the FP8 -> BF16 bit trick stays unchanged: decoded values are
-    //    pre-scaled by 2^-120 and magicScale compensates once per row/block.
+    //  - the FP8 -> FP32 decode builds the exact value with no subnormal
+    //    intermediate, so these kernels stay correct under every MXCSR
+    //    rounding / FTZ / DAZ combination.
 #ifdef __AVX2__
-    static inline void DecodeFP8E4M3x16_AVX2(const uint8_t *src, __m256 &lo, __m256 &hi) {
-        const __m128i signMask = _mm_set1_epi8((char)0x80);
-        const __m128i mantMask = _mm_set1_epi8(0x7F);
-        const __m128i zero = _mm_setzero_si128();
-        const __m128i bytes = _mm_loadu_si128((const __m128i*)src);
-        const __m128i signBytes = _mm_and_si128(bytes, signMask);
-        const __m128i mantBytes = _mm_and_si128(bytes, mantMask);
-        const __m128i signLo = _mm_unpacklo_epi8(signBytes, zero);
-        const __m128i mantLo = _mm_unpacklo_epi8(mantBytes, zero);
-        const __m128i bf16Lo = _mm_or_si128(_mm_slli_epi16(signLo, 8), _mm_slli_epi16(mantLo, 4));
-        const __m128i signHi = _mm_unpackhi_epi8(signBytes, zero);
-        const __m128i mantHi = _mm_unpackhi_epi8(mantBytes, zero);
-        const __m128i bf16Hi = _mm_or_si128(_mm_slli_epi16(signHi, 8), _mm_slli_epi16(mantHi, 4));
-        lo = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16Lo), 16));
-        hi = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16Hi), 16));
-    }
-
     static inline float HorizontalSum8_AVX2(__m256 v) {
         const __m128 lo = _mm256_castps256_ps128(v);
         const __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -742,12 +727,11 @@ namespace fastllm {
     }
 
     static inline float FP8E4M3ScalarToFloat_AVX2(uint8_t fp8Val) {
-        const uint16_t bf16Val = (uint16_t)(((uint16_t)(fp8Val & 0x80) << 8) |
-                                            ((uint16_t)(fp8Val & 0x7F) << 4));
-        const uint32_t bits = (uint32_t)bf16Val << 16;
-        float value;
-        memcpy(&value, &bits, sizeof(float));
-        return value;
+        const int exponent = (fp8Val >> 3) & 15;
+        const int mantissa = fp8Val & 7;
+        const float value = exponent ? std::ldexp(1.0f + mantissa / 8.0f, exponent - 7)
+                                     : mantissa / 512.0f;
+        return (fp8Val & 0x80) ? -value : value;
     }
 
     static inline void ConvertBFloat16ToFloat32_AVX2(const uint16_t *src, float *dst, int len) {
@@ -823,7 +807,6 @@ namespace fastllm {
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX2__
         const size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
-        const float magicScale = (float)pow(2, 120);
         const int blockM = 128;
         const int numBlocks = (m + blockM - 1) / blockM;
         const size_t blockStride = blockM + sizeof(float);
@@ -871,13 +854,16 @@ namespace fastllm {
                         for (; p + 15 < blockEnd; p += 16) {
                             const __m256 a0 = _mm256_loadu_ps(a + base + p);
                             const __m256 a1 = _mm256_loadu_ps(a + base + p + 8);
-                            __m256 w0lo, w0hi, w1lo, w1hi;
                             _mm_prefetch((const char*)(fp80 + p + 96), _MM_HINT_T0);
                             _mm_prefetch((const char*)(fp81 + p + 96), _MM_HINT_T0);
-                            DecodeFP8E4M3x16_AVX2(fp80 + p, w0lo, w0hi);
+                            const __m128i wb0 = _mm_loadu_si128((const __m128i*)(fp80 + p));
+                            const __m256 w0lo = FP8E4M3ToFloat_AVX2(wb0);
+                            const __m256 w0hi = FP8E4M3ToFloat_AVX2(_mm_srli_si128(wb0, 8));
                             s0 = _mm256_fmadd_ps(a0, w0lo, s0);
                             s1 = _mm256_fmadd_ps(a1, w0hi, s1);
-                            DecodeFP8E4M3x16_AVX2(fp81 + p, w1lo, w1hi);
+                            const __m128i wb1 = _mm_loadu_si128((const __m128i*)(fp81 + p));
+                            const __m256 w1lo = FP8E4M3ToFloat_AVX2(wb1);
+                            const __m256 w1hi = FP8E4M3ToFloat_AVX2(_mm_srli_si128(wb1, 8));
                             r0 = _mm256_fmadd_ps(a0, w1lo, r0);
                             r1 = _mm256_fmadd_ps(a1, w1hi, r1);
                         }
@@ -900,9 +886,9 @@ namespace fastllm {
                     }
 
                     float *floatC = outputData + (size_t)(iSuper + r) * k;
-                    floatC[j] = (HorizontalSum8_AVX2(total0) + tail0) * magicScale;
+                    floatC[j] = HorizontalSum8_AVX2(total0) + tail0;
                     if (hasSecond) {
-                        floatC[j + 1] = (HorizontalSum8_AVX2(total1) + tail1) * magicScale;
+                        floatC[j + 1] = HorizontalSum8_AVX2(total1) + tail1;
                     }
                 }
                 }
@@ -918,7 +904,6 @@ namespace fastllm {
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX2__
         const size_t perRow = GetDataBytes(DataType::FP8_E4M3_PERCHANNEL, 1, m);
-        const float magicScale = (float)pow(2, 120);
 
         // A 一次性从 BF16 转 FP32，之后全部从缓存读（调用方保证 n <= 31，
         // n*m*4 通常落 L3；转换只做一遍，避免 j 外层重排后重复转换）。
@@ -952,13 +937,16 @@ namespace fastllm {
                     for (; p + 15 < m; p += 16) {
                         const __m256 a0 = _mm256_loadu_ps(a + p);
                         const __m256 a1 = _mm256_loadu_ps(a + p + 8);
-                        __m256 w0lo, w0hi, w1lo, w1hi;
                         _mm_prefetch((const char*)(row0 + p + 96), _MM_HINT_T0);
                         _mm_prefetch((const char*)(row1 + p + 96), _MM_HINT_T0);
-                        DecodeFP8E4M3x16_AVX2(row0 + p, w0lo, w0hi);
+                        const __m128i wb0 = _mm_loadu_si128((const __m128i*)(row0 + p));
+                        const __m256 w0lo = FP8E4M3ToFloat_AVX2(wb0);
+                        const __m256 w0hi = FP8E4M3ToFloat_AVX2(_mm_srli_si128(wb0, 8));
                         s0 = _mm256_fmadd_ps(a0, w0lo, s0);
                         s1 = _mm256_fmadd_ps(a1, w0hi, s1);
-                        DecodeFP8E4M3x16_AVX2(row1 + p, w1lo, w1hi);
+                        const __m128i wb1 = _mm_loadu_si128((const __m128i*)(row1 + p));
+                        const __m256 w1lo = FP8E4M3ToFloat_AVX2(wb1);
+                        const __m256 w1hi = FP8E4M3ToFloat_AVX2(_mm_srli_si128(wb1, 8));
                         r0 = _mm256_fmadd_ps(a0, w1lo, r0);
                         r1 = _mm256_fmadd_ps(a1, w1hi, r1);
                     }
@@ -971,9 +959,9 @@ namespace fastllm {
                     float scale0, scale1;
                     memcpy(&scale0, row0 + m, sizeof(float));
                     memcpy(&scale1, row1 + m, sizeof(float));
-                    floatC[j] = (HorizontalSum8_AVX2(_mm256_add_ps(s0, s1)) + tail0) * scale0 * magicScale;
+                    floatC[j] = (HorizontalSum8_AVX2(_mm256_add_ps(s0, s1)) + tail0) * scale0;
                     if (hasSecond) {
-                        floatC[j + 1] = (HorizontalSum8_AVX2(_mm256_add_ps(r0, r1)) + tail1) * scale1 * magicScale;
+                        floatC[j + 1] = (HorizontalSum8_AVX2(_mm256_add_ps(r0, r1)) + tail1) * scale1;
                     }
                 }
             }
