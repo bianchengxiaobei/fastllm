@@ -25251,16 +25251,16 @@ namespace fastllm {
                                 // 正好对应这一块 2048 个 token。用来判断慢在算子
                                 // 本身、还是慢在反复申请/释放中间张量。
                                 if (GetFastllmEnv().printProfile) {
-                                // 线程内的 summary 只统计本线程派发的算子, prefill 的
-                                // 重活不在这条线程上, 所以它总是空的; 真正有意义的是
-                                // executor 上那份跨线程共享的按 op 汇总表, 打完清掉,
-                                // 于是每一块都对应 2048 个 token 的增量. prefill 每层
-                                // 算子走 Qwen3CudaDirectRunner, 不经过 Executor, 所以
-                                // 还要单独打一份 direct op 表
-                                // (FASTLLM_PROFILE_DIRECT_OPS).
-                                PrintProfileSummary();
-                                PrintProfiler();
-                                static_cast<Executor *>(GetExecutor())->ClearProfiler();
+                                    // 线程内的 summary 只统计本线程派发的算子, prefill 的
+                                    // 重活不在这条线程上, 所以它总是空的; 真正有意义的是
+                                    // executor 上那份跨线程共享的按 op 汇总表, 打完清掉,
+                                    // 于是每一块都对应 2048 个 token 的增量. prefill 每层
+                                    // 算子走 Qwen3CudaDirectRunner, 不经过 Executor, 所以
+                                    // 还要单独打一份 direct op 表
+                                    // (FASTLLM_PROFILE_DIRECT_OPS).
+                                    PrintProfileSummary();
+                                    PrintProfiler();
+                                    static_cast<Executor *>(GetExecutor())->ClearProfiler();
                                 }
                             }
                         }
