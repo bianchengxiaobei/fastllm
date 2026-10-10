@@ -168,6 +168,72 @@ namespace fastllm {
 
     static std::map<std::string, ExecPhaseStat> execPhaseProfile;
 
+    // Data::ToDevice 阶段的按张量归因, 由 FASTLLM_PROFILE_TODEVICE_TENSORS 打开.
+    // 用来回答"executor 的 toDevice 时间到底花在哪个输入张量上": key 是
+    // "opType/tensorName", 单位毫秒.
+    struct ToDeviceTensorStat {
+        double count = 0.0;
+        double ms = 0.0;
+    };
+
+    static std::map<std::string, ToDeviceTensorStat> toDeviceTensorProfile;
+
+    static bool ProfileToDeviceTensorsEnabled() {
+        static const bool enabled =
+            std::getenv("FASTLLM_PROFILE_TODEVICE_TENSORS") != nullptr;
+        return enabled;
+    }
+
+    // 关闭时构造/析构只有两次指针赋值, 不动热路径.
+    struct ToDeviceTensorTimer {
+        const std::string *opType = nullptr;
+        const std::string *name = nullptr;
+        std::chrono::system_clock::time_point start;
+        bool active = false;
+
+        ToDeviceTensorTimer(const std::string &op, const std::string &tensorName)
+                : opType(&op), name(&tensorName) {
+            this->active = ProfileToDeviceTensorsEnabled();
+            if (this->active) {
+                this->start = std::chrono::system_clock::now();
+            }
+        }
+
+        ~ToDeviceTensorTimer() {
+            if (!this->active) {
+                return;
+            }
+            ToDeviceTensorStat &stat =
+                toDeviceTensorProfile[*this->opType + "/" + *this->name];
+            stat.count += 1.0;
+            stat.ms += GetSpan(this->start, std::chrono::system_clock::now()) * 1000.0;
+        }
+    };
+
+    static void PrintToDeviceTensorProfile() {
+        if (toDeviceTensorProfile.empty()) {
+            return;
+        }
+        std::vector<std::pair<std::string, ToDeviceTensorStat> > items(
+            toDeviceTensorProfile.begin(), toDeviceTensorProfile.end());
+        std::sort(items.begin(), items.end(),
+                  [](const std::pair<std::string, ToDeviceTensorStat> &a,
+                     const std::pair<std::string, ToDeviceTensorStat> &b) {
+                      return a.second.ms > b.second.ms;
+                  });
+        printf("--- Data::ToDevice by tensor (FASTLLM_PROFILE_TODEVICE_TENSORS) ---\n");
+        printf("%-44s %8s %12s %10s\n", "opType/tensor", "count", "total ms", "ms/call");
+        double sumMs = 0.0;
+        for (auto &it : items) {
+            sumMs += it.second.ms;
+            printf("%-44s %8.0f %12.3f %10.4f\n", it.first.c_str(), it.second.count,
+                   it.second.ms,
+                   it.second.count > 0.0 ? it.second.ms / it.second.count : 0.0);
+        }
+        printf("%-44s %8s %12.3f\n", "SUM", "", sumMs);
+        fflush(stdout);
+    }
+
     struct ExecPhaseTimer {
         ExecPhaseStat *stat;
         std::chrono::system_clock::time_point last;
@@ -224,6 +290,7 @@ namespace fastllm {
     void ClearProfileSummary() {
         GetThreadProfileSummary().clear();
         execPhaseProfile.clear();
+        toDeviceTensorProfile.clear();
         ClearCpuAllocProfile();
     }
 
@@ -243,6 +310,7 @@ namespace fastllm {
         }
         printf("total spend %f\n", sum);
         PrintExecPhaseProfile();
+        PrintToDeviceTensorProfile();
         PrintCpuAllocProfile(" total");
         fflush(stdout);
     }
@@ -560,6 +628,7 @@ namespace fastllm {
                 phaseTimer.Split(&ExecPhaseStat::canRun);
                 bool intParamsSize = intParams.size();
                 for (auto &it: datas) {
+                    ToDeviceTensorTimer tensorTimer(opType, it.first);
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
@@ -705,6 +774,7 @@ namespace fastllm {
             phaseTimer.Split(&ExecPhaseStat::canRun);
             bool intParamsSize = intParams.size();
             for (auto &it: datas) {
+                ToDeviceTensorTimer tensorTimer(opType, it.first);
                 if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                     int batch = intParams.find(it.first + "___batch")->second;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
@@ -805,6 +875,7 @@ namespace fastllm {
         }
         printf("total spend %f\n", sum);
         PrintExecPhaseProfile();
+        PrintToDeviceTensorProfile();
 #ifdef __ANDROID__
         __android_log_print(ANDROID_LOG_INFO, "FastllmProfiler", "===== Profiler Results =====");
         for (auto &it : profiler) {

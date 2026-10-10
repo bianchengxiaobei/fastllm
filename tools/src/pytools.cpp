@@ -28,9 +28,22 @@
 
 #include "pytools_t2s.cpp"
 
+#ifdef USE_CUDA
+// 定义在 devices/cuda/fastllm-cuda.cu。这里只做退出标记, 不改公共头,
+// 免得动 fastllm-cuda.cuh 触发所有 CUDA 翻译单元重编。
+void FastllmCudaMarkProcessExiting();
+#endif
+
 void signal_handler(int signal) {
     if (signal == SIGINT) {
         printf("into exit\n");
+#ifdef USE_CUDA
+        // 这里是强制退出路径, 会跳过 Python 层的收尾。先置退出标记, 让随后的
+        // 静态析构里的释放路径直接跳过 CUDA 调用: 此刻 cudart 可能已经开始卸载,
+        // cudaFree 只会返回 cudaErrorCudartUnloading, 而显存由驱动统一回收。
+        FastllmCudaMarkProcessExiting();
+        fflush(stdout);
+#endif
         exit(0);
     }
 }
@@ -695,6 +708,16 @@ extern "C" {
         model.reset();
 #ifdef USE_NUMAS
         fastllm::ClearNumasMoeRuntimeCache();
+#endif
+        return;
+    }
+
+    DLL_EXPORT void mark_process_exiting() {
+        // 进程即将退出(不打算再归还显存)时调用: 之后所有释放路径都跳过 CUDA 调用,
+        // 免得 cudart 开始卸载后再 cudaFree 报 cudaErrorCudartUnloading。
+        // 模型析构很慢(几万个张量), 退出时逐个归还纯属浪费 —— 显存由驱动统一回收。
+#ifdef USE_CUDA
+        FastllmCudaMarkProcessExiting();
 #endif
         return;
     }

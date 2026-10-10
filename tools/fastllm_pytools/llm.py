@@ -3274,6 +3274,11 @@ class model:
     
     def release_memory(self):
         fastllm_lib.release_memory(self.model)
+
+    def mark_process_exiting(self):
+        # 进程即将退出时调用: 之后 native 侧所有释放路径都跳过 CUDA 调用。
+        # 退出时不需要逐个归还显存(模型析构慢), 显存由驱动统一回收。
+        fastllm_lib.mark_process_exiting()
     
     def set_save_history(self, save: bool):
         if getattr(self, "kvmem_enabled", False) and save:

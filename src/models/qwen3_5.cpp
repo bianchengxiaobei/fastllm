@@ -65,7 +65,7 @@ namespace fastllm {
         Data &w1, Data &w2, Data &w3, Data **weights, Data **biass, float sharedScale,
         bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
         MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit,
-        int activationQuantBlock, bool quantizeSharedExpert);
+        int activationQuantBlock, bool quantizeSharedExpert, bool cacheAdmission = true);
 #endif
 
     // runChunkPrefillReference 逐 chunk 把结果原地写进 core_attn_out 的第 ci 个槽位。
@@ -2727,6 +2727,7 @@ namespace fastllm {
         // prefill 走 GPU 的开关: --prefill_moe_gpu / FASTLLM_PREFILL_MOE_GPU 可以显式
         // 给 0/1; 不设置时按配置自动决定 —— 只有专家在 cpu 内存里时才默认打开,
         // numa/disk 各自有自己的快路径, 不替它们做决定.
+        // decode 走同一条路需要显式开 FASTLLM_DECODE_MOE_GPU=1(见下).
         static bool Qwen35PrefillMoeGpuFromHostEnabled(const std::string &moeDevice) {
             const int configured = GetFastllmEnv().prefillMoeGpu;
             if (configured >= 0) {
@@ -2742,6 +2743,59 @@ namespace fastllm {
                 return value > 0 ? value : 1;
             }();
             return minTokens;
+        }
+
+        // 单 token decode 也走"主机专家搬上卡算"的同一条路: 复用 prefill 的
+        // 逐专家异步上传 + GPU GEMM. 显存常驻专家缓存(--moe_cuda_cache)打开时
+        // 自动启用 —— 命中的专家不重传, 这正是缓存起作用的那条路; 也可以用
+        // FASTLLM_DECODE_MOE_GPU=0 单独关掉.
+        static bool Qwen35DecodeMoeGpuFromHostEnabled() {
+            static const int enabled = []() {
+                const char *env = std::getenv("FASTLLM_DECODE_MOE_GPU");
+                if (env != nullptr && env[0] != '\0') {
+                    return env[0] != '0' ? 1 : 0;
+                }
+                return GetMoeCudaCacheBytes() > 0 ? 1 : 0;
+            }();
+            return enabled != 0;
+        }
+
+        // 主机 MoE 逐层耗时诊断: 打开 FASTLLM_PROFILE_HOST_MOE 后, 把 decode 里
+        // 每个 MoE 层走的三种分支分别计时(墙钟), 每走满一个 token 的层数打一行:
+        //   cpu  = MergeMOEBlock 走 CPU(含 index/score 的 D2H 同步、CPU 反量化 GEMM、
+        //          结果 H2D) —— 这条是逐层同步, 会把 GPU 流水抽干;
+        //   host = 内存专家搬上卡算 (Qwen35TryPrefillMoeGpuFromHost);
+        //   cuda = 权重本来就在卡上 (Qwen3CudaMergeMOEBlock), 只有下发时间.
+        static bool Qwen35HostMoeProfileEnabled() {
+            static const bool enabled = std::getenv("FASTLLM_PROFILE_HOST_MOE") != nullptr;
+            return enabled;
+        }
+
+        static double Qwen35HostMoeNowMs() {
+            return (double)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-3;
+        }
+
+        static void Qwen35HostMoeProfileLap(int branch, double ms, int layersPerToken) {
+            static double sum[3] = {0.0, 0.0, 0.0};
+            static long long count[3] = {0, 0, 0};
+            static int layers = 0;
+            if (branch >= 0 && branch < 3) {
+                sum[branch] += ms;
+                count[branch]++;
+            }
+            if (++layers < layersPerToken) {
+                return;
+            }
+            printf("[fastllm-host-moe] layers=%d | cpu %lld层 %.1fms | host->gpu %lld层 %.1fms | "
+                   "cuda %lld层 %.1fms\n",
+                   layers, count[0], sum[0], count[1], sum[1], count[2], sum[2]);
+            fflush(stdout);
+            for (int i = 0; i < 3; i++) {
+                sum[i] = 0.0;
+                count[i] = 0;
+            }
+            layers = 0;
         }
 
         // 成功返回true(此时output是显存上的[tokens, hidden]); 失败返回false, 调用方回落到CPU路径
@@ -2760,7 +2814,8 @@ namespace fastllm {
             if (input.dims.size() < 2 || expertIndex.dims.size() < 2) {
                 return false;
             }
-            if (input.dims[0] < Qwen35PrefillMoeGpuFromHostMinTokens()) {
+            if (input.dims[0] < Qwen35PrefillMoeGpuFromHostMinTokens() &&
+                !(input.dims[0] == 1 && Qwen35DecodeMoeGpuFromHostEnabled())) {
                 return false;
             }
             // 第0/1个槽位是共享专家, 本模型没有, 只在占位
@@ -16118,7 +16173,10 @@ namespace fastllm {
 
             bool layerMappedNonCudaMoe = Qwen35LayerUsesMappedNonCudaMoe(this, i);
             const std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
-            // 原型: prefill 时把内存里的路由专家逐专家搬上卡交给GPU算(默认自动开)
+            const bool profileHostMoe = Qwen35HostMoeProfileEnabled();
+            const double hostMoeBeginMs = profileHostMoe ? Qwen35HostMoeNowMs() : 0.0;
+            // 原型: prefill 时把内存里的路由专家逐专家搬上卡交给GPU算(默认自动开);
+            // 单 token decode 要走同一条路得显式开 FASTLLM_DECODE_MOE_GPU=1
             bool prefillMoeOnGpu = layerMappedNonCudaMoe && !tensorParallel &&
                                    Qwen35PrefillMoeGpuFromHostEnabled(selectedMoeDevice) &&
                                    Qwen35TryPrefillMoeGpuFromHost(
@@ -16126,6 +16184,7 @@ namespace fastllm {
                                        weights[i], biass[i],
                                        w1, w2, w3, moeFinal,
                                        this->num_experts, gpuId, i);
+            const int hostMoeBranch = layerMappedNonCudaMoe ? (prefillMoeOnGpu ? 1 : 0) : 2;
             if (layerMappedNonCudaMoe) {
                 if (prefillMoeOnGpu) {
                     // 已在 Qwen35TryPrefillMoeGpuFromHost 里用GPU算完, moeFinal 就绪
@@ -16173,6 +16232,11 @@ namespace fastllm {
                 } else {
                     Qwen35ZeroCudaLike(moeFinal, hiddenStates, gpuId);
                 }
+            }
+            if (profileHostMoe) {
+                Qwen35HostMoeProfileLap(hostMoeBranch,
+                                        Qwen35HostMoeNowMs() - hostMoeBeginMs,
+                                        this->block_cnt);
             }
             moeFinal.Reshape(hiddenStates.dims);
             if (sharedExpertPending) {
@@ -25130,7 +25194,16 @@ namespace fastllm {
                                 // 正好对应这一块 2048 个 token。用来判断慢在算子
                                 // 本身、还是慢在反复申请/释放中间张量。
                                 if (GetFastllmEnv().printProfile) {
-                                    PrintProfileSummary();
+                                // 线程内的 summary 只统计本线程派发的算子, prefill 的
+                                // 重活不在这条线程上, 所以它总是空的; 真正有意义的是
+                                // executor 上那份跨线程共享的按 op 汇总表, 打完清掉,
+                                // 于是每一块都对应 2048 个 token 的增量. prefill 每层
+                                // 算子走 Qwen3CudaDirectRunner, 不经过 Executor, 所以
+                                // 还要单独打一份 direct op 表
+                                // (FASTLLM_PROFILE_DIRECT_OPS).
+                                PrintProfileSummary();
+                                PrintProfiler();
+                                static_cast<Executor *>(GetExecutor())->ClearProfiler();
                                 }
                             }
                         }
@@ -25407,6 +25480,16 @@ namespace fastllm {
                         lastRecordTime = nowTime;
                         genTokens = 0;
                     }
+                }
+
+                // 每个 decode step 打一份按 op 汇总(打完清掉), 一份 dump 正好对应一个
+                // token, 用来定位 decode 的耗时花在哪个算子上. 只覆盖走 Executor 派发的
+                // 算子(例如 CPU 上的 MergeMOE); 直接在 CUDA runner 里跑的注意力/GDN 看
+                // FASTLLM_PROFILE_SLOW_OPS 的埋点.
+                if (GetFastllmEnv().printProfile ||
+                    std::getenv("FASTLLM_PROFILE_SLOW_OPS") != nullptr) {
+                    PrintProfiler();
+                    static_cast<Executor *>(GetExecutor())->ClearProfiler();
                 }
 
                 for (int i = 0; i < (int)handles.size(); i++) {

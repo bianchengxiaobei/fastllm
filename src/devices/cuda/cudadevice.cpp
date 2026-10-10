@@ -18,6 +18,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm
 
 #include "utils.h"
 #include "json11.hpp"
+#include "moe_cache_config.h"
 
 #include <atomic>
 #include <cmath>
@@ -29,6 +30,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -8902,7 +8904,368 @@ namespace fastllm {
                weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
     }
 
-    void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
+    // ===== 主机专家显存常驻缓存 =====
+    //
+    // --device cuda + --moe_device cpu 时路由专家权重留在主机内存, 每个 decode token
+    // 都要把当次命中的专家重传一遍(每 token 几百 MB 的主机侧拷贝). 这里把已经传上卡
+    // 的专家按热度留在显存: 下一 token 命中的直接复用显存副本, 不再重传, 没命中的照旧
+    // 走原来的上传路径.
+    //
+    // 预算沿用 --moe_cuda_cache, 准入与淘汰沿用 --moe_cache_* 的 MoeCacheConfig(见
+    // docs/cuda-expert-cache.md). halfLife 以 decode step 计, 一个 step 对应多少次 MoE
+    // 调用按注册到的 MoE 权重表数量自动折算 —— 权重表指针就是层标识, 调用方不用传层号.
+    // 常驻专家的一对投影必须一起留在显存, 只留一半的专家算不了.
+    namespace {
+
+        struct HostMoeResidentEntry {
+            Data *gateup = nullptr;
+            Data *down = nullptr;
+            const void *gateupDevice = nullptr;
+            const void *downDevice = nullptr;
+            uint64_t bytes = 0;
+            int expertIndex = -1;
+            bool committed = false;
+        };
+
+        // 常驻一个专家占的显存: 打包权重本体 + CUDA 侧的 scale/min/bias 缓存.
+        static uint64_t HostMoeResidentWeightBytes(const Data &weight) {
+            uint64_t bytes = weight.GetBytes();
+            const int rows = weight.dims.empty() ? 0 : weight.dims[0];
+            if (rows > 0 && weight.group > 0) {
+                bytes += (uint64_t)rows * weight.group * sizeof(uint16_t) * 2;
+                bytes += (uint64_t)rows * sizeof(float);
+            }
+            return bytes;
+        }
+
+        class HostMoeResidentCache {
+        public:
+            static HostMoeResidentCache &Instance() {
+                static HostMoeResidentCache cache;
+                return cache;
+            }
+
+            // 本次 MoE 调用前算一次: skipUpload[i] 表示该专家已常驻(不用重传),
+            // keep[i] 表示该专家用完要保留(跳过释放). 返回累加器是否生效.
+            bool Plan(const void *table, bool prefill,
+                      const std::vector<std::vector<std::pair<int, float> > > &expertTasks,
+                      Data **weights,
+                      std::vector<char> &skipUpload, std::vector<char> &keep) {
+                std::lock_guard<std::mutex> guard(this->mutex);
+                this->SyncLocked();
+                const int expertCount = (int)expertTasks.size();
+                skipUpload.assign(expertCount, 0);
+                keep.assign(expertCount, 0);
+                if (!this->requested || expertCount <= 1) {
+                    return false;
+                }
+
+                this->tables.insert(table);
+                this->stepsPerToken = std::max<uint64_t>(1, (uint64_t)this->tables.size());
+                const uint64_t call = ++this->calls;
+                if (call % this->stepsPerToken == 0) {
+                    this->admissionsThisStep = 0;
+                    this->admissionBytesThisStep = 0;
+                }
+                if (prefill != this->lastPrefill) {
+                    // prefill 的热度先单独攒着: 默认(prefillPrior=0)不进 decode 热度,
+                    // 免得长 prompt 的专家把预算长期占住. 常驻权重本身仍然留着.
+                    if (!prefill) {
+                        if (this->policy.prefillPrior > 0.0f) {
+                            for (auto &item : this->prefillHeat) {
+                                this->heat[item.first] +=
+                                    item.second * this->policy.prefillPrior;
+                                this->heatTouch[item.first] = call;
+                            }
+                        }
+                        this->prefillHeat.clear();
+                    }
+                    this->lastPrefill = prefill;
+                }
+
+                // 1) 累计热度, 标记命中; 显存副本已经不在的记录(比如重载模型)直接丢掉重传.
+                std::set<const Data *> routed;
+                for (int i = 1; i < expertCount; i++) {
+                    const int routes = (int)expertTasks[i].size();
+                    if (routes <= 0) continue;
+                    Data *gateup = weights[i * 2];
+                    Data *down = weights[i * 2 + 1];
+                    if (gateup == nullptr || down == nullptr) continue;
+                    routed.insert(gateup);
+                    this->AddHeatLocked(gateup, (float)routes, call, prefill);
+                    auto it = this->resident.find(gateup);
+                    if (it == this->resident.end()) continue;
+                    if (!this->IsLiveLocked(it->second)) {
+                        this->EraseLocked(it, false, keep);
+                        continue;
+                    }
+                    skipUpload[i] = 1;
+                    keep[i] = 1;
+                    if (prefill) {
+                        this->prefillHitRoutes += (uint64_t)routes;
+                    } else {
+                        this->hitRoutes += (uint64_t)routes;
+                    }
+                }
+
+                // 2) 没命中的按热度补进预算, 只淘汰本轮没路由的冷专家.
+                if (this->policy.maxReplacements <= 0) {
+                    return true;
+                }
+                for (int i = 1; i < expertCount; i++) {
+                    if (this->admissionsThisStep >= this->policy.maxReplacements) break;
+                    const int routes = (int)expertTasks[i].size();
+                    if (routes <= 0 || skipUpload[i]) continue;
+                    Data *gateup = weights[i * 2];
+                    Data *down = weights[i * 2 + 1];
+                    if (gateup == nullptr || down == nullptr) continue;
+                    const float candidateHeat = this->RankHeatLocked(gateup);
+                    if (prefill) {
+                        this->prefillMissRoutes += (uint64_t)routes;
+                    } else {
+                        this->missRoutes += (uint64_t)routes;
+                    }
+                    if (candidateHeat < this->policy.minHeat) continue;
+                    const uint64_t bytes = HostMoeResidentWeightBytes(*gateup) +
+                                           HostMoeResidentWeightBytes(*down);
+                    if (bytes == 0 || bytes > this->budget) continue;
+                    if (this->policy.maxBytes > 0 &&
+                        this->admissionBytesThisStep + bytes > this->policy.maxBytes) {
+                        break;
+                    }
+                    if (!this->MakeRoomLocked(routed, bytes, candidateHeat, keep)) continue;
+                    HostMoeResidentEntry entry;
+                    entry.gateup = gateup;
+                    entry.down = down;
+                    entry.bytes = bytes;
+                    entry.expertIndex = i;
+                    this->resident[gateup] = entry;
+                    this->residentBytes += bytes;
+                    this->admissionsThisStep++;
+                    this->admissionBytesThisStep += bytes;
+                    keep[i] = 1;
+                }
+                static std::atomic<uint64_t> traceCounter(0);
+                const char *traceEnv = std::getenv("FASTLLM_HOST_MOE_RESIDENT_TRACE");
+                if (traceEnv != nullptr && traceEnv[0] != '\0' && traceEnv[0] != '0' &&
+                    (traceCounter.fetch_add(1) % 1024) == 0) {
+                    const uint64_t decodeRoutes = this->hitRoutes + this->missRoutes;
+                    const uint64_t prefillRoutes =
+                        this->prefillHitRoutes + this->prefillMissRoutes;
+                    printf("[fastllm-host-moe-resident] resident=%.2fGB slots=%d | "
+                           "decode hit=%llu miss=%llu (%.1f%%) | prefill hit=%llu miss=%llu\n",
+                           this->residentBytes / 1073741824.0,
+                           (int)this->resident.size(),
+                           (unsigned long long)this->hitRoutes,
+                           (unsigned long long)this->missRoutes,
+                           decodeRoutes > 0 ?
+                               100.0 * (double)this->hitRoutes / (double)decodeRoutes : 0.0,
+                           (unsigned long long)this->prefillHitRoutes,
+                           (unsigned long long)this->prefillMissRoutes);
+                    fflush(stdout);
+                }
+                return true;
+            }
+
+            // 上传循环结束后调用: 补上新常驻专家的显存指针.
+            void Commit() {
+                std::lock_guard<std::mutex> guard(this->mutex);
+                if (!this->requested) {
+                    return;
+                }
+                for (auto it = this->resident.begin(); it != this->resident.end();) {
+                    HostMoeResidentEntry &entry = it->second;
+                    if (!entry.committed) {
+                        entry.gateupDevice = entry.gateup->cudaData;
+                        entry.downDevice = entry.down->cudaData;
+                        if (entry.gateupDevice == nullptr || entry.downDevice == nullptr) {
+                            this->ReleaseBytesLocked(entry.bytes);
+                            it = this->resident.erase(it);
+                            continue;
+                        }
+                        entry.committed = true;
+                    }
+                    ++it;
+                }
+            }
+
+        private:
+            void SyncLocked() {
+                const uint64_t wanted = GetMoeCudaCacheBytes();
+                if (wanted != this->budget) {
+                    this->ClearLocked();
+                    this->budget = wanted;
+                }
+                this->requested = this->budget > 0;
+                this->policy = GetMoeCacheConfig();
+                if (this->stepsPerToken == 0) {
+                    this->stepsPerToken = 1;
+                }
+            }
+
+            void ClearLocked() {
+                this->heat.clear();
+                this->heatTouch.clear();
+                this->prefillHeat.clear();
+                this->resident.clear();
+                this->tables.clear();
+                this->residentBytes = 0;
+                this->calls = 0;
+                this->stepsPerToken = 1;
+                this->admissionsThisStep = 0;
+                this->admissionBytesThisStep = 0;
+                this->lastPrefill = false;
+                this->hitRoutes = 0;
+                this->missRoutes = 0;
+                this->prefillHitRoutes = 0;
+                this->prefillMissRoutes = 0;
+            }
+
+            void ReleaseBytesLocked(uint64_t bytes) {
+                this->residentBytes = this->residentBytes >= bytes ? this->residentBytes - bytes : 0;
+            }
+
+            bool IsLiveLocked(const HostMoeResidentEntry &entry) const {
+                if (!entry.committed) {
+                    return true;
+                }
+                return entry.gateup != nullptr && entry.down != nullptr &&
+                       entry.gateup->cudaData == entry.gateupDevice &&
+                       entry.down->cudaData == entry.downDevice;
+            }
+
+            void AddHeatLocked(const Data *key, float add, uint64_t call, bool prefill) {
+                if (prefill) {
+                    // prefill 一次把整段 prompt 的路由都灌进来, 数值量级大很多, 单独放,
+                    // 免得把 decode 阶段的热度直接淹掉(见 Plan 里的 prefillPrior).
+                    this->prefillHeat[key] += add;
+                    return;
+                }
+                float value = 0.0f;
+                auto heatIt = this->heat.find(key);
+                if (heatIt != this->heat.end()) {
+                    value = heatIt->second;
+                }
+                auto touchIt = this->heatTouch.find(key);
+                if (touchIt != this->heatTouch.end() && this->policy.halfLife > 0 &&
+                    call > touchIt->second) {
+                    const double steps = (double)(call - touchIt->second) /
+                                         (double)this->stepsPerToken;
+                    value *= (float)std::exp2(-steps / (double)this->policy.halfLife);
+                }
+                this->heat[key] = value + add;
+                this->heatTouch[key] = call;
+            }
+
+            // 准入与淘汰用的热度: decode 热度 + 还没结算的 prefill 热度.
+            float RankHeatLocked(const Data *key) const {
+                float value = 0.0f;
+                auto heatIt = this->heat.find(key);
+                if (heatIt != this->heat.end()) {
+                    value = heatIt->second;
+                }
+                auto prefillIt = this->prefillHeat.find(key);
+                if (prefillIt != this->prefillHeat.end()) {
+                    value += prefillIt->second;
+                }
+                return value;
+            }
+
+            // 释放一个专家在显存里的副本: 打包权重 + CUDA 侧量化元数据.
+            static void ReleaseDeviceState(Data *weight) {
+                if (weight == nullptr) {
+                    return;
+                }
+                std::set<void *> released;
+                for (void *pointer : weight->extraCudaData) {
+                    if (pointer != nullptr && released.insert(pointer).second) {
+                        FastllmCudaFreeAfterCurrentThreadStream(pointer);
+                    }
+                }
+                for (void *pointer : weight->extraCudaHalfData) {
+                    if (pointer != nullptr && released.insert(pointer).second) {
+                        FastllmCudaFreeAfterCurrentThreadStream(pointer);
+                    }
+                }
+                weight->extraCudaData.clear();
+                weight->extraCudaHalfData.clear();
+                if (weight->cudaData != nullptr) {
+                    FastllmCudaFreeAfterCurrentThreadStream(weight->cudaData);
+                    weight->cudaData = nullptr;
+                }
+                weight->cudaDataBorrowed = false;
+                weight->dataDevice = DataDevice::CPU;
+            }
+
+            // 淘汰一条常驻记录. releaseDevice=false 用于记录本身已经失效的情况.
+            void EraseLocked(std::map<const Data *, HostMoeResidentEntry>::iterator it,
+                             bool releaseDevice, std::vector<char> &keep) {
+                HostMoeResidentEntry &entry = it->second;
+                if (releaseDevice) {
+                    ReleaseDeviceState(entry.gateup);
+                    ReleaseDeviceState(entry.down);
+                }
+                if (!entry.committed && entry.expertIndex >= 0 &&
+                    entry.expertIndex < (int)keep.size()) {
+                    // 还没上传的候选被挤掉: 交回调用方按普通路径释放
+                    keep[entry.expertIndex] = 0;
+                }
+                this->ReleaseBytesLocked(entry.bytes);
+                this->resident.erase(it);
+            }
+
+            bool MakeRoomLocked(const std::set<const Data *> &routed, uint64_t needBytes,
+                                float candidateHeat, std::vector<char> &keep) {
+                while (this->residentBytes + needBytes > this->budget) {
+                    auto victim = this->resident.end();
+                    float victimHeat = std::numeric_limits<float>::max();
+                    for (auto it = this->resident.begin(); it != this->resident.end(); ++it) {
+                        if (routed.find(it->first) != routed.end()) {
+                            continue;
+                        }
+                        const float heat = this->RankHeatLocked(it->first);
+                        if (heat < victimHeat) {
+                            victimHeat = heat;
+                            victim = it;
+                        }
+                    }
+                    if (victim == this->resident.end()) {
+                        return false;
+                    }
+                    if (candidateHeat <
+                        victimHeat * this->policy.replacementFactor + this->policy.replacementMargin) {
+                        return false;
+                    }
+                    this->EraseLocked(victim, true, keep);
+                }
+                return true;
+            }
+
+            std::mutex mutex;
+            uint64_t budget = 0;
+            bool requested = false;
+            MoeCacheConfig policy;
+            std::map<const Data *, HostMoeResidentEntry> resident;
+            std::map<const Data *, float> heat;
+            std::map<const Data *, uint64_t> heatTouch;
+            std::map<const Data *, float> prefillHeat;
+            std::set<const void *> tables;
+            uint64_t residentBytes = 0;
+            uint64_t calls = 0;
+            uint64_t stepsPerToken = 1;
+            int admissionsThisStep = 0;
+            uint64_t admissionBytesThisStep = 0;
+            bool lastPrefill = false;
+            uint64_t hitRoutes = 0;
+            uint64_t missRoutes = 0;
+            uint64_t prefillHitRoutes = 0;
+            uint64_t prefillMissRoutes = 0;
+        };
+
+    }
+
+    void DoCudaMergeMOEFromCPU (Data &input
+, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
         MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit,
         int activationQuantBlock, bool quantizeSharedExpert, bool cacheAdmission) {
@@ -8980,6 +9343,11 @@ namespace fastllm {
             }
         }
 
+        // 主机专家显存常驻缓存: 传上卡的专家按热度留在显存, 下一 token 命中就不重传.
+        std::vector<char> hostResidentSkipUpload, hostResidentKeep;
+        bool hostResidentActive = HostMoeResidentCache::Instance().Plan(
+            weights, batch > 1, expertTasks, weights, hostResidentSkipUpload, hostResidentKeep);
+
         // The existing multi-row GLM kernels consume the same compact NUMA
         // layout as decode. Borrow resident/admission records without changing
         // the source weights shared by CPU and CUDA assist workers.
@@ -9031,6 +9399,8 @@ namespace fastllm {
                 }
             }
             weights = cachedWeights.data();
+            // 别名权重指向共享缓存, 常驻记录不再对应它们, 本次调用不参与.
+            hostResidentActive = false;
         }
 #endif
 
@@ -9299,6 +9669,10 @@ namespace fastllm {
         // allocSeconds 只在开归因时非空: 延迟释放把 cudaData 清回 nullptr, 每次上传
         // 都要重新向池子要一块显存, 这段开销原本混在 upload 里看不出来.
         auto doUploadWeight = [&](int slot, void *stream, double *allocSeconds) {
+            if (hostResidentActive && slot / 2 < (int)hostResidentSkipUpload.size() &&
+                hostResidentSkipUpload[slot / 2]) {
+                return; // 显存里已经有这个专家的副本, 不用重传
+            }
             Data *weight = weights[slot];
 #ifndef USE_ROCM
             // 别名权重指向共享的 GLM prefill 缓存, 源数据在固定内存的 NUMA 分片里,
@@ -9394,6 +9768,15 @@ namespace fastllm {
             double start = profileNow();
             doReleaseWeight(weight);
             profileRelease += profileNow() - start;
+        };
+        // 常驻专家跳过释放: 显存副本(含量化元数据)留给下一 token 复用.
+        auto releaseExpert = [&](int expert) {
+            if (hostResidentActive && expert < (int)hostResidentKeep.size() &&
+                hostResidentKeep[expert]) {
+                return;
+            }
+            releaseWeight(weights[expert * 2]);
+            releaseWeight(weights[expert * 2 + 1]);
         };
         void *copyStream = FastllmCudaStreamCreate(true);
         void *computeDoneEvent = FastllmCudaEventCreate();
@@ -9606,8 +9989,7 @@ namespace fastllm {
             }
 
             if (prevExpert >= 0) {
-                releaseWeight(weights[prevExpert * 2]);
-                releaseWeight(weights[prevExpert * 2 + 1]);
+                releaseExpert(prevExpert);
             }
 
             prevExpert = curExpert;
@@ -9616,8 +9998,10 @@ namespace fastllm {
 
         if (prevExpert >= 0) {
             FastllmCudaEventSynchronize(computeDoneEvent);
-            releaseWeight(weights[prevExpert * 2]);
-            releaseWeight(weights[prevExpert * 2 + 1]);
+            releaseExpert(prevExpert);
+        }
+        if (hostResidentActive) {
+            HostMoeResidentCache::Instance().Commit();
         }
         if (profileMoeStream) {
             static std::atomic<int> profilePrintCounter(0);

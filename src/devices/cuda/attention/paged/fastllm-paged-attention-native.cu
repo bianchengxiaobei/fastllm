@@ -529,6 +529,35 @@ static int FastllmPagedCublasLinearKvChunkSizeFromEnv(int fallback) {
     return FastllmPagedCublasChunkSizeFromEnv(fallback);
 }
 
+// 归因: FASTLLM_PAGED_DEBUG=1 时, 每当最终生效的分块组合变化就打一行. 同一块里每
+// 层算出来都一样, 所以每块只会打一次; 用来确认 configuredChunk 有没有被
+// min(chunk, kvLen) 或可用临时缓冲钳小.
+static void FastllmPagedDebugTrace(int useLinearKv, int configuredChunk,
+                                   int targetChunk, int maxChunk, int kvLen,
+                                   int qoLen, int group, int headDim,
+                                   int groupedRows, size_t wsBytes,
+                                   size_t fixedBytes) {
+    if (std::getenv("FASTLLM_PAGED_DEBUG") == nullptr) {
+        return;
+    }
+    static thread_local std::string lastTrace;
+    char buffer[384];
+    snprintf(buffer, sizeof(buffer),
+             "[fastllm-paged] linearKv=%d chunk cfg=%d target=%d max=%d "
+             "kvLen=%d qoLen=%d group=%d headDim=%d groupedRows=%d "
+             "ws=%.0f MB fixed=%.0f MB chunkWs=%.0f MB\n",
+             useLinearKv, configuredChunk, targetChunk, maxChunk, kvLen, qoLen,
+             group, headDim, groupedRows, (double)wsBytes / 1048576.0,
+             (double)fixedBytes / 1048576.0,
+             (double)(wsBytes > fixedBytes ? wsBytes - fixedBytes : 0) / 1048576.0);
+    if (lastTrace == buffer) {
+        return;
+    }
+    lastTrace = buffer;
+    printf("%s", buffer);
+    fflush(stdout);
+}
+
 static bool FastllmPagedCublasGroupedGqaEnabled() {
     const char *env = std::getenv("FASTLLM_PAGED_CUBLAS_GROUPED_GQA");
     return env == nullptr || env[0] != '0';
@@ -775,6 +804,9 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         }
     }
     int maxChunk = low;
+    FastllmPagedDebugTrace(useLinearKv ? 1 : 0, configuredChunk, targetChunk,
+                           maxChunk, kvLen, qoLen, group, headDim, groupedRows,
+                           wsBytes, fixedBytes);
     if (maxChunk <= 0) {
         if (ownPageIndices) {
             FastllmCudaFree(pageIndicesGpu);

@@ -122,15 +122,31 @@ bool FastllmCudaGetGraphError() {
     return fastllmCudaGraphErrorFlag.load(std::memory_order_acquire);
 }
 
+static std::atomic<bool> fastllmCudaProcessExiting(false);
+
+void FastllmCudaMarkProcessExiting() {
+    fastllmCudaProcessExiting.store(true, std::memory_order_relaxed);
+}
+
+bool FastllmCudaIsProcessExiting() {
+    return fastllmCudaProcessExiting.load(std::memory_order_relaxed);
+}
+
 void showError(cudaError_t result, char const* const message, const char* const file,
            int const line) {
-    if (cudaSuccess != result) {
-        fastllmCudaThreadErrorFlag = true;
-        fastllmCudaGraphErrorFlag.store(true, std::memory_order_release);
-        printf("%s\n  CUDA error = %d, %s at %s:%d\n  '%s'\n",
-            message, result, cudaGetErrorName(result), file, line, cudaGetErrorString(result));
-        fflush(stdout);
-    }  
+    if (cudaSuccess == result) {
+        return;
+    }
+    // 进程正在退出时 cudart 已进入卸载流程，此后的释放失败都是噪音：
+    // 显存由驱动统一回收，这里既不打印也不置错误标志，免得把正常退出伪装成一次失败。
+    if (cudaErrorCudartUnloading == result || FastllmCudaIsProcessExiting()) {
+        return;
+    }
+    fastllmCudaThreadErrorFlag = true;
+    fastllmCudaGraphErrorFlag.store(true, std::memory_order_release);
+    printf("%s\n  CUDA error = %d, %s at %s:%d\n  '%s'\n",
+        message, result, cudaGetErrorName(result), file, line, cudaGetErrorString(result));
+    fflush(stdout);
 }
 
 static std::atomic<bool> fastllmCudaMallocDisabled(false);
@@ -4471,6 +4487,9 @@ static std::vector<FastllmCudaMemPoolView> FastllmSnapshotCudaMemPoolViews() {
 }
 
 static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMemoryBuffer> &bigBuffers) {
+    if (FastllmCudaIsProcessExiting()) {
+        return 0;
+    }
     size_t released = 0;
     std::vector<CudaMemoryBuffer> keep;
     keep.reserve(bigBuffers.size());
@@ -4970,6 +4989,9 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
 }
 
 void FastllmCudaDirectFree(void *ret) {
+    if (FastllmCudaIsProcessExiting()) {
+        return;
+    }
     if (fastllm::TryFreeCudaWorkspace(ret)) return;
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
@@ -5085,6 +5107,9 @@ static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
 }
 
 static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
+    if (FastllmCudaIsProcessExiting()) {
+        return;
+    }
     cudaError_t state = cudaSetDevice(id);
     checkCudaErrors("Error: CUDA error when switching device to release cached memory!", state);
 
@@ -5559,6 +5584,9 @@ void FastllmCudaForceFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    if (FastllmCudaIsProcessExiting()) {
+        return;
+    }
     if (fastllm::TryFreeCudaWorkspace(ret)) return;
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
@@ -5717,6 +5745,9 @@ bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
 
 void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
+        return;
+    }
+    if (FastllmCudaIsProcessExiting()) {
         return;
     }
     if (fastllm::TryFreeCudaWorkspace(ret)) return;
@@ -5926,7 +5957,8 @@ void FastllmCudaMallocBigBuffer(size_t size) {
 
 static void FastllmCudaClearBigBufferWithRetain(
         size_t retainBytes, bool currentDeviceOnly, bool boundedRetain = false) {
-    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed) ||
+        FastllmCudaIsProcessExiting()) {
         return;
     }
     int id = -1;

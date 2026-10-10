@@ -1,9 +1,11 @@
 import argparse
 import asyncio
 import concurrent.futures
+import contextlib
 import fastapi
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -84,6 +86,18 @@ dev_mode_enabled:bool = False
 api_thread_pool_workers:int = 32
 request_executor = None
 
+def _terminate_now():
+    # Windows 上 os._exit 并不"立即": 它内部走 ExitProcess, 而 ExitProcess 会做
+    # DLL detach, fastllm_tools.dll 的 CRT 静态析构照样执行 —— 也就是进程退出时
+    # 仍然会把模型析构一遍(几万个张量, 实测 40s 以上)。所以要真正秒退只能
+    # TerminateProcess: 不跑任何清理, 显存和主机内存交给驱动/系统回收。
+    # Linux/macOS 上 os._exit 本来就跳过全部清理。
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.kernel32.TerminateProcess(
+            ctypes.windll.kernel32.GetCurrentProcess(), 0)
+    os._exit(0)
+
 def _prewarm_request_executor(executor, workers: int) -> int:
     started = 0
     ready = threading.Condition()
@@ -113,6 +127,29 @@ class FastLLMUvicornServer(uvicorn.Server):
     def __init__(self, config, startup_progress = None):
         super().__init__(config)
         self.startup_progress = startup_progress
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        # 不用 uvicorn 的优雅退出: 它会先等在飞的请求(一整段 decode)跑完才退,
+        # 表现就是 Ctrl+C 之后服务器还在一直 decode。这里直接接管信号, 立即退出。
+        # 进程一死显存由驱动回收, 所以不需要任何收尾。
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        previous = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, self.handle_exit_now)
+        try:
+            yield
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def handle_exit_now(self, sig, frame):
+        logging.info("Received signal %d, exiting immediately", sig)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        _terminate_now()
 
     async def startup(self, sockets = None):
         global request_executor
@@ -343,7 +380,26 @@ def _fastllm_server(args, startup_progress):
     set_ulimit()
     config = uvicorn.Config(app, host = args.host, port = args.port)
     startup_progress.progress("server_starting", 1, 1)
-    FastLLMUvicornServer(config, startup_progress = startup_progress).run()
+    try:
+        FastLLMUvicornServer(config, startup_progress = startup_progress).run()
+    finally:
+        _shutdown_model_on_exit(model)
+
+def _shutdown_model_on_exit(model):
+    # 退出时不再逐个归还显存: 模型析构实测要 40 秒以上(几万个张量 + KV/history 缓存),
+    # 而进程退出后显存和主机内存都由系统/驱动统一回收, 这一步纯属浪费。
+    # 先告诉 native 侧"进程要走了"(之后任何释放路径都跳过 CUDA 调用, 不会再有
+    # cudaErrorCudartUnloading), 然后立即结束进程, 不被在飞的 decode 拖住。
+    if request_executor is not None:
+        request_executor.shutdown(wait = False, cancel_futures = True)
+    logging.info("Exiting: skip in-process model release, driver reclaims memory")
+    try:
+        model.mark_process_exiting()
+    except Exception:
+        logging.exception("mark_process_exiting failed")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    _terminate_now()
 
 def fastllm_server(args):
     startup_progress = StartupProgressReporter(
