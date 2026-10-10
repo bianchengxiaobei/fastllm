@@ -15,7 +15,9 @@ if not defined BACKEND_OK (
 )
 
 set "SRC=%REPO%"
-set "BUILD=%SRC%\build-vs-%BACKEND%"
+rem default build dir is build-vs-<backend>; override with FTLLM_BUILD_DIR (relative to repo root)
+if not defined FTLLM_BUILD_DIR set "FTLLM_BUILD_DIR=build-vs-%BACKEND%"
+set "BUILD=%SRC%\%FTLLM_BUILD_DIR%"
 set "GENERATOR=Visual Studio 17 2022"
 
 if /I "%BACKEND%"=="gpu" (
@@ -39,10 +41,18 @@ if /I "%BACKEND%"=="gpu" (
 if /I "%BACKEND%"=="gpu" echo [build] CUDA_PATH=%CUDA_PATH%
 if /I "%BACKEND%"=="gpu" echo [build] CMAKE_PREFIX_PATH=%CMAKE_PREFIX_PATH%
 
+rem CUDA_ARCH defaults to native: local arch only, other GPUs fail with no kernel image.
+rem set FTLLM_CUDA_ARCHS=75;80;86;89;90;120 (then delete CMakeCache.txt) to ship for other GPUs.
+set "ARCH_ARG="
+if /I "%BACKEND%"=="gpu" (
+    if defined FTLLM_CUDA_ARCHS set "ARCH_ARG=-DCUDA_ARCH=%FTLLM_CUDA_ARCHS%"
+)
+if defined ARCH_ARG echo [build] CUDA_ARCH=%FTLLM_CUDA_ARCHS%
+
 if not exist "%BUILD%\CMakeCache.txt" (
     echo [build] configure %BUILD%
     if /I "%BACKEND%"=="gpu" (
-        cmake -S "%SRC%" -B "%BUILD%" -G "%GENERATOR%" -A x64 -DUSE_CUDA=ON
+        cmake -S "%SRC%" -B "%BUILD%" -G "%GENERATOR%" -A x64 -DUSE_CUDA=ON %ARCH_ARG%
     ) else (
         cmake -S "%SRC%" -B "%BUILD%" -G "%GENERATOR%" -A x64 -DUSE_CUDA=OFF
     )

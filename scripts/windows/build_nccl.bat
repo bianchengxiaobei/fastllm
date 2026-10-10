@@ -3,8 +3,11 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..\..") do set "REPO=%%~fI"
 set "SRC=%REPO%\third_party\nccl-windows"
-set "BUILD=%SRC%\build"
-set "INSTALL=%SRC%\install"
+rem for parallel toolchains (e.g. a CUDA 12.x build for V100) point these at separate dirs
+if not defined NCCL_BUILD_DIR set "NCCL_BUILD_DIR=%SRC%\build"
+if not defined NCCL_INSTALL_DIR set "NCCL_INSTALL_DIR=%SRC%\install"
+set "BUILD=%NCCL_BUILD_DIR%"
+set "INSTALL=%NCCL_INSTALL_DIR%"
 
 rem no goto/labels here: cmd desyncs when seeking a label in this repo's LF-only bat files
 if not exist "%SRC%\CMakeLists.txt" (
@@ -50,7 +53,7 @@ if not defined NCCL_JOBS set "NCCL_JOBS=4"
 
 echo [nccl] archs=%NCCL_CUDA_ARCHS% jobs=%NCCL_JOBS%
 echo [nccl] install %INSTALL%
-cmake -S "%SRC%" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=%NCCL_CUDA_ARCHS% -DCMAKE_INSTALL_PREFIX="%INSTALL%"
+cmake -S "%SRC%" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=%NCCL_CUDA_ARCHS%" -DCMAKE_INSTALL_PREFIX="%INSTALL%"
 if errorlevel 1 (
     echo [nccl] FAILED
     exit /b 1

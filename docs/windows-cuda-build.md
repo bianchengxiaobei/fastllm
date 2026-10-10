@@ -9,6 +9,7 @@ Windows 辅助脚本随仓库一起维护，位于 `scripts\windows\`，命令�
 
 | 文件 | 用途 |
 | --- | --- |
+| `scripts\windows\setup_build_env.bat` | 干净机器上一键用 winget 装齐构建依赖（加 `check` 只体检不安装） |
 | `scripts\windows\build_tools.bat` | 编译 `fastllm_tools.dll`（`cpu` / `gpu` 两个后端） |
 | `scripts\windows\build_nccl.bat` | 编译子模块里的 NCCL for Windows（`build_tools.bat gpu` 的前置依赖） |
 | `scripts\windows\cuda_arch.ps1` | 探测本机 GPU 架构号，供 `build_nccl.bat` 使用 |
@@ -21,7 +22,7 @@ Windows 辅助脚本随仓库一起维护，位于 `scripts\windows\`，命令�
 
 | 组件 | 版本 | 说明 |
 | --- | --- | --- |
-| Visual Studio 2022 | 17.x | 需要"使用 C++ 的桌面开发"工作负载，x64 工具链 |
+| Visual Studio 2022 | 17.x | 需要"使用 C++ 的桌面开发"工作负载，x64 工具链；VS IDE 或 VS Build Tools 都行（见"多架构（可移植）构建"） |
 | CUDA Toolkit | 13.4 | 默认路径 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4` |
 | NCCL（Windows 移植） | 2.29.x | CUDA 构建必需，官方不提供 Windows 版；仓库已把 [SystemPanic/nccl-windows](https://github.com/SystemPanic/nccl-windows) 挂成 `third_party/nccl-windows` 子模块并钉住 commit |
 | Ninja | 1.10+ | 仅编译 NCCL 时需要 |
@@ -29,6 +30,35 @@ Windows 辅助脚本随仓库一起维护，位于 `scripts\windows\`，命令�
 | uv | 最新 | 仅运行 `ftllm` 时需要，用于建 `fastllm\.venv` |
 
 CPU 构建（`build_tools.bat cpu`）只需要 VS2022。
+
+## 干净机器：先跑 setup_build_env.bat
+
+只 clone 了源码、机器上什么都没有时，先让脚本把上面这些依赖用 winget 装齐：
+
+```bat
+scripts\windows\setup_build_env.bat check   :: 只体检，列出缺什么
+scripts\windows\setup_build_env.bat         :: 装缺的那些
+```
+
+它会依次检查并安装（已有的跳过）：
+
+| 依赖 | winget 包 | 说明 |
+| --- | --- | --- |
+| MSVC 工具链 | `Microsoft.VisualStudio.2022.BuildTools` | 带 `VCTools` 工作负载，装的是**命令行工具链不是 IDE** |
+| CMake | `Kitware.CMake` | NCCL 和 fastllm 都靠它 |
+| Ninja | `Ninja-build.Ninja` | 只有编 NCCL 用 |
+| CUDA Toolkit | `Nvidia.CUDA` | 版本由 `FTLLM_CUDA_VERSION` 决定，默认 `13.4` |
+| Python | `Python.Python.3.12` | 3.10+ 才能跑 ftllm，NCCL 的 configure 也要一个解释器 |
+| uv | `astral-sh.uv` | `run_ftllm.bat` 用它建 venv |
+| Git | `Git.Git` | 拉 nccl 子模块、更新代码 |
+
+几个必然的限制，脚本不会替你解决：
+
+- **要管理员权限**：winget 安装会弹 UAC，第一次装 VS Build Tools 约 3 GB，CUDA 约 4 GB，加上编译时间，整机从零到能跑通常要一小时以上。
+- **装完要开新终端**：winget 改的是注册表里的 PATH，当前窗口看不到，所以脚本结尾会提示重开一个终端再执行 `build_nccl.bat`。
+- **显卡驱动不装**：驱动是运行期依赖，脚本只检测 `nvidia-smi` 并提醒，需要自己去 NVIDIA 官网装（V100 用 580 分支）。
+- **winget 本身缺失时**（部分 Windows Server / LTSC 镜像）脚本会直接失败并打印各组件的手动下载地址，先装 "App Installer" 再重试。
+- `FTLLM_CUDA_VERSION=12.9` 会让脚本去找/装 12.9，那是给 V100 那份产物用的（见下文"V100（sm_70）"一节）。
 
 ## 第一步：准备 NCCL
 
@@ -50,6 +80,7 @@ scripts\windows\build_nccl.bat
 | `NCCL_CUDA_ARCHS` | 目标架构号，如 `75`、`86;120`；默认按本机 GPU 探测 |
 | `NCCL_JOBS` | 并行编译任务数，默认取 `%NUMBER_OF_PROCESSORS%` |
 | `NCCL_VCVARS` | `vcvarsall.bat` 的绝对路径，默认由 `vswhere` 查找 |
+| `NCCL_BUILD_DIR` / `NCCL_INSTALL_DIR` | 构建与安装目录，默认 `third_party\nccl-windows\build` 和 `...\install`；并列多套工具链时用它们分开 |
 
 之后 `build_tools.bat gpu` 会自动把 `third_party\nccl-windows\install` 当作 `CMAKE_PREFIX_PATH`
 （`CMakeLists.txt` 里是 `find_package(NCCL CONFIG REQUIRED)`）。要改用别的 NCCL，
@@ -69,7 +100,8 @@ scripts\windows\build_tools.bat cpu     :: USE_CUDA=OFF
 
 脚本行为：
 
-- 生成器固定 `Visual Studio 17 2022` + `-A x64`，构建目录 `build-vs-gpu`（CPU 为 `build-vs-cpu`）。
+- 生成器固定 `Visual Studio 17 2022` + `-A x64`，构建目录 `build-vs-gpu`（CPU 为 `build-vs-cpu`），可用 `FTLLM_BUILD_DIR` 换成别的目录名（相对仓库根）。
+- CUDA 构建可用 `FTLLM_CUDA_ARCHS` 指定架构列表（见"多架构（可移植）构建"），不设则用 `native`。
 - 只在 `build-vs-gpu\CMakeCache.txt` 不存在时才 configure，想换配置先删掉该文件。
 - 构建目标只有 `fastllm_tools`，配置 `Release`。
 - 并行度默认取 `%NUMBER_OF_PROCESSORS%`，可用环境变量 `FTLLM_BUILD_JOBS` 覆盖。
@@ -90,6 +122,90 @@ CUDA 构建的额外产物是 `tools\ftllm\nccl.dll`（CMake 的后置步骤从 
 ```bat
 cmake --build build-vs-gpu --config Release --target main -- /m
 ```
+
+## 多架构（可移植）构建
+
+默认 `CUDA_ARCH` 是 `native`（`CMakeLists.txt` 顶部），只编本机算力、也不产 PTX。
+把这种产物拷到算力不同的卡上，加载时只会得到
+`CUDA error 209: no kernel image is available for execution on the device`，驱动连 JIT 都没有东西可用。
+
+要出能拿到别的卡上跑的产物，configure 时把架构列表写全：
+
+```bat
+set FTLLM_CUDA_ARCHS=75;80;86;89;90;120
+set NCCL_CUDA_ARCHS=75;80;86;89;90;120
+scripts\windows\build_nccl.bat
+scripts\windows\build_tools.bat gpu
+```
+
+- 两个架构变量都只在**首次 configure** 生效，改完要删掉 `build-vs-gpu\CMakeCache.txt`（NCCL 是 `third_party\nccl-windows\build\CMakeCache.txt`）重新 configure。
+- NCCL 的内核也是按架构出的，必须跟 `FTLLM_CUDA_ARCHS` 用同一批，否则多卡通信在别的卡上照样 `no kernel image`。
+- `120` 会被归一化成 `120f`（CUDA 12.9+ 的 family cubin），`121` 同理；列表里有 `90` 时会额外拉起 deep_gemm 的 `sm_90a` 目标，有 `120` 时会拉起 SM120 的专用目标。
+- 本仓库的 `CUDA_ARCH` 只出 cubin，不出 `-virtual` 的 PTX，所以"未来的卡"也要显式加算力号。
+- 体积：单架构的 `fastllm_tools.dll` 约 42 MB，每多一个架构大约多一份 CUDA 代码（构建已开 `-Xfatbin=-compress-all`）。
+
+只装命令行工具链（不装 VS IDE）也够用，生成器和 `vswhere`/`vcvarsall.bat` 都在 Build Tools 里：
+
+```bat
+winget install Microsoft.VisualStudio.2022.BuildTools
+:: 安装向导里勾上"使用 C++ 的桌面开发"（VCTools）工作负载
+winget install Kitware.CMake Ninja-build.Ninja
+```
+
+Ninja 只有编 NCCL 那一步要，编 fastllm 本体不需要。
+
+产物拷到**没装 CUDA/VS 的目标机**上跑时，还要补齐这些：
+
+| 文件 | 来源 |
+| --- | --- |
+| `MSVCP140.dll`、`VCRUNTIME140.dll`、`VCRUNTIME140_1.dll` | VC++ 2015-2022 x64 运行库（`vc_redist.x64.exe`），或从 `...\VC\Redist\MSVC\<版本>\x64\Microsoft.VC143.CRT\` 拷 |
+| `cublas64_13.dll`、`cublasLt64_13.dll` | CUDA Toolkit 的 `bin\x64`（合计约 550 MB，未随 DLL 一起出） |
+| `nccl.dll` | 已在 `tools\ftllm\`，CMake 后置步骤从 `NCCL::nccl` 拷的 |
+| `nvcuda.dll`、`nvcudart_hybrid64.dll` | NVIDIA 驱动自带，需要 r580+ 驱动（CUDA 13.x 的门槛） |
+
+另外两点：主体按 `/arch:AVX2` 编译（少数文件 `/arch:AVX10.1`），目标机 CPU 至少要支持 AVX2；
+`fastllm_tools.dll` 是 `ctypes.CDLL` 加载的纯 C 接口，跟 Python 版本无关，远端任意 Python 3 都能拉起来。
+
+## V100（sm_70）要单独一套 CUDA 12.x 产物
+
+CUDA 13.0 起 nvcc 移除了算力 < 7.5 的离线编译，本机 `nvcc --list-gpu-arch` 最小就是 `compute_75`，
+所以 `FTLLM_CUDA_ARCHS` 里写 `70` 只会得到 unsupported gpu architecture，PTX 也救不了（PTX 只能往高算力 JIT）。
+要让 V100 跑起来，必须用 **CUDA 12.x**（12.9 是最后一个还认 `sm_70` 的版本，已标 deprecated；
+12.6 更稳，但只覆盖到 `sm_90`，没有 `120f` 归一化）。
+
+工程本身有 Volta 路径，不用改代码：`src/devices/cuda/awq_sm70/`（TurboMind s884 子集，见 `CMakeLists.txt:561-572`）、
+`include/devices/cuda/fastllm-fp8-sm70.cuh`（`__CUDA_ARCH__ == 700` 专用实现）、Marlin 在 `__CUDA_ARCH__ < 750` 下编成占位实现运行期回退。
+
+两套产物并存的配方（各自独立构建目录 + 独立 NCCL install，互不覆盖）：
+
+```bat
+:: 1) V100：CUDA 12.9
+set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9
+set NCCL_CUDA_ARCHS=70;75;86;89;90
+set NCCL_BUILD_DIR=%CD%\third_party\nccl-windows\build-cu129
+set NCCL_INSTALL_DIR=%CD%\third_party\nccl-windows\install-cu129
+scripts\windows\build_nccl.bat
+
+set NCCL_ROOT=%NCCL_INSTALL_DIR%
+set FTLLM_CUDA_ARCHS=%NCCL_CUDA_ARCHS%
+set FTLLM_BUILD_DIR=build-vs-gpu-cu129
+scripts\windows\build_tools.bat gpu
+:: 产物 build-vs-gpu-cu129\tools\ftllm\fastllm_tools.dll
+
+:: 2) sm_75 及以上：照旧用 CUDA 13.4，构建目录仍是 build-vs-gpu，两边互不影响
+```
+
+几个要紧的点：
+
+- NCCL 用哪套工具链编就配哪套产物，别共用 `install`：同进程里同时加载 `cudart64_12` 和 `cudart64_13` 官方不支持，
+  出问题很难查。`build_nccl.bat` 的 `CUDA_PATH` 同样会走上面的 12.9。
+- 12.9 下 `sm_120`/`120f` 的目标照样会打开（归一化门槛是 `>= 12.9`），所以这一份可以直接带 `120`。
+- 打包时别改 DLL 文件名：`fastllm_pytools\llm.py` 里写死了 `fastllm_tools.dll`，按卡选目录（两套 `tools\ftllm`）分发。
+- 验产物算力：`cuobjdump --list-elf <dll> | findstr sm_`，CUDA 12.9 那份应能看到 `sm_70`。
+- V100 目标机侧：驱动要用 **580 分支**（最后一个支持 Volta 的驱动分支），cuBLAS 换成 CUDA 12 的
+  `cublas64_12.dll`/`cublasLt64_12.dll`，其余运行库要求同上。
+- 预期要压低：Volta 没有 bf16、没有 cp.async，FP8 走 `fastllm-fp8-sm70.cuh` 的模拟实现，
+  paged attention 落在 `__CUDA_ARCH__ < 800` 的回退分支，Marlin int4 也是回退路径。
 
 ## 第三步：运行
 
