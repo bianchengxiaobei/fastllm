@@ -603,7 +603,19 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
-        if (model->kvMemConfig.enabled) return;
+        if (model->kvMemConfig.enabled) {
+            // KVMem caches are borrowed sparse views; their pageIndex must never
+            // be recorded into the global paged pool (see kvmem.md). Cross-request
+            // reuse goes through the linear prefix snapshot, which also carries
+            // the full-attention KVMem dumps for this same committed length.
+            if (!this->multimodalInput.empty()) {
+                return;
+            }
+            if (model != nullptr) {
+                model->TryRecordPagedPrefixCacheExtra(this);
+            }
+            return;
+        }
         if (!this->multimodalInput.empty()) {
             return;
         }
@@ -2224,6 +2236,56 @@ namespace fastllm {
                                     }
                                 }
                             }
+                        } else if (model->kvMemConfig.enabled && !isMultimodal &&
+                                   ctx->cacheLen == 0 &&
+                                   ctx->intParams.find("paged_prefix_restore_disabled") ==
+                                       ctx->intParams.end()) {
+                            // KVMem keeps its KV in per-request host/device stores,
+                            // not the global paged pool, so it restores through the
+                            // model-specific snapshot: the linear layers are rebuilt
+                            // from their snapshots and every full-attention layer
+                            // receives a prefix dump that the first forward seeds
+                            // into its fresh cache. At least one prompt token must
+                            // remain so the next token can actually be produced.
+                            int kvMemCachedLen = model->QueryPagedPrefixCacheExtra(
+                                ctx, (int)ctx->currentTokens.size());
+                            auto kvMemRestoreStart = std::chrono::steady_clock::now();
+                            bool kvMemRestored = kvMemCachedLen > 0 &&
+                                kvMemCachedLen < (int)ctx->currentTokens.size() &&
+                                model->RestorePagedPrefixCacheExtra(ctx, kvMemCachedLen);
+                            float kvMemRestoreMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - kvMemRestoreStart).count();
+                            if (kvMemRestored) {
+                                ctx->currentTokens.erase(
+                                    ctx->currentTokens.begin(),
+                                    ctx->currentTokens.begin() + kvMemCachedLen);
+                                ctx->cacheLen = kvMemCachedLen;
+                                printf("[Qwen3.5 KVMem] prefix cache hit: tokens=%d, restore=%.0f ms.\n",
+                                       kvMemCachedLen, kvMemRestoreMs);
+                                fflush(stdout);
+                            } else {
+                                if (kvMemCachedLen == 0) {
+                                    printf("[Qwen3.5 KVMem] no prefix match (prompt=%d "
+                                           "tokens), prefilling from scratch.\n",
+                                           (int)ctx->currentTokens.size());
+                                } else {
+                                    printf("[Qwen3.5 KVMem] prefix restore failed "
+                                           "(tokens=%d), prefilling from scratch.\n",
+                                           kvMemCachedLen);
+                                }
+                                fflush(stdout);
+                                // A prefix hit is useful only when the complete
+                                // model state can be restored. Drop any partial
+                                // state and let this request prefill normally.
+                                for (auto &kv : ctx->pastKeyValues) {
+                                    ReleasePagedCachePages(kv.first, true);
+                                    ReleasePagedCachePages(kv.second, true);
+                                    kv.first.kvMemSeed.reset();
+                                    kv.second.kvMemSeed.reset();
+                                }
+                                ctx->cacheLen = 0;
+                                ctx->intParams["paged_prefix_restore_disabled"] = 1;
+                            }
                         }
 
                         // currentActivate already includes every pending
@@ -2597,7 +2659,9 @@ namespace fastllm {
                         model->isIntermediateChunkedPrefill =
                             oldIntermediateChunkedPrefill;
                         st += curLen;
+                        float recordSpend = 0;
                         if (st < len) {
+                            auto recordStartTime = std::chrono::system_clock::now();
                             dictLocker.lock();
                             auto contextIt = model->responseContextDict.dicts.find(handles[0]);
                             if (contextIt != model->responseContextDict.dicts.end() &&
@@ -2605,15 +2669,28 @@ namespace fastllm {
                                 contextIt->second->TryRecordPagedCache(model);
                             }
                             dictLocker.unlock();
+                            recordSpend = GetSpan(recordStartTime, std::chrono::system_clock::now());
                         }
                         if (model->verbose) {
                             auto chunkEndTime = std::chrono::system_clock::now();
                             float chunkSpend = GetSpan(chunkStartTime, chunkEndTime);
+                            // Report the forward alone: a prefix snapshot dump runs
+                            // inside this window and otherwise makes a fast chunk
+                            // look like a slow prefill.
+                            float forwardSpend = std::max(0.0f, chunkSpend - recordSpend);
                             float totalSpend = GetSpan(prefillStartTime, chunkEndTime);
-                            float chunkSpeed = chunkSpend > 0 ? curLen / chunkSpend : 0;
+                            float chunkSpeed = forwardSpend > 0 ? curLen / forwardSpend : 0;
                             float avgSpeed = totalSpend > 0 ? st / totalSpend : 0;
                             printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
                                    st, len, st * 100 / len, chunkSpeed);
+                            if (model->kvMemConfig.enabled && chunkSpend > 2.0f) {
+                                printf("[Qwen3.5 KVMem] chunk breakdown: tokens=%d, forward=%.2fs "
+                                       "(%.1f t/s), record=%.2fs, total=%.2fs, avg=%.1f t/s.\n",
+                                       curLen, forwardSpend,
+                                       forwardSpend > 0 ? curLen / forwardSpend : 0,
+                                       recordSpend, chunkSpend, avgSpeed);
+                                fflush(stdout);
+                            }
                         }
                     }
                 } else {
@@ -2643,7 +2720,13 @@ namespace fastllm {
                     }
                 }
                 if (printProfile) {
-                    PrintLoopProfile("new", seqLens, (int)ret.size(), profileStartTime);
+                    // The per-op table is big. Keep it for iterations that were
+                    // actually slow so a KVMem profile run is not flooded by the
+                    // thousands of fast decode iterations.
+                    float loopSpend = GetSpan(profileStartTime, std::chrono::system_clock::now());
+                    if (!model->kvMemConfig.enabled || loopSpend > 5.0f) {
+                        PrintLoopProfile("new", seqLens, (int)ret.size(), profileStartTime);
+                    }
                 }
 
                 forwardLocker.unlock();

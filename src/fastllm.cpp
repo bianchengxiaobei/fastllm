@@ -1287,6 +1287,7 @@ namespace fastllm {
         cache.isPagedKVCache = false;
         cache.kvMemCache.reset();
         cache.kvMemConfig.reset();
+        cache.kvMemSeed.reset();
         return true;
     }
 

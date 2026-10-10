@@ -519,6 +519,7 @@ namespace fastllm {
 
     class PagedCacheManager;
     struct KvMemConfig;
+    struct KvMemPrefixData;
     class KvMemCache;
 
     class Data {
@@ -536,6 +537,10 @@ namespace fastllm {
         // Optional request-owned sparse KV storage; pageIndex is a borrowed view.
         std::shared_ptr<const KvMemConfig> kvMemConfig;
         std::shared_ptr<KvMemCache> kvMemCache;
+        // Pending prefix seed consumed once when kvMemCache is first created.
+        // Pure host bytes (never a Data copy) so it survives Data::CopyFrom's
+        // KVMem guard. Reset by the cache after a successful Seed.
+        std::shared_ptr<KvMemPrefixData> kvMemSeed;
         int pageLen = 128; // 每个page的长度（token数）
         PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号

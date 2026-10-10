@@ -784,30 +784,44 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         return bytes;
     };
     size_t fixedBytes = stateBytes * 4 + qScratchBytes + outFloatScratchBytes;
-    size_t needBytes = fixedBytes + chunkWorkspaceBytes(targetChunk) + 1024;
-    uint8_t *workspace = (uint8_t*)FastllmBorrowCudaTempBuffer(needBytes, &wsBytes, &wsOwn);
-    if (workspace == nullptr || wsBytes <= fixedBytes + 1024) {
-        if (ownPageIndices) {
-            FastllmCudaFree(pageIndicesGpu);
+    // FastllmBorrowCudaTempBuffer 要么给足 needBytes, 要么返回 nullptr(显存不够),
+    // 不会给一个比请求小的缓冲(见 fastllm-attention-workspace.cu:152-174). 所以它
+    // 一旦返回成功, 下面的二分必然得到 targetChunk; 反过来, 一次失败就等于整条
+    // paged cuBLAS 路径被放弃, 而失败的原因只是这一次 malloc 的大小. 低显存设备
+    // 因此必须手设 FASTLLM_PAGED_CUBLAS_CHUNK 把请求压小才走得通.
+    // 这里改成申请失败就减半重试, 让默认值在显存紧张的卡上自动退到装得下的分块.
+    uint8_t *workspace = nullptr;
+    int maxChunk = 0;
+    int attemptChunk = targetChunk;
+    const int minAttemptChunk = std::min(targetChunk, 128);
+    while (true) {
+        size_t needBytes = fixedBytes + chunkWorkspaceBytes(attemptChunk) + 1024;
+        workspace = (uint8_t*)FastllmBorrowCudaTempBuffer(needBytes, &wsBytes, &wsOwn);
+        if (workspace != nullptr && wsBytes > fixedBytes + 1024) {
+            size_t availableChunkBytes = wsBytes - fixedBytes - 1024;
+            int low = 0, high = attemptChunk;
+            while (low < high) {
+                int mid = low + (high - low + 1) / 2;
+                if (chunkWorkspaceBytes(mid) <= availableChunkBytes) {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            maxChunk = low;
+            if (maxChunk > 0) {
+                break;
+            }
         }
-        FastllmReleaseCudaTempBuffer(workspace, wsOwn);
-        return false;
-    }
-    size_t availableChunkBytes = wsBytes - fixedBytes - 1024;
-    int low = 0, high = targetChunk;
-    while (low < high) {
-        int mid = low + (high - low + 1) / 2;
-        if (chunkWorkspaceBytes(mid) <= availableChunkBytes) {
-            low = mid;
-        } else {
-            high = mid - 1;
+        if (attemptChunk <= minAttemptChunk) {
+            break;
         }
+        attemptChunk = std::max(minAttemptChunk, attemptChunk / 2);
     }
-    int maxChunk = low;
-    FastllmPagedDebugTrace(useLinearKv ? 1 : 0, configuredChunk, targetChunk,
+    FastllmPagedDebugTrace(useLinearKv ? 1 : 0, configuredChunk, attemptChunk,
                            maxChunk, kvLen, qoLen, group, headDim, groupedRows,
                            wsBytes, fixedBytes);
-    if (maxChunk <= 0) {
+    if (workspace == nullptr || maxChunk <= 0) {
         if (ownPageIndices) {
             FastllmCudaFree(pageIndicesGpu);
         }

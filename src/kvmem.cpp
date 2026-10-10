@@ -71,8 +71,8 @@ namespace fastllm {
             if (slots[p] >= 0) --stats.residentPages;
             slots[p] = -1;
             lastUsed[p] = 0;
-            stats.hostBytes -= host[p].size();
-            host[p].clear();
+            stats.hostBytes -= host[p] ? host[p]->size() : 0;
+            host[p].reset();
         }
         visible.erase(std::lower_bound(visible.begin(), visible.end(), count), visible.end());
         stats.tokens = end;
@@ -136,7 +136,7 @@ namespace fastllm {
         std::vector<std::pair<int, std::vector<uint8_t>>> backups;
         for (int p : victims) {
             if ((int64_t)(p + 1) * pageLen > oldTokens) throw std::logic_error("KVMem: attempted partial-page eviction");
-            if (host[p].empty()) backups.emplace_back(p, std::vector<uint8_t>(pageBytes));
+            if (!host[p]) backups.emplace_back(p, std::vector<uint8_t>(pageBytes));
         }
         if (backups.size() > (config.hostBytes - stats.hostBytes) / pageBytes) {
             throw std::runtime_error("KVMem: host budget exhausted");
@@ -147,7 +147,7 @@ namespace fastllm {
             for (auto &item : backups) reads.push_back({slots[item.first], item.second.data()});
             if (!reads.empty()) read(reads);
             for (auto &item : backups) {
-                host[item.first] = std::move(item.second);
+                host[item.first] = std::make_shared<const std::vector<uint8_t>>(std::move(item.second));
                 stats.hostBytes += pageBytes;
             }
             std::vector<bool> used(capacity, false);
@@ -165,7 +165,7 @@ namespace fastllm {
                 if (slots[p] >= 0) continue;
                 while (free < capacity && used[free]) ++free;
                 if (free == capacity) throw std::logic_error("KVMem: no free slot");
-                if (!host[p].empty()) writes.push_back({free, host[p].data()});
+                if (host[p]) writes.push_back({free, host[p]->data()});
                 else if ((int64_t)p * pageLen < oldTokens) throw std::logic_error("KVMem: missing host backing");
                 slots[p] = free;
                 used[free] = true;
@@ -182,5 +182,61 @@ namespace fastllm {
             throw;
         }
         return visible;
+    }
+
+    bool KvMemPages::Seed(
+            const std::vector<std::shared_ptr<const std::vector<uint8_t>>> &hostPages,
+            int tokens) {
+        if (failed) return false;
+        if (InTransaction() || tokens <= 0 || tokens > config.maxTokens) {
+            return false;
+        }
+        if (stats.tokens != 0 || stats.residentPages != 0 || !visible.empty()) {
+            return false;
+        }
+        const int pages = (tokens + pageLen - 1) / pageLen;
+        if ((int)hostPages.size() != pages) return false;
+        if ((uint64_t)pages * pageBytes > config.hostBytes) return false;
+        for (const auto &page : hostPages) {
+            if (!page || page->size() != pageBytes) return false;
+        }
+        // Share every backup (the store keeps its own references for later
+        // requests); keep all slots non-resident so the first Append restores
+        // exactly the selected pages on demand.
+        for (int p = 0; p < pages; ++p) {
+            host[p] = hostPages[p];
+            slots[p] = -1;
+            lastUsed[p] = 0;
+        }
+        stats.tokens = tokens;
+        stats.hostBytes = (uint64_t)pages * pageBytes;
+        stats.residentPages = 0;
+        stats.evictedPages = 0;
+        stats.restoredPages = 0;
+        visible.clear();
+        return true;
+    }
+
+    namespace {
+        const std::shared_ptr<const std::vector<uint8_t>> &EmptyHostPage() {
+            static const std::shared_ptr<const std::vector<uint8_t>> empty;
+            return empty;
+        }
+    }
+
+    const std::shared_ptr<const std::vector<uint8_t>> &KvMemPages::ColdPage(int logicalPage) const {
+        if (logicalPage < 0 || logicalPage >= (int)slots.size()) return EmptyHostPage();
+        // A GPU-resident page has no cold backup here; the caller must read it
+        // back from the device via PageSlot().
+        if (slots[logicalPage] >= 0) return EmptyHostPage();
+        if (!host[logicalPage] || host[logicalPage]->size() != pageBytes) {
+            return EmptyHostPage();
+        }
+        return host[logicalPage];
+    }
+
+    int KvMemPages::PageSlot(int logicalPage) const {
+        if (logicalPage < 0 || logicalPage >= (int)slots.size()) return -1;
+        return slots[logicalPage];
     }
 }

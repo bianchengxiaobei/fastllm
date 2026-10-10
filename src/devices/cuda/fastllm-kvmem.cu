@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace fastllm {
@@ -280,6 +281,106 @@ namespace {
                 throw;
             }
         }
+        // Install a committed prefix so this cache resumes without re-prefilling
+        // those tokens. Only the cold host backups and the retrieval index are
+        // restored; the GPU pools stay empty and the first Append pulls the
+        // selected pages back over PCIe via TransferPages<true>.
+        bool Seed(const KvMemPrefixData &data) override {
+            if (failed || FastllmCudaGetDevice() != device) return false;
+            if (data.tokens <= 0 || data.tokens > config.maxTokens ||
+                pages.Tokens() != 0) {
+                return false;
+            }
+            const int pagesCount = (data.tokens + pageLen - 1) / pageLen;
+            if ((int)data.hostPages.size() != pagesCount) return false;
+            if (!pages.Seed(data.hostPages, data.tokens)) return false;
+            const int sumsPages = std::min(data.sumsPages, pagesCount);
+            const size_t sumsBytes = (size_t)sumsPages * heads * dim * sizeof(float);
+            if (sumsBytes > 0) {
+                if (data.sums.size() < sumsBytes) { failed = true; return false; }
+                try {
+                    Check(cudaMemcpyAsync(sums.cudaData, data.sums.data(), sumsBytes,
+                                          cudaMemcpyHostToDevice, cudaStreamPerThread));
+                    Check(cudaStreamSynchronize(cudaStreamPerThread));
+                } catch (...) { failed = true; return false; }
+            }
+            scores.clear();
+            scoredQueryBucket = -1;
+            scoredQueryInterval = 0;
+            previousAppendTokens = 0;
+            return true;
+        }
+        // Dump the committed prefix for cross-request reuse. Reuses the pages of
+        // `reuse` (the previous, shorter dump of the same request) so successive
+        // dumps only read back the newly completed pages. Does not mutate the
+        // cache, so it may run at any time before release.
+        bool Export(KvMemPrefixData &data,
+                    const KvMemPrefixData *reuse = nullptr) const override {
+            if (failed || FastllmCudaGetDevice() != device) return false;
+            const int pagesCount = pages.TokenPages();
+            if (pagesCount <= 0) return false;
+            data.tokens = pages.Tokens();
+            data.hostPages.assign(pagesCount,
+                                  std::shared_ptr<const std::vector<uint8_t>>());
+            for (int p = 0; p < pagesCount; ++p) {
+                // Committed full pages never change, so the common prefix can be
+                // shared with the previous dump instead of read back again. The
+                // final partial page grows with new tokens, so it is never
+                // shared.
+                if (reuse != nullptr && p < (int)reuse->hostPages.size() &&
+                    reuse->hostPages[p] != nullptr &&
+                    (int64_t)(p + 1) * pageLen <= reuse->tokens) {
+                    data.hostPages[p] = reuse->hostPages[p];
+                    continue;
+                }
+                if (const std::shared_ptr<const std::vector<uint8_t>> &cold =
+                        pages.ColdPage(p)) {
+                    data.hostPages[p] = cold;
+                    continue;
+                }
+                // Resident pages (including the partial tail) are read back now.
+                const int slot = pages.PageSlot(p);
+                if (slot < 0) return false;
+                std::shared_ptr<std::vector<uint8_t>> out =
+                    std::make_shared<std::vector<uint8_t>>(onePageBytes * 2);
+                try {
+                    Check(cudaMemcpyAsync(out->data(),
+                        (uint8_t*)poolK.cudaData + (size_t)slot * onePageBytes,
+                        onePageBytes, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                    Check(cudaMemcpyAsync(out->data() + onePageBytes,
+                        (uint8_t*)poolV.cudaData + (size_t)slot * onePageBytes,
+                        onePageBytes, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                } catch (...) { return false; }
+                data.hostPages[p] = out;
+            }
+            // sums is per committed page and never changes once the page is
+            // full, so only the pages past the reused prefix are read back.
+            const size_t sumsRow = (size_t)heads * dim * sizeof(float);
+            const size_t sumsBytes = (size_t)pagesCount * sumsRow;
+            data.sumsPages = pagesCount;
+            data.sums.resize(sumsBytes);
+            size_t sharedBytes = 0;
+            if (reuse != nullptr && reuse->sumsPages > 0) {
+                int reuseFullPages = (int)((int64_t)reuse->tokens / pageLen);
+                reuseFullPages = std::min(reuseFullPages, reuse->sumsPages);
+                reuseFullPages = std::min(reuseFullPages, pagesCount);
+                sharedBytes = std::min((size_t)reuseFullPages * sumsRow,
+                                       reuse->sums.size());
+                if (sharedBytes > 0) {
+                    std::memcpy(data.sums.data(), reuse->sums.data(), sharedBytes);
+                }
+            }
+            const size_t remainingSums = sumsBytes - sharedBytes;
+            try {
+                if (remainingSums > 0) {
+                    Check(cudaMemcpyAsync(data.sums.data() + sharedBytes,
+                        (const uint8_t*)sums.cudaData + sharedBytes, remainingSums,
+                        cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                }
+                Check(cudaStreamSynchronize(cudaStreamPerThread));
+            } catch (...) { return false; }
+            return true;
+        }
     };
 }
 
@@ -294,6 +395,15 @@ void KvMemAppend(const Data &rawQ, const Data &rawK, const Data &k, const Data &
         }
         keyCache.kvMemCache = std::make_shared<CudaKvMemCache>(*keyCache.kvMemConfig, k);
         valueCache.kvMemCache = keyCache.kvMemCache;
+        // Consume a pending prefix seed once, before the first Append. The seed
+        // only carries cold host backups + retrieval index, so the appended
+        // tokens below continue right after the restored prefix.
+        if (keyCache.kvMemSeed) {
+            if (!keyCache.kvMemCache->Seed(*keyCache.kvMemSeed)) {
+                throw std::invalid_argument("KVMem: prefix seed rejected");
+            }
+            keyCache.kvMemSeed.reset();
+        }
     }
     if (keyCache.kvMemCache != valueCache.kvMemCache) {
         throw std::invalid_argument("KVMem: key/value cache owners differ");
