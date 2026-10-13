@@ -1291,6 +1291,95 @@ namespace fastllm {
         return true;
     }
 
+    // KVMem operates on one device at a time. A tensor-parallel cache exposes its
+    // per-device storages through multiDeviceDatas and the views carry their
+    // device ids; an ordinary tensor yields exactly one view with device == -1,
+    // since a flat tensor's dataDeviceIds is not a split identity. Views come out
+    // ordered by ascending device id so positional pairing is stable.
+    void KvMemDeviceViews(const Data &cache, std::vector<KvMemDeviceView> &views) {
+        views.clear();
+        if (cache.multiDeviceData) {
+            for (auto &it : cache.multiDeviceDatas) {
+                if (it.second != nullptr) {
+                    views.push_back({it.first, it.second});
+                }
+            }
+            if (!views.empty()) {
+                return;
+            }
+        }
+        views.push_back({-1, const_cast<Data*>(&cache)});
+    }
+
+    void KvMemCopyDeviceData(const Data &src, Data &dst) {
+        if (!src.multiDeviceData || src.multiDeviceDatas.empty()) {
+            dst.CopyFrom(src);
+            return;
+        }
+        AssertInFastLLM(!dst.multiDeviceData && dst.multiDeviceDatas.empty(),
+                        "KVMem: a per-device copy needs a fresh destination.");
+        dst.dataType = src.dataType;
+        dst.UpdateUnitSize();
+        dst.dataDevice = DataDevice::CUDA;
+        dst.dataDeviceIds = src.dataDeviceIds;
+        dst.dims = src.dims;
+        dst.strides = src.strides;
+        dst.tpLayout = src.tpLayout;
+        dst.tpAxis = src.tpAxis;
+        dst.tpGlobalDims = src.tpGlobalDims;
+        dst.tpRanges = src.tpRanges;
+        dst.multiDeviceData = true;
+        dst.cudaData = nullptr;
+        for (const auto &entry : src.multiDeviceDatas) {
+            const Data *localSrc = entry.second;
+            if (localSrc == nullptr || localSrc->dims.empty()) {
+                continue;
+            }
+            Data *local = new Data(localSrc->dataType, localSrc->dims);
+            local->dataDevice = DataDevice::CUDA;
+            local->dataDeviceIds = {entry.first};
+#ifdef USE_CUDA
+            int previousDevice = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(entry.first);
+            local->Allocate();
+            if (localSrc->cudaData != nullptr) {
+                FastllmCudaCopyFromDeviceToDevice(local->cudaData, localSrc->cudaData, local->GetBytes());
+            }
+            FastllmCudaSetDevice(previousDevice);
+#endif
+            dst.multiDeviceDatas[entry.first] = local;
+        }
+    }
+
+    void KvMemBeginTransaction(Data &keyCache, int tokens) {
+        std::vector<KvMemDeviceView> views;
+        KvMemDeviceViews(keyCache, views);
+        for (const KvMemDeviceView &view : views) {
+            if (view.data->kvMemCache) {
+                view.data->kvMemCache->BeginTransaction(tokens);
+            }
+        }
+    }
+
+    void KvMemFinishTransaction(Data &keyCache, Data &valueCache, int acceptedTokens) {
+        std::vector<KvMemDeviceView> keyViews, valueViews;
+        KvMemDeviceViews(keyCache, keyViews);
+        KvMemDeviceViews(valueCache, valueViews);
+        if (keyViews.size() != valueViews.size()) {
+            throw std::runtime_error("KVMem: key/value cache device views differ");
+        }
+        for (size_t i = 0; i < keyViews.size(); ++i) {
+            if (!keyViews[i].data->kvMemCache) {
+                continue;
+            }
+            if (keyViews[i].device != valueViews[i].device) {
+                throw std::runtime_error("KVMem: key/value cache device views differ");
+            }
+            keyViews[i].data->kvMemCache->FinishTransaction(
+                acceptedTokens, *keyViews[i].data, *valueViews[i].data);
+        }
+    }
+
     void Data::FakeFrom(const Data &ori, size_t offset) {
         if (ori.kvMemConfig || kvMemConfig) {
             throw std::runtime_error("KVMem cache views require an explicit backend implementation");

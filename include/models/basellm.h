@@ -451,7 +451,24 @@ namespace fastllm {
         // shadow legacy head-count fields on basellm.
         virtual uint64_t KvMemLayerBytesPerToken(int layer) const { return 0; }
         virtual void ValidateKvMemModel(const KvMemConfig &config) const {}
-        void PrepareKvMemCaches(int batch, int devices, const std::vector<std::pair<Data*, Data*>> &caches);
+        // Devices the KVMem target attention actually runs on, together with each
+        // device's share of the KV heads. A tensor-parallel model overrides this;
+        // the default resolves a single CUDA device from deviceMap, so models
+        // that never split KV heads keep their existing behavior. Empty means the
+        // forward path cannot host KVMem.
+        virtual void GetKvMemDevices(std::vector<int> &devices, std::map<int, int> &ratios) const;
+        // Per-token KV bytes of one layer on one device: the model-wide
+        // KvMemLayerBytesPerToken scaled by that device's KV-head share. Single
+        // device (the only entry has ratio 1) returns the model-wide value.
+        uint64_t KvMemLayerDeviceBytesPerToken(int layer, int device,
+                                               const std::map<int, int> &ratios) const;
+        void PrepareKvMemCaches(int batch, int devices, const std::vector<std::pair<Data*, Data*>> &caches,
+                                int requestPrefixTokens = 0);
+        // Turns each KV cache into a per-device store when KVMem pages on more
+        // than one device. Idempotent, and safe before any append; the prefix
+        // restore calls it because it installs per-device seeds.
+        void SplitKvMemCaches(const std::vector<std::pair<Data*, Data*>> &caches,
+                              int requestPrefixTokens = 0) const;
 
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 

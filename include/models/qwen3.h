@@ -92,6 +92,7 @@ namespace fastllm {
 
         bool SupportsKvMem() const override { return true; }
         uint64_t KvMemLayerBytesPerToken(int) const override { return 4ULL * num_key_value_heads * head_dim; }
+        void GetKvMemDevices(std::vector<int> &devices, std::map<int, int> &ratios) const override;
         virtual bool CanUseGPUForward() const override;
 
         virtual void OnAutoWarmupFinished() override;

@@ -883,7 +883,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
-                        help='启用稀疏主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭；单卡单请求，Qwen3/3.5 普通解码及 Qwen3.5 DFlash/MTP')
+                        help='启用稀疏主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"prefix_tokens":4096,"retrieval_norm_power":1.0}。prefix_tokens 常驻保留序列开头的 token（chat template 的 system 段），默认 0 表示按 chat template 逐请求自动推导。retrieval_norm_power 取值 [0,1]，0 为原始点积、1 为余弦相似度，默认 0。默认关闭；单请求，单卡或按 KV head 切分的张量并行多卡，Qwen3/3.5 普通解码及 Qwen3.5 DFlash/MTP')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')

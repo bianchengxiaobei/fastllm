@@ -7,10 +7,13 @@
 #include "models/qwen3.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
+#include <unordered_set>
 
 using namespace fastllm;
 #define CHECK(x) do { if (!(x)) throw std::runtime_error(#x); } while (0)
@@ -132,7 +135,8 @@ template<class T> void Run(DataType type, int group, int dim) {
         CHECK(std::is_sorted(logicalPages.begin(), logicalPages.end()));
         if (old + n > config->residentTokens && n > 1)
             CHECK(std::find(logicalPages.begin(), logicalPages.end(), targetPage) != logicalPages.end());
-        Data qs(INT32), ps(INT32), pi(INT32), last(INT32);
+        // Windows headers also define a global INT32, so qualify the enum.
+        Data qs(DataType::INT32), ps(DataType::INT32), pi(DataType::INT32), last(DataType::INT32);
         Ints(qs, {0, n}); Ints(ps, {0, (int)kc.pageIndex.size()});
         Ints(pi, kc.pageIndex); Ints(last, {kc.lastPageLen});
         output.Resize({heads, n, dim}); output.dataDevice = DataDevice::CUDA; output.dataDeviceIds = {0}; output.Allocate();
@@ -310,7 +314,7 @@ template<class T> void RunLargeTransfers(DataType type) {
     config->prefillTokens = 512;
     Data key(type), value(type);
     key.kvMemConfig = value.kvMemConfig = config;
-    auto expectedK = [](int h, int t, int d) -> T {
+    auto expectedK = [&](int h, int t, int d) -> T {
         return T(d == 0 ? float(t / pageLen) : float((h * 7 + t * 11 + d * 3) % 67 - 33) / 64);
     };
     auto expectedV = [](int h, int t, int d) -> T { return T(float((h * 13 + t * 7 + d * 11) % 97 - 48) / 64); };
@@ -336,9 +340,13 @@ template<class T> void RunLargeTransfers(DataType type) {
     };
     while (old < 24576) append(512, 1);
     int round = 0;
+    long long transferMs = 0;
     for (int preferred : {65, 1, 65, 1}) {
         const auto before = key.kvMemCache->Stats().restoredPages;
+        const auto start = std::chrono::steady_clock::now();
         append(8, preferred);
+        transferMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
         const auto restored = key.kvMemCache->Stats().restoredPages - before;
         CHECK(restored > 0 && restored <= 64);
         CHECK(round++ == 0 ? restored == 64 : restored < 64);
@@ -354,7 +362,178 @@ template<class T> void RunLargeTransfers(DataType type) {
                 }
         }
     }
-    printf("PASS KVMem batched 32 MiB restore dtype=%d\n", (int)type);
+    printf("PASS KVMem batched 32 MiB restore dtype=%d (%lld ms for 4 rounds)\n",
+           (int)type, transferMs);
+}
+
+// Successive prefix dumps of one context must reference the retrieval index of
+// their common prefix instead of copying it per length, and a seeded cache must
+// land on the same selection and KV bytes as one that appended the prefix.
+template<class T> void RunPrefixReuse(DataType type, int group, int dim) {
+    constexpr int pageLen = 16, kvHeads = 2;
+    const int heads = kvHeads * group;
+    const size_t sumsRow = (size_t)kvHeads * dim * sizeof(float);
+    auto config = std::make_shared<KvMemConfig>();
+    config->enabled = true;
+    config->maxTokens = 512;
+    // 208 tokens = 13 resident pages, so the last append still has to select.
+    config->residentTokens = 208;
+    config->sinkTokens = config->recentTokens = pageLen;
+    config->retrievalTokens = 2 * pageLen;
+    config->prefillTokens = 128;
+    auto key = [&](int h, int t, int d) -> T {
+        return T(d == 0 ? float(t / pageLen) : float((h * 7 + t * 11 + d * 3) % 67 - 33) / 100);
+    };
+    auto value = [](int h, int t, int d) -> T { return T(float((h * 13 + t * 7 + d * 11) % 97 - 48) / 64); };
+    auto query = [](int h, int t, int d) -> T { return T(d < 2 ? 0.0f : float((h * 7 + t * 5 + d * 13) % 31 - 15) / 40); };
+    // Append n tokens starting at old, preferring targetPage with row 0.
+    auto append = [&](Data &kc, Data &vc, int old, int n, int targetPage) {
+        Data q(type), k(type), v(type), rawQ(type), rawK(type);
+        std::vector<T> qh((size_t)heads * n * dim), kh((size_t)kvHeads * n * dim), vh(kh.size());
+        std::vector<T> qr(qh.size(), T(0.0f)), kr(kh.size(), T(0.0f));
+        for (int t = 0; t < n; ++t) {
+            for (int h = 0; h < heads; ++h) {
+                qr[((size_t)t * heads + h) * dim + targetPage] = T(4.0f);
+                if (t > 0) qr[((size_t)t * heads + h) * dim + 5] = T(100.0f);
+                for (int d = 0; d < dim; ++d) qh[((size_t)h * n + t) * dim + d] = query(h, old + t, d);
+            }
+            for (int h = 0; h < kvHeads; ++h) {
+                kr[((size_t)t * kvHeads + h) * dim + (old + t) / pageLen] = T(4.0f);
+                for (int d = 0; d < dim; ++d) {
+                    kh[((size_t)h * n + t) * dim + d] = key(h, old + t, d);
+                    vh[((size_t)h * n + t) * dim + d] = value(h, old + t, d);
+                }
+            }
+        }
+        Upload(q, {heads, n, dim}, qh); Upload(k, {kvHeads, n, dim}, kh); Upload(v, {kvHeads, n, dim}, vh);
+        Upload(rawQ, {1, n, heads, dim}, qr); Upload(rawK, {1, n, kvHeads, dim}, kr);
+        KvMemAppend(rawQ, rawK, k, v, kc, vc);
+    };
+    auto logicalPages = [&](const Data &kc) {
+        auto pool = Read<T>(*kc.pagedKVCacheData);
+        std::vector<int> pages;
+        for (int slot : kc.pageIndex) pages.push_back((int)(float)pool[(size_t)slot * pageLen * kvHeads * dim]);
+        return pages;
+    };
+    auto checkContent = [&](const Data &kc, const Data &vc, int total) {
+        auto poolK = Read<T>(*kc.pagedKVCacheData), poolV = Read<T>(*vc.pagedKVCacheData);
+        for (int slot : kc.pageIndex) {
+            const size_t base = (size_t)slot * pageLen * kvHeads * dim;
+            const int page = (int)(float)poolK[base];
+            for (int t = page * pageLen; t < std::min(total, (page + 1) * pageLen); ++t)
+                for (int h = 0; h < kvHeads; ++h) for (int d = 0; d < dim; ++d) {
+                    const size_t i = base + ((size_t)(t % pageLen) * kvHeads + h) * dim + d;
+                    CHECK((float)poolK[i] == (float)key(h, t, d));
+                    CHECK((float)poolV[i] == (float)value(h, t, d));
+                }
+        }
+    };
+    Data keyCache(type), valueCache(type);
+    keyCache.kvMemConfig = valueCache.kvMemConfig = config;
+    append(keyCache, valueCache, 0, 96, 3);
+    KvMemPrefixData first;
+    CHECK(keyCache.kvMemCache->Export(first, nullptr));
+    CHECK(first.tokens == 96 && first.sumsPages == 6 && first.sums.size() == 1);
+    CHECK(first.sums[0].data && first.sums[0].bytes == 6 * sumsRow);
+    append(keyCache, valueCache, 96, 112, 1);
+    KvMemPrefixData second;
+    CHECK(keyCache.kvMemCache->Export(second, &first));
+    CHECK(second.tokens == 208 && second.sumsPages == 13 && second.sums.size() == 2);
+    CHECK(second.sums[0].data == first.sums[0].data && second.sums[0].bytes == 6 * sumsRow);
+    CHECK(second.sums[1].data != first.sums[0].data && second.sums[1].bytes == 7 * sumsRow);
+    // A partial trailing page grows with new tokens, so it is never inherited.
+    append(keyCache, valueCache, 208, 5, 3);
+    KvMemPrefixData third;
+    CHECK(keyCache.kvMemCache->Export(third, &second));
+    CHECK(third.tokens == 213 && third.sumsPages == 14 && third.sums.size() == 3);
+    CHECK(third.sums[0].data == first.sums[0].data && third.sums[0].bytes == 6 * sumsRow);
+    CHECK(third.sums[1].data == second.sums[1].data && third.sums[1].bytes == 7 * sumsRow);
+    CHECK(third.sums[2].bytes == sumsRow);
+    // The three lengths together own one longest-prefix index, not one each.
+    std::unordered_set<const void *> blobs;
+    size_t owned = 0;
+    for (const KvMemPrefixData *dump : {&first, &second, &third})
+        for (const KvMemPrefixSums &slice : dump->sums)
+            if (blobs.insert(slice.data.get()).second) owned += slice.data->size();
+    CHECK(owned == 14 * sumsRow);
+    // The seeded cache must reproduce the appended cache's selection and bytes.
+    Data refKey(type), refValue(type);
+    refKey.kvMemConfig = refValue.kvMemConfig = config;
+    append(refKey, refValue, 0, 96, 3);
+    append(refKey, refValue, 96, 112, 1);
+    append(refKey, refValue, 208, 5, 3);
+    Data seedKey(type), seedValue(type);
+    seedKey.kvMemConfig = seedValue.kvMemConfig = config;
+    seedKey.kvMemSeed = std::make_shared<KvMemPrefixData>(third);
+    append(seedKey, seedValue, 213, 6, 11);
+    append(refKey, refValue, 213, 6, 11);
+    CHECK(seedKey.kvMemSeed == nullptr);
+    CHECK(seedKey.dims[1] == refKey.dims[1] && seedKey.lastPageLen == refKey.lastPageLen);
+    CHECK(logicalPages(seedKey) == logicalPages(refKey));
+    const std::vector<int> visible = logicalPages(seedKey);
+    CHECK(std::find(visible.begin(), visible.end(), 11) != visible.end());
+    checkContent(seedKey, seedValue, seedKey.dims[1]);
+    // A dump whose slices do not cover sumsPages must not be installed.
+    KvMemPrefixData broken = third;
+    broken.sums.pop_back();
+    Data badKey(type), badValue(type);
+    badKey.kvMemConfig = badValue.kvMemConfig = config;
+    badKey.kvMemSeed = std::make_shared<KvMemPrefixData>(broken);
+    bool rejected = false;
+    try { append(badKey, badValue, 213, 6, 11); } catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected);
+    printf("PASS KVMem prefix index reuse dtype=%d group=%d dim=%d owned=%llu\n", (int)type, group, dim,
+           (unsigned long long)owned);
+}
+
+// Retrieval normalisation. The query is e0, page 3 has mean key 5*e0 and page 4
+// has 6*e0 + 6*e1: the raw dot product ranks page 4 first, cosine ranks page 3.
+template<class T> void RunRetrievalNormPower(DataType type, float normPower, int expected) {
+    constexpr int pageLen = 16, kvHeads = 1, heads = 1, dim = 128;
+    auto config = std::make_shared<KvMemConfig>();
+    config->enabled = true;
+    config->maxTokens = 64 * pageLen;
+    config->residentTokens = 6 * pageLen;
+    config->sinkTokens = config->recentTokens = config->retrievalTokens = config->prefillTokens = pageLen;
+    config->retrievalNormPower = normPower;
+    Data key(type), value(type);
+    key.kvMemConfig = value.kvMemConfig = config;
+    auto meanKey = [](int page, int d) {
+        if (page == 3) return d == 0 ? 5.0f : 0.0f;
+        if (page == 4) return d == 0 ? 6.0f : (d == 1 ? 6.0f : 0.0f);
+        return 0.0f;
+    };
+    for (int old = 0; old < 10 * pageLen; old += pageLen) {
+        Data rq(type), rk(type), k(type), v(type);
+        std::vector<T> qr((size_t)pageLen * heads * dim, T(0.f));
+        std::vector<T> kr((size_t)pageLen * kvHeads * dim, T(0.f));
+        std::vector<T> kh(kr.size(), T(0.f)), vh(kr.size(), T(0.f));
+        for (int t = 0; t < pageLen; ++t) {
+            const int page = (old + t) / pageLen;
+            qr[(size_t)t * heads * dim] = T(4.f);
+            for (int h = 0; h < kvHeads; ++h) {
+                const size_t i = ((size_t)h * pageLen + t) * dim;
+                kr[i] = T(meanKey(page, 0));
+                kr[i + 1] = T(meanKey(page, 1));
+                // The pooled key carries the logical page for identification.
+                kh[i + 2] = T((float)page);
+                vh[i + 2] = T((float)page);
+            }
+        }
+        Upload(rq, {1, pageLen, heads, dim}, qr);
+        Upload(rk, {1, pageLen, kvHeads, dim}, kr);
+        Upload(k, {kvHeads, pageLen, dim}, kh);
+        Upload(v, {kvHeads, pageLen, dim}, vh);
+        KvMemAppend(rq, rk, k, v, key, value);
+    }
+    auto pool = Read<T>(*key.pagedKVCacheData);
+    std::vector<int> selected;
+    for (int slot : key.pageIndex)
+        selected.push_back((int)(float)pool[(size_t)slot * pageLen * kvHeads * dim + 2]);
+    CHECK(std::find(selected.begin(), selected.end(), expected) != selected.end());
+    CHECK(std::find(selected.begin(), selected.end(), expected == 4 ? 3 : 4) == selected.end());
+    printf("PASS KVMem retrieval norm power %.1f dtype=%d expected=%d\n",
+           normPower, (int)type, expected);
 }
 
 int main() {
@@ -370,6 +549,8 @@ int main() {
             Run<__nv_bfloat16>(BFLOAT16, group, dim);
             RunTransactions<half>(FLOAT16, group, dim);
             RunTransactions<__nv_bfloat16>(BFLOAT16, group, dim);
+            RunPrefixReuse<half>(FLOAT16, group, dim);
+            RunPrefixReuse<__nv_bfloat16>(BFLOAT16, group, dim);
         }
         SetPageLen(128);
         for (int interval : {1, 32, 64}) {
@@ -378,9 +559,15 @@ int main() {
         }
         RunLargeTransfers<half>(FLOAT16);
         RunLargeTransfers<__nv_bfloat16>(BFLOAT16);
+        SetPageLen(16);
+        for (float normPower : {0.0f, 1.0f}) {
+            const int expected = normPower > 0.0f ? 3 : 4;
+            RunRetrievalNormPower<half>(FLOAT16, normPower, expected);
+            RunRetrievalNormPower<__nv_bfloat16>(BFLOAT16, normPower, expected);
+        }
     } catch (const std::exception &error) {
         fprintf(stderr, "FAIL KVMem: %s\n", error.what()); return 1;
     }
-    printf("PASS KVMem all 8 cases\n");
+    printf("PASS KVMem all 9 cases\n");
     return 0;
 }

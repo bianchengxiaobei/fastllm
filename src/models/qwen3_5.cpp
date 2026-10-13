@@ -858,6 +858,33 @@ namespace fastllm {
         return std::max(0, std::min(value, QWEN35_MTP_MAX_DRAFTS));
     }
 
+    // Prefill seeding feeds every chunk through the draft layer again and keeps
+    // the whole chunk's hidden states, which on a CPU-resident MoE costs about
+    // as much as the target prefill itself. Seeding every chunk is the default
+    // (MTP stays available for the whole session, long prompts prefill slowly);
+    // a snapshot without draft state is never reusable by the next turn, so
+    // skipping the seeding trades MTP away for the rest of the conversation.
+    //   FASTLLM_QWEN35_MTP_PREFILL_SEED=1/true/unset -> seed every chunk
+    //   FASTLLM_QWEN35_MTP_PREFILL_SEED=single/auto  -> seed single-chunk prefills only
+    //   FASTLLM_QWEN35_MTP_PREFILL_SEED=0/false      -> never seed
+    static int Qwen35MtpPrefillSeedMode() {
+        const char *env = std::getenv("FASTLLM_QWEN35_MTP_PREFILL_SEED");
+        if (env == nullptr || env[0] == '\0') {
+            return 1;
+        }
+        std::string value = env;
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (value == "single" || value == "auto" || value == "chunk" ||
+            value == "-1") {
+            return -1;
+        }
+        if (value == "0" || value == "false" || value == "off" || value == "no") {
+            return 0;
+        }
+        return 1;
+    }
+
     static bool Qwen35MtpDisabledByEnv() {
         return Qwen35MtpDraftsPerStep() <= 0;
     }
@@ -2781,25 +2808,76 @@ namespace fastllm {
                 std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-3;
         }
 
-        static void Qwen35HostMoeProfileLap(int branch, double ms, int layersPerToken) {
+        // index/score 的 D2H 单独计时: 这两句是 CPU MoE 路径唯一的跨设备同步点,
+        // 阻塞式 cudaMemcpy 在 Windows/WDDM 上的固定开销要能单独看见.
+        struct Qwen35HostMoeD2HState {
+            double indexMs = 0.0;
+            double scoreMs = 0.0;
+            size_t indexBytes = 0;
+            size_t scoreBytes = 0;
+        };
+
+        static Qwen35HostMoeD2HState &Qwen35HostMoeD2H() {
+            static thread_local Qwen35HostMoeD2HState state;
+            return state;
+        }
+
+        // probe 按层类型拆: full_attention_interval=4, 索引满足 i%4==3 的才是全注意力层,
+        // 长上下文下它们才是 GPU 前缀的大头; 全 O(1) 状态的那些线性注意力层不该贵.
+        struct Qwen35HostMoeLayerProbeState {
+            double probeFullMs = 0.0;
+            double probeLinearMs = 0.0;
+            double mergeFullMs = 0.0;
+            double mergeLinearMs = 0.0;
+            double maxProbeMs = 0.0;
+            int maxProbeLayer = -1;
+        };
+
+        static Qwen35HostMoeLayerProbeState &Qwen35HostMoeLayerProbe() {
+            static thread_local Qwen35HostMoeLayerProbeState state;
+            return state;
+        }
+
+        static void Qwen35HostMoeProfileLap(int branch, double ms, int layersPerToken,
+                                            double probeMs, double mergeMs, double pushMs) {
             static double sum[3] = {0.0, 0.0, 0.0};
             static long long count[3] = {0, 0, 0};
+            static double probeSum = 0.0, mergeSum = 0.0, pushSum = 0.0;
             static int layers = 0;
             if (branch >= 0 && branch < 3) {
                 sum[branch] += ms;
                 count[branch]++;
             }
+            probeSum += probeMs;
+            mergeSum += mergeMs;
+            pushSum += pushMs;
             if (++layers < layersPerToken) {
                 return;
             }
             printf("[fastllm-host-moe] layers=%d | cpu %lld层 %.1fms | host->gpu %lld层 %.1fms | "
                    "cuda %lld层 %.1fms\n",
                    layers, count[0], sum[0], count[1], sum[1], count[2], sum[2]);
+            printf("[fastllm-host-moe-split] probe(含 index/score D2H)=%.1fms "
+                   "merge=%.1fms push(Reset+ToDevice)=%.1fms rest=%.1fms\n",
+                   probeSum, mergeSum, pushSum,
+                   sum[0] + sum[1] + sum[2] - probeSum - mergeSum - pushSum);
+            Qwen35HostMoeD2HState &d2h = Qwen35HostMoeD2H();
+            printf("[fastllm-host-moe-d2h] index=%.1fms/%zuB score=%.1fms/%zuB frames=%d\n",
+                   d2h.indexMs, d2h.indexBytes, d2h.scoreMs, d2h.scoreBytes, layers);
+            d2h.indexMs = d2h.scoreMs = 0.0;
+            Qwen35HostMoeLayerProbeState &layerProbe = Qwen35HostMoeLayerProbe();
+            printf("[fastllm-host-moe-layer] probe full(i%4==3)=%.1fms linear=%.1fms max=%.1fms@L%d | "
+                   "merge full=%.1fms linear=%.1fms\n",
+                   layerProbe.probeFullMs, layerProbe.probeLinearMs,
+                   layerProbe.maxProbeMs, layerProbe.maxProbeLayer,
+                   layerProbe.mergeFullMs, layerProbe.mergeLinearMs);
+            layerProbe = Qwen35HostMoeLayerProbeState();
             fflush(stdout);
             for (int i = 0; i < 3; i++) {
                 sum[i] = 0.0;
                 count[i] = 0;
             }
+            probeSum = mergeSum = pushSum = 0.0;
             layers = 0;
         }
 
@@ -2933,8 +3011,20 @@ namespace fastllm {
                 return false;
             }
             // 路由要在host侧做, 先把index/score拷回内存
+            const bool hostMoeD2HProfile = Qwen35HostMoeProfileEnabled();
+            double hostMoeD2HMark = hostMoeD2HProfile ? Qwen35HostMoeNowMs() : 0.0;
             expertIndex.ToDevice(DataDevice::CPU);
+            if (hostMoeD2HProfile) {
+                double now = Qwen35HostMoeNowMs();
+                Qwen35HostMoeD2H().indexMs += now - hostMoeD2HMark;
+                Qwen35HostMoeD2H().indexBytes = (size_t)expertIndex.GetBytes();
+                hostMoeD2HMark = now;
+            }
             expertScore.ToDevice(DataDevice::CPU);
+            if (hostMoeD2HProfile) {
+                Qwen35HostMoeD2H().scoreMs += Qwen35HostMoeNowMs() - hostMoeD2HMark;
+                Qwen35HostMoeD2H().scoreBytes = (size_t)expertScore.GetBytes();
+            }
             if (expertIndex.cpuData == nullptr || expertScore.cpuData == nullptr ||
                 expertIndex.dims[0] <= 0 || expertIndex.dims[1] <= 0 ||
                 expertScore.Count(0) != expertIndex.Count(0)) {
@@ -5155,10 +5245,11 @@ namespace fastllm {
             bool linear = false;
             Qwen35LinearPrefixSnapshotCache first;
             Qwen35LinearPrefixSnapshotCache second;
-            // Full-attention layers under KVMem carry this instead of first/second.
-            // Shared so it can be handed to a fresh request cache as
-            // Data::kvMemSeed without copying host bytes.
-            std::shared_ptr<KvMemPrefixData> kvMem;
+            // Full-attention layers under KVMem carry this instead of first/second,
+            // one dump per device (key -1 when the cache is not split). Shared so it
+            // can be handed to a fresh request cache as Data::kvMemSeed without
+            // copying host bytes.
+            std::map<int, std::shared_ptr<KvMemPrefixData> > kvMem;
         };
 
         struct Qwen35LinearPrefixSnapshot {
@@ -7528,8 +7619,10 @@ namespace fastllm {
                     Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
                     Qwen3CudaRMSNorm(runner, *k, *kNormWeight, rmsNormEps, *k);
                     if (useKvMem) {
-                        kvMemRawQ.CopyFrom(*q);
-                        kvMemRawK.CopyFrom(*k);
+                        // Pre-RoPE Q/K feed the retrieval index. A tensor-parallel
+                        // tensor has no flat backing buffer, so mirror its shards.
+                        KvMemCopyDeviceData(*q, kvMemRawQ);
+                        KvMemCopyDeviceData(*k, kvMemRawK);
                     }
                     Qwen35CudaApplyRotary(runner, *q, *allPositionIds,
                                           rotaryDim, mropeSections, ropeBase, ropeScale, ropeConfig);
@@ -8502,10 +8595,11 @@ namespace fastllm {
             bool linear = false;
             Qwen35LinearPrefixSnapshotCache first;
             Qwen35LinearPrefixSnapshotCache second;
-            // Full-attention layers under KVMem carry this instead of first/second.
-            // Shared so it can be handed to a fresh request cache as
-            // Data::kvMemSeed without copying host bytes.
-            std::shared_ptr<KvMemPrefixData> kvMem;
+            // Full-attention layers under KVMem carry this instead of first/second,
+            // one dump per device (key -1 when the cache is not split). Shared so it
+            // can be handed to a fresh request cache as Data::kvMemSeed without
+            // copying host bytes.
+            std::map<int, std::shared_ptr<KvMemPrefixData> > kvMem;
         };
 
         struct Qwen35LinearPrefixSnapshot {
@@ -9874,6 +9968,24 @@ namespace fastllm {
 #endif
     }
 
+    void Qwen3_5Model::GetKvMemDevices(std::vector<int> &devices, std::map<int, int> &ratios) const {
+        devices.clear();
+        ratios.clear();
+#ifndef USE_CUDA
+        return;
+#else
+        if (GetKVCacheInCPU()) {
+            return;
+        }
+        // KVMem pages on exactly the devices the target attention is
+        // tensor-parallel over, with the same KV-head split ratios.
+        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios)) {
+            devices.clear();
+            ratios.clear();
+        }
+#endif
+    }
+
     bool Qwen3_5Model::ShouldEnforceAutoWarmupRuntimeBatchLimit() const {
         return !Qwen35MtpDisabledByEnv() &&
                Qwen35MtpDraftsPerStep() > 0 && HasMtpWeights();
@@ -10860,17 +10972,25 @@ namespace fastllm {
                 snapshot->dflashTokens = currentLen;
             } else {
                 auto mtpIt = mtpCaches.find(context);
-                if (mtpIt == mtpCaches.end() ||
-                    mtpIt->second.tokens != currentLen ||
-                    mtpIt->second.key.dims.size() < 2 ||
-                    mtpIt->second.value.dims.size() < 2 ||
-                    mtpIt->second.key.dims[1] != currentLen ||
-                    mtpIt->second.value.dims[1] != currentLen ||
-                    !SnapshotMtpPagedCache(mtpIt->second, snapshot->mtpKey, snapshot->mtpValue)) {
+                if (mtpIt == mtpCaches.end()) {
+                    // This request prefilled without seeding a draft cache (long
+                    // prompt, or the cache was dropped after a fallback). Its
+                    // linear and KVMem state is still a fully reusable prefix,
+                    // so record it without MTP state instead of discarding the
+                    // snapshot and losing prefix reuse for the next turn.
+                    snapshot->mtpValid = false;
+                    snapshot->mtpTokens = 0;
+                } else if (mtpIt->second.tokens != currentLen ||
+                           mtpIt->second.key.dims.size() < 2 ||
+                           mtpIt->second.value.dims.size() < 2 ||
+                           mtpIt->second.key.dims[1] != currentLen ||
+                           mtpIt->second.value.dims[1] != currentLen ||
+                           !SnapshotMtpPagedCache(mtpIt->second, snapshot->mtpKey, snapshot->mtpValue)) {
                     return false;
+                } else {
+                    snapshot->mtpValid = true;
+                    snapshot->mtpTokens = currentLen;
                 }
-                snapshot->mtpValid = true;
-                snapshot->mtpTokens = currentLen;
             }
 #else
             return false;
@@ -10934,19 +11054,38 @@ namespace fastllm {
                         return false;
                     }
                     const Data &keyCache = context->pastKeyValues[i].first;
-                    if (keyCache.kvMemCache == nullptr ||
-                        keyCache.kvMemCache != context->pastKeyValues[i].second.kvMemCache) {
+                    const Data &valueCache = context->pastKeyValues[i].second;
+                    std::vector<KvMemDeviceView> keyViews, valueViews;
+                    KvMemDeviceViews(keyCache, keyViews);
+                    KvMemDeviceViews(valueCache, valueViews);
+                    if (keyViews.empty() || keyViews.size() != valueViews.size()) {
                         return false;
                     }
-                    const KvMemPrefixData *reuse =
-                        (prev != nullptr && i < (int)prev->layers.size())
-                            ? prev->layers[i].kvMem.get() : nullptr;
-                    std::shared_ptr<KvMemPrefixData> dump(new KvMemPrefixData());
-                    if (!keyCache.kvMemCache->Export(*dump, reuse) ||
-                        dump->tokens != currentLen) {
-                        return false;
+                    // Every device dumps its own share of the prefix; the pages of
+                    // the previous, shorter dump of the same request are reused so
+                    // successive dumps only read back the newly completed ones.
+                    std::map<int, std::shared_ptr<KvMemPrefixData> > dumps;
+                    for (size_t v = 0; v < keyViews.size(); ++v) {
+                        if (keyViews[v].device != valueViews[v].device ||
+                            keyViews[v].data->kvMemCache == nullptr ||
+                            keyViews[v].data->kvMemCache != valueViews[v].data->kvMemCache) {
+                            return false;
+                        }
+                        const KvMemPrefixData *reuse = nullptr;
+                        if (prev != nullptr && i < (int)prev->layers.size()) {
+                            auto it = prev->layers[i].kvMem.find(keyViews[v].device);
+                            if (it != prev->layers[i].kvMem.end()) {
+                                reuse = it->second.get();
+                            }
+                        }
+                        std::shared_ptr<KvMemPrefixData> dump(new KvMemPrefixData());
+                        if (!keyViews[v].data->kvMemCache->Export(*dump, reuse) ||
+                            dump->tokens != currentLen) {
+                            return false;
+                        }
+                        dumps[keyViews[v].device] = std::move(dump);
                     }
-                    snapshot->layers[i].kvMem = std::move(dump);
+                    snapshot->layers[i].kvMem = std::move(dumps);
                 }
                 long long kvDumpMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - kvDumpStart).count();
@@ -10956,7 +11095,45 @@ namespace fastllm {
                     fflush(stdout);
                 }
             }
+            // 淘汰归因: 默认每个被淘汰的 dump 打一行(回答"某个长度是被淘汰了还是本来
+            // 就没有"); 设 FASTLLM_PREFIX_CACHE_EVICT_LOG=0 可以关掉.
+            static const bool prefixEvictLog = []() {
+                const char *env = std::getenv("FASTLLM_PREFIX_CACHE_EVICT_LOG");
+                return !(env != nullptr && env[0] == '0');
+            }();
+            auto logEvict = [&items](const char *rule, long long len) {
+                printf("[Qwen3.5 KVMem] snapshot evict: rule=%s len=%lld remaining=%d\n",
+                       rule, len, (int)items.size());
+                fflush(stdout);
+            };
             items.push_back(std::move(snapshot));
+            if (kvMemMode && prefixEvictLog) {
+                // 同一个前缀链上只差几个 token 的 dump 是同一个请求两个 record 点
+                // 的产物: basellm.cpp:2607 把最后一个 chunk 的 curLen 减 1, 于是最后
+                // 一个数据 chunk 记一次(L), prefill 结束(basellm.cpp:2716)再记一次
+                // (L+1). 日志里 64 个 dump 有 16 对相差 1 个 token, 白占一半槽位.
+                // 对"长度必须 <= prompt 且逐 token 相等"的匹配器来说两者几乎等价,
+                // 所以只留长的那个.
+                const Qwen35LinearPrefixSnapshot *latest = items.back().get();
+                if (latest != nullptr) {
+                    for (auto it = items.begin(); it != items.end() - 1; ) {
+                        Qwen35LinearPrefixSnapshot *old = it->get();
+                        bool duplicate =
+                            old != nullptr &&
+                            old->cachedLen < latest->cachedLen &&
+                            latest->cachedLen - old->cachedLen <= pageLen &&
+                            (int)old->tokens.size() == old->cachedLen &&
+                            std::equal(old->tokens.begin(), old->tokens.end(),
+                                       latest->tokens.begin());
+                        if (!duplicate) {
+                            ++it;
+                            continue;
+                        }
+                        logEvict("duplicate", old->cachedLen);
+                        it = items.erase(it);
+                    }
+                }
+            }
             // KVMem eviction keeps a spread of lengths. The dumps of one request
             // form a chain (each tokens list is a prefix of the next) and share
             // their pages, so dropping the shortest frees almost nothing while
@@ -10964,7 +11141,7 @@ namespace fastllm {
             // exactly the "same context, new question" case. A dump whose length
             // is within a factor of two of another dump is redundant: the ladder
             // that survives still lands within 2x of any divergence point.
-            auto eraseMostRedundant = [&items](int onlyRequestId) -> bool {
+            auto eraseMostRedundant = [&items](int onlyRequestId, long long *outLen) -> bool {
                 auto eligible = [&](int i) {
                     return items[i] != nullptr &&
                            (onlyRequestId < 0 ||
@@ -11005,6 +11182,10 @@ namespace fastllm {
                 if (victim < 0) {
                     return false;
                 }
+                if (outLen != nullptr) {
+                    *outLen = items[victim] == nullptr ? -1 :
+                              (long long)items[victim]->cachedLen;
+                }
                 items.erase(items.begin() + victim);
                 return true;
             };
@@ -11024,8 +11205,12 @@ namespace fastllm {
             }
             while (requestRecords > maxPerRequest) {
                 if (kvMemMode) {
-                    if (!eraseMostRedundant(requestId)) {
+                    long long evictedLen = -1;
+                    if (!eraseMostRedundant(requestId, &evictedLen)) {
                         break;
+                    }
+                    if (prefixEvictLog) {
+                        logEvict("per-request", evictedLen);
                     }
                 } else {
                     auto oldest = items.end();
@@ -11049,13 +11234,18 @@ namespace fastllm {
             int maxRecords = Qwen35LinearPrefixSnapshotMaxRecords();
             if (kvMemMode) {
                 // Room for several contexts at once; the dumps of one context
-                // share their pages, so the extra entries are nearly free.
+                // share their pages and index slices, so the extra entries are
+                // nearly free.
                 maxRecords = std::max(maxRecords, 64);
             }
             while ((int)items.size() > maxRecords) {
                 if (kvMemMode) {
-                    if (!eraseMostRedundant(-1)) {
+                    long long evictedLen = -1;
+                    if (!eraseMostRedundant(-1, &evictedLen)) {
                         break;
+                    }
+                    if (prefixEvictLog) {
+                        logEvict("record-cap", evictedLen);
                     }
                 } else {
                     items.erase(items.begin());
@@ -11063,9 +11253,10 @@ namespace fastllm {
             }
             if (kvMemMode) {
                 // KVMem needs several lengths per request so a shorter common
-                // prefix can still be reused. Pages are shared across those
-                // dumps, so keeping more of them costs only the small linear
-                // state. A total byte cap still bounds the host footprint.
+                // prefix can still be reused. Pages and retrieval-index slices
+                // are shared across those dumps, so keeping more of them costs
+                // only the small linear state. A total byte cap still bounds the
+                // host footprint.
                 uint64_t budget = (uint64_t)Qwen35EnvInt(
                     "FASTLLM_KVMEM_PREFIX_HOST_MIB", 8192) << 20;
                 auto totalKvMemBytes = [&]() {
@@ -11076,13 +11267,17 @@ namespace fastllm {
                             continue;
                         }
                         for (const auto &layer : item->layers) {
-                            if (layer.kvMem == nullptr) {
-                                continue;
-                            }
-                            bytes += layer.kvMem->sums.size();
-                            for (const auto &page : layer.kvMem->hostPages) {
-                                if (page && pages.insert(page.get()).second) {
-                                    bytes += page->size();
+                            for (const auto &deviceDump : layer.kvMem) {
+                                const KvMemPrefixData &dump = *deviceDump.second;
+                                for (const KvMemPrefixSums &slice : dump.sums) {
+                                    if (slice.data && pages.insert(slice.data.get()).second) {
+                                        bytes += slice.data->size();
+                                    }
+                                }
+                                for (const auto &page : dump.hostPages) {
+                                    if (page && pages.insert(page.get()).second) {
+                                        bytes += page->size();
+                                    }
                                 }
                             }
                         }
@@ -11090,8 +11285,12 @@ namespace fastllm {
                     return bytes;
                 };
                 while (totalKvMemBytes() > budget && items.size() > 1) {
-                    if (!eraseMostRedundant(-1)) {
+                    long long evictedLen = -1;
+                    if (!eraseMostRedundant(-1, &evictedLen)) {
                         break;
+                    }
+                    if (prefixEvictLog) {
+                        logEvict("byte-budget", evictedLen);
                     }
                 }
                 kvMemSnapshotBytes = totalKvMemBytes();
@@ -11153,6 +11352,16 @@ namespace fastllm {
                 requireMtp, requireDFlash, dflashLayers,
                 dflashKvHeads, dflashHeadDim,
                 this->kvMemConfig.enabled ? 1 : 0);
+        if (snapshot == nullptr && requireMtp) {
+            // A snapshot recorded by a prefill that never seeded a draft cache
+            // carries no MTP state. Reuse it anyway rather than prefilling the
+            // whole prompt again: this request simply decodes without drafts.
+            snapshot = Qwen35FindLinearPrefixSnapshotLocked(
+                this, context->currentTokens, maxCachedLen, -1,
+                false, requireDFlash, dflashLayers,
+                dflashKvHeads, dflashHeadDim,
+                this->kvMemConfig.enabled ? 1 : 0);
+        }
         if (snapshot == nullptr && this->kvMemConfig.enabled) {
             // A KVMem miss is either "different prompt" or "the matching dump was
             // evicted". Report the retained dumps and the longest token prefix this
@@ -11208,6 +11417,15 @@ namespace fastllm {
                 requireMtp, requireDFlash, dflashLayers,
                 dflashKvHeads, dflashHeadDim,
                 kvMemMode ? 1 : 0);
+            if (snapshot == nullptr && requireMtp) {
+                // Same fallback as the query above: a snapshot without draft
+                // state is still restorable, the request just decodes plainly.
+                snapshot = Qwen35FindLinearPrefixSnapshotLocked(
+                    this, context->currentTokens, cachedLen, cachedLen,
+                    false, requireDFlash, dflashLayers,
+                    dflashKvHeads, dflashHeadDim,
+                    kvMemMode ? 1 : 0);
+            }
             if (snapshot == nullptr || (int)snapshot->layers.size() < this->block_cnt) {
                 return false;
             }
@@ -11216,7 +11434,7 @@ namespace fastllm {
                     // Full-attention layers under KVMem must carry a portable
                     // prefix dump; any missing layer aborts the whole restore so
                     // the request cannot be left with a partial state.
-                    if (kvMemMode && snapshot->layers[i].kvMem == nullptr) {
+                    if (kvMemMode && snapshot->layers[i].kvMem.empty()) {
                         return false;
                     }
                     continue;
@@ -11240,10 +11458,19 @@ namespace fastllm {
                 }
             }
             if (kvMemMode) {
-                // Hand each full-attention layer its prefix dump. The request
-                // cache is created lazily in KvMemAppend, which consumes the seed
-                // once via Data::kvMemSeed. Sharing the snapshot keeps the host
-                // bytes single-copy.
+                // Hand each full-attention layer its per-device prefix dump. The
+                // request cache is created lazily in KvMemAppend, which consumes the
+                // seed once via Data::kvMemSeed. Sharing the snapshot keeps the host
+                // bytes single-copy. The per-device storages must exist first, since
+                // each device's seed lands on its own share.
+                {
+                    std::vector<std::pair<Data *, Data *> > kvMemCaches;
+                    kvMemCaches.reserve(context->pastKeyValues.size());
+                    for (auto &kv : context->pastKeyValues) {
+                        kvMemCaches.emplace_back(&kv.first, &kv.second);
+                    }
+                    SplitKvMemCaches(kvMemCaches, context->generationConfig.kvMemPrefixTokens);
+                }
                 for (int i = 0; i < this->block_cnt; i++) {
                     if (Qwen35LayerIsLinearAttention(this, i)) {
                         continue;
@@ -11251,8 +11478,24 @@ namespace fastllm {
                     if (i >= (int)context->pastKeyValues.size()) {
                         return false;
                     }
-                    context->pastKeyValues[i].first.kvMemSeed = snapshot->layers[i].kvMem;
-                    context->pastKeyValues[i].second.kvMemSeed = snapshot->layers[i].kvMem;
+                    Data &keyCache = context->pastKeyValues[i].first;
+                    Data &valueCache = context->pastKeyValues[i].second;
+                    std::vector<KvMemDeviceView> keyViews, valueViews;
+                    KvMemDeviceViews(keyCache, keyViews);
+                    KvMemDeviceViews(valueCache, valueViews);
+                    if (keyViews.empty() || keyViews.size() != valueViews.size() ||
+                        keyViews.size() != snapshot->layers[i].kvMem.size()) {
+                        return false;
+                    }
+                    for (size_t v = 0; v < keyViews.size(); ++v) {
+                        auto it = snapshot->layers[i].kvMem.find(keyViews[v].device);
+                        if (keyViews[v].device != valueViews[v].device ||
+                            it == snapshot->layers[i].kvMem.end() || it->second == nullptr) {
+                            return false;
+                        }
+                        keyViews[v].data->kvMemSeed = it->second;
+                        valueViews[v].data->kvMemSeed = it->second;
+                    }
                 }
             }
             if (requireMtp || requireDFlash) {
@@ -11293,9 +11536,8 @@ namespace fastllm {
                     restoredDFlashCacheTokens =
                         dflashCache.draftKeyValues.empty() ? 0 :
                         dflashCache.draftKeyValues[0].first.dims[1];
-                } else {
-                    if (!snapshot->mtpValid ||
-                        snapshot->mtpTokens != cachedLen) {
+                } else if (snapshot->mtpValid) {
+                    if (snapshot->mtpTokens != cachedLen) {
                         return false;
                     }
                     MtpKvCache &mtpCache = mtpCaches[context];
@@ -11306,6 +11548,9 @@ namespace fastllm {
                     }
                     mtpCache.tokens = cachedLen;
                 }
+                // A snapshot without draft state leaves the request without a
+                // draft cache (both caches are erased above), so it decodes
+                // without drafts. That is the state it was recorded in.
 #else
                 return false;
 #endif
@@ -16642,6 +16887,15 @@ namespace fastllm {
             const std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
             const bool profileHostMoe = Qwen35HostMoeProfileEnabled();
             const double hostMoeBeginMs = Qwen35HostMoeNowMs();
+            // 拆段: probe = Qwen35TryPrefillMoeGpuFromHost(含 index/score 的 D2H 同步),
+            // merge = MergeMOEBlock 本体, push = ResetCpuScratch + 结果 H2D.
+            double hostMoeProbeMs = 0.0, hostMoeMergeMs = 0.0, hostMoePushMs = 0.0;
+            double hostMoeMarkMs = hostMoeBeginMs;
+            auto hostMoeLap = [&](double &bucket) {
+                double now = Qwen35HostMoeNowMs();
+                bucket += now - hostMoeMarkMs;
+                hostMoeMarkMs = now;
+            };
             // 原型: prefill 时把内存里的路由专家逐专家搬上卡交给GPU算(默认自动开);
             // 单 token decode 要走同一条路得显式开 FASTLLM_DECODE_MOE_GPU=1
             bool prefillMoeOnGpu = layerMappedNonCudaMoe && !tensorParallel &&
@@ -16651,6 +16905,7 @@ namespace fastllm {
                                        weights[i], biass[i],
                                        w1, w2, w3, moeFinal,
                                        this->num_experts, gpuId, i);
+            hostMoeLap(hostMoeProbeMs);
             const int hostMoeBranch = layerMappedNonCudaMoe ? (prefillMoeOnGpu ? 1 : 0) : 2;
             if (layerMappedNonCudaMoe) {
                 if (prefillMoeOnGpu) {
@@ -16667,10 +16922,12 @@ namespace fastllm {
                         computeType, threadTpMoeAtype,
                         &moeInputTemp, &moeOutputTemp);
                     FastllmCudaSetDevice(gpuId);
+                    hostMoeLap(hostMoeMergeMs);
                     if (moeFinal.dataDevice != DataDevice::CUDA || moeFinal.cudaData == nullptr ||
                         (!moeFinal.dataDeviceIds.empty() && moeFinal.dataDeviceIds[0] != gpuId)) {
                         moeFinal.ToDevice(DataDevice::CUDA, {gpuId}, true);
                     }
+                    hostMoeLap(hostMoePushMs);
                 } else {
                     Qwen35ZeroCudaLike(moeFinal, hiddenStates, gpuId);
                 }
@@ -16708,7 +16965,21 @@ namespace fastllm {
             }
 #endif
             if (profileHostMoe) {
-                Qwen35HostMoeProfileLap(hostMoeBranch, hostMoeSpendMs, this->block_cnt);
+                Qwen35HostMoeLayerProbeState &layerProbe = Qwen35HostMoeLayerProbe();
+                const bool fullAttentionLayer = (i % 4 == 3);
+                if (fullAttentionLayer) {
+                    layerProbe.probeFullMs += hostMoeProbeMs;
+                    layerProbe.mergeFullMs += hostMoeMergeMs;
+                } else {
+                    layerProbe.probeLinearMs += hostMoeProbeMs;
+                    layerProbe.mergeLinearMs += hostMoeMergeMs;
+                }
+                if (hostMoeProbeMs > layerProbe.maxProbeMs) {
+                    layerProbe.maxProbeMs = hostMoeProbeMs;
+                    layerProbe.maxProbeLayer = i;
+                }
+                Qwen35HostMoeProfileLap(hostMoeBranch, hostMoeSpendMs, this->block_cnt,
+                                        hostMoeProbeMs, hostMoeMergeMs, hostMoePushMs);
             }
             moeFinal.Reshape(hiddenStates.dims);
             if (sharedExpertPending) {
@@ -16879,7 +17150,8 @@ namespace fastllm {
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
-        PrepareKvMemCaches(batch, (int)devices.size(), pastKeyValues);
+        PrepareKvMemCaches(batch, (int)devices.size(), pastKeyValues,
+                           generationConfigs.empty() ? 0 : generationConfigs[0].kvMemPrefixTokens);
         bool tensorParallel = devices.size() > 1;
         auto mtpTargetProfileRecord = [&](int logitRows) {
             if (!mtpTargetProfileEnabled) {
@@ -20460,7 +20732,7 @@ namespace fastllm {
                 while (!transactions.empty()) {
                     int layer = transactions.back();
                     auto &kv = pastKeyValues[layer];
-                    kv.first->kvMemCache->FinishTransaction(accepted, *kv.first, *kv.second);
+                    KvMemFinishTransaction(*kv.first, *kv.second, accepted);
                     transactions.pop_back();
                 }
             };
@@ -20470,7 +20742,7 @@ namespace fastllm {
                 // the request. Never let exception cleanup throw a second time.
                 for (int layer : transactions) {
                     auto &kv = pastKeyValues[layer];
-                    try { kv.first->kvMemCache->FinishTransaction(0, *kv.first, *kv.second); }
+                    try { KvMemFinishTransaction(*kv.first, *kv.second, 0); }
                     catch (...) {}
                 }
                 speculativeCaptureFirstTokenLinearState = oldCapture;
@@ -20484,10 +20756,11 @@ namespace fastllm {
             for (int i = 0; i < block_cnt; ++i) {
                 if (isAttentionLayerAt(i)) {
                     auto &kv = pastKeyValues[i];
-                    if (!kv.first->kvMemCache || kv.first->kvMemCache != kv.second->kvMemCache) {
+                    if ((!kv.first->kvMemCache && !kv.first->multiDeviceData) ||
+                        (!kv.second->kvMemCache && !kv.second->multiDeviceData)) {
                         throw std::runtime_error("KVMem: missing speculative target cache");
                     }
-                    kv.first->kvMemCache->BeginTransaction(seqLen);
+                    KvMemBeginTransaction(*kv.first, seqLen);
                     transactions.push_back(i);
                 } else {
                     linearScratch[i].first.CopyFrom(*pastKeyValues[i].first);
@@ -24164,8 +24437,61 @@ namespace fastllm {
             // Restoring text-only KV here makes Qwen35ForwardMultimodal take
             // its decode branch, skipping vision encoding and chunked prefill.
             // Media-aware cache keys and position state are required first.
-            if (model->kvMemConfig.enabled || ctx == nullptr || !ctx->multimodalInput.empty() ||
+            if (ctx == nullptr || !ctx->multimodalInput.empty() ||
                 ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
+                return 0;
+            }
+            if (model->kvMemConfig.enabled) {
+                // KVMem keeps its KV in per-request stores instead of the global
+                // paged pool, so a prefix is reusable only through the model
+                // snapshot: the linear layers are rebuilt from it and every
+                // full-attention layer receives a dump that its first forward
+                // seeds into a fresh cache. The MTP scheduler can be selected
+                // together with KVMem, and without this branch every turn would
+                // prefill its whole prompt again.
+                if (ctx->intParams.find("paged_prefix_restore_disabled") !=
+                    ctx->intParams.end()) {
+                    return 0;
+                }
+                int kvMemCachedLen = model->QueryPagedPrefixCacheExtra(
+                    ctx, (int)ctx->currentTokens.size());
+                auto kvMemRestoreStart = std::chrono::steady_clock::now();
+                bool kvMemRestored = kvMemCachedLen > 0 &&
+                    kvMemCachedLen < (int)ctx->currentTokens.size() &&
+                    model->RestorePagedPrefixCacheExtra(ctx, kvMemCachedLen);
+                if (kvMemRestored) {
+                    ctx->currentTokens.erase(
+                        ctx->currentTokens.begin(),
+                        ctx->currentTokens.begin() + kvMemCachedLen);
+                    ctx->cacheLen = kvMemCachedLen;
+                    float kvMemRestoreMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - kvMemRestoreStart).count();
+                    printf("[Qwen3.5 KVMem] prefix cache hit: tokens=%d, restore=%.0f ms.\n",
+                           kvMemCachedLen, kvMemRestoreMs);
+                    fflush(stdout);
+                    return kvMemCachedLen;
+                }
+                if (kvMemCachedLen == 0) {
+                    printf("[Qwen3.5 KVMem] no prefix match (prompt=%d "
+                           "tokens), prefilling from scratch.\n",
+                           (int)ctx->currentTokens.size());
+                } else {
+                    printf("[Qwen3.5 KVMem] prefix restore failed "
+                           "(tokens=%d), prefilling from scratch.\n",
+                           kvMemCachedLen);
+                }
+                fflush(stdout);
+                // A prefix hit is useful only when the complete model state can
+                // be restored. Drop any partial state and let this request
+                // prefill normally.
+                for (auto &kv : ctx->pastKeyValues) {
+                    releasePagedCachePages(kv.first, true);
+                    releasePagedCachePages(kv.second, true);
+                    kv.first.kvMemSeed.reset();
+                    kv.second.kvMemSeed.reset();
+                }
+                ctx->cacheLen = 0;
+                ctx->intParams["paged_prefix_restore_disabled"] = 1;
                 return 0;
             }
             auto probeRefs = model->GetPagedKVCacheManagers(model->kvCacheId, true);
@@ -25320,11 +25646,16 @@ namespace fastllm {
                                 model->deviceMap, longPrefillDraftDevices,
                                 longPrefillDraftRatios) &&
                             !longPrefillDraftDevices.empty();
+                        const int longPrefillSeedMode =
+                            Qwen35MtpPrefillSeedMode();
                         bool seedLongPrefillMtp =
                             !schedulerUsesDFlash && canSeedLongPrefillDraft &&
                             !Qwen35MtpDisabledByEnv() &&
                             longPrefillMtpDrafts > 0 &&
-                            model->HasMtpWeights();
+                            model->HasMtpWeights() &&
+                            (longPrefillSeedMode > 0 ||
+                             (longPrefillSeedMode < 0 &&
+                              len <= longPrefillChunkSize));
                         bool seedLongPrefillDFlash =
                             schedulerUsesDFlash && canSeedLongPrefillDraft &&
                             longPrefillDFlashDrafts > 0 &&
@@ -25650,17 +25981,34 @@ namespace fastllm {
                             }
                             st += curLen;
                             int cachedTokens = longPrefillBaseTokens + st;
+                            float recordSpend = 0;
                             if (cachedTokens % pageLen == 0) {
+                                auto recordStartTime = std::chrono::system_clock::now();
                                 singleContext->TryRecordPagedCache(model);
+                                recordSpend = GetSpan(
+                                    recordStartTime, std::chrono::system_clock::now());
                             }
                             if (model->verbose) {
                                 auto chunkEndTime = std::chrono::system_clock::now();
                                 float chunkSpend = GetSpan(chunkStartTime, chunkEndTime);
                                 float totalSpend = GetSpan(prefillStartTime, chunkEndTime);
-                                float chunkSpeed = chunkSpend > 0 ? curLen / chunkSpend : 0;
-                                (void)totalSpend;
+                                // Report the forward alone, like the non-MTP
+                                // scheduler does: the KVMem prefix dump runs
+                                // inside this window and otherwise makes a fast
+                                // chunk look like a slow prefill.
+                                float forwardSpend = std::max(0.0f, chunkSpend - recordSpend);
+                                float chunkSpeed = forwardSpend > 0 ? curLen / forwardSpend : 0;
+                                float avgSpeed = totalSpend > 0 ? st / totalSpend : 0;
                                 printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
                                        st, len, st * 100 / len, chunkSpeed);
+                                if (model->kvMemConfig.enabled && chunkSpend > 2.0f) {
+                                    printf("[Qwen3.5 KVMem] chunk breakdown: tokens=%d, forward=%.2fs "
+                                           "(%.1f t/s), record=%.2fs, total=%.2fs, avg=%.1f t/s.\n",
+                                           curLen, forwardSpend,
+                                           forwardSpend > 0 ? curLen / forwardSpend : 0,
+                                           recordSpend, chunkSpend, avgSpeed);
+                                    fflush(stdout);
+                                }
                                 // 每个 prefill block 结束后打一次按 op 汇总的
                                 // 分表 + CPU 分配探针。表是增量（打一次清一次），
                                 // 正好对应这一块 2048 个 token。用来判断慢在算子

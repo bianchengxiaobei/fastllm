@@ -1154,8 +1154,10 @@ namespace fastllm {
                     Qwen3CudaRMSNorm(runner, k, *kNormWeight, rmsNormEps, k);
                 }
                 if (useKvMem) {
-                    kvMemRawQ.CopyFrom(*q);
-                    kvMemRawK.CopyFrom(k);
+                    // Pre-RoPE Q/K feed the retrieval index. A tensor-parallel
+                    // tensor has no flat backing buffer, so mirror its shards.
+                    KvMemCopyDeviceData(*q, kvMemRawQ);
+                    KvMemCopyDeviceData(k, kvMemRawK);
                 }
                 qwen3cuda::Qwen3CudaRopeEncoding(runner, *q, *allPositionIds, rotaryDim, curRopeTheta, ropeScale, ropeConfig);
                 qwen3cuda::Qwen3CudaRopeEncoding(runner, k, *allPositionIds, rotaryDim, curRopeTheta, ropeScale, ropeConfig);
@@ -1502,6 +1504,24 @@ namespace fastllm {
         return GetQwen3GPUForwardDevices(this->deviceMap, devices, ratios);
 #else
         return false;
+#endif
+    }
+
+    void Qwen3Model::GetKvMemDevices(std::vector<int> &devices, std::map<int, int> &ratios) const {
+        devices.clear();
+        ratios.clear();
+#ifndef USE_CUDA
+        return;
+#else
+        if (GetKVCacheInCPU()) {
+            return;
+        }
+        // KVMem pages on exactly the devices the target attention is
+        // tensor-parallel over, with the same KV-head split ratios.
+        if (!GetQwen3GPUForwardDevices(this->deviceMap, devices, ratios)) {
+            devices.clear();
+            ratios.clear();
+        }
 #endif
     }
 
@@ -2680,7 +2700,8 @@ namespace fastllm {
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
-        PrepareKvMemCaches(batch, (int)devices.size(), pastKeyValues);
+        PrepareKvMemCaches(batch, (int)devices.size(), pastKeyValues,
+                           generationConfigs.empty() ? 0 : generationConfigs[0].kvMemPrefixTokens);
         bool tensorParallel = devices.size() > 1;
         bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
         const DataType computeType = ResolveQwen3ThreadTpComputeType(this->dataType);

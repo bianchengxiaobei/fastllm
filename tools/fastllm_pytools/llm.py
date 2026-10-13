@@ -497,8 +497,13 @@ fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctype
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
 
 fastllm_lib.set_kvmem_llm_model.argtypes = (
-    [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 6 + [ctypes.c_uint64, ctypes.c_int])
+    [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 7 +
+    [ctypes.c_uint64, ctypes.c_int, ctypes.c_float])
 fastllm_lib.set_kvmem_llm_model.restype = ctypes.c_char_p
+
+if hasattr(fastllm_lib, "set_kvmem_prefix_tokens_llm_model"):
+    fastllm_lib.set_kvmem_prefix_tokens_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+    fastllm_lib.set_kvmem_prefix_tokens_llm_model.restype = ctypes.c_bool
 
 fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int64]
 
@@ -1337,6 +1342,49 @@ def try_load_hf_tokenizer(path):
     ret = _attach_local_chat_template(ret, path)
     return ret
 
+def _decode_print_interval():
+    # 未设置或非法值 -> 不打印
+    value = os.environ.get("FASTLLM_PRINT_DECODE")
+    if value is None or value.strip() == "":
+        return 0
+    value = value.strip().lower()
+    if value in ("off", "false", "none", "no"):
+        return 0
+    try:
+        interval = int(value)
+    except ValueError:
+        return 0
+    return interval if interval > 0 else 0
+
+class DecodeTextPrinter:
+    # Decode 阶段把生成文本打到窗口, 粒度由 FASTLLM_PRINT_DECODE 控制:
+    #   未设置 / 0 / off / false / none -> 不打印 (默认)
+    #   1 -> 每个 token 打一次
+    #   N -> 每 N 个 token 打一次
+    def __init__ (self):
+        self.interval = _decode_print_interval()
+        self.pending_text = []
+        self.pending_tokens = 0
+
+    def feed (self, text, token_count = 1):
+        if (self.interval <= 0 or not text):
+            return
+        self.pending_text.append(text)
+        self.pending_tokens += max(1, token_count)
+        if (self.pending_tokens >= self.interval):
+            self.emit()
+
+    def flush (self):
+        if (self.interval > 0):
+            self.emit()
+
+    def emit (self):
+        if (self.pending_text):
+            sys.stdout.write("".join(self.pending_text))
+            sys.stdout.flush()
+        self.pending_text = []
+        self.pending_tokens = 0
+
 class model:
     def __init__ (self, path : str,
                   id : int = -99999,
@@ -1917,6 +1965,49 @@ class model:
             and callable(getattr(self.hf_tokenizer,
                                  "apply_chat_template", None))
         )
+
+    def _kvmem_apply_prefix_pin(self, conversation, prompt, render, tokenize, total,
+                                transform=None):
+        """Pin the leading system block for KVMem, unless it cannot be derived.
+
+        The block is measured as the token gap between the request prompt and the
+        same conversation rendered without its leading system messages and without
+        tools, so the tool schema that a chat template folds into the system block
+        is covered too. render(messages) and tokenize(text) reuse the path that
+        produced the prompt; the count is trusted only when the baseline still
+        renders and its tail is the prompt's tail. total() returns the prompt's
+        already-computed token count. A template that cannot render the baseline
+        (or that moves the system block) simply leaves the configured pin alone.
+        """
+        if not getattr(self, "kvmem_enabled", False):
+            return
+        if getattr(self, "kvmem_prefix_tokens", 0) != 0:
+            return
+        if not hasattr(fastllm_lib, "set_kvmem_prefix_tokens_llm_model"):
+            return
+        try:
+            if conversation is None or not len(conversation) or not prompt:
+                return
+            messages = transform(conversation) if transform is not None else conversation
+            start = 0
+            while start < len(messages) and messages[start].get("role") == "system":
+                start += 1
+            if start == 0 or start == len(messages):
+                return
+            baseline = render(messages[start:])
+            if not baseline:
+                return
+            if not prompt.endswith(baseline[-min(len(baseline), 64):]):
+                return
+            prompt_tokens = total()
+            tokens = prompt_tokens - len(tokenize(baseline))
+            if 0 < tokens < prompt_tokens:
+                if tokens != getattr(self, "kvmem_prefix_pin_reported", None):
+                    self.kvmem_prefix_pin_reported = tokens
+                    print("[Fastllm] KVMem prefix pin: %d tokens" % tokens, flush = True)
+                fastllm_lib.set_kvmem_prefix_tokens_llm_model(self.model, tokens)
+        except Exception as error:
+            logging.debug("KVMem prefix pin skipped: %s", error)
 
     def _build_messages(self, query: str, history: List[Tuple[str, str]]) -> List[Dict[str, str]]:
         messages = []
@@ -2911,8 +3002,23 @@ class model:
                         input = encode_hf_prompt(tokenizer, prompt)
                 #print("prompt", prompt[:100])
                 #print("input", input[:100])
+                if conversation:
+                    self._kvmem_apply_prefix_pin(
+                        conversation, prompt,
+                        lambda messages: apply_hf_chat_template(
+                            tokenizer, messages,
+                            add_generation_prompt = add_generation_prompt,
+                            tokenize = False,
+                            enable_thinking = enable_thinking,
+                            tools = None,
+                            thinking_alias = True,
+                            thinking_effort = thinking_effort,
+                            chat_template_kwargs = chat_template_kwargs),
+                        lambda text: encode_hf_prompt(tokenizer, text),
+                        lambda: len(input),
+                        transform = self.trans_conversation)
 
-            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                         max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
@@ -2935,6 +3041,13 @@ class model:
                     prompt = self.apply_chat_template(conversation)
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
+            self._kvmem_apply_prefix_pin(
+                conversation, prompt,
+                lambda messages: self._render_qwen35_text_prompt(
+                    messages, add_generation_prompt, enable_thinking)
+                if self._is_qwen35() else self.apply_chat_template(messages),
+                lambda text: self.tokenizer_cache.tokenize_with_cache(self, text),
+                lambda: len(self.tokenizer_cache.tokenize_with_cache(self, prompt)))
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             if (self.save_history):
                 input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
@@ -3049,6 +3162,16 @@ class model:
                 yield cur
 
     async def stream_response_handle_async(self, handle, response_statistics = None):
+        # 包一层, 生成结束时把不满一个打印间隔的残余文本也刷到窗口。
+        decode_printer = DecodeTextPrinter()
+        try:
+            async for text in self._stream_response_handle_async_impl(
+                    handle, response_statistics, decode_printer):
+                yield text
+        finally:
+            decode_printer.flush()
+
+    async def _stream_response_handle_async_impl(self, handle, response_statistics, decode_printer):
         import time
         is_prefill = True
         start_time = time.time()
@@ -3108,6 +3231,7 @@ class model:
                     tokens.append(token)
                     ret = tokenizer.decode(tokens)
                     if ret.encode().find(b'\xef\xbf\xbd') == -1:
+                        decoded_token_count = len(tokens)
                         if (self.save_history and
                                 handle in self.current_tokenizer_cache):
                             self.current_tokenizer_cache[handle][0].append(ret)
@@ -3115,12 +3239,15 @@ class model:
                                 [] + tokens)
                         tokens.clear()
                         ready_text += ret
+                        decode_printer.feed(ret, decoded_token_count)
                 yield ready_text
             if len(tokens) > 0:
                 if (self.save_history and handle in self.current_tokenizer_cache):
                     self.current_tokenizer_cache[handle][0].append(tokenizer.decode(tokens))
                     self.current_tokenizer_cache[handle][1].append([] + tokens)
-                yield tokenizer.decode(tokens)
+                tail_text = tokenizer.decode(tokens)
+                decode_printer.feed(tail_text, len(tokens))
+                yield tail_text
         else:
             res = ""
             ret = b''
@@ -3147,6 +3274,7 @@ class model:
                     if (self.save_history and
                             handle in self.current_tokenizer_cache):
                         pending_tokens.append(token)
+                batch_token_count = len(ready_tokens)
                 cur = ""
                 try:
                     cur = ret.decode()
@@ -3164,6 +3292,7 @@ class model:
                     self.current_tokenizer_cache[handle][0].append(cur)
                     self.current_tokenizer_cache[handle][1].append([] + pending_tokens)
                     pending_tokens.clear()
+                decode_printer.feed(cur, batch_token_count)
                 yield cur
                     
     async def stream_response_async(self,
@@ -3312,17 +3441,23 @@ class model:
         fastllm_lib.set_cuda_shared_expert(cuda_shared_expert)
 
     def set_kvmem(self, *, enabled=True, max_tokens=32768, resident_tokens=8192,
-                  sink_tokens=128, recent_tokens=2048, retrieval_tokens=4096,
-                  prefill_tokens=512, host_mib=8192, retrieval_interval=64):
-        """Opt into sparse, host-backed KV before warmup (single-GPU Qwen3/3.5).
+                  sink_tokens=128, prefix_tokens=0, recent_tokens=2048, retrieval_tokens=4096,
+                  prefill_tokens=512, host_mib=8192, retrieval_interval=64,
+                  retrieval_norm_power=0.0):
+        """Opt into sparse, host-backed KV before warmup (Qwen3/3.5, single GPU or tensor parallel).
 
-        This changes attention once the resident budget is exceeded. Prefix
-        caching and batching are disabled; Qwen3.5 also supports DFlash/MTP.
-        Token budgets except max_tokens must align to the configured KV page.
+        This changes attention once the resident budget is exceeded. History
+        caching and batching are disabled; Qwen3.5 also supports DFlash/MTP and
+        prefix reuse. Token budgets except max_tokens must align to the configured
+        KV page, and host_mib covers the whole request across every device.
+        prefix_tokens pins the leading tokens (a chat template's system block)
+        into every attention view; zero leaves the choice to the caller.
+        retrieval_norm_power interpolates the retrieval score between the raw dot
+        product (0) and cosine similarity (1) in [0, 1].
         retrieval_interval controls speculative score reuse in committed tokens;
         it need not be page aligned. Use 1 to refresh every verification round.
         """
-        values = (max_tokens, resident_tokens, sink_tokens, recent_tokens,
+        values = (max_tokens, resident_tokens, sink_tokens, prefix_tokens, recent_tokens,
                   retrieval_tokens, prefill_tokens)
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be bool")
@@ -3332,11 +3467,16 @@ class model:
             raise ValueError("host_mib must be a positive integer below 2**44")
         if type(retrieval_interval) is not int or not 1 <= retrieval_interval <= 2147483647:
             raise ValueError("retrieval_interval must be a positive 32-bit integer")
+        if not isinstance(retrieval_norm_power, (int, float)) or not 0.0 <= retrieval_norm_power <= 1.0:
+            raise ValueError("retrieval_norm_power must be within [0, 1]")
         error = fastllm_lib.set_kvmem_llm_model(
-            self.model, enabled, *values, host_mib << 20, retrieval_interval)
+            self.model, enabled, *values, host_mib << 20, retrieval_interval,
+            float(retrieval_norm_power))
         if error:
             raise ValueError(error.decode("utf-8", errors="replace"))
         self.kvmem_enabled = enabled
+        self.kvmem_prefix_tokens = prefix_tokens if enabled else 0
+        self.kvmem_prefix_pin_reported = None
         if enabled:
             self.save_history = False
 

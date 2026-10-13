@@ -2,6 +2,7 @@
 #include "kvmem.h"
 #include <algorithm>
 
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -32,6 +33,16 @@ int main() {
     for (int interval : {0, -1}) {
         auto other = config;
         other.retrievalInterval = interval;
+        Throws([&] { other.Validate(4); });
+    }
+    for (float power : {0.0f, 0.5f, 1.0f}) {
+        auto other = config;
+        other.retrievalNormPower = power;
+        other.Validate(4);
+    }
+    for (float power : {-0.1f, 1.1f, std::nanf("")}) {
+        auto other = config;
+        other.retrievalNormPower = power;
         Throws([&] { other.Validate(4); });
     }
     for (int seed = 0; seed < 20; ++seed) {
@@ -190,9 +201,64 @@ int main() {
         append(2);
         CHECK(pages.Slot(2) == slot && pages.Stats().restoredPages == before);
     }
+    // A pinned prefix stays in every attention view, is never evicted, and does
+    // not consume a retrieval slot even when it outranks every candidate.
+    {
+        auto pinned = config;
+        pinned.residentTokens = 32;
+        pinned.prefixTokens = 8;
+        KvMemPages pages(pinned, 4, 8);
+        std::vector<std::vector<uint8_t>> device(8, std::vector<uint8_t>(8));
+        auto backup = [&](const std::vector<KvMemPages::ReadPage> &batch) {
+            for (auto page : batch) std::memcpy(page.data, device[page.slot].data(), 8);
+        };
+        auto restore = [&](const std::vector<KvMemPages::WritePage> &batch) {
+            for (auto page : batch) std::memcpy(device[page.slot].data(), page.data, 8);
+        };
+        auto append = [&]() {
+            const int old = pages.Tokens();
+            std::vector<float> scores(40, 0);
+            scores[1] = 1000;
+            scores[5] = 100;
+            pages.Append(4, scores, backup, restore);
+            for (int t = old; t < old + 4; ++t)
+                device[pages.Slot(t / 4)][t % 4] = t + 1;
+            auto visible = pages.Visible();
+            CHECK(std::is_sorted(visible.begin(), visible.end()));
+            for (int p : {0, 1, 2})
+                if (p * 4 < old + 4)
+                    CHECK(std::find(visible.begin(), visible.end(), p) != visible.end());
+            if (old + 4 > pinned.residentTokens)
+                CHECK(std::find(visible.begin(), visible.end(), 5) != visible.end());
+            for (int p : visible) for (int t = p * 4; t < std::min(old + 4, p * 4 + 4); ++t)
+                CHECK(device[pages.Slot(p)][t % 4] == t + 1);
+        };
+        while (pages.Tokens() < 80) append();
+        CHECK(pages.Stats().evictedPages > 0);
+        CHECK(pages.Slot(0) >= 0 && pages.Slot(1) >= 0 && pages.Slot(2) >= 0);
+    }
+    // A request pin is rounded up to whole pages and capped at what the resident
+    // budget can hold; a non-positive request keeps the configured value.
+    {
+        auto pin = config;
+        pin.residentTokens = 32;
+        pin.prefixTokens = 8;
+        CHECK(KvMemClampPrefixTokens(pin, 4, 0) == 8);
+        CHECK(KvMemClampPrefixTokens(pin, 4, -5) == 8);
+        CHECK(KvMemClampPrefixTokens(pin, 4, 5) == 8);
+        CHECK(KvMemClampPrefixTokens(pin, 4, 12) == 12);
+        CHECK(KvMemClampPrefixTokens(pin, 4, 20) == 12);
+        auto tight = pin;
+        tight.residentTokens = 20;
+        CHECK(KvMemClampPrefixTokens(tight, 4, 8) == 0);
+    }
     auto invalid = config; invalid.hostBytes = 1;
     Throws([&] { KvMemPages pages(invalid, 4, 8); });
     invalid = config; invalid.residentTokens = 12;
+    Throws([&] { invalid.Validate(4); });
+    invalid = config; invalid.prefixTokens = 6;
+    Throws([&] { invalid.Validate(4); });
+    invalid = config; invalid.prefixTokens = 8;
     Throws([&] { invalid.Validate(4); });
     KvMemPages failed(config, 4, 8);
     auto read = [](const std::vector<KvMemPages::ReadPage>&) { throw std::runtime_error("transfer failed"); };

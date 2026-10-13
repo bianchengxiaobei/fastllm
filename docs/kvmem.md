@@ -1,8 +1,8 @@
 # KVMem（实验性，默认关闭）
 
-KVMem 用固定大小的 GPU KV 池和按需分配的主机备份保存长上下文。超过 GPU 常驻预算后，注意力只访问 sink、最近上下文和检索到的旧页。这会改变模型输出；KV 字节的无损换页不代表稀疏注意力与完整注意力等价。
+KVMem 用固定大小的 GPU KV 池和按需分配的主机备份保存长上下文。超过 GPU 常驻预算后，注意力只访问 sink、常驻前缀（`prefix_tokens`）、最近上下文和检索到的旧页。这会改变模型输出；KV 字节的无损换页不代表稀疏注意力与完整注意力等价。
 
-当前接入 Qwen3 和 Qwen3.5 的单卡 CUDA 普通解码，以及 Qwen3.5 的 DFlash/MTP 推测解码。支持 head_dim 为 128/256 的 FP16/BF16 MHA/GQA，计算与 KV 类型须一致。启用后目标模型使用单请求 eager 路径并关闭历史/prefix 缓存；尚不支持 TP、多模态、滑窗注意力或带位置偏置的目标注意力。未传入配置时，原有缓存、CUDA Graph、融合算子和推测解码路径保持原样。
+当前接入 Qwen3 和 Qwen3.5 的 CUDA 普通解码（单卡或张量并行的多卡），以及 Qwen3.5 的 DFlash/MTP 推测解码。支持 head_dim 为 128/256 的 FP16/BF16 MHA/GQA，计算与 KV 类型须一致。启用后目标模型使用单请求 eager 路径并关闭历史缓存；尚不支持多模态、滑窗注意力或带位置偏置的目标注意力。未传入配置时，原有缓存、CUDA Graph、融合算子和推测解码路径保持原样。
 
 ## 参考来源
 
@@ -15,13 +15,15 @@ KVMem 用固定大小的 GPU KV 池和按需分配的主机备份保存长上下
 ```python
 model.set_kvmem(
     max_tokens=32768,        # 逻辑上下文上限，不会扩展模型 RoPE 上限
-    resident_tokens=8192,   # 每个完整注意力层的 GPU KV 槽位数
+    resident_tokens=8192,   # 每个完整注意力层、每个设备的 GPU KV 槽位数
     sink_tokens=128,
+    prefix_tokens=0,        # 常驻保留序列开头的 token，用于 chat template 的 system 段
     recent_tokens=2048,
     retrieval_tokens=4096,
     prefill_tokens=512,
-    host_mib=8192,          # 整个请求所有完整注意力层的主机 KV 预算
+    host_mib=8192,          # 整个请求所有完整注意力层、所有设备的主机 KV 预算
     retrieval_interval=64,  # 推测验证的检索刷新间隔；1 表示逐轮刷新
+    retrieval_norm_power=0,  # 检索评分的归一化指数；0 点积、1 余弦
 )
 model.warmup()
 ```
@@ -47,11 +49,28 @@ Qwen3.5 推测解码沿用现有参数，将上述 `--speculative_algorithm off`
 
 `retrieval_interval` 默认为 64，控制 DFlash/MTP 目标验证的检索评分复用：已提交 token 位置跨过对应间隔时刷新。它是正整数，不要求按物理 KV 页对齐，也不改变常驻或检索页数。需要更短的复用间隔时可设为 32，需要逐轮刷新时设为 1；Python 和 CLI 共用此参数。例如在已有 `--kvmem` JSON 中加入 `"retrieval_interval":32`，或向 `model.set_kvmem` 传入 `retrieval_interval=32`。更长间隔减少检索和换页开销，但查询变化时可能继续使用旧评分并影响输出质量。普通解码仍按 KV 页边界刷新。
 
-除 `max_tokens` 外，token 预算必须按 KV 页长对齐（默认 128）。常驻预算至少覆盖 `sink + recent + retrieval + prefill + 一页`，最后一页用于未对齐边界。主机预算须能容纳逻辑上限下所有完整注意力层的 KV（向上取整到完整页）；内存只在冷页首次换出时实际分配。预算不足、模型不支持或配置组合不支持时会报错。
+`retrieval_norm_power` 默认为 0，取值 `[0, 1]`，在该区间内插值检索评分：分母用 `count · meanK^p · √dim`，其中 `meanK` 是该页每个 KV head 的 mean-K 范数。`p=0` 就是原始点积 `q · sumK / (count · √dim)`，key 范数大的页（模板、重复文本）天然占优；`p=1` 是纯余弦相似度 `q · meanK / (‖meanK‖ · √dim)`，只按方向对齐排序。范数为 0 的页得 0 分，不会因除零产生 NaN。它作用于每一次检索刷新，不是请求级参数，改动后需要重建才能生效。
 
-GPU KV 大小约为 `resident_tokens × 全注意力层数 × KV heads × head_dim × 4` 字节；此外还有 FP32 mean-K 索引、当前分块的 Q/K 临时张量、GDN 状态和模型工作区。`host_mib` 限制 KV 页备份，不包含模型其他 CPU 内存。`--kv_cache_limit` 与此模式不兼容；显式 `--chunked_prefill_size` 可设置默认 `prefill_tokens`，JSON 中的值优先。
+除 `max_tokens` 外，token 预算必须按 KV 页长对齐（默认 128）。常驻预算至少覆盖 `sink + prefix + recent + retrieval + prefill + 一页`，最后一页用于未对齐边界。主机预算须能容纳逻辑上限下所有完整注意力层的 KV（向上取整到完整页）；多卡时按各设备的 KV head 份额分摊到各设备，份额和为总额。内存只在冷页首次换出时实际分配。预算不足、模型不支持或配置组合不支持时会报错。
 
-冷页备份使用普通主机内存。CUDA 换页批量提交 K/V 拷贝，每批完成后统一同步，避免逐页显式同步；不增加额外的 pinned 中转副本。所有旧页备份完成后才复用槽位，恢复完成后才发布新页表。
+`prefix_tokens` 默认为 0 且必须按页对齐：大于 0 时，序列开头这些 token 所在的页始终留在注意力视图里，检索不会再为它们评分，也不会进入淘汰候选。它用于保证 chat template 的 system 段（agent 规则、工具定义）不会被稀疏选页丢掉——`sink_tokens` 默认只覆盖 128 个 token，远小于常见 system 段。代价是常驻预算要相应放大，且每轮前缀复用时这些页必然要从前缀快照恢复到 GPU。
+
+`prefix_tokens` 为 0 时，服务端会按 chat template 逐请求推导 system 段的 token 数：把「去掉开头 system 消息、且不带 `tools`」的同一对话渲染一遍作为基线，取「请求 prompt 的 token 数 − 基线 token 数」。这样模板折进 system 块的工具 schema 也被算进去，而 Qwen 系模板要求的"必须有 user query"也能满足——只渲染 system 消息会被模板直接拒绝。基线必须渲染成功，且其结尾必须仍是 prompt 的结尾（模板在有无 system 时改变了尾部结构就不可信），否则不 pin（0）。开头连续的多个 system 消息按整体处理。
+
+参数显式配置时以参数为准，不再推导。推导覆盖 HF chat template 路径和 Qwen3.5 的模板渲染路径；其他渲染路径（如 DeepSeek 的 Python 编码器、直接传 query 的请求）不 pin，退回 0。推导失败只记录 debug 日志，不影响请求。请求级 pin 按 `resident - (sink + recent + retrieval + prefill + 一页)` 夹取并向上取整到页长，被上限截短时打印一次告警；配置期校验仍然按 `prefix_tokens` 执行。推导出的值发生变化时打印一次 `[Fastllm] KVMem prefix pin: N tokens`，连续请求的值不变则不重复打印。
+
+## 张量并行
+
+KVMem 可以在张量并行的多卡上运行：每张卡持有自己那份 KV head 分片，各自维护独立的 GPU 页池和主机备份。启用方式与普通张量并行相同（`FASTLLM_TP`、`multicuda`，或逗号分隔的设备映射）。
+
+- **统一选页**：每层的各卡共用一份检索评分，由设备号最小的卡计算后广播，因此所有卡选出的逻辑页完全一致。注意力参数因此只生成一次并复制到各卡。评分取自一张卡的 KV head 分片，是对全部 head 的近似。
+- **预算**：`resident_tokens` 是每设备、每层的逻辑 token 预算，各卡常驻数量相同；`host_mib` 是请求级总额，按 KV head 份额分摊，所以单卡的校验结果与多卡一致。
+- **事务与快照**：推测验证的 `BeginTransaction` / `FinishTransaction` 与前缀快照都扇出到各设备，各卡提交或回滚同一长度；前缀快照按设备分别 dump 和下发。
+- **布局约束**：只支持按 KV head 切分的张量并行，仍为单请求、单进程。其它多卡布局（如按层切分）会被拒绝。各卡的 KV head 数取自前向自己的切分比例。
+
+GPU KV 大小（每张卡）约为 `resident_tokens × 全注意力层数 × KV heads × head_dim × 4` 字节；此外还有 FP32 mean-K 索引、当前分块的 Q/K 临时张量、GDN 状态和模型工作区。索引和评分缓冲按已提交的总页数懒分配并按几何增长，不预留 `max_tokens` 对应的全部行，因此短请求在长上下文配置下不会占用整个逻辑上下文的索引。`host_mib` 限制 KV 页备份，不包含模型其他 CPU 内存。`--kv_cache_limit` 与此模式不兼容；显式 `--chunked_prefill_size` 可设置默认 `prefill_tokens`，JSON 中的值优先。
+
+冷页备份使用普通主机内存。CUDA 换页批量提交 K/V 拷贝，每批完成后统一同步，避免逐页显式同步；备份与恢复都经过一块 grow-only 的 pinned 中转缓冲（pageable 的 D2H 只有几百 MB/s），相邻物理槽位合并成一次拷贝，中转内存不超过几 MB。所有旧页备份完成后才复用槽位，恢复完成后才发布新页表。
 
 物理驻留与注意力选页分开管理：本轮未选中的完整旧页可以留在空闲槽位中，只有新增页或检索缺页需要空间时，才从未选中的驻留页中按最近使用时间淘汰。缓存命中不会增加注意力可见页，也不改变选页顺序或检索评分；常驻上限和 GPU KV 池大小保持不变。`residentPages` 统计全部物理驻留页，可能大于当前注意力视图的页数。
 
@@ -78,15 +97,15 @@ Qwen3.5 目标也可与全部采用滑窗注意力、原生 default RoPE 的 DFl
 
 - `KvMemPages`（`include/kvmem.h`、`src/kvmem.cpp`）只负责逻辑页、槽位、选页、预算和主机备份。批量传输回调与 CUDA/模型解耦，回调须在返回前完成整批传输，包括异常路径。每个请求的每层单独拥有实例。
 - `KvMemAppend`（`src/devices/cuda/fastllm-kvmem.cu`）接收归一化的 RoPE 前 Q/K `[1,T,H,D]` 及 RoPE 后 K/V `[H,T,D]`，增量更新 FP32 key-sum 索引，再写入固定 GPU 池。输出 `Data.pageIndex` 是按逻辑顺序排列的借用视图，`Data.dims[1]` 保留完整逻辑长度。
-- 模型覆盖 `SupportsKvMem()` 和返回实际 KV 字节数的 `KvMemLayerBytesPerToken(layer)`，如有混合层则覆盖 `KvMemLayerEligible()`，模型特有约束可通过 `ValidateKvMemModel(config)` 校验本次候选配置，在单卡前向入口调用 `PrepareKvMemCaches()`。完整注意力层在 RoPE 之前保留 Q/K，RoPE 之后调用 `KvMemAppend()`，再使用现有 causal paged attention。位置编码仍使用绝对 token 位置。
-- 推测验证在每层 `KvMemCache` 上调用 `BeginTransaction(tokens)`，执行一次指定行数的前向，再调用 `FinishTransaction(acceptedTokens, keyCache, valueCache)`。参数是保留的输入前缀行数，包含验证首 token；传 0 表示完全回滚，也可在尚未执行 Append 时取消。禁止嵌套事务、多次 Append 和越界提交。模型还须恢复其他循环状态：Qwen3.5 验证使用独立 GDN 状态，提交相应前缀快照；无可用快照时回滚 KV，再重放已接受输入。
+- 模型覆盖 `SupportsKvMem()` 和返回实际 KV 字节数的 `KvMemLayerBytesPerToken(layer)`，如有混合层则覆盖 `KvMemLayerEligible()`，模型特有约束可通过 `ValidateKvMemModel(config)` 校验本次候选配置。张量并行模型还要覆盖 `GetKvMemDevices()`，返回前向实际切分到的设备及各设备的 KV head 比例；默认实现只解析单个 `cuda`/`cuda:N` 设备。在前向入口调用 `PrepareKvMemCaches()`。完整注意力层在 RoPE 之前保留 Q/K（分片张量经 `KvMemCopyDeviceData()` 逐设备复制），RoPE 之后调用 `KvMemAppend()`，再使用现有 causal paged attention。位置编码仍使用绝对 token 位置。
+- 推测验证在每层 `KvMemCache` 上调用 `BeginTransaction(tokens)`，执行一次指定行数的前向，再调用 `FinishTransaction(acceptedTokens, keyCache, valueCache)`。模型侧通过 `KvMemBeginTransaction()` / `KvMemFinishTransaction()` 调用，它们会扇出到该层的各个设备。参数是保留的输入前缀行数，包含验证首 token；传 0 表示完全回滚，也可在尚未执行 Append 时取消。禁止嵌套事务、多次 Append 和越界提交。模型还须恢复其他循环状态：Qwen3.5 验证使用独立 GDN 状态，提交相应前缀快照；无可用快照时回滚 KV，再重放已接受输入。
 - 调度器释放缓存时调用 `ReleaseKvMemCache()`，不能将借用的 `pageIndex` 返还给全局分页池。禁止隐式 `Data::CopyFrom` 克隆 KVMem 缓存。事务不提供任意历史快照或 prefix 共享；其他模型必须显式接入状态提交与异常清理。
 
 ## 检索与边界
 
-索引保存每个逻辑页、每个 KV head 的 FP32 key sum，查询时除以实际 token 数得到 mean-K。对每个 Q head 计算缩放点积，对所有已提交页做 softmax 后平均各 head 的概率。当前按层独立选页，与 NInfer 的跨层聚合策略不同。
+索引保存每个逻辑页、每个 KV head 的 FP32 key sum，查询时除以实际 token 数得到 mean-K。对每个 Q head 计算缩放点积（分母可选乘上 mean-K 范数的 `retrieval_norm_power` 次幂，见上），对所有已提交页做 softmax 后平均各 head 的概率。当前按层独立选页，与 NInfer 的跨层聚合策略不同；张量并行时同一层的各卡共用一份选页结果（见「张量并行」），不再按设备各选一次。
 
-分块 prefill 用首行 query 查询此前已提交的页，避免未来 token 影响之前行的选页；当前 query 所在的全部尾页始终保留，因此压缩页表后的 causal mask 与绝对时间顺序一致。每个 prefill 分块、分块后的首个单 token，以及 decode 的页边界会刷新检索。最后一个 prompt token 独立执行，使用最后的提示 query 刷新检索再采样。
+分块 prefill 用首行 query 查询此前已提交的页，避免未来 token 影响之前行的选页；当前 query 所在的全部尾页始终保留，因此压缩页表后的 causal mask 与绝对时间顺序一致。常驻前缀页同样始终保留，且不参与检索评分与淘汰候选，所以它不占用 `retrieval_tokens` 的名额。每个 prefill 分块、分块后的首个单 token，以及 decode 的页边界会刷新检索。最后一个 prompt token 独立执行，使用最后的提示 query 刷新检索再采样。
 
 完整冷页首次换出后保持不可变，重复换出复用主机副本。正在写入的半页和整个验证尾部不会被换出；传输完成后才复用槽位和发布新页表。验证只查询此前已提交的索引，新 raw K 暂存至提交时，仅将接受前缀加入 key sum。拒绝尾部的物理页与逻辑长度同步裁剪，后续追加覆盖半页里的无效尾部；拒绝 token 不进入主机备份或索引。
 
@@ -94,4 +113,4 @@ Qwen3.5 目标也可与全部采用滑窗注意力、原生 default RoPE 的 DFl
 
 ## 验证入口
 
-`kvmem_pages_test` 覆盖换页、预算、刷新间隔配置校验、因果边界、事务与失败状态；`cuda_kvmem_test` 覆盖 FP16/BF16、MHA/GQA、不同 head_dim、检索恢复、大批量换页、稀疏注意力的 CPU 数值参考，以及拒绝/部分接受/全部接受后的 KV 和检索索引一致性、共享缓存释放及模型配置失败的状态保留。检索测试包含默认 64、显式 32 和逐轮刷新，验证区间内复用、跨界刷新、取消重试及普通/推测模式切换。两者都接入 CTest。CUDA 测试需要可用 GPU。
+`kvmem_pages_test` 覆盖换页、预算、刷新间隔与 `prefix_tokens`、`retrieval_norm_power` 配置校验、请求级 pin 的取整与夹取、常驻前缀的选页与不淘汰、因果边界、事务与失败状态；`cuda_kvmem_test` 覆盖 FP16/BF16、MHA/GQA、不同 head_dim、检索恢复、大批量换页、稀疏注意力的 CPU 数值参考、`retrieval_norm_power` 在点积与余弦下选中不同页，以及拒绝/部分接受/全部接受后的 KV 和检索索引一致性、共享缓存释放及模型配置失败的状态保留。检索测试包含默认 64、显式 32 和逐轮刷新，验证区间内复用、跨界刷新、取消重试及普通/推测模式切换。两者都接入 CTest。CUDA 测试需要可用 GPU。张量并行路径没有独立用例，需在多卡机器上实测。

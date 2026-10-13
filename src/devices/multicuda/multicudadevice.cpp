@@ -3496,6 +3496,45 @@ namespace fastllm {
             }
         }
 
+        if (kCaches.kvMemConfig || vCaches.kvMemConfig) {
+            // KVMem keeps each device's pages in its own request-owned pool and
+            // every device selects the same logical pages, so the page metadata is
+            // replicated (above) while the pools stay per-device. There is no root
+            // pool to page on, so skip the root-manager setup entirely.
+            for (int device : devices) {
+                Data *localQ = q.multiDeviceDatas.find(device) == q.multiDeviceDatas.end()
+                    ? nullptr : q.multiDeviceDatas[device];
+                auto kIt = kCaches.multiDeviceDatas.find(device);
+                auto vIt = vCaches.multiDeviceDatas.find(device);
+                AssertInFastLLM(localQ != nullptr &&
+                                kIt != kCaches.multiDeviceDatas.end() && kIt->second != nullptr &&
+                                vIt != vCaches.multiDeviceDatas.end() && vIt->second != nullptr &&
+                                kIt->second->pagedKVCacheData != nullptr &&
+                                vIt->second->pagedKVCacheData != nullptr,
+                                "MultiCudaAttentionPagedBatchOp: KVMem needs per-device paged state.\n");
+                Data *localKCache = kIt->second;
+                Data *localVCache = vIt->second;
+                FastllmCudaSetDevice(device);
+                output.multiDeviceDatas[device]->Allocate();
+                int localGroup = group;
+                if (!localKCache->dims.empty() && localKCache->dims[0] > 0) {
+                    localGroup = std::max(1, localQ->dims[0] / localKCache->dims[0]);
+                }
+                FastllmCudaHalfPagedAttentionBatch(
+                    *localQ, *localKCache, *localVCache,
+                    *qSizes.multiDeviceDatas[device], *pageSizes.multiDeviceDatas[device],
+                    *pageIndexs.multiDeviceDatas[device], *lastPageLens.multiDeviceDatas[device],
+                    *output.multiDeviceDatas[device],
+                    localGroup,
+                    scale, attentionType, inited, false, enableCudaGraph, flashInferCudaGraph
+                );
+            }
+            if (sync) {
+                SyncCudaAndCheckAll(devices, "MultiCudaAttentionPagedBatchOp");
+            }
+            return;
+        }
+
         if (!kCaches.multiDeviceData) {
             kCaches.multiDeviceData = true;
             kCaches.tpLayout = TP_LAYOUT_SHARDED;

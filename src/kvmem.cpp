@@ -12,19 +12,32 @@ namespace fastllm {
         if (retrievalInterval <= 0) {
             throw std::invalid_argument("KVMem: retrieval interval must be positive");
         }
+        if (!(retrievalNormPower >= 0.0f) || retrievalNormPower > 1.0f) {
+            throw std::invalid_argument("KVMem: retrieval norm power must be in [0, 1]");
+        }
         if (pageLen <= 0 || maxTokens < 2 || residentTokens <= 0 ||
-            sinkTokens < 0 || recentTokens < pageLen || retrievalTokens < 0 ||
+            sinkTokens < 0 || prefixTokens < 0 || recentTokens < pageLen || retrievalTokens < 0 ||
             prefillTokens <= 0 || hostBytes == 0 || maxTokens > std::numeric_limits<int>::max() - pageLen) {
             throw std::invalid_argument("KVMem: invalid cache budgets");
         }
-        for (int value : {residentTokens, sinkTokens, recentTokens, retrievalTokens, prefillTokens}) {
+        for (int value : {residentTokens, sinkTokens, prefixTokens, recentTokens, retrievalTokens, prefillTokens}) {
             if (value % pageLen != 0) {
                 throw std::invalid_argument("KVMem: token budgets must be multiples of the KV page size");
             }
         }
-        if ((int64_t)sinkTokens + recentTokens + retrievalTokens + prefillTokens + pageLen > residentTokens) {
-            throw std::invalid_argument("KVMem: resident budget must cover sink + recent + retrieval + prefill + one boundary page");
+        if ((int64_t)sinkTokens + prefixTokens + recentTokens + retrievalTokens + prefillTokens + pageLen > residentTokens) {
+            throw std::invalid_argument("KVMem: resident budget must cover sink + prefix + recent + retrieval + prefill + one boundary page");
         }
+    }
+
+    int KvMemClampPrefixTokens(const KvMemConfig &config, int pageLen, int requested) {
+        if (pageLen <= 0) return 0;
+        const int64_t cap = (int64_t)config.residentTokens -
+                ((int64_t)config.sinkTokens + config.recentTokens + config.retrievalTokens +
+                 config.prefillTokens + pageLen);
+        if (cap < 0) return 0;
+        const int64_t wanted = std::min<int64_t>(requested > 0 ? requested : config.prefixTokens, cap);
+        return (int)(std::min<int64_t>((wanted + pageLen - 1) / pageLen * pageLen, cap));
     }
 
     KvMemPages::KvMemPages(const KvMemConfig &config, int pageLen, size_t pageBytes)
@@ -96,7 +109,7 @@ namespace fastllm {
         if (pages <= capacity) {
             for (int p = 0; p < pages; ++p) keep.insert(p);
         } else {
-            for (int p = 0; p < std::min(pages, config.sinkTokens / pageLen); ++p) keep.insert(p);
+            for (int p = 0; p < std::min(pages, (config.sinkTokens + config.prefixTokens) / pageLen); ++p) keep.insert(p);
             // Use the start of the query, not its end: all rows keep their
             // preceding recent history, even when a prefill straddles pages.
             int first = std::max(0, oldTokens - config.recentTokens) / pageLen;
@@ -133,10 +146,10 @@ namespace fastllm {
 
         // Allocate all required backing pages before changing device residency.
         // A partial page is always in the query's recent/writable tail.
-        std::vector<std::pair<int, std::vector<uint8_t>>> backups;
+        std::vector<std::pair<int, KvMemBytes>> backups;
         for (int p : victims) {
             if ((int64_t)(p + 1) * pageLen > oldTokens) throw std::logic_error("KVMem: attempted partial-page eviction");
-            if (!host[p]) backups.emplace_back(p, std::vector<uint8_t>(pageBytes));
+            if (!host[p]) backups.emplace_back(p, KvMemBytes(pageBytes));
         }
         if (backups.size() > (config.hostBytes - stats.hostBytes) / pageBytes) {
             throw std::runtime_error("KVMem: host budget exhausted");
@@ -147,7 +160,7 @@ namespace fastllm {
             for (auto &item : backups) reads.push_back({slots[item.first], item.second.data()});
             if (!reads.empty()) read(reads);
             for (auto &item : backups) {
-                host[item.first] = std::make_shared<const std::vector<uint8_t>>(std::move(item.second));
+                host[item.first] = std::make_shared<const KvMemBytes>(std::move(item.second));
                 stats.hostBytes += pageBytes;
             }
             std::vector<bool> used(capacity, false);
@@ -185,7 +198,7 @@ namespace fastllm {
     }
 
     bool KvMemPages::Seed(
-            const std::vector<std::shared_ptr<const std::vector<uint8_t>>> &hostPages,
+            const std::vector<KvMemSharedBytes> &hostPages,
             int tokens) {
         if (failed) return false;
         if (InTransaction() || tokens <= 0 || tokens > config.maxTokens) {
@@ -218,13 +231,13 @@ namespace fastllm {
     }
 
     namespace {
-        const std::shared_ptr<const std::vector<uint8_t>> &EmptyHostPage() {
-            static const std::shared_ptr<const std::vector<uint8_t>> empty;
+        const KvMemSharedBytes &EmptyHostPage() {
+            static const KvMemSharedBytes empty;
             return empty;
         }
     }
 
-    const std::shared_ptr<const std::vector<uint8_t>> &KvMemPages::ColdPage(int logicalPage) const {
+    const KvMemSharedBytes &KvMemPages::ColdPage(int logicalPage) const {
         if (logicalPage < 0 || logicalPage >= (int)slots.size()) return EmptyHostPage();
         // A GPU-resident page has no cold backup here; the caller must read it
         // back from the device via PageSlot().

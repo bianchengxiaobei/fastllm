@@ -293,6 +293,11 @@ extern "C" {
         return svalue;
     }
 
+    // Request-scoped KVMem prefix pin. Staged by the caller and consumed by the
+    // launch wrapper that builds that request's GenerationConfig, so a pin never
+    // leaks into the next request.
+    static thread_local int pendingKvMemPrefixTokens = 0;
+
     DLL_EXPORT fastllm::GenerationConfig make_config(int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                           float temperature, float repeat_penalty, bool output_logits, bool add_special_tokens) {
         fastllm::GenerationConfig config;
@@ -307,6 +312,8 @@ extern "C" {
         }
         config.output_logits = output_logits;
         config.add_special_tokens = add_special_tokens;
+        config.kvMemPrefixTokens = pendingKvMemPrefixTokens;
+        pendingKvMemPrefixTokens = 0;
         return config;
     }
 
@@ -1224,8 +1231,9 @@ extern "C" {
     }
 
     DLL_EXPORT const char *set_kvmem_llm_model(int modelId, bool enabled, int maxTokens,
-            int residentTokens, int sinkTokens, int recentTokens, int retrievalTokens,
-            int prefillTokens, unsigned long long hostBytes, int retrievalInterval) {
+            int residentTokens, int sinkTokens, int prefixTokens, int recentTokens, int retrievalTokens,
+            int prefillTokens, unsigned long long hostBytes, int retrievalInterval,
+            float retrievalNormPower) {
         fastllmPytoolsContextResult.clear();
         try {
             fastllm::KvMemConfig config;
@@ -1233,16 +1241,30 @@ extern "C" {
             config.maxTokens = maxTokens;
             config.residentTokens = residentTokens;
             config.sinkTokens = sinkTokens;
+            config.prefixTokens = prefixTokens;
             config.recentTokens = recentTokens;
             config.retrievalTokens = retrievalTokens;
             config.prefillTokens = prefillTokens;
             config.retrievalInterval = retrievalInterval;
+            config.retrievalNormPower = retrievalNormPower;
             config.hostBytes = hostBytes;
             models.GetModel(modelId)->ConfigureKvMem(config);
         } catch (const std::exception &error) {
             fastllmPytoolsContextResult = error.what();
         }
         return fastllmPytoolsContextResult.c_str();
+    }
+
+    DLL_EXPORT bool set_kvmem_prefix_tokens_llm_model(int modelId, int tokens) {
+        models.locker.lock();
+        auto it = models.models.find(modelId);
+        bool modelExists = it != models.models.end() && it->second != nullptr;
+        models.locker.unlock();
+        if (!modelExists) {
+            return false;
+        }
+        pendingKvMemPrefixTokens = tokens > 0 ? tokens : 0;
+        return true;
     }
 
     DLL_EXPORT void set_kv_cache_limit_llm_model(int modelId, long long bytes) {

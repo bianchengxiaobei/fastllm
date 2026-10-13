@@ -5827,19 +5827,35 @@ ops += (long long)lines * inputDim * interDim * 2;
             int m = weightsBatch / 2 - 1; // num experts
 
             if (input.dims[0] == 1) {
+                // 这条通用分支以前没有探针, 而它正是 float16 输入的 MoE 唯一落点,
+                // 所以按 逐专家 gateup / swiglu / down / add 四个桶计时.
+                double normalGateMs = 0.0, normalSwigluMs = 0.0, normalDownMs = 0.0, normalAddMs = 0.0;
+                double normalSharedMs = 0.0, normalLast = CpuProfileNowMs();
+                auto normalLap = [&](double &bucket) {
+                    if (!profileDetail) {
+                        return;
+                    }
+                    double now = CpuProfileNowMs();
+                    bucket += now - normalLast;
+                    normalLast = now;
+                };
                 output.Allocate(0.0f);
                 for (int j = 0; j < topk; j++) {
                     int expertIdx = normalizeExpertIdx(indexData[j]);
                     float value = scoreData[j];
 
                     Linear(input, *weights[(expertIdx + 1) * 2], Data(), w3);
+                    normalLap(normalGateMs);
                     if (useGeglu) {
                         Geglu(w3, w1);
                     } else {
                         Swiglu(w3, w1);
                     }
+                    normalLap(normalSwigluMs);
                     Linear(w1, *weights[(expertIdx + 1) * 2 + 1], Data(), w2);
+                    normalLap(normalDownMs);
                     AddTo(output, w2, value);
+                    normalLap(normalAddMs);
                 }
 
                 if (weights[0] != nullptr) {
@@ -5851,6 +5867,16 @@ ops += (long long)lines * inputDim * interDim * 2;
                     }
                     Linear(w1, *weights[1], Data(), w2);
                     AddTo(output, w2, sharedScale);
+                    normalLap(normalSharedMs);
+                }
+                if (profileDetail) {
+                    printf("[fastllm-profile-cpu-moe] generic_bs1 input=%s weight=%s topk=%d experts=%d "
+                           "gateup=%.3f swiglu=%.3f down=%.3f add=%.3f shared=%.3f total=%.3f\n",
+                           GetDataTypeName(input.dataType).c_str(),
+                           GetDataTypeName(weights[2]->dataType).c_str(), topk, m,
+                           normalGateMs, normalSwigluMs, normalDownMs, normalAddMs, normalSharedMs,
+                           normalGateMs + normalSwigluMs + normalDownMs + normalAddMs + normalSharedMs);
+                    fflush(stdout);
                 }
             } else {
                 int bs = input.dims[0], dim = output.dims[1];
