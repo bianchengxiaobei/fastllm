@@ -63,6 +63,9 @@ namespace py = pybind11;
 #include "gguf.h"
 
 namespace fastllm {
+#ifdef USE_NUMAS
+    void ReleaseNumasMoeWeightArena(Data *weight);
+#endif
     extern BF16ToFP32Manager bf16tofp32;
 
     namespace {
@@ -2787,6 +2790,9 @@ namespace fastllm {
                 }
             }
         }
+#endif
+#ifdef USE_NUMAS
+        ReleaseNumasMoeWeightArena(this);
 #endif
     }
 
