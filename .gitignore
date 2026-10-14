@@ -68,3 +68,6 @@ CLAUDE.md
 /*.sln
 /*.vcxproj
 /*.vcxproj.filters
+
+# MSVC 适配前的原始文件备份（个人环境，不入库）
+*.bak-mswin
