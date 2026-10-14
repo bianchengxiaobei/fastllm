@@ -5221,7 +5221,7 @@ bool FastllmCudaQwen4SparseDecode(const fastllm::Data &query, const fastllm::Dat
 #else
     using namespace fastllm;
     if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
-        indices.dataType != INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
+        indices.dataType != fastllm::DataType::INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
         value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 || groups > 32 ||
         int64_t(query.dims[0]) != int64_t(key.dims[0]) * groups || query.dims[1] != 1 ||
         indices.dims[0] != 1 || query.dims[2] != key.dims[2] || query.dims[2] <= 0 ||
