@@ -231,10 +231,11 @@ set(FASTLLM_LARGE_MODEL_SOURCES src/models/qwen3_5.cpp)
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
-        src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/deepseekv41.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp
+        src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
+        src/models/deepseekv41.cpp src/models/deepseekv41_execution.cpp src/models/deepseekv41_gpu.cpp src/models/deepseekv41_hybrid.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/qwen4_exp_gpu.cpp src/models/qwen4_exp_hybrid.cpp src/utils/hybrid_moe.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
-        src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/gpt_oss.cpp
+        src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
         third_party/json11/json11.cpp
         third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp
@@ -301,15 +302,34 @@ if (USE_CUDA)
         message(STATUS "CUDA20 is unavailable for this CMake/NVCC combination, falling back to CUDA17")
     endif()
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # NVCC 13.0 ICEs in std::_Destroy for this unit's C++20 host containers.
+    # It requires only C++17; retain C++20 for the other CUDA/DeepGEMM units.
+    if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0 AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+        set_source_files_properties(
+            src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
+            PROPERTIES COMPILE_OPTIONS "-std=c++17")
+    endif()
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
     # TurboMind s884 内核（third_party/turbomind）依赖这些 nvcc 特性。
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
     if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
-        # The default fatbinary heuristic leaves many smaller cubins uncompressed.
-        # Compress every image so splitting CUDA units does not inflate the library;
-        # both native machine code and PTX remain available.
-        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
+        # Preserve legacy compression for normal builds; wheel releases opt in
+        # to CUDA 12.4+ compression. All cubins and PTX are retained.
+        set(FASTLLM_CUDA_COMPRESSION "legacy" CACHE STRING "CUDA fatbinary compression mode")
+        set_property(CACHE FASTLLM_CUDA_COMPRESSION PROPERTY STRINGS legacy size speed balance default none)
+        if (FASTLLM_CUDA_COMPRESSION STREQUAL "legacy")
+            add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
+        elseif (FASTLLM_CUDA_COMPRESSION MATCHES "^(size|speed|balance|default|none)$")
+            if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+                message(FATAL_ERROR "FASTLLM_CUDA_COMPRESSION requires CUDA 12.8+; use legacy with older compilers")
+            endif()
+            add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=${FASTLLM_CUDA_COMPRESSION}>)
+        else()
+            message(FATAL_ERROR "Unknown FASTLLM_CUDA_COMPRESSION: ${FASTLLM_CUDA_COMPRESSION}")
+        endif()
     endif()
     set(FASTLLM_CUDA_ARCHITECTURES ${CUDA_ARCH})
     if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
@@ -981,6 +1001,10 @@ if (UNIT_TEST)
             set_tests_properties(cpu_gguf_moe_decode PROPERTIES LABELS "cpu;gguf;moe;numa")
         endif()
     endif()
+
+    add_executable(execution_mode_test test/basic/test_execution_mode.cpp)
+    target_include_directories(execution_mode_test PRIVATE include)
+    fastllm_add_checked_test(execution_mode execution_mode_test "ALL_PASS" 60)
 
     add_executable(moe_decode_policy_test test/basic/test_moe_decode_policy.cpp)
     target_include_directories(moe_decode_policy_test PRIVATE include)
