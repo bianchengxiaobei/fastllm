@@ -46,8 +46,10 @@ rem --- MSVC toolchain: VS Build Tools is enough, no IDE needed ---
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VCPATH="
 if exist "%VSWHERE%" for /f "usebackq delims=" %%A in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VCPATH=%%A"
+rem quote every path echoed from inside an if ( ) body: a ) inside the path (e.g. "Program Files (x86)")
+rem closes the block while cmd is still reading it and the script dies with "was unexpected at this time"
 if defined VCPATH (
-    echo [setup] ok: MSVC toolchain at %VCPATH%
+    echo [setup] ok: MSVC toolchain at "%VCPATH%"
 ) else (
     set "MISSING=%MISSING% vs-buildtools"
     if not defined CHECK_ONLY (
@@ -86,7 +88,7 @@ rem --- CUDA toolkit: a pinned version must exist as-is; otherwise honour CUDA_P
 set "CUDAROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v%FTLLM_CUDA_VERSION%"
 if not exist "%CUDAROOT%\bin\nvcc.exe" if not defined CUDAVER_EXPLICIT if defined CUDA_PATH set "CUDAROOT=%CUDA_PATH%"
 if exist "%CUDAROOT%\bin\nvcc.exe" (
-    echo [setup] ok: CUDA toolkit at %CUDAROOT%
+    echo [setup] ok: CUDA toolkit at "%CUDAROOT%"
 ) else (
     set "MISSING=%MISSING% cuda"
     if not defined CHECK_ONLY (
