@@ -35,11 +35,20 @@ if not defined CUDA_PATH (
 )
 
 rem Ninja 构建必须自己先进入 MSVC x64 环境
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not defined NCCL_VCVARS (
-    for /f "usebackq tokens=*" %%A in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "NCCL_VCVARS=%%A\VC\Auxiliary\Build\vcvarsall.bat"
+    rem 必须带上 VC.Tools 要求: 只按 -latest 挑会命中装了 VS 但没装 C++ 工作负载的那个实例
+    for /f "usebackq delims=" %%A in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Auxiliary\Build\vcvarsall.bat`) do set "NCCL_VCVARS=%%A"
 )
 if not exist "%NCCL_VCVARS%" (
     echo [nccl] cannot find vcvarsall.bat, set NCCL_VCVARS manually
+    echo [nccl] vswhere="%VSWHERE%"
+    echo [nccl] tried "%NCCL_VCVARS%"
+    if exist "%VSWHERE%" (
+        echo [nccl] VS instances that vswhere sees:
+        "%VSWHERE%" -products * -property installationPath
+    )
+    echo [nccl] fix: run scripts\windows\setup_build_env.bat to install the C++ workload
     exit /b 1
 )
 call "%NCCL_VCVARS%" x64 > nul
