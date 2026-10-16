@@ -51,7 +51,7 @@ Qwen3.5 推测解码沿用现有参数，将上述 `--speculative_algorithm off`
 
 `retrieval_norm_power` 默认为 0，取值 `[0, 1]`，在该区间内插值检索评分：分母用 `count · meanK^p · √dim`，其中 `meanK` 是该页每个 KV head 的 mean-K 范数。`p=0` 就是原始点积 `q · sumK / (count · √dim)`，key 范数大的页（模板、重复文本）天然占优；`p=1` 是纯余弦相似度 `q · meanK / (‖meanK‖ · √dim)`，只按方向对齐排序。范数为 0 的页得 0 分，不会因除零产生 NaN。它作用于每一次检索刷新，不是请求级参数，改动后需要重建才能生效。
 
-除 `max_tokens` 外，token 预算必须按 KV 页长对齐（默认 128）。常驻预算至少覆盖 `sink + prefix + recent + retrieval + prefill + 一页`，最后一页用于未对齐边界。主机预算须能容纳逻辑上限下所有完整注意力层的 KV（向上取整到完整页）；多卡时按各设备的 KV head 份额分摊到各设备，份额和为总额。内存只在冷页首次换出时实际分配。预算不足、模型不支持或配置组合不支持时会报错。
+除 `max_tokens` 外，token 预算必须按 KV 页长对齐（默认 128）。常驻预算至少覆盖 `sink + prefix + recent + retrieval + prefill + 一页`，最后一页用于未对齐边界。主机预算须能容纳逻辑上限下所有完整注意力层的 KV（向上取整到完整页）；多卡时按各设备的 KV head 份额分摊到各设备，份额和为总额。内存只在冷页首次换出时实际分配。预算不足、模型不支持或配置组合不支持时会报错。逐参数的取值方法、对齐换算、显存与主机内存核算见 [KVMem 参数填写手册](kvmem_params_manual.md)。
 
 `prefix_tokens` 默认为 0 且必须按页对齐：大于 0 时，序列开头这些 token 所在的页始终留在注意力视图里，检索不会再为它们评分，也不会进入淘汰候选。它用于保证 chat template 的 system 段（agent 规则、工具定义）不会被稀疏选页丢掉——`sink_tokens` 默认只覆盖 128 个 token，远小于常见 system 段。代价是常驻预算要相应放大，且每轮前缀复用时这些页必然要从前缀快照恢复到 GPU。
 
