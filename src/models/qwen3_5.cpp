@@ -28,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <unordered_set>
 
@@ -10886,7 +10887,21 @@ namespace fastllm {
         // record keeps one unaligned snapshot for growing chats. Their KV dumps
         // share pages, so the extra lengths cost little.
         int interval = Qwen35LinearPrefixSnapshotIntervalTokens();
-        if (!kvMemMode && snapshotCount > 0 && currentLen % interval != 0) {
+        if (kvMemMode) {
+            // 但"每过一个 chunk 落一份"太密: 一个 100K 的 prompt 落 25 份, 两三个请求就
+            // 把每请求/记录数上限占满, 把上一轮的 turn 边界(下一轮 prompt 的前缀)挤出去,
+            // 下一轮只能从头 prefill. KVMem 的长度本来就不需要对页对齐, 所以中途长度按
+            // 更粗的间隔落, 只留够用的阶梯; 而"整段上下文已经喂完"的那次
+            // (currentLen == allTokens.size(), prefill 结束/生成结束)一定留 —— 它正好
+            // 是下一轮 prompt 的前缀.
+            const int kvMemInterval = pageLen * std::max(
+                1, Qwen35EnvInt("FASTLLM_KVMEM_PREFIX_SNAPSHOT_INTERVAL_PAGES", 256));
+            if (snapshotCount > 0 &&
+                currentLen != (int)context->allTokens.size() &&
+                currentLen - lastSnapshotLen < kvMemInterval) {
+                return false;
+            }
+        } else if (snapshotCount > 0 && currentLen % interval != 0) {
             return false;
         }
         int requestId = context->intParams["qwen35_linear_prefix_request_id"];
@@ -11018,19 +11033,115 @@ namespace fastllm {
                 }
             }
             snapshot->requestId = requestId;
-            snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
-            if (kvMemMode) {
-                // Share pages with the longest previous dump of this request
-                // that is still in the list, so a multi-length snapshot set
-                // costs about one full copy of KV rather than one per length.
-                // Reuse pages from the longest existing dump whose tokens are a
-                // prefix of this one. Committed KV only depends on the token
-                // prefix, so the match may come from an earlier request (for
-                // example the snapshot this request itself restored from).
-                // Sharing across requests is what keeps the host footprint at
-                // roughly one copy of the union of prefixes.
-                const Qwen35LinearPrefixSnapshot *prev = nullptr;
-                for (auto &item : items) {
+        snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
+        // 淘汰归因: 默认每个被淘汰的 dump 打一行(回答"某个长度是被淘汰了还是本来
+        // 就没有"); 设 FASTLLM_PREFIX_CACHE_EVICT_LOG=0 可以关掉.
+        static const bool prefixEvictLog = []() {
+            const char *env = std::getenv("FASTLLM_PREFIX_CACHE_EVICT_LOG");
+            return !(env != nullptr && env[0] == '0');
+        }();
+        auto logEvict = [&items](const char *rule, long long len, const char *extra) {
+            printf("[Qwen3.5 KVMem] snapshot evict: rule=%s len=%lld remaining=%d%s\n",
+                   rule, len, (int)items.size(), extra);
+            fflush(stdout);
+        };
+        // KVMem 前缀快照的宿主内存预算, 以及"页归属"口径. 落盘前的判定和落盘后的兜底
+        // 淘汰共用这一份, 免得两处口径不一致.
+        uint64_t prefixSnapshotBudget = (uint64_t)Qwen35EnvInt(
+            "FASTLLM_KVMEM_PREFIX_HOST_MIB", 8192) << 20;
+        std::vector<std::vector<std::pair<const void *, uint64_t> > > itemPages;
+        auto collectSnapshotPages = [&]() {
+            itemPages.assign(items.size(),
+                             std::vector<std::pair<const void *, uint64_t> >());
+            for (size_t idx = 0; idx < items.size(); idx++) {
+                if (items[idx] == nullptr) {
+                    continue;
+                }
+                std::vector<std::pair<const void *, uint64_t> > &pages = itemPages[idx];
+                for (const auto &layer : items[idx]->layers) {
+                    for (const auto &deviceDump : layer.kvMem) {
+                        const KvMemPrefixData &dump = *deviceDump.second;
+                        for (const KvMemPrefixSums &slice : dump.sums) {
+                            if (slice.data) {
+                                pages.emplace_back(slice.data.get(),
+                                                   (uint64_t)slice.data->size());
+                            }
+                        }
+                        for (const auto &page : dump.hostPages) {
+                            if (page) {
+                                pages.emplace_back(page.get(), (uint64_t)page->size());
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        auto totalSnapshotBytes = [&]() {
+            std::unordered_set<const void *> pages;
+            uint64_t bytes = 0;
+            for (auto &list : itemPages) {
+                for (auto &page : list) {
+                    if (pages.insert(page.first).second) {
+                        bytes += page.second;
+                    }
+                }
+            }
+            return bytes;
+        };
+        // 只挑"删了确实能释放字节"的那份. 一份 dump 若是另一份的前缀, 它的页全被别人
+        // 引用, 删掉几乎不释放字节, 却会丢掉一个可复用长度, 还会让之后同一段前缀的 dump
+        // 退化成整份全拷贝 —— 越删越容易超预算. 所以挑独占字节最多的那份, 并列时挑更旧
+        // 的(下标小). protectLast 用来护住刚记录/即将记录的那份: 它花过 0.1~0.8s 落盘.
+        auto selectByteVictim = [&](int protectIdx, bool protectLast) -> int {
+            struct KvMemPageRef {
+                int count = 0;
+                int lastItem = -1;
+            };
+            std::unordered_map<const void *, KvMemPageRef> pageRef;
+            for (size_t idx = 0; idx < itemPages.size(); idx++) {
+                for (auto &page : itemPages[idx]) {
+                    KvMemPageRef &ref = pageRef[page.first];
+                    if (ref.lastItem != (int)idx) {
+                        ref.count++;
+                        ref.lastItem = (int)idx;
+                    }
+                }
+            }
+            int victim = -1;
+            uint64_t victimBytes = 0;
+            const int last = protectLast ? (int)items.size() - 1 : -1;
+            for (size_t idx = 0; idx < items.size(); idx++) {
+                if (items[idx] == nullptr || (int)idx == protectIdx || (int)idx == last) {
+                    continue;
+                }
+                uint64_t exclusive = 0;
+                for (auto &page : itemPages[idx]) {
+                    auto ref = pageRef.find(page.first);
+                    if (ref != pageRef.end() && ref->second.count == 1) {
+                        exclusive += page.second;
+                    }
+                }
+                if (exclusive > victimBytes) {
+                    victimBytes = exclusive;
+                    victim = (int)idx;
+                }
+            }
+            return victim;
+        };
+        if (kvMemMode) {
+            // Share pages with the longest previous dump of this request
+            // that is still in the list, so a multi-length snapshot set
+            // costs about one full copy of KV rather than one per length.
+            // Reuse pages from the longest existing dump whose tokens are a
+            // prefix of this one. Committed KV only depends on the token
+            // prefix, so the match may come from an earlier request (for
+            // example the snapshot this request itself restored from).
+            // Sharing across requests is what keeps the host footprint at
+            // roughly one copy of the union of prefixes.
+            auto choosePrevIndex = [&]() -> int {
+                int best = -1;
+                for (int idx = 0; idx < (int)items.size(); idx++) {
+                    const Qwen35LinearPrefixSnapshot *item = items[idx].get();
                     if (item == nullptr || !item->kvMemMode ||
                         item->cachedLen <= 0 || item->cachedLen >= currentLen ||
                         (int)item->layers.size() != this->block_cnt ||
@@ -11041,11 +11152,73 @@ namespace fastllm {
                                     snapshot->tokens.begin())) {
                         continue;
                     }
-                    if (prev == nullptr || item->cachedLen > prev->cachedLen) {
-                        prev = item.get();
+                    if (best < 0 || item->cachedLen > items[best]->cachedLen) {
+                        best = idx;
                     }
                 }
-                auto kvDumpStart = std::chrono::steady_clock::now();
+                return best;
+            };
+            // Export 只回读 (currentLen - prevLen) 那段新页, 其余与前一份共享, 所以新增
+            // 字节能按新增 token 数直接算. 落盘前先算: 放不下就腾地方, 腾不出来就不落盘
+            // —— 否则这份 dump 会在落盘后的 byte 淘汰里被自己删掉(日志里那次 dump 759ms
+            // 紧接着被 evict), 白付一次 GPU->host 全量拷贝, 还顺手挤掉别人的可复用长度.
+            uint64_t perTokenBytes = 0;
+            for (int i = 0; i < this->block_cnt; i++) {
+                if (!Qwen35LayerIsLinearAttention(this, i) && this->KvMemLayerEligible(i)) {
+                    perTokenBytes += this->KvMemLayerBytesPerToken(i);
+                }
+            }
+            int prevIndex = choosePrevIndex();
+            collectSnapshotPages();
+            uint64_t grew = (uint64_t)(currentLen - (prevIndex >= 0 ?
+                                                         (int)items[prevIndex]->cachedLen : 0)) *
+                            perTokenBytes;
+            // 检索索引 slice 没算进来(实测比纯 KV 高 <1%), 留 2% 余量.
+            grew += grew / 50;
+            if (totalSnapshotBytes() + grew > prefixSnapshotBudget &&
+                grew <= prefixSnapshotBudget) {
+                while (totalSnapshotBytes() + grew > prefixSnapshotBudget) {
+                    int victim = selectByteVictim(prevIndex, false);
+                    if (victim < 0) {
+                        break;
+                    }
+                    uint64_t bytesBefore = totalSnapshotBytes();
+                    int evictedLen = (int)items[victim]->cachedLen;
+                    items.erase(items.begin() + victim);
+                    if (victim == prevIndex) {
+                        // 共享锚点被腾掉了: 这次的新页会变多, 得按新的 prev 重算.
+                        prevIndex = choosePrevIndex();
+                    }
+                    collectSnapshotPages();
+                    uint64_t bytesAfter = totalSnapshotBytes();
+                    grew = (uint64_t)(currentLen - (prevIndex >= 0 ?
+                                                        (int)items[prevIndex]->cachedLen : 0)) *
+                           perTokenBytes;
+                    grew += grew / 50;
+                    if (prefixEvictLog) {
+                        char extra[96];
+                        snprintf(extra, sizeof(extra), " kvmem=%.1f MiB freed=%.1f MiB",
+                                 bytesAfter / 1048576.0,
+                                 (bytesBefore > bytesAfter ? bytesBefore - bytesAfter : 0) / 1048576.0);
+                        logEvict("make-room", evictedLen, extra);
+                    }
+                }
+            }
+            if (totalSnapshotBytes() + grew > prefixSnapshotBudget) {
+                // 真放不下: 这一档不落盘, 但把间隔游标推掉, 免得每过一个 chunk 白估一次.
+                // "整段上下文喂完"那次不走间隔门, 所以那次的 dump 还会再试一次.
+                context->intParams["qwen35_linear_prefix_last_len"] = currentLen;
+                context->intParams["qwen35_linear_prefix_count"] = snapshotCount + 1;
+                printf("[Qwen3.5 KVMem] snapshot skip: tokens=%d need=%.1f MiB, "
+                       "kvmem=%.1f MiB, budget=%.1f MiB, dumps=%d.\n",
+                       currentLen, grew / 1048576.0, totalSnapshotBytes() / 1048576.0,
+                       prefixSnapshotBudget / 1048576.0, (int)items.size());
+                fflush(stdout);
+                return false;
+            }
+            const Qwen35LinearPrefixSnapshot *prev =
+                prevIndex >= 0 ? items[prevIndex].get() : nullptr;
+            auto kvDumpStart = std::chrono::steady_clock::now();
                 for (int i = 0; i < this->block_cnt; i++) {
                     if (Qwen35LayerIsLinearAttention(this, i)) {
                         continue;
@@ -11095,17 +11268,6 @@ namespace fastllm {
                     fflush(stdout);
                 }
             }
-            // 淘汰归因: 默认每个被淘汰的 dump 打一行(回答"某个长度是被淘汰了还是本来
-            // 就没有"); 设 FASTLLM_PREFIX_CACHE_EVICT_LOG=0 可以关掉.
-            static const bool prefixEvictLog = []() {
-                const char *env = std::getenv("FASTLLM_PREFIX_CACHE_EVICT_LOG");
-                return !(env != nullptr && env[0] == '0');
-            }();
-            auto logEvict = [&items](const char *rule, long long len) {
-                printf("[Qwen3.5 KVMem] snapshot evict: rule=%s len=%lld remaining=%d\n",
-                       rule, len, (int)items.size());
-                fflush(stdout);
-            };
             items.push_back(std::move(snapshot));
             if (kvMemMode && prefixEvictLog) {
                 // 同一个前缀链上只差几个 token 的 dump 是同一个请求两个 record 点
@@ -11129,7 +11291,7 @@ namespace fastllm {
                             ++it;
                             continue;
                         }
-                        logEvict("duplicate", old->cachedLen);
+                        logEvict("duplicate", old->cachedLen, "");
                         it = items.erase(it);
                     }
                 }
@@ -11210,7 +11372,7 @@ namespace fastllm {
                         break;
                     }
                     if (prefixEvictLog) {
-                        logEvict("per-request", evictedLen);
+                        logEvict("per-request", evictedLen, "");
                     }
                 } else {
                     auto oldest = items.end();
@@ -11245,7 +11407,7 @@ namespace fastllm {
                         break;
                     }
                     if (prefixEvictLog) {
-                        logEvict("record-cap", evictedLen);
+                        logEvict("record-cap", evictedLen, "");
                     }
                 } else {
                     items.erase(items.begin());
@@ -11257,43 +11419,31 @@ namespace fastllm {
                 // are shared across those dumps, so keeping more of them costs
                 // only the small linear state. A total byte cap still bounds the
                 // host footprint.
-                uint64_t budget = (uint64_t)Qwen35EnvInt(
-                    "FASTLLM_KVMEM_PREFIX_HOST_MIB", 8192) << 20;
-                auto totalKvMemBytes = [&]() {
-                    std::unordered_set<const void *> pages;
-                    uint64_t bytes = 0;
-                    for (auto &item : items) {
-                        if (item == nullptr) {
-                            continue;
+                // 落盘前的估算留了 2% 余量, 但实测偏小或别的请求挤进来时仍可能超,
+                // 这里兜底: 只删确实能释放字节的那份, 并护住刚记录的这一份.
+                collectSnapshotPages();
+                while (totalSnapshotBytes() > prefixSnapshotBudget && items.size() > 1) {
+                    int victim = selectByteVictim(-1, true);
+                    if (victim < 0) {
+                        if (prefixEvictLog) {
+                            logEvict("byte-budget-stuck", -1, "");
                         }
-                        for (const auto &layer : item->layers) {
-                            for (const auto &deviceDump : layer.kvMem) {
-                                const KvMemPrefixData &dump = *deviceDump.second;
-                                for (const KvMemPrefixSums &slice : dump.sums) {
-                                    if (slice.data && pages.insert(slice.data.get()).second) {
-                                        bytes += slice.data->size();
-                                    }
-                                }
-                                for (const auto &page : dump.hostPages) {
-                                    if (page && pages.insert(page.get()).second) {
-                                        bytes += page->size();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    return bytes;
-                };
-                while (totalKvMemBytes() > budget && items.size() > 1) {
-                    long long evictedLen = -1;
-                    if (!eraseMostRedundant(-1, &evictedLen)) {
                         break;
                     }
+                    uint64_t bytesBefore = totalSnapshotBytes();
+                    long long evictedLen = items[victim]->cachedLen;
+                    items.erase(items.begin() + victim);
+                    collectSnapshotPages();
+                    uint64_t bytesAfter = totalSnapshotBytes();
                     if (prefixEvictLog) {
-                        logEvict("byte-budget", evictedLen);
+                        char extra[96];
+                        snprintf(extra, sizeof(extra), " kvmem=%.1f MiB freed=%.1f MiB",
+                                 bytesAfter / 1048576.0,
+                                 (bytesBefore > bytesAfter ? bytesBefore - bytesAfter : 0) / 1048576.0);
+                        logEvict("byte-budget", evictedLen, extra);
                     }
                 }
-                kvMemSnapshotBytes = totalKvMemBytes();
+                kvMemSnapshotBytes = totalSnapshotBytes();
             }
             kvMemSnapshotCount = (int)items.size();
         }
@@ -11362,12 +11512,15 @@ namespace fastllm {
                 dflashKvHeads, dflashHeadDim,
                 this->kvMemConfig.enabled ? 1 : 0);
         }
-        if (snapshot == nullptr && this->kvMemConfig.enabled) {
-            // A KVMem miss is either "different prompt" or "the matching dump was
-            // evicted". Report the retained dumps and the longest token prefix this
-            // prompt shares with any of them so the two cases are distinguishable.
+        // 保留的 dump 状态: 长度列表 + 与本次 prompt 的最大公共前缀. 命中和未命中两条
+        // 路径都要报 —— 只看未命中分不清"同一段历史还在, 只是长度档被淘汰了"和"提示词
+        // 本身在很早的位置就分叉了".
+        std::string dumpLengths;
+        int dumpCount = 0;
+        int bestCommonPrefix = 0;
+        int longestUsableDump = 0;
+        auto describeRetainedDumps = [&]() {
             std::vector<int> lengths;
-            int bestCommon = 0;
             auto all = Qwen35LinearPrefixSnapshots().find(this);
             if (all != Qwen35LinearPrefixSnapshots().end()) {
                 for (auto &itemPtr : all->second) {
@@ -11376,6 +11529,9 @@ namespace fastllm {
                         continue;
                     }
                     lengths.push_back(item->cachedLen);
+                    if (item->cachedLen <= (int)context->currentTokens.size()) {
+                        longestUsableDump = std::max(longestUsableDump, item->cachedLen);
+                    }
                     int limit = std::min((int)item->tokens.size(),
                                          (int)context->currentTokens.size());
                     int common = 0;
@@ -11383,18 +11539,36 @@ namespace fastllm {
                            item->tokens[common] == context->currentTokens[common]) {
                         ++common;
                     }
-                    bestCommon = std::max(bestCommon, common);
+                    bestCommonPrefix = std::max(bestCommonPrefix, common);
                 }
             }
             std::sort(lengths.begin(), lengths.end());
-            std::string joined;
             for (size_t i = 0; i < lengths.size(); i++) {
-                if (i) joined += ",";
-                joined += std::to_string(lengths[i]);
+                if (i) {
+                    dumpLengths += ",";
+                }
+                dumpLengths += std::to_string(lengths[i]);
             }
+            dumpCount = (int)lengths.size();
+        };
+        if (snapshot != nullptr && this->kvMemConfig.enabled) {
+            // matched 远小于 best_common_prefix 说明同一段历史还在, 只是"长度 <= prompt
+            // 的那些档"只剩最短的几份(长的被淘汰了); 两者都很小说明提示词本身早分叉了.
+            describeRetainedDumps();
+            printf("[Qwen3.5 KVMem] prefix hit detail: prompt=%d, matched=%d, "
+                   "longest_dump<=prompt=%d, dumps=%d [%s], best_common_prefix=%d.\n",
+                   (int)context->currentTokens.size(), snapshot->cachedLen,
+                   longestUsableDump, dumpCount, dumpLengths.c_str(), bestCommonPrefix);
+            fflush(stdout);
+        }
+        if (snapshot == nullptr && this->kvMemConfig.enabled) {
+            // A KVMem miss is either "different prompt" or "the matching dump was
+            // evicted". Report the retained dumps and the longest token prefix this
+            // prompt shares with any of them so the two cases are distinguishable.
+            describeRetainedDumps();
             printf("[Qwen3.5 KVMem] prefix miss: prompt=%d, dumps=%d [%s], best_common_prefix=%d.\n",
-                   (int)context->currentTokens.size(), (int)lengths.size(),
-                   joined.c_str(), bestCommon);
+                   (int)context->currentTokens.size(), dumpCount,
+                   dumpLengths.c_str(), bestCommonPrefix);
             fflush(stdout);
         }
         return snapshot == nullptr ? 0 : snapshot->cachedLen;
