@@ -5254,6 +5254,17 @@ namespace fastllm {
         std::chrono::steady_clock::time_point begin;
         std::mutex lock;
         std::vector<Entry> entries;
+        // 0=预读/查表 1=转换 2=锁内合并 3=搬设备 4=进度
+        static const int PhaseCount = 5;
+        std::atomic<long long> phaseNanos[PhaseCount] = {};
+
+        void AddPhase(int index, double seconds) {
+            if (!enabled || index < 0 || index >= PhaseCount || seconds <= 0.0) {
+                return;
+            }
+            phaseNanos[index].fetch_add((long long)(seconds * 1e9),
+                                        std::memory_order_relaxed);
+        }
 
         void Start() {
             if (!enabled) {
@@ -5321,6 +5332,14 @@ namespace fastllm {
                 printf(" %ds:%.0f", i, (double)windowBytes[i] / mib);
             }
             printf(" (MiB/s)\n");
+            static const char *phaseNames[PhaseCount] = {
+                "prefetch", "convert", "merge", "device", "progress"};
+            printf("[fastllm-load-profile] phases(线程累计):");
+            for (int i = 0; i < PhaseCount; i++) {
+                printf(" %s=%.1fs", phaseNames[i],
+                       phaseNanos[i].load(std::memory_order_relaxed) / 1e9);
+            }
+            printf("\n");
 
             std::sort(snapshot.begin(), snapshot.end(),
                       [](const Entry &a, const Entry &b) {
@@ -6057,6 +6076,16 @@ namespace fastllm {
                     }();
                     bool prefetchStarted = false;
                     uint64_t prefetchNextOffset = 0;
+                    double phaseMark = gWeightLoadProfile.enabled ?
+                        gWeightLoadProfile.Now() : 0.0;
+                    auto markPhase = [&](int index) {
+                        if (!gWeightLoadProfile.enabled) {
+                            return;
+                        }
+                        double now = gWeightLoadProfile.Now();
+                        gWeightLoadProfile.AddPhase(index, now - phaseMark);
+                        phaseMark = now;
+                    };
                     for (int i = st; i < end; i++) {
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
@@ -6073,12 +6102,15 @@ namespace fastllm {
                         }
                         if (IsSafeTensorQuantAuxTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
+                            markPhase(0);
                             printLoadingProgress(tensor.bytes);
                             gWeightLoadProfile.Record(tensorName, tensor.bytes,
                                 loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart,
                                 GetThreadCpuSeconds() - loadProfileCpuStart);
+                            markPhase(4);
                             continue;
                         }
+                        markPhase(0);
                         std::string scaleTensorName = "";
                         std::string qzeroTensorName = "";
                         PackedInt4GroupInfo packedInt4Info;
@@ -6419,11 +6451,13 @@ namespace fastllm {
                             }
                             tensor.ClearBuffer();
 
+                            markPhase(1);
                             locker.lock();
                             markWeightFinished(weightName);
                             model->OnWeightLoaded(weightName, allFinishNames);
                             if (model->IsWeightConsumedAfterLoad(weightName)) {
                                 locker.unlock();
+                                markPhase(2);
                                 continue;
                             }
                             // 检查是否需要合并权重
@@ -6591,6 +6625,7 @@ namespace fastllm {
                                 locker.lock();
                             }
                             locker.unlock();
+                            markPhase(2);
 #ifdef USE_TFACC
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "tfacc")) {
@@ -6623,12 +6658,14 @@ namespace fastllm {
                                     model->MoveSpecialWeightToCudaIfNeeded(weightName, weightIt->second);
                                 }
                             }
+                            markPhase(3);
                         }
 
                         printLoadingProgress(tensor.bytes);
                         gWeightLoadProfile.Record(tensorName, tensor.bytes,
                             loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart,
                             GetThreadCpuSeconds() - loadProfileCpuStart);
+                        markPhase(4);
                     }
         };
 
