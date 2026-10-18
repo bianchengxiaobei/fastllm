@@ -100,6 +100,13 @@ namespace fastllm {
         if (address == nullptr || bytes == 0) {
             return;
         }
+        static const bool prefetchEnabled = []() {
+            const char *env = std::getenv("FASTLLM_LOAD_PREFETCH");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        if (!prefetchEnabled) {
+            return;
+        }
 #if defined(_WIN32) || defined(_WIN64)
         typedef BOOL (WINAPI *PrefetchVirtualMemoryFn)(
             HANDLE, ULONG_PTR, void *, ULONG);
@@ -5858,6 +5865,13 @@ namespace fastllm {
         // 4.2 读取
         std::vector <std::thread*> threads;
         int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
+        // 机械盘/QLC 上 16 路并发读会互相打断顺序流，可用环境变量降到 1~2 路做对照。
+        if (const char *loadThreadsEnv = std::getenv("FASTLLM_LOAD_THREADS")) {
+            int value = std::atoi(loadThreadsEnv);
+            if (value > 0) {
+                threadNum = std::min(value, 64);
+            }
+        }
         std::mutex locker;
         int cnt = 0;
         int loadProgressTotal = std::max(1, (int)tensorMap.size());
