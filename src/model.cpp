@@ -23,6 +23,7 @@
 #include <unistd.h>
 #endif
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <unordered_map>
 #if defined(__linux__) && defined(__GLIBC__)
@@ -5133,6 +5134,105 @@ namespace fastllm {
         return std::unique_ptr<fastllm::basellm> (model);
     }
 
+    // FASTLLM_PROFILE_LOAD=1: 逐个权重记录加载耗时，并按秒统计已完成字节，
+    // 用来判断“加载中途速度掉下来”是读盘、转换还是设备搬运造成的。
+    // 只在显式设置环境变量时收集，正常启动没有额外开销。
+    struct WeightLoadProfile {
+        struct Entry {
+            std::string name;
+            uint64_t bytes = 0;
+            double start = 0.0;
+            double seconds = 0.0;
+        };
+
+        bool enabled = std::getenv("FASTLLM_PROFILE_LOAD") != nullptr;
+        std::chrono::steady_clock::time_point begin;
+        std::mutex lock;
+        std::vector<Entry> entries;
+
+        void Start() {
+            if (!enabled) {
+                return;
+            }
+            begin = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> guard(lock);
+            entries.clear();
+        }
+
+        double Now() const {
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - begin).count();
+        }
+
+        void Record(const std::string &name, uint64_t bytes,
+                    double start, double seconds) {
+            if (!enabled) {
+                return;
+            }
+            Entry entry;
+            entry.name = name;
+            entry.bytes = bytes;
+            entry.start = start;
+            entry.seconds = seconds;
+            std::lock_guard<std::mutex> guard(lock);
+            entries.push_back(std::move(entry));
+        }
+
+        void Report() {
+            if (!enabled) {
+                return;
+            }
+            std::vector<Entry> snapshot;
+            {
+                std::lock_guard<std::mutex> guard(lock);
+                snapshot.swap(entries);
+            }
+            if (snapshot.empty()) {
+                return;
+            }
+            const double wall = Now();
+            uint64_t totalBytes = 0;
+            for (auto &it : snapshot) {
+                totalBytes += it.bytes;
+            }
+            const double mib = 1024.0 * 1024.0;
+            printf("\n[fastllm-load-profile] tensors=%d bytes=%.2f GiB wall=%.2f s avg=%.1f MiB/s\n",
+                   (int)snapshot.size(), (double)totalBytes / mib / 1024.0, wall,
+                   wall > 0.0 ? (double)totalBytes / mib / wall : 0.0);
+
+            // 每个完成窗口只统计在该秒内结束的权重，能直接看出掉速发生在第几秒。
+            const int windowCount = std::max(1, (int)std::ceil(wall));
+            std::vector<uint64_t> windowBytes(windowCount, 0);
+            for (auto &it : snapshot) {
+                int index = (int)(it.start + it.seconds);
+                index = std::min(windowCount - 1, std::max(0, index));
+                windowBytes[index] += it.bytes;
+            }
+            printf("[fastllm-load-profile] throughput:");
+            for (int i = 0; i < windowCount; i++) {
+                printf(" %ds:%.0f", i, (double)windowBytes[i] / mib);
+            }
+            printf(" (MiB/s)\n");
+
+            std::sort(snapshot.begin(), snapshot.end(),
+                      [](const Entry &a, const Entry &b) {
+                          return a.seconds > b.seconds;
+                      });
+            const int topN = std::min<int>(10, (int)snapshot.size());
+            for (int i = 0; i < topN; i++) {
+                const Entry &it = snapshot[i];
+                printf("[fastllm-load-profile]   #%d %-52s %9.1f MiB %9.1f ms (%7.1f MiB/s) @%.2fs\n",
+                       i + 1, it.name.c_str(), (double)it.bytes / mib,
+                       it.seconds * 1000.0,
+                       it.seconds > 0.0 ? (double)it.bytes / mib / it.seconds : 0.0,
+                       it.start);
+            }
+            fflush(stdout);
+        }
+    };
+
+    static WeightLoadProfile gWeightLoadProfile;
+
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
@@ -5703,6 +5803,7 @@ namespace fastllm {
             totalLoadBytes += safeTensors.itmeDict[tensorName].bytes;
         }
         ReportModelLoadProgress("weights_load", 0, loadProgressTotal, 0, totalLoadBytes);
+        gWeightLoadProfile.Start();
         if (serialTensors.empty() && tensors.empty()) {
             ReportModelLoadProgress("weights_load", 1, 1);
         }
@@ -5760,9 +5861,13 @@ namespace fastllm {
                     for (int i = st; i < end; i++) {
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
+                        const double loadProfileStart = gWeightLoadProfile.enabled ?
+                            gWeightLoadProfile.Now() : 0.0;
                         if (IsSafeTensorQuantAuxTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             printLoadingProgress(tensor.bytes);
+                            gWeightLoadProfile.Record(tensorName, tensor.bytes,
+                                loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart);
                             continue;
                         }
                         std::string scaleTensorName = "";
@@ -6318,6 +6423,8 @@ namespace fastllm {
                         }
 
                         printLoadingProgress(tensor.bytes);
+                        gWeightLoadProfile.Record(tensorName, tensor.bytes,
+                            loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart);
                     }
         };
 
@@ -6369,6 +6476,7 @@ namespace fastllm {
         }
         model->OnWeightLoadGroupFinished();
         model->OnModelWeightsLoaded();
+        gWeightLoadProfile.Report();
 
         printf("\n");
         fflush(stdout);
