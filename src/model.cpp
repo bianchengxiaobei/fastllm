@@ -1216,12 +1216,19 @@ namespace fastllm {
             ReadRawAt(this->data_offsets[0], dst, len);
         }
 
-        // 把本张量在映射里的范围一次性提交给系统预读，避免逐页同步缺页。
-        void Prefetch() {
+        // 把本张量在映射里的范围提交给系统预读，避免逐页同步缺页。
+        // extraBytes 用于把后面若干张量一起拉进来：QLC/SATA 盘上 4K 随机读只有
+        // 几十 MB/s，只有把请求合并成几十 MB 的顺序读才能跑到顺序带宽。
+        void Prefetch(size_t extraBytes = 0) {
             if (fileBase == nullptr || bytes == 0) {
                 return;
             }
-            PrefetchMappedRange(fileBase + data_offsets[0], (size_t)bytes);
+            uint64_t begin = data_offsets[0];
+            uint64_t length = bytes + (uint64_t)extraBytes;
+            if (begin + length > fileSize) {
+                length = fileSize - begin;
+            }
+            PrefetchMappedRange(fileBase + begin, (size_t)length);
         }
 
         void ReadRawAt(uint64_t offset, void *dst, size_t len) {
@@ -5980,6 +5987,18 @@ namespace fastllm {
             return ret;
         };
         auto loadSafeTensorRange = [&](int st, int end) {
+                    // 每个线程维护自己的滚动预读窗口：跨过窗口一半时再提交下一段，
+                    // 避免每张量都重复遍历同一批页表项。
+                    const size_t prefetchWindowBytes = []() -> size_t {
+                        const char *env = std::getenv("FASTLLM_LOAD_PREFETCH_WINDOW_MB");
+                        long mb = env == nullptr ? 32 : std::atol(env);
+                        if (mb < 0) {
+                            mb = 0;
+                        }
+                        return (size_t)mb * 1024 * 1024;
+                    }();
+                    bool prefetchStarted = false;
+                    uint64_t prefetchNextOffset = 0;
                     for (int i = st; i < end; i++) {
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
@@ -5987,10 +6006,12 @@ namespace fastllm {
                             gWeightLoadProfile.Now() : 0.0;
                         const double loadProfileCpuStart = gWeightLoadProfile.enabled ?
                             GetThreadCpuSeconds() : 0.0;
-                        // 当前块整体预读；顺带把下一块也提交出去，和本块的转换重叠。
-                        tensor.Prefetch();
-                        if (i + 1 < end) {
-                            safeTensors.itmeDict[(*activeTensors)[i + 1]].Prefetch();
+                        if (prefetchWindowBytes == 0 || !prefetchStarted ||
+                            tensor.data_offsets[0] >= prefetchNextOffset) {
+                            tensor.Prefetch(prefetchWindowBytes);
+                            prefetchStarted = true;
+                            prefetchNextOffset = tensor.data_offsets[0] +
+                                std::max<uint64_t>(prefetchWindowBytes / 2, 8ULL << 20);
                         }
                         if (IsSafeTensorQuantAuxTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
