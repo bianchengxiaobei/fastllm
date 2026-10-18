@@ -5157,6 +5157,8 @@ namespace fastllm {
             begin = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> guard(lock);
             entries.clear();
+            printf("[fastllm-load-profile] enabled, collecting per-tensor timings\n");
+            fflush(stdout);
         }
 
         double Now() const {
