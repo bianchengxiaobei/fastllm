@@ -979,6 +979,18 @@ namespace fastllm {
         return interval;
     }
 
+    // 非投机 decode(没有 MTP/DFlash 权重) 也要能看分段耗时: 显式开
+    // FASTLLM_QWEN35_DECODE_PROFILE=1 就强制采样, 间隔仍由
+    // FASTLLM_QWEN35_MTP_PROFILE / FASTLLM_QWEN35_MTP_WORKER_PROFILE 给出.
+    static bool Qwen35DecodeStageProfileRequested() {
+        static const bool requested = []() {
+            const char *env = std::getenv("FASTLLM_QWEN35_DECODE_PROFILE");
+            return env != nullptr && env[0] != '\0' &&
+                   Qwen35MoeIsTrueString(env);
+        }();
+        return requested;
+    }
+
     static int Qwen35MtpWorkerProfileInterval() {
         static int interval = []() {
             const char *env = std::getenv("FASTLLM_QWEN35_MTP_WORKER_PROFILE");
@@ -2880,6 +2892,21 @@ namespace fastllm {
             }
             probeSum = mergeSum = pushSum = 0.0;
             layers = 0;
+        }
+
+        // lm_head(含最后 norm 与 logits 类型转换) 单独计时: 它不在 40 层循环里,
+        // 上一层口径([fastllm-host-moe])看不到, 而它恰好是 token 尾部耗时的去向.
+        static double Qwen35HostMoeHeadBeginMs() {
+            return Qwen35HostMoeProfileEnabled() ? Qwen35HostMoeNowMs() : -1.0;
+        }
+
+        static void Qwen35HostMoeProfileHead(double beginMs) {
+            if (beginMs < 0.0) {
+                return;
+            }
+            printf("[fastllm-host-moe-head] norm+lm_head+ToFloat=%.1fms\n",
+                   Qwen35HostMoeNowMs() - beginMs);
+            fflush(stdout);
         }
 
 #ifdef USE_CUDA
@@ -14242,6 +14269,10 @@ namespace fastllm {
         Qwen3CudaDirectRunner cudaRunner(gpuId);
         int mtpWorkerProfileInterval = speculativeCollectAllLogits ?
             Qwen35MtpWorkerProfileInterval() : 0;
+        if (mtpWorkerProfileInterval <= 0 && Qwen35DecodeStageProfileRequested()) {
+            int forced = Qwen35MtpWorkerProfileInterval();
+            mtpWorkerProfileInterval = forced > 0 ? forced : 8;
+        }
         bool mtpWorkerProfileEnabled = mtpWorkerProfileInterval > 0;
         int mtpWorkerProfileSeqTokens = 0;
         for (int len : seqLens) {
@@ -17185,6 +17216,11 @@ namespace fastllm {
             addPartialToResidualReduce(moeFinal);
             captureDFlashHidden(i);
         }
+        double hostMoeHeadBeginMs = -1.0;
+        if (Qwen35HostMoeProfileEnabled()) {
+            ForceDeviceSync();
+            hostMoeHeadBeginMs = Qwen35HostMoeHeadBeginMs();
+        }
         mtpWorkerProfileSyncMark(mtpWorkerProfileLayersUs);
         if (speculativeCacheOnlyForward ||
             (isIntermediateChunkedPrefill &&
@@ -17249,6 +17285,10 @@ namespace fastllm {
         } else if (!preserveNativeLogits) {
             Qwen3CudaToDataType(cudaRunner, logits, DataType::FLOAT32);
         }
+        if (hostMoeHeadBeginMs >= 0.0) {
+            ForceDeviceSync();
+            Qwen35HostMoeProfileHead(hostMoeHeadBeginMs);
+        }
         mtpWorkerProfileSyncMark(mtpWorkerProfileHeadUs);
         mtpWorkerProfileRecord();
 #endif
@@ -17288,6 +17328,10 @@ namespace fastllm {
         (void)attentionMask;
         int mtpTargetProfileInterval = speculativeCollectAllLogits ?
             Qwen35MtpProfileInterval() : 0;
+        if (mtpTargetProfileInterval <= 0 && Qwen35DecodeStageProfileRequested()) {
+            int forced = Qwen35MtpProfileInterval();
+            mtpTargetProfileInterval = forced > 0 ? forced : 8;
+        }
         bool mtpTargetProfileEnabled = mtpTargetProfileInterval > 0;
         int mtpTargetProfileSeqTokens = 0;
         for (int len : seqLens) {
