@@ -5754,6 +5754,28 @@ namespace fastllm {
         }
         model->OnWeightsCreated(allWeightNames);
         const WeightMergeIndex mergeIndex(model->weightMergeRules);
+        // 每条合并规则已完成的输入数，代替每次加载都线性扫描 rule.allInputs。
+        // 老写法每加载一个权重就遍历该规则全部输入（MoE 融合规则有几百个专家名），
+        // 并对 allWeightNames / allFinishNames 各做一次 std::set 查找，复杂度是
+        // O(权重数 × 规则输入数)，而且整段持有 locker：加载越靠后集合越大、
+        // 缓存命中越差，全局吞吐被拖成几十 MiB/s。
+        std::vector<int> ruleRequiredInputs(model->weightMergeRules.size(), 0);
+        for (size_t ruleId = 0; ruleId < model->weightMergeRules.size(); ruleId++) {
+            for (auto &name : model->weightMergeRules[ruleId].allInputs) {
+                if (allWeightNames.find(name) != allWeightNames.end()) {
+                    ruleRequiredInputs[ruleId]++;
+                }
+            }
+        }
+        std::vector<int> ruleFinishedInputs(model->weightMergeRules.size(), 0);
+        // 调用方必须持有 locker
+        auto markWeightFinished = [&](const std::string &weightName) {
+            if (allFinishNames.insert(weightName).second) {
+                for (size_t ruleId : mergeIndex.Find(weightName)) {
+                    ruleFinishedInputs[ruleId]++;
+                }
+            }
+        };
         std::stable_sort(tensors.begin(), tensors.end(),
                          [&](const std::string &a, const std::string &b) {
                              return model->GetWeightLoadPriority(a, tensorMap[a]) <
@@ -5768,17 +5790,28 @@ namespace fastllm {
         int loadProgressTotal = std::max(1, (int)tensorMap.size());
         uint64_t completedLoadBytes = 0;
         uint64_t totalLoadBytes = 0;
+        std::atomic<int> lastPrintedProgress{-1};
         auto printLoadingProgress = [&](uint64_t tensorBytes) {
-            locker.lock();
-            int current = ++cnt;
-            completedLoadBytes += tensorBytes;
-            uint64_t currentBytes = completedLoadBytes;
-            int progress = std::min(100, current * 100 / loadProgressTotal);
-            printf("Loading %d \r", progress);
-            fflush(stdout);
-            locker.unlock();
-            if (current == loadProgressTotal ||
-                current * 100 / loadProgressTotal != (current - 1) * 100 / loadProgressTotal) {
+            int current = 0;
+            uint64_t currentBytes = 0;
+            int progress = 0;
+            bool crossedPercent = false;
+            {
+                std::lock_guard<std::mutex> guard(locker);
+                current = ++cnt;
+                completedLoadBytes += tensorBytes;
+                currentBytes = completedLoadBytes;
+                progress = std::min(100, current * 100 / loadProgressTotal);
+                crossedPercent = current == loadProgressTotal ||
+                    current * 100 / loadProgressTotal != (current - 1) * 100 / loadProgressTotal;
+            }
+            // printf + fflush 在 Windows 控制台是毫秒级开销，九万多个权重逐个刷会把
+            // 全局吞吐压住；只在百分比变化时输出。
+            if (lastPrintedProgress.exchange(progress) != progress) {
+                printf("Loading %d \r", progress);
+                fflush(stdout);
+            }
+            if (crossedPercent) {
                 ReportModelLoadProgress("weights_load", current, loadProgressTotal,
                                         currentBytes, totalLoadBytes);
             }
@@ -6213,7 +6246,7 @@ namespace fastllm {
                             tensor.ClearBuffer();
 
                             locker.lock();
-                            allFinishNames.insert(weightName);
+                            markWeightFinished(weightName);
                             model->OnWeightLoaded(weightName, allFinishNames);
                             if (model->IsWeightConsumedAfterLoad(weightName)) {
                                 locker.unlock();
@@ -6224,16 +6257,10 @@ namespace fastllm {
                             for (size_t ruleId : mergeIndex.Find(weightName)) {
                                 auto &rule = model->weightMergeRules[ruleId];
                                 needMerge = true;
-                                bool canMerge = true;
-                                for (auto &name : rule.allInputs) {
-                                    if (allWeightNames.find(name) != allWeightNames.end() && 
-                                        allFinishNames.find(name) == allFinishNames.end()) {
-                                        canMerge = false;
-                                    }
-                                }
-                                if (!canMerge) {
+                                if (ruleFinishedInputs[ruleId] < ruleRequiredInputs[ruleId]) {
                                     continue;
                                 }
+                                bool canMerge = true;
                                 for (auto &it : rule.rules) {
                                     for (auto input : it.inputs) {
                                         if (model->weight[input].dims.size() == 2) {
@@ -6380,7 +6407,7 @@ namespace fastllm {
                                     }
 
                                     locker.lock();
-                                    allFinishNames.insert(mergedWeightName);
+                                    markWeightFinished(mergedWeightName);
                                     model->OnWeightLoaded(mergedWeightName, allFinishNames);
                                     locker.unlock();
                                     for (auto input : it.inputs) {
