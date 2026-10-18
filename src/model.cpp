@@ -122,10 +122,25 @@ namespace fastllm {
         if (prefetch == nullptr) {
             return;
         }
+        // PrefetchVirtualMemory 要求页对齐的起点，而 safetensors 的张量偏移不是
+        // 页对齐的。不修正的话每次调用都会失败，预读等于没开。
+        SYSTEM_INFO systemInfo;
+        GetSystemInfo(&systemInfo);
+        const uintptr_t pageSize = systemInfo.dwPageSize != 0 ?
+            (uintptr_t)systemInfo.dwPageSize : 4096ULL;
+        const uintptr_t begin = (uintptr_t)address;
+        const uintptr_t alignedBegin = begin - begin % pageSize;
         MemoryRangeEntry entry;
-        entry.VirtualAddress = const_cast<void*>(address);
-        entry.NumberOfBytes = bytes;
-        prefetch(GetCurrentProcess(), 1, &entry, 0);
+        entry.VirtualAddress = (void*)alignedBegin;
+        entry.NumberOfBytes = bytes + (size_t)(begin - alignedBegin);
+        if (!prefetch(GetCurrentProcess(), 1, &entry, 0)) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                printf("[fastllm-load] PrefetchVirtualMemory failed, err=%lu\n",
+                       (unsigned long)GetLastError());
+                fflush(stdout);
+            }
+        }
 #elif defined(__linux__)
         long pageSize = sysconf(_SC_PAGESIZE);
         if (pageSize <= 0) {
@@ -1217,18 +1232,23 @@ namespace fastllm {
         }
 
         // 把本张量在映射里的范围提交给系统预读，避免逐页同步缺页。
-        // extraBytes 用于把后面若干张量一起拉进来：QLC/SATA 盘上 4K 随机读只有
+        // windowBytes 用于把后面若干张量一起拉进来：QLC/SATA 盘上 4K 随机读只有
         // 几十 MB/s，只有把请求合并成几十 MB 的顺序读才能跑到顺序带宽。
-        void Prefetch(size_t extraBytes = 0) {
+        // 大张量至少覆盖自身全长，否者窗口只覆盖开头，剩下仍然退化成逐页缺页。
+        void Prefetch(size_t windowBytes = 0) {
             if (fileBase == nullptr || bytes == 0) {
                 return;
             }
-            uint64_t begin = data_offsets[0];
-            uint64_t length = bytes + (uint64_t)extraBytes;
+            const uint64_t begin = data_offsets[0];
+            uint64_t length = std::max<uint64_t>(bytes, (uint64_t)windowBytes);
             if (begin + length > fileSize) {
                 length = fileSize - begin;
             }
-            PrefetchMappedRange(fileBase + begin, (size_t)length);
+            const uint64_t chunk = 64ULL << 20;
+            for (uint64_t done = 0; done < length; done += chunk) {
+                PrefetchMappedRange(fileBase + begin + done,
+                                    (size_t)std::min<uint64_t>(chunk, length - done));
+            }
         }
 
         void ReadRawAt(uint64_t offset, void *dst, size_t len) {
@@ -5322,6 +5342,41 @@ namespace fastllm {
 
     static WeightLoadProfile gWeightLoadProfile;
 
+    // FASTLLM_LOAD_PROBE=1：用 8 MiB 缓冲顺序读一遍模型文件，给磁盘的纯读带宽，
+    // 用来区分"盘就这么快"和"加载路径把顺序读退化成了小请求"。
+    static void ProbeSequentialFileRead(const std::set<std::string> &files) {
+        printf("[fastllm-load-probe] begin\n");
+        std::vector<uint8_t> buffer(8ULL << 20);
+        uint64_t totalBytes = 0;
+        double totalSeconds = 0.0;
+        for (auto &file : files) {
+            FILE *fp = fopen(file.c_str(), "rb");
+            if (fp == nullptr) {
+                printf("[fastllm-load-probe] open failed: %s\n", file.c_str());
+                continue;
+            }
+            auto begin = std::chrono::steady_clock::now();
+            uint64_t bytes = 0;
+            size_t got = 0;
+            while ((got = fread(buffer.data(), 1, buffer.size(), fp)) > 0) {
+                bytes += got;
+            }
+            fclose(fp);
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - begin).count();
+            totalBytes += bytes;
+            totalSeconds += elapsed;
+            printf("[fastllm-load-probe] %-36s %8.1f MiB %8.1f MiB/s\n",
+                   file.substr(file.find_last_of("/\\") + 1).c_str(),
+                   bytes / 1048576.0,
+                   elapsed > 0.0 ? bytes / 1048576.0 / elapsed : 0.0);
+        }
+        printf("[fastllm-load-probe] total %.2f GiB in %.1f s = %.1f MiB/s\n",
+               totalBytes / 1073741824.0, totalSeconds,
+               totalSeconds > 0.0 ? totalBytes / 1048576.0 / totalSeconds : 0.0);
+        fflush(stdout);
+    }
+
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
@@ -5457,6 +5512,9 @@ namespace fastllm {
             }
         }
         SafeTensors safeTensors(stFiles);
+        if (std::getenv("FASTLLM_LOAD_PROBE") != nullptr) {
+            ProbeSequentialFileRead(stFiles);
+        }
 
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
