@@ -24,6 +24,7 @@
 #endif
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <exception>
 #include <unordered_map>
 #if defined(__linux__) && defined(__GLIBC__)
@@ -91,6 +92,67 @@ namespace fastllm {
         const std::function<void(size_t)> &onProgress);
 #endif
     extern BF16ToFP16Manager bf16tofp16;
+
+    // safetensors 是整文件映射后逐张量 memcpy 的。默认路径下每个 4KB 页都要单独
+    // 触发一次同步缺页，16 个加载线程交错访问同一个映射时预读基本失效，读吞吐会
+    // 掉到 SATA SSD 的 4K 随机水平（几十 MiB/s）。这里按张量范围一次性把页拉进来。
+    void PrefetchMappedRange(const void *address, size_t bytes) {
+        if (address == nullptr || bytes == 0) {
+            return;
+        }
+#if defined(_WIN32) || defined(_WIN64)
+        typedef BOOL (WINAPI *PrefetchVirtualMemoryFn)(
+            HANDLE, ULONG_PTR, void *, ULONG);
+        struct MemoryRangeEntry {
+            void *VirtualAddress;
+            size_t NumberOfBytes;
+        };
+        static PrefetchVirtualMemoryFn prefetch = []() -> PrefetchVirtualMemoryFn {
+            HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+            return kernel == nullptr ? nullptr :
+                (PrefetchVirtualMemoryFn)GetProcAddress(kernel, "PrefetchVirtualMemory");
+        }();
+        if (prefetch == nullptr) {
+            return;
+        }
+        MemoryRangeEntry entry;
+        entry.VirtualAddress = const_cast<void*>(address);
+        entry.NumberOfBytes = bytes;
+        prefetch(GetCurrentProcess(), 1, &entry, 0);
+#elif defined(__linux__)
+        long pageSize = sysconf(_SC_PAGESIZE);
+        if (pageSize <= 0) {
+            return;
+        }
+        uintptr_t begin = (uintptr_t)address;
+        uintptr_t end = begin + bytes;
+        begin -= begin % (uintptr_t)pageSize;
+        madvise((void*)begin, end - begin, MADV_WILLNEED);
+#else
+        (void)address;
+        (void)bytes;
+#endif
+    }
+
+    // 当前线程累计 CPU 时间（秒），用于区分"等 IO/等锁"和"真的在算"。
+    double GetThreadCpuSeconds() {
+#if defined(_WIN32) || defined(_WIN64)
+        FILETIME createTime, exitTime, kernelTime, userTime;
+        if (GetThreadTimes(GetCurrentThread(), &createTime, &exitTime,
+                           &kernelTime, &userTime)) {
+            auto toU64 = [](const FILETIME &time) -> uint64_t {
+                return ((uint64_t)time.dwHighDateTime << 32) | time.dwLowDateTime;
+            };
+            return (double)(toU64(kernelTime) + toU64(userTime)) * 1e-7;
+        }
+#elif defined(__linux__)
+        struct timespec ts;
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+            return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+        }
+#endif
+        return 0.0;
+    }
 
     std::string ReadAllFile(const std::string &fileName) {
         std::ifstream t(fileName.c_str(), std::ios::in);
@@ -1145,6 +1207,14 @@ namespace fastllm {
 
         void ReadRaw(void *dst, size_t len) {
             ReadRawAt(this->data_offsets[0], dst, len);
+        }
+
+        // 把本张量在映射里的范围一次性提交给系统预读，避免逐页同步缺页。
+        void Prefetch() {
+            if (fileBase == nullptr || bytes == 0) {
+                return;
+            }
+            PrefetchMappedRange(fileBase + data_offsets[0], (size_t)bytes);
         }
 
         void ReadRawAt(uint64_t offset, void *dst, size_t len) {
@@ -5143,6 +5213,7 @@ namespace fastllm {
             uint64_t bytes = 0;
             double start = 0.0;
             double seconds = 0.0;
+            double cpuSeconds = 0.0;
         };
 
         bool enabled = std::getenv("FASTLLM_PROFILE_LOAD") != nullptr;
@@ -5167,7 +5238,7 @@ namespace fastllm {
         }
 
         void Record(const std::string &name, uint64_t bytes,
-                    double start, double seconds) {
+                    double start, double seconds, double cpuSeconds) {
             if (!enabled) {
                 return;
             }
@@ -5176,6 +5247,7 @@ namespace fastllm {
             entry.bytes = bytes;
             entry.start = start;
             entry.seconds = seconds;
+            entry.cpuSeconds = cpuSeconds;
             std::lock_guard<std::mutex> guard(lock);
             entries.push_back(std::move(entry));
         }
@@ -5223,10 +5295,11 @@ namespace fastllm {
             const int topN = std::min<int>(10, (int)snapshot.size());
             for (int i = 0; i < topN; i++) {
                 const Entry &it = snapshot[i];
-                printf("[fastllm-load-profile]   #%d %-52s %9.1f MiB %9.1f ms (%7.1f MiB/s) @%.2fs\n",
+                printf("[fastllm-load-profile]   #%d %-52s %9.1f MiB %9.1f ms (%7.1f MiB/s) cpu=%3.0f%% @%.2fs\n",
                        i + 1, it.name.c_str(), (double)it.bytes / mib,
                        it.seconds * 1000.0,
                        it.seconds > 0.0 ? (double)it.bytes / mib / it.seconds : 0.0,
+                       it.seconds > 0.0 ? 100.0 * it.cpuSeconds / it.seconds : 0.0,
                        it.start);
             }
             fflush(stdout);
@@ -5898,11 +5971,19 @@ namespace fastllm {
                         auto &tensor = safeTensors.itmeDict[tensorName];
                         const double loadProfileStart = gWeightLoadProfile.enabled ?
                             gWeightLoadProfile.Now() : 0.0;
+                        const double loadProfileCpuStart = gWeightLoadProfile.enabled ?
+                            GetThreadCpuSeconds() : 0.0;
+                        // 当前块整体预读；顺带把下一块也提交出去，和本块的转换重叠。
+                        tensor.Prefetch();
+                        if (i + 1 < end) {
+                            safeTensors.itmeDict[(*activeTensors)[i + 1]].Prefetch();
+                        }
                         if (IsSafeTensorQuantAuxTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             printLoadingProgress(tensor.bytes);
                             gWeightLoadProfile.Record(tensorName, tensor.bytes,
-                                loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart);
+                                loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart,
+                                GetThreadCpuSeconds() - loadProfileCpuStart);
                             continue;
                         }
                         std::string scaleTensorName = "";
@@ -6453,7 +6534,8 @@ namespace fastllm {
 
                         printLoadingProgress(tensor.bytes);
                         gWeightLoadProfile.Record(tensorName, tensor.bytes,
-                            loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart);
+                            loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart,
+                            GetThreadCpuSeconds() - loadProfileCpuStart);
                     }
         };
 
