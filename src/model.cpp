@@ -5351,7 +5351,8 @@ namespace fastllm {
         std::mutex lock;
         std::vector<Entry> entries;
         // 0=预读/查表 1=转换 2=锁内合并 3=搬设备 4=进度 5=等锁 6=整个张量循环
-        static const int PhaseCount = 7;
+        // 7=打包转换(CreateBuffer*) 8=CreateFromOriData 9=ClearBuffer
+        static const int PhaseCount = 10;
         std::atomic<long long> phaseNanos[PhaseCount] = {};
         std::vector<std::pair<std::string, double>> sections;
 
@@ -5439,14 +5440,14 @@ namespace fastllm {
             printf(" (MiB/s)\n");
             static const char *phaseNames[PhaseCount] = {
                 "prefetch", "convert", "merge", "device", "progress",
-                "lockWait", "loopTotal"};
+                "lockWait", "loopTotal", "createBuf", "oriData", "clearBuf"};
             printf("[fastllm-load-profile] phases(线程累计):");
             for (int i = 0; i < PhaseCount; i++) {
                 printf(" %s=%.1fs", phaseNames[i],
                        phaseNanos[i].load(std::memory_order_relaxed) / 1e9);
             }
             double accounted = 0.0;
-            for (int i = 0; i < PhaseCount - 1; i++) {
+            for (int i = 0; i < 6; i++) {
                 accounted += phaseNanos[i].load(std::memory_order_relaxed) / 1e9;
             }
             printf(" unaccounted=%.1fs\n",
@@ -6306,6 +6307,8 @@ namespace fastllm {
                             std::string weightName = it.first;
                             auto dataType = it.second;
                             int ggmlType = -1;
+                            double convMark = gWeightLoadProfile.enabled ?
+                                gWeightLoadProfile.Now() : 0.0;
 
                             bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
                             // With no explicit --moe_dtype, AWQ experts inherit the global
@@ -6614,6 +6617,11 @@ namespace fastllm {
                                     if (it.second == DATA_AUTO_CONV) {
                                         tensor.Transpose(oriDataType);
                                     }
+                                    if (gWeightLoadProfile.enabled) {
+                                        gWeightLoadProfile.AddPhase(7,
+                                            gWeightLoadProfile.Now() - convMark);
+                                        convMark = gWeightLoadProfile.Now();
+                                    }
                                     Data &loadedWeight = model->weight[weightName];
                                     if (!TryAdoptSafeTensorBuffer(
                                             loadedWeight, tensor, oriDataType,
@@ -6627,11 +6635,20 @@ namespace fastllm {
                                             tensor.scalesBuffer, curGroupCnt,
                                             tensor.blockK, tensor.blockM);
                                     }
+                                    if (gWeightLoadProfile.enabled) {
+                                        gWeightLoadProfile.AddPhase(8,
+                                            gWeightLoadProfile.Now() - convMark);
+                                        convMark = gWeightLoadProfile.Now();
+                                    }
                                 }
                                 if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
                                     model->weight[weightName].CalcWeightSum();
                             }
                             tensor.ClearBuffer();
+                            if (gWeightLoadProfile.enabled) {
+                                gWeightLoadProfile.AddPhase(9,
+                                    gWeightLoadProfile.Now() - convMark);
+                            }
 
                             markPhase(1);
                             const double lockWaitStart = gWeightLoadProfile.enabled ?
