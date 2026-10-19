@@ -128,11 +128,16 @@ namespace fastllm {
 
     // 按偏移整块读。整块指这一次调用要的字节数（通常就是一整个张量），
     // 不要退化成 CRT 的 4KB 缓冲读，否则又是一串 4K 随机请求。
+    static std::atomic<long long> gLoadReadNanos{0};
+    static std::atomic<long long> gLoadReadCalls{0};
+    static std::atomic<long long> gLoadReadBytes{0};
+
     static bool ReadFileAtOffset(const std::string &fileName, uint64_t offset,
                                  void *dst, size_t len) {
         if (!UseLoadReadFile() || dst == nullptr || len == 0) {
             return false;
         }
+        auto readBegin = std::chrono::steady_clock::now();
         HANDLE handle = GetLoadFileHandle(fileName);
         if (handle == INVALID_HANDLE_VALUE) {
             return false;
@@ -152,6 +157,12 @@ namespace fastllm {
             }
             done += got;
         }
+        gLoadReadNanos.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - readBegin).count(),
+            std::memory_order_relaxed);
+        gLoadReadCalls.fetch_add(1, std::memory_order_relaxed);
+        gLoadReadBytes.fetch_add((long long)len, std::memory_order_relaxed);
         return true;
     }
 #endif
@@ -5441,6 +5452,20 @@ namespace fastllm {
             printf(" unaccounted=%.1fs\n",
                    phaseNanos[PhaseCount - 1].load(std::memory_order_relaxed) / 1e9 -
                        accounted);
+            {
+                const long long readCalls =
+                    gLoadReadCalls.load(std::memory_order_relaxed);
+                const double readSeconds =
+                    gLoadReadNanos.load(std::memory_order_relaxed) / 1e9;
+                const long long readBytes =
+                    gLoadReadBytes.load(std::memory_order_relaxed);
+                printf("[fastllm-load-profile] readIO: calls=%lld total=%.1fs "
+                       "avg=%.2fms bytes=%.2fGiB (%.1f MiB/s)\n",
+                       readCalls, readSeconds,
+                       readCalls > 0 ? readSeconds * 1000.0 / readCalls : 0.0,
+                       readBytes / 1073741824.0,
+                       readSeconds > 0.0 ? readBytes / 1048576.0 / readSeconds : 0.0);
+            }
             {
                 std::lock_guard<std::mutex> guard(lock);
                 printf("[fastllm-load-profile] sections:");
