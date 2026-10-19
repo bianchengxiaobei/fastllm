@@ -1258,6 +1258,103 @@ namespace fastllm {
                                                       const std::string &tensorName);
     static bool IsPackedFP4Tensor(const SafeTensors &safeTensors, const std::string &name);
 
+#if defined(_WIN32) || defined(_WIN64)
+    // 加载时每个张量都会 new 出一块临时缓冲（0.5MB 量级），转换完立刻 delete。
+    // MSVC 的堆对 512KB 以上的块每次都要 VirtualAlloc / VirtualFree，而
+    // VirtualFree 会让全机 TLB 失效，多线程加载时还要抢同一个 NT 堆锁：
+    // 实测 93093 个张量光 ClearBuffer 就是 809 秒（平均 8.7ms 一次 0.5MB 的
+    // delete[]）。这里按线程缓存刚释放过的块，同尺寸直接复用。
+    //
+    // 块本身还是 new uint8_t[] 出来的，池只是暂时留着不放；池里查不到的指针
+    // （跨线程释放、或者别的路径 delete[]）直接回退到 delete[]，依然合法。
+    static const size_t kSafeTensorBlockMinBytes = 64 << 10;
+    static const size_t kSafeTensorBlockMaxBytes = 32 << 20;
+    static const size_t kSafeTensorBlockThreadBytes = 32 << 20;
+
+    struct SafeTensorBlockPool {
+        std::map <uint8_t*, size_t> blockBytes;
+        std::map <size_t, std::vector <uint8_t*> > freeLists;
+        size_t cachedBytes = 0;
+
+        ~SafeTensorBlockPool() {
+            for (auto &it : freeLists) {
+                for (uint8_t *p : it.second) {
+                    delete[] p;
+                }
+            }
+        }
+    };
+
+    static thread_local SafeTensorBlockPool safeTensorBlockPool;
+
+    static bool UseSafeTensorBlockPool() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_CPU_BLOCK_CACHE");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
+    static uint8_t *AllocSafeTensorBlock(size_t bytes) {
+        if (bytes < kSafeTensorBlockMinBytes || bytes > kSafeTensorBlockMaxBytes ||
+            !UseSafeTensorBlockPool()) {
+            return new uint8_t[bytes];
+        }
+        SafeTensorBlockPool &pool = safeTensorBlockPool;
+        auto it = pool.freeLists.find(bytes);
+        if (it != pool.freeLists.end() && !it->second.empty()) {
+            uint8_t *p = it->second.back();
+            it->second.pop_back();
+            pool.cachedBytes -= bytes;
+            pool.blockBytes[p] = bytes;
+            return p;
+        }
+        uint8_t *p = new uint8_t[bytes];
+        pool.blockBytes[p] = bytes;
+        return p;
+    }
+
+    static void FreeSafeTensorBlock(uint8_t *p) {
+        if (p == nullptr) {
+            return;
+        }
+        SafeTensorBlockPool &pool = safeTensorBlockPool;
+        auto it = pool.blockBytes.find(p);
+        if (it == pool.blockBytes.end()) {
+            delete[] p;
+            return;
+        }
+        const size_t bytes = it->second;
+        pool.blockBytes.erase(it);
+        if (bytes < kSafeTensorBlockMinBytes || bytes > kSafeTensorBlockMaxBytes ||
+            pool.cachedBytes + bytes > kSafeTensorBlockThreadBytes) {
+            delete[] p;
+            return;
+        }
+        pool.freeLists[bytes].push_back(p);
+        pool.cachedBytes += bytes;
+    }
+
+    // 块的 ownership 被转给 Data 时（TryAdoptSafeTensorBuffer）要把记录摘掉，
+    // 否则这块地址以后被别的 new 复用、再进池时会带着错误的尺寸。
+    static void ForgetSafeTensorBlock(uint8_t *p) {
+        if (p != nullptr) {
+            safeTensorBlockPool.blockBytes.erase(p);
+        }
+    }
+#else
+    static uint8_t *AllocSafeTensorBlock(size_t bytes) {
+        return new uint8_t[bytes];
+    }
+
+    static void FreeSafeTensorBlock(uint8_t *p) {
+        delete[] p;
+    }
+
+    static void ForgetSafeTensorBlock(uint8_t *p) {
+    }
+#endif
+
     struct SafeTensorItem {
         std::string tensorName;
         std::string fileName;
@@ -1474,7 +1571,7 @@ namespace fastllm {
                                         scale.bytes == scaleBytesCount &&
                                         outputBytes == weightBytes + scaleBytesCount,
                                         "CreateBufferWithScale error: compact E4M3 NVFP4 byte count mismatch.");
-                        buffer = new uint8_t[outputBytes];
+                        buffer = AllocSafeTensorBlock(outputBytes);
                         FILE *fw = fopen(this->fileName.c_str(), "rb");
 #if defined(_WIN32) || defined(_WIN64)
                         _fseeki64(fw, this->data_offsets[0], 0);
@@ -1513,7 +1610,7 @@ namespace fastllm {
                         ReadRaw(packed.data(), this->bytes);
                         scale.ReadRaw(scaleBytes.data(), scale.bytes);
 
-                        buffer = new uint8_t[packedBytes];
+                        buffer = AllocSafeTensorBlock(packedBytes);
                         memset(buffer, 0, packedBytes);
                         for (int i = 0; i < n; i++) {
                             uint8_t *dstRow = buffer + (size_t)i * packedRowBytes;
@@ -1538,7 +1635,7 @@ namespace fastllm {
                     ReadRaw(packed.data(), this->bytes);
                     scale.ReadRaw(scaleBytes.data(), scale.bytes);
 
-                    buffer = new uint8_t[outputBytes];
+                    buffer = AllocSafeTensorBlock(outputBytes);
                     if (dstType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                         PackCompactE4M3NVFP4Block16Rows(
                             n, m, packed.data(), scaleBytes.data(), {scale2Value},
@@ -1567,7 +1664,7 @@ namespace fastllm {
                 }
                 size_t dataBytes = dstType == DataType::NVFP4 ? GetNVFP4WeightBytes(n, m) : (size_t)n * m;
                 size_t scaleBytes = dstType == DataType::NVFP4 ? scale.bytes : 0;
-                buffer = new uint8_t[dataBytes + scaleBytes];
+                buffer = AllocSafeTensorBlock(dataBytes + scaleBytes);
                 ReadRaw(buffer, this->bytes);
                 AssertInFastLLM(this->bytes == dataBytes,
                                 "CreateBufferWithScale error: scaled data bytes mismatch.");
@@ -1589,7 +1686,7 @@ namespace fastllm {
             } else {
                 AssertInFastLLM(scale.buffer != nullptr,
                                 "CreateBufferWithScale error: scale buffer is empty.");
-                buffer = new uint8_t[n * m * sizeof(float)];
+                buffer = AllocSafeTensorBlock(n * m * sizeof(float));
                 float *floatBuffer = (float*)buffer;
 
                 uint8_t *ori = new uint8_t[this->bytes];
@@ -1638,7 +1735,7 @@ namespace fastllm {
             static const int awq_shift[8] = {0,16,4,20,8,24,12,28}; // awq order = [0,2,4,8,1,3,5,7]
 
             if (dstType == DataType::FLOAT32) {
-                buffer = new uint8_t[this->bytes * 8];
+                buffer = AllocSafeTensorBlock(this->bytes * 8);
                 float *floatBuffer = (float*)buffer;
                 for (int x = 0; x < n; x++) {
                     for (int y = 0; y < m * 8; y++) {
@@ -1651,7 +1748,7 @@ namespace fastllm {
                     }
                 }
             } else if (dstType == DataType::INT4_GROUP) {
-                buffer = new uint8_t[this->bytes];
+                buffer = AllocSafeTensorBlock(this->bytes);
                 memset(buffer, 0, this->bytes);
                 int group = (n - 1) / groupCnt + 1;
                 scalesBuffer = new float[m * 8 * group];
@@ -1714,10 +1811,12 @@ namespace fastllm {
                                 "Compact INT4_GROUP32 requires group-32 BF16 scales.");
                 const size_t rowBytes = packedBytesPerRow +
                                         (size_t)groups * sizeof(uint16_t);
-                buffer = new uint8_t[(size_t)rows * rowBytes];
+                buffer = AllocSafeTensorBlock((size_t)rows * rowBytes);
                 const uint16_t *sourceScales = (const uint16_t*)scale.buffer;
                 // 整块读一次，别逐行 1KB 读：那样每个张量就是 2000 次小请求。
-                std::vector<uint8_t> packedRows((size_t)rows * packedBytesPerRow);
+                // 缓冲按线程复用，免得每个张量都 new/delete 一块 0.5MB。
+                static thread_local std::vector<uint8_t> packedRows;
+                packedRows.resize((size_t)rows * packedBytesPerRow);
                 ReadRawAt(this->data_offsets[0], packedRows.data(), packedRows.size());
                 for (size_t row = 0; row < (size_t)rows; row++) {
                     uint8_t *dstRow = buffer + row * rowBytes;
@@ -1740,7 +1839,7 @@ namespace fastllm {
             } else {
                 AssertInFastLLM(dstType == DataType::INT4_GROUP,
                                 "CreateBufferWithPackedInt4Group error: unsupported destination type.");
-                buffer = new uint8_t[this->bytes];
+                buffer = AllocSafeTensorBlock(this->bytes);
                 ReadRaw(buffer, this->bytes);
                 for (size_t i = 0; i < this->bytes; i++) {
                     uint8_t value = buffer[i];
@@ -1841,7 +1940,7 @@ namespace fastllm {
                 "Padded input dimensions are not supported.");
 
             ClearBuffer();
-            buffer = new uint8_t[this->bytes];
+            buffer = AllocSafeTensorBlock(this->bytes);
             ReadRawData(buffer, this->bytes);
 
             // compressed-tensors places q0 in the low nibble; FastLLM's
@@ -1892,7 +1991,7 @@ namespace fastllm {
             const size_t rows = (size_t)this->shape[0];
             const size_t columns = (size_t)this->shape[1];
             ClearBuffer();
-            buffer = new uint8_t[rows * (columns + 2 * sizeof(float))];
+            buffer = AllocSafeTensorBlock(rows * (columns + 2 * sizeof(float)));
             for (size_t row = 0; row < rows; row++) {
                 uint8_t *dst = buffer + row * (columns + 2 * sizeof(float));
                 ReadRawAt(this->data_offsets[0] + row * columns, dst, columns);
@@ -1913,7 +2012,7 @@ namespace fastllm {
             DataType srcType;
             if (this->dtype == "fastllm") {
                 ClearBuffer();
-                buffer = new uint8_t[this->bytes];
+                buffer = AllocSafeTensorBlock(this->bytes);
                 ReadRaw(buffer, this->bytes);
                 return;
             } else if (this->dtype == "F8_E4M3") {
@@ -1938,7 +2037,7 @@ namespace fastllm {
                 // weight_scale convention; unrelated U8 tensors remain plain
                 // integer data.
                 ClearBuffer();
-                buffer = new uint8_t[(size_t)len * sizeof(float)];
+                buffer = AllocSafeTensorBlock((size_t)len * sizeof(float));
                 std::vector<uint8_t> ori(len);
                 ReadRaw(ori.data(), len);
                 float *dst = (float*)buffer;
@@ -1951,7 +2050,7 @@ namespace fastllm {
                     ErrorInFastLLM("SafeTensorItem.CreateBuffer: I64 tensor " + this->tensorName + " should be loaded as int32.\n");
                 }
                 ClearBuffer();
-                buffer = new uint8_t[(size_t)len * sizeof(int32_t)];
+                buffer = AllocSafeTensorBlock((size_t)len * sizeof(int32_t));
                 std::vector<int64_t> ori(len);
                 ReadRaw(ori.data(), len * sizeof(int64_t));
                 int32_t *dst = (int32_t*)buffer;
@@ -1976,7 +2075,7 @@ namespace fastllm {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport dst dtype " + std::to_string(dstType) + "\n");
             }
             ClearBuffer();
-            buffer = new uint8_t[(size_t)len * unitSize];
+            buffer = AllocSafeTensorBlock((size_t)len * unitSize);
             if (dstType == srcType) {
                 ReadRaw(buffer, this->bytes);
             } else {
@@ -2005,7 +2104,7 @@ namespace fastllm {
         }
 
         void ClearBuffer() {
-            delete[] buffer;
+            FreeSafeTensorBlock(buffer);
             buffer = nullptr;
             delete[] minsBuffer;
             minsBuffer = nullptr;
@@ -2591,6 +2690,7 @@ namespace fastllm {
         weight.expansionSize = weight.Count(0);
         weight.expansionBytes = weight.GetBytes();
         weight.cpuData = tensor.buffer;
+        ForgetSafeTensorBlock(tensor.buffer);
         tensor.buffer = nullptr;
         return true;
     }

@@ -512,6 +512,91 @@ namespace fastllm {
         fastllmEnv.cudaGraph = v;
     }
 
+#if defined(_WIN32) || defined(_WIN64)
+    // Windows 版的大块缓存池。Linux 那边在 TuneGlibcAllocatorForTransientTensors
+    // 里用 mallopt 把 mmap/trim 阈值抬到 1GB，超过阈值的 transient 块就留在
+    // glibc arena 里复用；MSVC 的堆没有对应的开关，512KB 以上的请求每次都走
+    // VirtualAlloc，delete[] 时 VirtualFree 还要让全机 TLB 失效。
+    //
+    // 权重加载正好踩在这个尺寸上：几十万个张量的临时缓冲是 0.5MB 量级，
+    // 每个张量 create -> 转换 -> 释放一轮。实测 16 线程加载 93093 个张量时
+    // 光 new/delete 就占了 2000+ 秒（单次 0.5MB 的 delete[] 平均 8.7ms），
+    // 而且加线程毫无帮助，因为所有线程抢的是同一个 NT 堆。
+    //
+    // 这里的池只缓存每个线程最近释放过的块，块本身仍是 new uint8_t[] 出来的：
+    // 池记不住某个块时（跨线程释放、或者走的是别处的 delete[]）直接回退到
+    // delete[]，这些路径依然合法，不存在所有权混乱。
+    //
+    // FASTLLM_CPU_BLOCK_CACHE=0 可关闭。
+    static const uint64_t kCpuBlockCacheMinBytes = 64ull << 10;
+    static const uint64_t kCpuBlockCacheMaxBytes = 32ull << 20;
+    static const uint64_t kCpuBlockCacheThreadBytes = 32ull << 20;
+
+    struct CpuBlockCache {
+        std::map<uint8_t *, uint64_t> blockBytes;
+        std::map<uint64_t, std::vector<uint8_t *> > freeLists;
+        uint64_t cachedBytes = 0;
+
+        ~CpuBlockCache() {
+            for (auto &it : freeLists) {
+                for (uint8_t *p : it.second) {
+                    delete[] p;
+                }
+            }
+        }
+    };
+
+    static thread_local CpuBlockCache cpuBlockCache;
+
+    static bool UseCpuBlockCache() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_CPU_BLOCK_CACHE");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
+    static uint8_t *AllocCpuBlock(uint64_t bytes) {
+        if (bytes < kCpuBlockCacheMinBytes || bytes > kCpuBlockCacheMaxBytes ||
+            !UseCpuBlockCache()) {
+            return new uint8_t[bytes];
+        }
+        CpuBlockCache &cache = cpuBlockCache;
+        auto it = cache.freeLists.find(bytes);
+        if (it != cache.freeLists.end() && !it->second.empty()) {
+            uint8_t *p = it->second.back();
+            it->second.pop_back();
+            cache.cachedBytes -= bytes;
+            cache.blockBytes[p] = bytes;
+            return p;
+        }
+        uint8_t *p = new uint8_t[bytes];
+        cache.blockBytes[p] = bytes;
+        return p;
+    }
+
+    static void FreeCpuBlock(uint8_t *p) {
+        if (p == nullptr) {
+            return;
+        }
+        CpuBlockCache &cache = cpuBlockCache;
+        auto it = cache.blockBytes.find(p);
+        if (it == cache.blockBytes.end()) {
+            delete[] p;
+            return;
+        }
+        const uint64_t bytes = it->second;
+        cache.blockBytes.erase(it);
+        if (bytes < kCpuBlockCacheMinBytes || bytes > kCpuBlockCacheMaxBytes ||
+            cache.cachedBytes + bytes > kCpuBlockCacheThreadBytes) {
+            delete[] p;
+            return;
+        }
+        cache.freeLists[bytes].push_back(p);
+        cache.cachedBytes += bytes;
+    }
+#endif
+
     // 专家权重流式的中转环: 槽数越多, 主机越能跑到 DMA 前面(不容易被槽位事件反压);
     // 单槽宽越大, 单个权重块需要切的片越少. 总量是不可换出的主机内存, 夹在 256MB 内.
     void SetMoePinnedStaging(int slots, int slotMb) {
@@ -2504,7 +2589,11 @@ namespace fastllm {
         if (this->dataDevice == DataDevice::CPU) {
             auto allocSt = profileCpuAlloc ? std::chrono::steady_clock::now() :
                 std::chrono::steady_clock::time_point();
+#if defined(_WIN32) || defined(_WIN64)
+            this->cpuData = AllocCpuBlock(this->expansionBytes);
+#else
             this->cpuData = new uint8_t[this->expansionBytes];
+#endif
             if (profileCpuAlloc) {
                 cpuAllocNanos.fetch_add(ElapsedNanos(allocSt));
                 cpuAllocBytes.fetch_add((long long)this->expansionBytes);
@@ -2566,7 +2655,11 @@ namespace fastllm {
             if (ownsCpuData) {
                 auto freeSt = profileCpuAlloc ? std::chrono::steady_clock::now() :
                     std::chrono::steady_clock::time_point();
+#if defined(_WIN32) || defined(_WIN64)
+                FreeCpuBlock(this->cpuData);
+#else
                 delete[] this->cpuData;
+#endif
                 if (profileCpuAlloc) {
                     cpuFreeNanos.fetch_add(ElapsedNanos(freeSt));
                 }
