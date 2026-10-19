@@ -5940,7 +5940,10 @@ void FastllmCudaFree(void *ret) {
         cudaError_t switchState = cudaSetDevice(pointerDevice);
         if (switchState != cudaSuccess) {
             checkCudaErrors("CUDA error when switching to the pointer owner before release!", switchState);
-            cudaError_t restoreState = cudaSetDevice(oriId);
+            cudaError_t restoreState = cudaSuccess;
+            if (oriId >= 0) {
+                restoreState = cudaSetDevice(oriId);
+            }
             checkCudaErrors("CUDA error when restoring device after a failed release switch!", restoreState);
             return;
         }
@@ -5951,7 +5954,12 @@ void FastllmCudaFree(void *ret) {
         checkCudaErrors("CUDA error when synchronizing before release!", syncState);
     }
     cudaError_t state = cudaFree(ret);
-    cudaError_t restoreState = cudaSetDevice(oriId);
+    // oriId 由 FastllmCudaGetDevice 得到, 它在 cudart 卸载期会静默返回 -1;
+    // 拿 -1 去 cudaSetDevice 只会得到 cudaErrorInvalidDevice 101 的噪音。
+    cudaError_t restoreState = cudaSuccess;
+    if (oriId >= 0) {
+        restoreState = cudaSetDevice(oriId);
+    }
     checkCudaErrors("CUDA error when release memory!", state);
     checkCudaErrors("CUDA error when restoring device after release!", restoreState);
 }

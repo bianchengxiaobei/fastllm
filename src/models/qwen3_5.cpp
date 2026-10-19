@@ -1164,6 +1164,11 @@ namespace fastllm {
         if (interval <= 0) {
             return;
         }
+        // 显式开分段计时时只看 decode(单 token) 的样本, 否则 warmup/prefill 的
+        // 大 batch 会把平均值整体抬上去.
+        if (Qwen35DecodeStageProfileRequested() && seqTokens != 1) {
+            return;
+        }
         Qwen35MtpTargetProfileAggregate &stats = Qwen35MtpTargetProfileStats();
         long long samples = stats.samples.fetch_add(1, std::memory_order_relaxed) + 1;
         if (tensorParallel) {
@@ -1216,6 +1221,9 @@ namespace fastllm {
             long long setupUs, long long layersUs, long long headUs,
             long long totalUs) {
         if (interval <= 0) {
+            return;
+        }
+        if (Qwen35DecodeStageProfileRequested() && seqTokens != 1) {
             return;
         }
         Qwen35MtpWorkerProfileAggregate &stats = Qwen35MtpWorkerProfileStats();

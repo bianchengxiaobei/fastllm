@@ -98,6 +98,17 @@ def _terminate_now():
             ctypes.windll.kernel32.GetCurrentProcess(), 0)
     os._exit(0)
 
+def _mark_native_process_exiting():
+    # 信号退出走 TerminateProcess, 但 native 侧的退出标记不能漏: 漏了之后
+    # cudart 开始卸载时收尾路径仍会真调 cudaFree/cudaSetDevice, 打印
+    # cudaErrorInvalidDevice 101 之类的退出噪音(显存反正由驱动回收)。
+    # 标记本身只是一次原子写, 顺手置上。
+    try:
+        from .llm import fastllm_lib
+        fastllm_lib.mark_process_exiting()
+    except Exception:
+        logging.exception("mark_process_exiting failed")
+
 def _prewarm_request_executor(executor, workers: int) -> int:
     started = 0
     ready = threading.Condition()
@@ -149,6 +160,7 @@ class FastLLMUvicornServer(uvicorn.Server):
         logging.info("Received signal %d, exiting immediately", sig)
         sys.stdout.flush()
         sys.stderr.flush()
+        _mark_native_process_exiting()
         _terminate_now()
 
     async def startup(self, sockets = None):
