@@ -5254,8 +5254,8 @@ namespace fastllm {
         std::chrono::steady_clock::time_point begin;
         std::mutex lock;
         std::vector<Entry> entries;
-        // 0=预读/查表 1=转换 2=锁内合并 3=搬设备 4=进度 5=整个张量循环
-        static const int PhaseCount = 6;
+        // 0=预读/查表 1=转换 2=锁内合并 3=搬设备 4=进度 5=等锁 6=整个张量循环
+        static const int PhaseCount = 7;
         std::atomic<long long> phaseNanos[PhaseCount] = {};
         std::vector<std::pair<std::string, double>> sections;
 
@@ -5342,7 +5342,8 @@ namespace fastllm {
             }
             printf(" (MiB/s)\n");
             static const char *phaseNames[PhaseCount] = {
-                "prefetch", "convert", "merge", "device", "progress", "loopTotal"};
+                "prefetch", "convert", "merge", "device", "progress",
+                "lockWait", "loopTotal"};
             printf("[fastllm-load-profile] phases(线程累计):");
             for (int i = 0; i < PhaseCount; i++) {
                 printf(" %s=%.1fs", phaseNames[i],
@@ -5971,8 +5972,10 @@ namespace fastllm {
 
         // 4.2 读取
         std::vector <std::thread*> threads;
-        int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
-        // 机械盘/QLC 上 16 路并发读会互相打断顺序流，可用环境变量降到 1~2 路做对照。
+        // 加载是 IO 密集，不该用 alive 池的大小：那个池按物理核数做了 clamp，
+        // 4 核机器上只有 4 个 worker，加载线程数被连带压到 4。
+        int threadNum = std::min(16, std::max(4, (int)std::thread::hardware_concurrency()));
+        // 机械盘/QLC 上 16 路并发读会互相打断顺序流，可用环境变量降下来做对照。
         if (const char *loadThreadsEnv = std::getenv("FASTLLM_LOAD_THREADS")) {
             int value = std::atoi(loadThreadsEnv);
             if (value > 0) {
@@ -6481,7 +6484,13 @@ namespace fastllm {
                             tensor.ClearBuffer();
 
                             markPhase(1);
+                            const double lockWaitStart = gWeightLoadProfile.enabled ?
+                                gWeightLoadProfile.Now() : 0.0;
                             locker.lock();
+                            if (gWeightLoadProfile.enabled) {
+                                gWeightLoadProfile.AddPhase(5,
+                                    gWeightLoadProfile.Now() - lockWaitStart);
+                            }
                             markWeightFinished(weightName);
                             model->OnWeightLoaded(weightName, allFinishNames);
                             if (model->IsWeightConsumedAfterLoad(weightName)) {
@@ -6697,7 +6706,7 @@ namespace fastllm {
                         markPhase(4);
                     }
                     if (gWeightLoadProfile.enabled) {
-                        gWeightLoadProfile.AddPhase(5,
+                        gWeightLoadProfile.AddPhase(6,
                             gWeightLoadProfile.Now() - threadBegin);
                     }
         };
