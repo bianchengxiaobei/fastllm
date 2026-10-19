@@ -5454,6 +5454,9 @@ namespace fastllm {
         // 7=打包转换(CreateBuffer*) 8=CreateFromOriData 9=ClearBuffer
         static const int PhaseCount = 10;
         std::atomic<long long> phaseNanos[PhaseCount] = {};
+        // 每个阶段里这条线程自己的 CPU 时间。阶段耗时里 CPU 占比很低，说明是在等
+        // （等锁、等页、等内核），不是在算：这是区分两者的唯一直接证据。
+        std::atomic<long long> phaseCpuNanos[PhaseCount] = {};
         std::vector<std::pair<std::string, double>> sections;
 
         void AddPhase(int index, double seconds) {
@@ -5462,6 +5465,14 @@ namespace fastllm {
             }
             phaseNanos[index].fetch_add((long long)(seconds * 1e9),
                                         std::memory_order_relaxed);
+            static thread_local double lastCpuSeconds = -1.0;
+            const double cpuNow = GetThreadCpuSeconds();
+            if (lastCpuSeconds >= 0.0 && cpuNow > lastCpuSeconds) {
+                phaseCpuNanos[index].fetch_add(
+                    (long long)((cpuNow - lastCpuSeconds) * 1e9),
+                    std::memory_order_relaxed);
+            }
+            lastCpuSeconds = cpuNow;
         }
 
         void AddSection(const std::string &name, double seconds) {
@@ -5546,6 +5557,16 @@ namespace fastllm {
                 printf(" %s=%.1fs", phaseNames[i],
                        phaseNanos[i].load(std::memory_order_relaxed) / 1e9);
             }
+            printf("[fastllm-load-profile] phaseCpu(线程累计):");
+            for (int i = 0; i < PhaseCount; i++) {
+                const double phaseSeconds =
+                    phaseNanos[i].load(std::memory_order_relaxed) / 1e9;
+                const double cpuSeconds =
+                    phaseCpuNanos[i].load(std::memory_order_relaxed) / 1e9;
+                printf(" %s=%.0f%%", phaseNames[i],
+                       phaseSeconds > 0.0 ? 100.0 * cpuSeconds / phaseSeconds : 0.0);
+            }
+            printf("\n");
             double accounted = 0.0;
             for (int i = 0; i < 6; i++) {
                 accounted += phaseNanos[i].load(std::memory_order_relaxed) / 1e9;
@@ -6239,6 +6260,17 @@ namespace fastllm {
         uint64_t completedLoadBytes = 0;
         uint64_t totalLoadBytes = 0;
         std::atomic<int> lastPrintedProgress{-1};
+        // FASTLLM_LOAD_LIMIT_MB=N：只处理前 N MB 就打 profile 退出。
+        // 用来把「加载早期」和「后期」分开量：同一台机器同一个模型，
+        // 早期快、后期慢，说明变慢跟进程已经占住的权重内存有关，不是每张量的固有成本。
+        uint64_t loadLimitBytes = 0;
+        if (const char *limitEnv = std::getenv("FASTLLM_LOAD_LIMIT_MB")) {
+            long long limitMb = std::atoll(limitEnv);
+            if (limitMb > 0) {
+                loadLimitBytes = (uint64_t)limitMb << 20;
+            }
+        }
+        std::atomic<uint64_t> loadLimitDoneBytes{0};
         auto printLoadingProgress = [&](uint64_t tensorBytes) {
             int current = 0;
             uint64_t currentBytes = 0;
@@ -6748,6 +6780,15 @@ namespace fastllm {
                             if (gWeightLoadProfile.enabled) {
                                 gWeightLoadProfile.AddPhase(9,
                                     gWeightLoadProfile.Now() - convMark);
+                            }
+                            if (loadLimitBytes > 0) {
+                                uint64_t limitDoneBytes = loadLimitDoneBytes.fetch_add(
+                                    tensor.bytes) + tensor.bytes;
+                                if (limitDoneBytes >= loadLimitBytes) {
+                                    gWeightLoadProfile.Report();
+                                    fflush(stdout);
+                                    std::exit(0);
+                                }
                             }
 
                             markPhase(1);
