@@ -5254,9 +5254,10 @@ namespace fastllm {
         std::chrono::steady_clock::time_point begin;
         std::mutex lock;
         std::vector<Entry> entries;
-        // 0=预读/查表 1=转换 2=锁内合并 3=搬设备 4=进度
-        static const int PhaseCount = 5;
+        // 0=预读/查表 1=转换 2=锁内合并 3=搬设备 4=进度 5=整个张量循环
+        static const int PhaseCount = 6;
         std::atomic<long long> phaseNanos[PhaseCount] = {};
+        std::vector<std::pair<std::string, double>> sections;
 
         void AddPhase(int index, double seconds) {
             if (!enabled || index < 0 || index >= PhaseCount || seconds <= 0.0) {
@@ -5264,6 +5265,14 @@ namespace fastllm {
             }
             phaseNanos[index].fetch_add((long long)(seconds * 1e9),
                                         std::memory_order_relaxed);
+        }
+
+        void AddSection(const std::string &name, double seconds) {
+            if (!enabled) {
+                return;
+            }
+            std::lock_guard<std::mutex> guard(lock);
+            sections.push_back(std::make_pair(name, seconds));
         }
 
         void Start() {
@@ -5333,13 +5342,27 @@ namespace fastllm {
             }
             printf(" (MiB/s)\n");
             static const char *phaseNames[PhaseCount] = {
-                "prefetch", "convert", "merge", "device", "progress"};
+                "prefetch", "convert", "merge", "device", "progress", "loopTotal"};
             printf("[fastllm-load-profile] phases(线程累计):");
             for (int i = 0; i < PhaseCount; i++) {
                 printf(" %s=%.1fs", phaseNames[i],
                        phaseNanos[i].load(std::memory_order_relaxed) / 1e9);
             }
-            printf("\n");
+            double accounted = 0.0;
+            for (int i = 0; i < PhaseCount - 1; i++) {
+                accounted += phaseNanos[i].load(std::memory_order_relaxed) / 1e9;
+            }
+            printf(" unaccounted=%.1fs\n",
+                   phaseNanos[PhaseCount - 1].load(std::memory_order_relaxed) / 1e9 -
+                       accounted);
+            {
+                std::lock_guard<std::mutex> guard(lock);
+                printf("[fastllm-load-profile] sections:");
+                for (auto &it : sections) {
+                    printf(" %s=%.1fs", it.first.c_str(), it.second);
+                }
+                printf("\n");
+            }
 
             std::sort(snapshot.begin(), snapshot.end(),
                       [](const Entry &a, const Entry &b) {
@@ -6010,6 +6033,11 @@ namespace fastllm {
         }
         ReportModelLoadProgress("weights_load", 0, loadProgressTotal, 0, totalLoadBytes);
         gWeightLoadProfile.Start();
+        if (gWeightLoadProfile.enabled) {
+            printf("[fastllm-load-profile] plan: serial=%d parallel=%d loadThreads=%d\n",
+                   (int)serialTensors.size(), (int)tensors.size(), threadNum);
+            fflush(stdout);
+        }
         if (serialTensors.empty() && tensors.empty()) {
             ReportModelLoadProgress("weights_load", 1, 1);
         }
@@ -6076,8 +6104,9 @@ namespace fastllm {
                     }();
                     bool prefetchStarted = false;
                     uint64_t prefetchNextOffset = 0;
-                    double phaseMark = gWeightLoadProfile.enabled ?
+                    const double threadBegin = gWeightLoadProfile.enabled ?
                         gWeightLoadProfile.Now() : 0.0;
+                    double phaseMark = threadBegin;
                     auto markPhase = [&](int index) {
                         if (!gWeightLoadProfile.enabled) {
                             return;
@@ -6667,8 +6696,19 @@ namespace fastllm {
                             GetThreadCpuSeconds() - loadProfileCpuStart);
                         markPhase(4);
                     }
+                    if (gWeightLoadProfile.enabled) {
+                        gWeightLoadProfile.AddPhase(5,
+                            gWeightLoadProfile.Now() - threadBegin);
+                    }
         };
 
+        auto loadSectionBegin = std::chrono::steady_clock::now();
+        auto finishLoadSection = [&](const char *name) {
+            auto now = std::chrono::steady_clock::now();
+            gWeightLoadProfile.AddSection(
+                name, std::chrono::duration<double>(now - loadSectionBegin).count());
+            loadSectionBegin = now;
+        };
         activeTensors = &serialTensors;
         int serialStart = 0;
         while (serialStart < (int)serialTensors.size()) {
@@ -6706,6 +6746,7 @@ namespace fastllm {
             model->OnWeightLoadGroupFinished();
             serialStart = serialEnd;
         }
+        finishLoadSection("serial");
         activeTensors = &tensors;
 
         for (int i = 0; i < threadNum; i++) {
@@ -6715,8 +6756,10 @@ namespace fastllm {
             threads[i]->join();
             delete threads[i];
         }
+        finishLoadSection("parallel");
         model->OnWeightLoadGroupFinished();
         model->OnModelWeightsLoaded();
+        finishLoadSection("finalize");
         gWeightLoadProfile.Report();
 
         printf("\n");
