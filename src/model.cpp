@@ -125,6 +125,35 @@ namespace fastllm {
         cache.push_back(entry);
         return handle;
     }
+
+    // 按偏移整块读。整块指这一次调用要的字节数（通常就是一整个张量），
+    // 不要退化成 CRT 的 4KB 缓冲读，否则又是一串 4K 随机请求。
+    static bool ReadFileAtOffset(const std::string &fileName, uint64_t offset,
+                                 void *dst, size_t len) {
+        if (!UseLoadReadFile() || dst == nullptr || len == 0) {
+            return false;
+        }
+        HANDLE handle = GetLoadFileHandle(fileName);
+        if (handle == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        LARGE_INTEGER position;
+        position.QuadPart = (LONGLONG)offset;
+        if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
+            return false;
+        }
+        uint8_t *cur = (uint8_t*)dst;
+        size_t done = 0;
+        while (done < len) {
+            DWORD chunk = (DWORD)std::min<size_t>(len - done, 256u << 20);
+            DWORD got = 0;
+            if (!ReadFile(handle, cur + done, chunk, &got, nullptr) || got == 0) {
+                return false;
+            }
+            done += got;
+        }
+        return true;
+    }
 #endif
 
     // safetensors 是整文件映射后逐张量 memcpy 的。默认路径下每个 4KB 页都要单独
@@ -1295,32 +1324,11 @@ namespace fastllm {
             AssertInFastLLM(fileBase != nullptr && offset + len <= fileSize,
                             "SafeTensorItem read out of range: " + tensorName);
 #if defined(_WIN32) || defined(_WIN64)
-            // 实测映射读会退化成逐 4KB 同步缺页：16 线程并发时整机读带宽卡在
-            // 60~65 MiB/s（QLC/SATA 的 4K 随机水平），PrefetchVirtualMemory
-            // 也合并不出大请求。这里改成每线程一个 FILE_FLAG_SEQUENTIAL_SCAN
-            // 句柄，按偏移直接 ReadFile，请求大小就是张量本身。
-            if (UseLoadReadFile()) {
-                HANDLE handle = GetLoadFileHandle(fileName);
-                if (handle != INVALID_HANDLE_VALUE) {
-                    LARGE_INTEGER position;
-                    position.QuadPart = (LONGLONG)offset;
-                    if (SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
-                        uint8_t *cur = (uint8_t*)dst;
-                        size_t done = 0;
-                        while (done < len) {
-                            DWORD chunk = (DWORD)std::min<size_t>(len - done, 256u << 20);
-                            DWORD got = 0;
-                            if (!ReadFile(handle, cur + done, chunk, &got, nullptr) ||
-                                got == 0) {
-                                break;
-                            }
-                            done += got;
-                        }
-                        if (done == len) {
-                            return;
-                        }
-                    }
-                }
+            // 实测映射读会退化成逐 4KB 同步缺页，16 线程并发时整机读带宽卡在
+            // 60~65 MiB/s（QLC/SATA 的 4K 随机水平），预读也合并不出大请求。
+            // 这里按偏移直接整块 ReadFile，请求大小就是调用方要的字节数。
+            if (ReadFileAtOffset(fileName, offset, dst, len)) {
+                return;
             }
 #endif
             memcpy(dst, fileBase + offset, len);
@@ -1697,17 +1705,18 @@ namespace fastllm {
                                         (size_t)groups * sizeof(uint16_t);
                 buffer = new uint8_t[(size_t)rows * rowBytes];
                 const uint16_t *sourceScales = (const uint16_t*)scale.buffer;
-                std::vector<uint8_t> packedRow(packedBytesPerRow);
+                // 整块读一次，别逐行 1KB 读：那样每个张量就是 2000 次小请求。
+                std::vector<uint8_t> packedRows((size_t)rows * packedBytesPerRow);
+                ReadRawAt(this->data_offsets[0], packedRows.data(), packedRows.size());
                 for (size_t row = 0; row < (size_t)rows; row++) {
                     uint8_t *dstRow = buffer + row * rowBytes;
-                    ReadRawAt(this->data_offsets[0] + row * packedBytesPerRow,
-                              packedRow.data(), packedBytesPerRow);
+                    const uint8_t *packedRow = packedRows.data() + row * packedBytesPerRow;
                     // compressed-tensors stores q0 in the low nibble. Keep the
                     // normal FastLLM convention (q0 in the high nibble).
                     for (size_t group = 0; group < (size_t)groups; group++) {
                         uint8_t *dstBlock = dstRow +
                             GetInt4Group32DataOffset(group, groups);
-                        const uint8_t *srcBlock = packedRow.data() + group * 16;
+                        const uint8_t *srcBlock = packedRow + group * 16;
                         for (size_t i = 0; i < 16; i++) {
                             uint8_t value = srcBlock[i];
                             dstBlock[i] = (uint8_t)((value << 4) | (value >> 4));
@@ -1742,6 +1751,13 @@ namespace fastllm {
                 output != nullptr && outputBytes == this->bytes,
                 "SafeTensorItem.ReadRawData error: destination size does not match tensor " +
                 this->tensorName + ".");
+#if defined(_WIN32) || defined(_WIN64)
+            // 这里原来每次 fopen + fread：CRT 默认 4KB 缓冲，等于把整块读拆成
+            // 一串 4KB 请求，九万多个张量都走这条路径。
+            if (ReadFileAtOffset(fileName, data_offsets[0], output, outputBytes)) {
+                return;
+            }
+#endif
             FILE *file = fopen(this->fileName.c_str(), "rb");
             AssertInFastLLM(
                 file != nullptr,
