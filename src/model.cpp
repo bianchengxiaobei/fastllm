@@ -5502,6 +5502,46 @@ namespace fastllm {
         printf("[fastllm-load-probe] total %.2f GiB in %.1f s = %.1f MiB/s\n",
                totalBytes / 1073741824.0, totalSeconds,
                totalSeconds > 0.0 ? totalBytes / 1048576.0 / totalSeconds : 0.0);
+#if defined(_WIN32) || defined(_WIN64)
+        // 再来一遍绕开系统缓存的冷读：FILE_FLAG_NO_BUFFERING 直接把请求打到设备，
+        // 和上面的缓存命中数字一对比，就能分清"盘慢"和"中间层在拖"。
+        for (auto &file : files) {
+            HANDLE handle = CreateFileA(
+                file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
+                    FILE_FLAG_SEQUENTIAL_SCAN,
+                nullptr);
+            if (handle == INVALID_HANDLE_VALUE) {
+                printf("[fastllm-load-probe] cold open failed: %s err=%lu\n",
+                       file.c_str(), (unsigned long)GetLastError());
+                continue;
+            }
+            const size_t block = 8ULL << 20;
+            void *raw = VirtualAlloc(nullptr, block, MEM_COMMIT | MEM_RESERVE,
+                                     PAGE_READWRITE);
+            LARGE_INTEGER fileSize;
+            GetFileSizeEx(handle, &fileSize);
+            const uint64_t limit = fileSize.QuadPart / block * block;
+            auto begin = std::chrono::steady_clock::now();
+            uint64_t bytes = 0;
+            DWORD got = 0;
+            while (bytes < limit &&
+                   ReadFile(handle, (uint8_t*)raw, (DWORD)block, &got, nullptr) &&
+                   got > 0) {
+                bytes += got;
+            }
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - begin).count();
+            printf("[fastllm-load-probe] cold(no-buffering) %-22s %8.1f MiB %8.1f MiB/s\n",
+                   file.substr(file.find_last_of("/\\") + 1).c_str(),
+                   bytes / 1048576.0,
+                   elapsed > 0.0 ? bytes / 1048576.0 / elapsed : 0.0);
+            fflush(stdout);
+            VirtualFree(raw, 0, MEM_RELEASE);
+            CloseHandle(handle);
+        }
+#endif
         fflush(stdout);
     }
 
