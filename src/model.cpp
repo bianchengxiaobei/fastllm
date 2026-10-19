@@ -93,6 +93,40 @@ namespace fastllm {
 #endif
     extern BF16ToFP16Manager bf16tofp16;
 
+#if defined(_WIN32) || defined(_WIN64)
+    // FASTLLM_LOAD_READFILE=0 可以退回映射读，方便对照。
+    static bool UseLoadReadFile() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_LOAD_READFILE");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
+    // SetFilePointerEx + ReadFile 共享句柄会互相踩文件指针，所以每线程一套。
+    static HANDLE GetLoadFileHandle(const std::string &fileName) {
+        struct Entry {
+            std::string name;
+            HANDLE handle = INVALID_HANDLE_VALUE;
+        };
+        static thread_local std::vector<Entry> cache;
+        for (auto &it : cache) {
+            if (it.name == fileName) {
+                return it.handle;
+            }
+        }
+        HANDLE handle = CreateFileA(
+            fileName.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+        Entry entry;
+        entry.name = fileName;
+        entry.handle = handle;
+        cache.push_back(entry);
+        return handle;
+    }
+#endif
+
     // safetensors 是整文件映射后逐张量 memcpy 的。默认路径下每个 4KB 页都要单独
     // 触发一次同步缺页，16 个加载线程交错访问同一个映射时预读基本失效，读吞吐会
     // 掉到 SATA SSD 的 4K 随机水平（几十 MiB/s）。这里按张量范围一次性把页拉进来。
@@ -1239,6 +1273,12 @@ namespace fastllm {
             if (fileBase == nullptr || bytes == 0) {
                 return;
             }
+#if defined(_WIN32) || defined(_WIN64)
+            // 走 ReadFile 直读时不需要再预读映射页。
+            if (UseLoadReadFile()) {
+                return;
+            }
+#endif
             const uint64_t begin = data_offsets[0];
             uint64_t length = std::max<uint64_t>(bytes, (uint64_t)windowBytes);
             if (begin + length > fileSize) {
@@ -1254,6 +1294,35 @@ namespace fastllm {
         void ReadRawAt(uint64_t offset, void *dst, size_t len) {
             AssertInFastLLM(fileBase != nullptr && offset + len <= fileSize,
                             "SafeTensorItem read out of range: " + tensorName);
+#if defined(_WIN32) || defined(_WIN64)
+            // 实测映射读会退化成逐 4KB 同步缺页：16 线程并发时整机读带宽卡在
+            // 60~65 MiB/s（QLC/SATA 的 4K 随机水平），PrefetchVirtualMemory
+            // 也合并不出大请求。这里改成每线程一个 FILE_FLAG_SEQUENTIAL_SCAN
+            // 句柄，按偏移直接 ReadFile，请求大小就是张量本身。
+            if (UseLoadReadFile()) {
+                HANDLE handle = GetLoadFileHandle(fileName);
+                if (handle != INVALID_HANDLE_VALUE) {
+                    LARGE_INTEGER position;
+                    position.QuadPart = (LONGLONG)offset;
+                    if (SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
+                        uint8_t *cur = (uint8_t*)dst;
+                        size_t done = 0;
+                        while (done < len) {
+                            DWORD chunk = (DWORD)std::min<size_t>(len - done, 256u << 20);
+                            DWORD got = 0;
+                            if (!ReadFile(handle, cur + done, chunk, &got, nullptr) ||
+                                got == 0) {
+                                break;
+                            }
+                            done += got;
+                        }
+                        if (done == len) {
+                            return;
+                        }
+                    }
+                }
+            }
+#endif
             memcpy(dst, fileBase + offset, len);
         }
 
