@@ -5770,15 +5770,16 @@ namespace fastllm {
         fflush(stdout);
     }
 
-    // FASTLLM_ALLOC_PROBE=1：只测内存分配，不加载模型。
+    // FASTLLM_ALLOC_PROBE=1：只测内存，不加载模型。
     //
-    // 权重加载会在进程里陆续攒下十九 GB、每块 0.5MB 量级的缓冲，九万多块。
-    // 这里按同样的尺寸和块数分配一遍，打印每 5000 块的速率：如果曲线尾部跟真实
-    // 加载一样掉到几十 MiB/s，掉速就出在分配器身上（块数一多就变慢），跟读盘和
-    // 转换代码无关。后半段改成从一个整段 VirtualAlloc 里切，等于 arena 方案的对照。
+    // 真实加载要往新分配的 19.5 GB 里写一遍（读盘落缓冲 + 转换），也就是必须付
+    // 4.8M 次首次触碰缺页。这里在纯净进程里直接测这段成本：16 线程各自 new 出
+    // 平均张量大小的块、写满、保持存活（和权重一样不释放），再用一整段 VirtualAlloc
+    // 切块做对照。两个对照组都必须是全新内存，所以先跑堆、再跑 arena。
     static void ProbeCpuAllocCurve() {
-        const size_t blockBytes = 512 * 1024;
         const int blockCount = 93093;
+        // 19.48 GiB / 93093 ≈ 224 KB，和真实加载的平均张量一样大。
+        const size_t blockBytes = (size_t)(19.48 * 1024 * 1024 * 1024 / blockCount);
         const int reportEvery = 5000;
         const double mib = 1024.0 * 1024.0;
         auto now = []() {
@@ -5788,69 +5789,9 @@ namespace fastllm {
         printf("[fastllm-alloc-probe] blocks=%d blockBytes=%d total=%.1f GiB\n",
                blockCount, (int)blockBytes,
                (double)blockCount * blockBytes / mib / 1024.0);
+        PrintProcessMemoryStats("probe-begin");
         fflush(stdout);
 
-        {
-            std::vector<uint8_t*> blocks;
-            blocks.reserve(blockCount);
-            double windowBegin = now();
-            uint64_t windowBytes = 0;
-            for (int i = 0; i < blockCount; i++) {
-                uint8_t *p = new uint8_t[blockBytes];
-                memset(p, 1, blockBytes);
-                blocks.push_back(p);
-                windowBytes += blockBytes;
-                if ((i + 1) % reportEvery == 0) {
-                    const double windowSeconds = now() - windowBegin;
-                    printf("[fastllm-alloc-probe] heap  %6d blocks %8.1f MiB/s\n",
-                           i + 1, windowBytes / mib / windowSeconds);
-                    fflush(stdout);
-                    windowBegin = now();
-                    windowBytes = 0;
-                }
-            }
-            const double freeBegin = now();
-            for (uint8_t *p : blocks) {
-                delete[] p;
-            }
-            printf("[fastllm-alloc-probe] heap  free %d blocks in %.2f s\n",
-                   (int)blocks.size(), now() - freeBegin);
-            fflush(stdout);
-        }
-
-        {
-            uint8_t *arena = nullptr;
-#if defined(_WIN32) || defined(_WIN64)
-            arena = (uint8_t*)VirtualAlloc(nullptr, (size_t)blockCount * blockBytes,
-                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#endif
-            if (arena == nullptr) {
-                arena = new uint8_t[(size_t)blockCount * blockBytes];
-            }
-            double windowBegin = now();
-            uint64_t windowBytes = 0;
-            for (int i = 0; i < blockCount; i++) {
-                memset(arena + (size_t)i * blockBytes, 1, blockBytes);
-                windowBytes += blockBytes;
-                if ((i + 1) % reportEvery == 0) {
-                    const double windowSeconds = now() - windowBegin;
-                    printf("[fastllm-alloc-probe] arena %6d blocks %8.1f MiB/s\n",
-                           i + 1, windowBytes / mib / windowSeconds);
-                    fflush(stdout);
-                    windowBegin = now();
-                    windowBytes = 0;
-                }
-            }
-#if defined(_WIN32) || defined(_WIN64)
-            VirtualFree(arena, 0, MEM_RELEASE);
-#else
-            delete[] arena;
-#endif
-            fflush(stdout);
-        }
-
-        // 多线程版：真实加载是 16 个 worker 同时 new/写/释放，单线程探针测不出
-        // 堆锁被抢到什么程度。这里同样 16 线程、块保持存活（和权重一样不释放）。
         auto runMulti = [&](const char *tag, bool useArena) {
             const int threadNum = 16;
             uint8_t *arena = nullptr;
@@ -5864,6 +5805,7 @@ namespace fastllm {
                     arena = new uint8_t[(size_t)blockCount * blockBytes];
                 }
             }
+            PrintProcessMemoryStats(tag);
             std::atomic<int> nextBlock{0};
             std::atomic<int> doneBlocks{0};
             std::mutex reportLock;
@@ -5902,6 +5844,7 @@ namespace fastllm {
             for (auto &worker : workers) {
                 worker.join();
             }
+            PrintProcessMemoryStats(tag);
             for (auto &blocks : held) {
                 for (uint8_t *p : blocks) {
                     delete[] p;
@@ -5916,6 +5859,7 @@ namespace fastllm {
             }
             fflush(stdout);
         };
+        // 堆在前：这一段拿到的是全新的页，跟真实加载一致。
         runMulti("heap16 ", false);
         runMulti("arena16", true);
         std::_Exit(0);
