@@ -1309,6 +1309,12 @@ namespace fastllm {
     static std::atomic<long long> gSafeTensorBlockMisses{0};
     static std::atomic<long long> gSafeTensorBlockPooledFrees{0};
     static std::atomic<long long> gSafeTensorBlockDirectFrees{0};
+    // 在真实进程里直接量分配/释放的耗时：同样的动作在纯净进程里是 0.13ms 级，
+    // 这里如果是毫秒级，说明是进程状态（堆布局/映射/CUDA 上下文）把它拖慢的。
+    static std::atomic<long long> gSafeTensorAllocNanos{0};
+    static std::atomic<long long> gSafeTensorAllocCalls{0};
+    static std::atomic<long long> gSafeTensorFreeNanos{0};
+    static std::atomic<long long> gSafeTensorFreeCalls{0};
 
     static bool UseSafeTensorBlockPool() {
         static const bool enabled = []() {
@@ -1319,10 +1325,13 @@ namespace fastllm {
     }
 
     static uint8_t *AllocSafeTensorBlock(size_t bytes) {
+        const auto allocBegin = std::chrono::steady_clock::now();
+        gSafeTensorAllocCalls.fetch_add(1, std::memory_order_relaxed);
+        uint8_t *ret = nullptr;
         if (bytes < kSafeTensorBlockMinBytes || bytes > kSafeTensorBlockMaxBytes ||
             !UseSafeTensorBlockPool()) {
-            return new uint8_t[bytes];
-        }
+            ret = new uint8_t[bytes];
+        } else {
         SafeTensorBlockPool &pool = safeTensorBlockPool;
         auto it = pool.freeLists.find(bytes);
         if (it != pool.freeLists.end() && !it->second.empty()) {
@@ -1331,23 +1340,36 @@ namespace fastllm {
             pool.cachedBytes -= bytes;
             pool.blockBytes[p] = bytes;
             gSafeTensorBlockHits.fetch_add(1, std::memory_order_relaxed);
-            return p;
-        }
+            ret = p;
+        } else {
         gSafeTensorBlockMisses.fetch_add(1, std::memory_order_relaxed);
         uint8_t *p = new uint8_t[bytes];
         pool.blockBytes[p] = bytes;
-        return p;
+        ret = p;
+        }
+        }
+        gSafeTensorAllocNanos.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - allocBegin).count(),
+            std::memory_order_relaxed);
+        return ret;
     }
 
     static void FreeSafeTensorBlock(uint8_t *p) {
         if (p == nullptr) {
             return;
         }
+        const auto freeBegin = std::chrono::steady_clock::now();
+        gSafeTensorFreeCalls.fetch_add(1, std::memory_order_relaxed);
         SafeTensorBlockPool &pool = safeTensorBlockPool;
         auto it = pool.blockBytes.find(p);
         if (it == pool.blockBytes.end()) {
             gSafeTensorBlockDirectFrees.fetch_add(1, std::memory_order_relaxed);
             delete[] p;
+            gSafeTensorFreeNanos.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - freeBegin).count(),
+                std::memory_order_relaxed);
             return;
         }
         const size_t bytes = it->second;
@@ -1356,11 +1378,19 @@ namespace fastllm {
             pool.cachedBytes + bytes > kSafeTensorBlockThreadBytes) {
             gSafeTensorBlockDirectFrees.fetch_add(1, std::memory_order_relaxed);
             delete[] p;
+            gSafeTensorFreeNanos.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - freeBegin).count(),
+                std::memory_order_relaxed);
             return;
         }
         gSafeTensorBlockPooledFrees.fetch_add(1, std::memory_order_relaxed);
         pool.freeLists[bytes].push_back(p);
         pool.cachedBytes += bytes;
+        gSafeTensorFreeNanos.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - freeBegin).count(),
+            std::memory_order_relaxed);
     }
 
     // 块的 ownership 被转给 Data 时（TryAdoptSafeTensorBuffer）要把记录摘掉，
@@ -5630,6 +5660,24 @@ namespace fastllm {
                    gSafeTensorBlockMisses.load(std::memory_order_relaxed),
                    gSafeTensorBlockPooledFrees.load(std::memory_order_relaxed),
                    gSafeTensorBlockDirectFrees.load(std::memory_order_relaxed));
+            {
+                const long long allocCalls =
+                    gSafeTensorAllocCalls.load(std::memory_order_relaxed);
+                const long long freeCalls =
+                    gSafeTensorFreeCalls.load(std::memory_order_relaxed);
+                const double allocSeconds =
+                    gSafeTensorAllocNanos.load(std::memory_order_relaxed) / 1e9;
+                const double freeSeconds =
+                    gSafeTensorFreeNanos.load(std::memory_order_relaxed) / 1e9;
+                printf("[fastllm-load-profile] blockTime: alloc=%.2fs/%lld (%.3fms) "
+                       "free=%.2fs/%lld (%.3fms)\n",
+                       allocSeconds, allocCalls,
+                       allocCalls > 0 ? allocSeconds * 1e3 / allocCalls : 0.0,
+                       freeSeconds, freeCalls,
+                       freeCalls > 0 ? freeSeconds * 1e3 / freeCalls : 0.0);
+                fflush(stdout);
+            }
+            PrintCpuAllocProfile(" load");
             printf("\n[fastllm-load-profile] tensors=%d bytes=%.2f GiB wall=%.2f s avg=%.1f MiB/s\n",
                    (int)snapshot.size(), (double)totalBytes / mib / 1024.0, wall,
                    wall > 0.0 ? (double)totalBytes / mib / wall : 0.0);
