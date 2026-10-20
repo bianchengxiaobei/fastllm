@@ -93,6 +93,27 @@ namespace fastllm {
 #endif
     extern BF16ToFP16Manager bf16tofp16;
 
+    // 加载过程中的「穷人的采样剖析器」：每个 worker 在自己当前所处的步骤上打一个
+    // 标签，看门狗线程每几毫秒把 16 个 worker 的标签各计一次数。阶段耗时+CPU 占比
+    // 只能说明「在等」，这个直方图直接给出在等哪一行。
+    // 放在文件靠前的位置：前面几处合并代码也要打标签。
+    static const int kLoadStepSlots = 32;
+    static std::atomic<const char *> gLoadStepLabels[kLoadStepSlots];
+    static std::atomic<int> gLoadStepSlotCount{0};
+    static thread_local int gLoadStepSlot = -1;
+
+    static inline void SetLoadStep(const char *label) {
+        int slot = gLoadStepSlot;
+        if (slot < 0) {
+            slot = gLoadStepSlotCount.fetch_add(1);
+            if (slot >= kLoadStepSlots) {
+                slot = kLoadStepSlots - 1;
+            }
+            gLoadStepSlot = slot;
+        }
+        gLoadStepLabels[slot].store(label, std::memory_order_relaxed);
+    }
+
 #if defined(_WIN32) || defined(_WIN64)
     // FASTLLM_LOAD_READFILE=0 可以退回映射读，方便对照。
     static bool UseLoadReadFile() {
@@ -5342,7 +5363,9 @@ namespace fastllm {
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
                                         } else {
+                                            SetLoadStep("mergeAlloc");
                                             mergeData.Allocate();
+                                            SetLoadStep("mergeCopy");
                                             uint64_t offset = 0;
                                             uint64_t scaleOffset = 0;
                                             bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
@@ -5560,26 +5583,6 @@ namespace fastllm {
     static void PrintProcessMemoryStats(const char *tag) {
     }
 #endif
-
-    // 加载过程中的「穷人的采样剖析器」：每个 worker 在自己当前所处的步骤上打一个
-    // 标签，看门狗线程每几毫秒把 16 个 worker 的标签各计一次数。阶段耗时+CPU 占比
-    // 只能说明「在等」，这个直方图直接给出在等哪一行。
-    static const int kLoadStepSlots = 32;
-    static std::atomic<const char *> gLoadStepLabels[kLoadStepSlots];
-    static std::atomic<int> gLoadStepSlotCount{0};
-    static thread_local int gLoadStepSlot = -1;
-
-    static inline void SetLoadStep(const char *label) {
-        int slot = gLoadStepSlot;
-        if (slot < 0) {
-            slot = gLoadStepSlotCount.fetch_add(1);
-            if (slot >= kLoadStepSlots) {
-                slot = kLoadStepSlots - 1;
-            }
-            gLoadStepSlot = slot;
-        }
-        gLoadStepLabels[slot].store(label, std::memory_order_relaxed);
-    }
 
     // 看门狗：每 2ms 给所有 worker 的当前步骤各记一票，停止时按票数从多到少打印。
     struct LoadStepSampler {
@@ -7183,13 +7186,16 @@ namespace fastllm {
                                     gWeightLoadProfile.Now() - lockWaitStart);
                             }
                             markWeightFinished(weightName);
+                            SetLoadStep("onLoaded");
                             model->OnWeightLoaded(weightName, allFinishNames);
+                            SetLoadStep("consumed");
                             if (model->IsWeightConsumedAfterLoad(weightName)) {
                                 locker.unlock();
                                 markPhase(2);
                                 continue;
                             }
                             // 检查是否需要合并权重
+                            SetLoadStep("mergeCheck");
                             bool needMerge = false;
                             for (size_t ruleId : mergeIndex.Find(weightName)) {
                                 auto &rule = model->weightMergeRules[ruleId];
@@ -7301,7 +7307,9 @@ namespace fastllm {
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
                                         } else {
+                                            SetLoadStep("mergeAlloc");
                                             mergeData.Allocate();
+                                            SetLoadStep("mergeCopy");
                                             uint64_t offset = 0;
                                             uint64_t scaleOffset = 0;
                                             bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
