@@ -4549,10 +4549,10 @@ namespace fastllm {
         }
 #ifdef USE_MMAP
         if (data.name.empty()) {
-            delete[] data.cpuData;
+        fastllm::FreeCpuDataBlock(data.cpuData);
         }
 #else
-        delete[] data.cpuData;
+        fastllm::FreeCpuDataBlock(data.cpuData);
 #endif
         data.cpuData = nullptr;
     }

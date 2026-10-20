@@ -595,6 +595,151 @@ namespace fastllm {
         cache.freeLists[bytes].push_back(p);
         cache.cachedBytes += bytes;
     }
+
+    // 权重缓冲的 arena。
+    //
+    // 实测：真实进程里 new uint8_t[~660KB] 平均 2.7ms，加载期 41453 次全新的权重缓冲
+    // 就是 112 秒线程时间；同一个探针在纯净进程里做同样的事只要 40us。差异是进程里
+    // 已经攒了 19.5GB 的堆块，MSVC 的堆要在上万个段里找位置，而且这些分配全程持有
+    // 堆锁 —— 16 个加载线程全在这把锁上排队，所以加线程毫无帮助。
+    //
+    // 这里改成一整段 VirtualAlloc 里做指针加法：每个线程给一块 64MB 的切片区，用完
+    // 再向全局要，之后分配就是无锁的加法。权重加载完不释放，切片区正好复用。
+    // 释放的块按尺寸进本线程的空闲表（跨线程释放的查不到记录，就不回收，留在 arena
+    // 里，不会造成悬垂指针）。
+    //
+    // 关键点：这里分配出来的指针和 delete[] 不兼容，所以所有释放 cpuData 的地方都必须
+    // 走 FreeCpuDataBlock —— 它先判断指针是否属于 arena，不属于才 delete[]。
+    static const size_t kCpuArenaChunkBytes = 64ull << 20;
+    static const size_t kCpuArenaBigBytes = 32ull << 20;
+    static const size_t kCpuArenaThreadCacheBytes = 256ull << 20;
+
+    struct CpuArenaChunk {
+        uint8_t *base = nullptr;
+        size_t bytes = 0;
+    };
+
+    static std::mutex gCpuArenaMutex;
+    static std::vector<CpuArenaChunk> gCpuArenaChunks;
+
+    struct CpuArenaThreadState {
+        uint8_t *base = nullptr;
+        size_t offset = 0;
+        size_t bytes = 0;
+        std::map<uint8_t *, size_t> blockBytes;
+        std::map<size_t, std::vector<uint8_t *> > freeLists;
+        size_t cachedBytes = 0;
+    };
+
+    static thread_local CpuArenaThreadState gCpuArenaThread;
+
+    static bool UseCpuArena() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_CPU_ARENA");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
+    static uint8_t *CpuArenaAlloc(size_t bytes) {
+        bytes = (bytes + 63) & ~(size_t)63;
+        CpuArenaThreadState &state = gCpuArenaThread;
+        auto it = state.freeLists.find(bytes);
+        if (it != state.freeLists.end() && !it->second.empty()) {
+            uint8_t *p = it->second.back();
+            it->second.pop_back();
+            state.cachedBytes -= bytes;
+            state.blockBytes[p] = bytes;
+            return p;
+        }
+        if (bytes > kCpuArenaBigBytes) {
+            uint8_t *p = (uint8_t *)VirtualAlloc(nullptr, bytes,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (p == nullptr) {
+                return nullptr;
+            }
+            {
+                std::lock_guard<std::mutex> guard(gCpuArenaMutex);
+                CpuArenaChunk chunk;
+                chunk.base = p;
+                chunk.bytes = bytes;
+                gCpuArenaChunks.push_back(chunk);
+            }
+            state.blockBytes[p] = bytes;
+            return p;
+        }
+        if (state.base == nullptr || state.offset + bytes > state.bytes) {
+            const size_t chunkBytes = std::max(kCpuArenaChunkBytes, bytes);
+            uint8_t *chunk = (uint8_t *)VirtualAlloc(nullptr, chunkBytes,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (chunk == nullptr) {
+                return nullptr;
+            }
+            {
+                std::lock_guard<std::mutex> guard(gCpuArenaMutex);
+                CpuArenaChunk item;
+                item.base = chunk;
+                item.bytes = chunkBytes;
+                gCpuArenaChunks.push_back(item);
+            }
+            state.base = chunk;
+            state.offset = 0;
+            state.bytes = chunkBytes;
+        }
+        uint8_t *p = state.base + state.offset;
+        state.offset += bytes;
+        state.blockBytes[p] = bytes;
+        return p;
+    }
+
+    static bool CpuArenaOwns(const void *p) {
+        if (p == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(gCpuArenaMutex);
+        for (auto &chunk : gCpuArenaChunks) {
+            const uint8_t *base = chunk.base;
+            if ((const uint8_t *)p >= base && (const uint8_t *)p < base + chunk.bytes) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void CpuArenaFree(uint8_t *p) {
+        CpuArenaThreadState &state = gCpuArenaThread;
+        auto it = state.blockBytes.find(p);
+        if (it == state.blockBytes.end()) {
+            // 跨线程释放：查不到尺寸，留在 arena 里不回收（不会悬垂）。
+            return;
+        }
+        const size_t bytes = it->second;
+        state.blockBytes.erase(it);
+        if (bytes > kCpuArenaBigBytes ||
+            state.cachedBytes + bytes > kCpuArenaThreadCacheBytes) {
+            return;
+        }
+        state.freeLists[bytes].push_back(p);
+        state.cachedBytes += bytes;
+    }
+
+    // 释放 cpuData 的唯一入口：arena 的块不还给系统，其余交给块缓存（查不到就 delete[]）。
+    void FreeCpuDataBlock(uint8_t *p) {
+        if (p == nullptr) {
+            return;
+        }
+        if (CpuArenaOwns(p)) {
+            CpuArenaFree(p);
+            return;
+        }
+        FreeCpuBlock(p);
+    }
+#endif
+
+#if !defined(_WIN32) && !defined(_WIN64)
+    void FreeCpuDataBlock(uint8_t *p) {
+        delete[] p;
+    }
 #endif
 
     // 专家权重流式的中转环: 槽数越多, 主机越能跑到 DMA 前面(不容易被槽位事件反压);
@@ -1564,7 +1709,7 @@ namespace fastllm {
                 this->dims.resize(0);
 
                 if (this->dataDevice == DataDevice::CPU) {
-                    delete[] this->cpuData;
+                    fastllm::FreeCpuDataBlock(this->cpuData);
                     this->cpuData = nullptr;
                 } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
@@ -2590,7 +2735,11 @@ namespace fastllm {
             auto allocSt = profileCpuAlloc ? std::chrono::steady_clock::now() :
                 std::chrono::steady_clock::time_point();
 #if defined(_WIN32) || defined(_WIN64)
-            this->cpuData = AllocCpuBlock(this->expansionBytes);
+            this->cpuData = UseCpuArena() ? CpuArenaAlloc(this->expansionBytes) :
+                AllocCpuBlock(this->expansionBytes);
+            if (this->cpuData == nullptr) {
+                this->cpuData = new uint8_t[this->expansionBytes];
+            }
 #else
             this->cpuData = new uint8_t[this->expansionBytes];
 #endif
@@ -2656,9 +2805,9 @@ namespace fastllm {
                 auto freeSt = profileCpuAlloc ? std::chrono::steady_clock::now() :
                     std::chrono::steady_clock::time_point();
 #if defined(_WIN32) || defined(_WIN64)
-                FreeCpuBlock(this->cpuData);
+                FreeCpuDataBlock(this->cpuData);
 #else
-                delete[] this->cpuData;
+                fastllm::FreeCpuDataBlock(this->cpuData);
 #endif
                 if (profileCpuAlloc) {
                     cpuFreeNanos.fetch_add(ElapsedNanos(freeSt));
@@ -2869,9 +3018,9 @@ namespace fastllm {
         if (this->cpuData != nullptr)
 #ifdef USE_MMAP
             if (this->mapFile == nullptr)
-                delete[] this->cpuData;
+                fastllm::FreeCpuDataBlock(this->cpuData);
 #else
-           delete[] this->cpuData;
+           fastllm::FreeCpuDataBlock(this->cpuData);
 #endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
@@ -3302,12 +3451,12 @@ namespace fastllm {
                             delete[] cpuData;
                         }
                         if ((this->isModelWeight || this->isKVCache) && this->mapFile == nullptr) {
-                            delete[] this->cpuData;
+                            fastllm::FreeCpuDataBlock(this->cpuData);
                             this->cpuData = nullptr;
                         }
 #else
                         if (this->isModelWeight || this->isKVCache) {
-                            delete[] this->cpuData;
+                            fastllm::FreeCpuDataBlock(this->cpuData);
                             this->cpuData = nullptr;
                         }
 #endif

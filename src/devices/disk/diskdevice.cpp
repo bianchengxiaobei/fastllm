@@ -1733,7 +1733,7 @@ namespace fastllm {
             }
         }
 
-        delete[] weight.cpuData;
+        fastllm::FreeCpuDataBlock(weight.cpuData);
         weight.cpuData = new uint8_t[packed.size()];
         memcpy(weight.cpuData, packed.data(), packed.size());
         weight.dataType = DataType::FP8_E4M3_BLOCK_128;
@@ -1781,7 +1781,7 @@ namespace fastllm {
             }
         }
 
-        delete[] weight.cpuData;
+        fastllm::FreeCpuDataBlock(weight.cpuData);
         weight.cpuData = new uint8_t[packed.size()];
         memcpy(weight.cpuData, packed.data(), packed.size());
         weight.dataType = DataType::NVFP4_BLOCK_16;
@@ -2296,7 +2296,7 @@ namespace fastllm {
             FastllmCudaCopyFromHostToDevice(weight->cudaData, weight->cpuData, weight->GetBytes());
             weight->dataDevice = DataDevice::CUDA;
             weight->dataDeviceIds = {device};
-            delete[] weight->cpuData;
+            fastllm::FreeCpuDataBlock(weight->cpuData);
             weight->cpuData = nullptr;
             offset += weight->GetBytes();
         }

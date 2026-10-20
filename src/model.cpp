@@ -1286,9 +1286,12 @@ namespace fastllm {
     //
     // 块本身还是 new uint8_t[] 出来的，池只是暂时留着不放；池里查不到的指针
     // （跨线程释放、或者别的路径 delete[]）直接回退到 delete[]，依然合法。
-    static const size_t kSafeTensorBlockMinBytes = 64 << 10;
-    static const size_t kSafeTensorBlockMaxBytes = 32 << 20;
-    static const size_t kSafeTensorBlockThreadBytes = 32 << 20;
+    // 实测真相进程里一次 new 是 2.7~5ms（纯净探针里 40us），而且加载期几乎不发生
+    // Data::FreeSpace，等于每个权重缓冲都是一次全新的堆操作。池的区间要覆盖所有
+    // 常见的张量尺寸：原来 64KB 下界把一半的小权重挡在池外，32MiB 上界又把大块排除。
+    static const size_t kSafeTensorBlockMinBytes = 1 << 10;
+    static const size_t kSafeTensorBlockMaxBytes = 64 << 20;
+    static const size_t kSafeTensorBlockThreadBytes = 256 << 20;
 
     struct SafeTensorBlockPool {
         std::map <uint8_t*, size_t> blockBytes;

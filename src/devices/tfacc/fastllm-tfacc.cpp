@@ -201,7 +201,7 @@ namespace fastllm {
         SendLongMessage(buffer.buffer.data(), buffer.buffer.size());
 
         /// TODO: data->clear()
-        delete[] data->cpuData;
+        fastllm::FreeCpuDataBlock(data->cpuData);
         data->cpuData = new uint8_t[1];
         // data->weightSum.clear();
         data->mins.clear();

@@ -744,10 +744,10 @@ static void ReleaseTritonMoeFp8SourceWeight(fastllm::Data *weight) {
     if (weight->cpuData != nullptr) {
 #ifdef USE_MMAP
         if (weight->name.empty()) {
-            delete[] weight->cpuData;
+            fastllm::FreeCpuDataBlock(weight->cpuData);
         }
 #else
-        delete[] weight->cpuData;
+        fastllm::FreeCpuDataBlock(weight->cpuData);
 #endif
         weight->cpuData = nullptr;
     }

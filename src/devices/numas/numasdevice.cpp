@@ -3546,7 +3546,7 @@ namespace fastllm {
             std::vector<int>().swap(data->weightSum);
         }
 
-        delete[] data->cpuData;
+        fastllm::FreeCpuDataBlock(data->cpuData);
         data->cpuData = nullptr;
     }
 
@@ -3680,7 +3680,7 @@ namespace fastllm {
                     const size_t sourceBytes = weight->GetBytes();
                     retainedBytes += sourceBytes -
                         detail::DiscardUnusedHostBufferPages(weight->cpuData, sourceBytes);
-                    delete[] weight->cpuData;
+                    fastllm::FreeCpuDataBlock(weight->cpuData);
                     weight->cpuData = nullptr;
                 }
             }
@@ -4058,7 +4058,7 @@ namespace fastllm {
                         (size_t)node * groupsPerNode * elementsPerGroup,
                     shardBytes);
             }
-            delete[] weight.cpuData;
+            fastllm::FreeCpuDataBlock(weight.cpuData);
             weight.cpuData = nullptr;
             weight.isPinned = false;
         }
@@ -5647,7 +5647,7 @@ namespace fastllm {
             for (Data *weight : ggufPending) {
                 weight->expansionBytes = weight->GetBytes();
                 weight->isPinned = false;
-                delete[] weight->cpuData;
+                fastllm::FreeCpuDataBlock(weight->cpuData);
                 weight->cpuData = nullptr;
             }
         }

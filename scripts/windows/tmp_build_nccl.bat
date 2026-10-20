@@ -1,0 +1,87 @@
+@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+for %%I in ("%SCRIPT_DIR%..\..") do set "REPO=%%~fI"
+set "SRC=%REPO%\third_party\nccl-windows"
+rem for parallel toolchains (e.g. a CUDA 12.x build for V100) point these at separate dirs
+if not defined NCCL_BUILD_DIR set "NCCL_BUILD_DIR=%SRC%\build"
+if not defined NCCL_INSTALL_DIR set "NCCL_INSTALL_DIR=%SRC%\install"
+set "BUILD=%NCCL_BUILD_DIR%"
+set "INSTALL=%NCCL_INSTALL_DIR%"
+
+rem no goto/labels here: cmd desyncs when seeking a label in this repo's LF-only bat files
+if not exist "%SRC%\CMakeLists.txt" (
+    echo [nccl] %SRC% has no source
+    echo [nccl] run: git submodule update --init third_party/nccl-windows
+    exit /b 1
+)
+
+where ninja >nul 2>nul
+if errorlevel 1 (
+    echo [nccl] ninja not found on PATH
+    exit /b 1
+)
+
+rem 架构影响 NCCL 内核的编译产物，务必与本机 GPU 一致，可用 NCCL_CUDA_ARCHS 覆盖
+if not defined NCCL_CUDA_ARCHS (
+    for /f "usebackq delims=" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%cuda_arch.ps1"`) do set "NCCL_CUDA_ARCHS=%%A"
+)
+if not defined NCCL_CUDA_ARCHS set "NCCL_CUDA_ARCHS=native"
+
+if not defined CUDA_PATH (
+    if exist "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4" (
+        set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+    )
+)
+
+rem Ninja 构建必须自己先进入 MSVC x64 环境
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not defined NCCL_VCVARS (
+    rem 必须带上 VC.Tools 要求: 只按 -latest 挑会命中装了 VS 但没装 C++ 工作负载的那个实例
+    for /f "usebackq delims=" %%A in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Auxiliary\Build\vcvarsall.bat`) do set "NCCL_VCVARS=%%A"
+)
+if not exist "%NCCL_VCVARS%" (
+    echo [nccl] cannot find vcvarsall.bat, set NCCL_VCVARS manually
+    echo [nccl] vswhere="%VSWHERE%"
+    echo [nccl] tried "%NCCL_VCVARS%"
+    if exist "%VSWHERE%" (
+        echo [nccl] VS instances that vswhere sees:
+        "%VSWHERE%" -products * -property installationPath
+    )
+    echo [nccl] fix: run scripts\windows\setup_build_env.bat to install the C++ workload
+    exit /b 1
+)
+call "%NCCL_VCVARS%" x64 > nul
+if errorlevel 1 (
+    echo [nccl] vcvarsall.bat x64 failed
+    exit /b 1
+)
+
+if not defined NCCL_JOBS set "NCCL_JOBS=%NUMBER_OF_PROCESSORS%"
+if not defined NCCL_JOBS set "NCCL_JOBS=4"
+
+echo [nccl] archs=%NCCL_CUDA_ARCHS% jobs=%NCCL_JOBS%
+echo [nccl] install %INSTALL%
+cmake -S "%SRC%" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=%NCCL_CUDA_ARCHS%" -DCMAKE_INSTALL_PREFIX="%INSTALL%"
+echo STUB: skipped configure
+if errorlevel 1 (
+    echo [nccl] FAILED
+    exit /b 1
+)
+
+cmake --build "%BUILD%" --parallel %NCCL_JOBS% --target install
+echo STUB: skipped build
+if errorlevel 1 (
+    echo [nccl] FAILED
+    exit /b 1
+)
+
+if not exist "%INSTALL%\lib\cmake\NCCL\NCCLConfig.cmake" (
+    echo STUB: would be "install finished but ... missing"
+    echo REACHED_END_OK
+    exit /b 0
+)
+
+echo [nccl] ok: %INSTALL%\lib\cmake\NCCL\NCCLConfig.cmake
+echo [nccl] build_tools.bat gpu picks this install up automatically
+exit /b 0

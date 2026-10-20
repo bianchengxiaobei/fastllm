@@ -993,6 +993,11 @@ namespace fastllm {
 
     void PrintCpuAllocProfile(const char *tag = nullptr);
 
+    // 释放 Data::cpuData 的唯一入口。Windows 上 cpuData 可能来自 arena（一整段
+    // VirtualAlloc 切出来的），那种指针不能用 delete[]。所有释放 cpuData 的地方
+    // 都必须走这个函数，不能直接 delete[]。
+    void FreeCpuDataBlock(uint8_t *p);
+
     void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total); // 执行到了current, 一共total，使用deviceMap切换设备
 
     int LLMSamplingOnly(Data &logits, int outerOffset, const GenerationConfig &config);

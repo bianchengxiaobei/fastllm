@@ -370,7 +370,7 @@ namespace fastllm {
         if (weight.mapFile) {
             weight.mapFile.reset();
         } else {
-            delete[] weight.cpuData;
+            fastllm::FreeCpuDataBlock(weight.cpuData);
         }
         weight.cpuData = packed;
         weight.dataType = DataType::FP8_E4M3_BLOCK_128;

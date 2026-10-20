@@ -1336,7 +1336,7 @@ namespace fastllm {
             weight.cudaData = nullptr;
             weight.deviceData = nullptr;
             if (weight.cpuData != nullptr) {
-                delete[] weight.cpuData;
+                fastllm::FreeCpuDataBlock(weight.cpuData);
                 weight.cpuData = nullptr;
             }
             weight.scales.clear();

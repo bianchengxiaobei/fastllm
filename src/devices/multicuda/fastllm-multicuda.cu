@@ -775,10 +775,10 @@ static void ReleaseMultiCudaSplitSource(fastllm::Data &weight) {
         if (!weight.isFake) {
 #ifdef USE_MMAP
             if (weight.mapFile == nullptr) {
-                delete[] weight.cpuData;
+                fastllm::FreeCpuDataBlock(weight.cpuData);
             }
 #else
-            delete[] weight.cpuData;
+            fastllm::FreeCpuDataBlock(weight.cpuData);
 #endif
         }
         weight.cpuData = nullptr;

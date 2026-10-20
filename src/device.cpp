@@ -21,7 +21,7 @@ namespace fastllm {
         AssertInFastLLM(data.deviceData == nullptr, "Copy data to " + this->deviceName + " from cpu failed: device's data is not null.\n");
         Malloc(&data.deviceData, data.expansionBytes);
         bool ret = CopyDataFromCPU(data.cudaData, data.cpuData, data.expansionBytes);
-        delete[] data.cpuData;
+        fastllm::FreeCpuDataBlock(data.cpuData);
         data.cpuData = nullptr;
         return ret;
     }
