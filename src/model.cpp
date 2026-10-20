@@ -103,6 +103,21 @@ namespace fastllm {
         return enabled;
     }
 
+    // 二分加载路径用：分别跳过读盘和建权重缓冲，看剩下的时间落在哪一段。
+    // FASTLLM_LOAD_SKIP_READ=1   张量内容不读盘，直接清零填充
+    // FASTLLM_LOAD_SKIP_WEIGHT=1 不建 model->weight 的缓冲（不转换、不拷贝）
+    static bool SkipLoadRead() {
+        static const bool enabled =
+            std::getenv("FASTLLM_LOAD_SKIP_READ") != nullptr;
+        return enabled;
+    }
+
+    static bool SkipWeightBuild() {
+        static const bool enabled =
+            std::getenv("FASTLLM_LOAD_SKIP_WEIGHT") != nullptr;
+        return enabled;
+    }
+
     // SetFilePointerEx + ReadFile 共享句柄会互相踩文件指针，所以每线程一套。
     static HANDLE GetLoadFileHandle(const std::string &fileName) {
         struct Entry {
@@ -1445,6 +1460,10 @@ namespace fastllm {
             AssertInFastLLM(fileBase != nullptr && offset + len <= fileSize,
                             "SafeTensorItem read out of range: " + tensorName);
 #if defined(_WIN32) || defined(_WIN64)
+            if (SkipLoadRead()) {
+                memset(dst, 0, len);
+                return;
+            }
             // 实测映射读会退化成逐 4KB 同步缺页，16 线程并发时整机读带宽卡在
             // 60~65 MiB/s（QLC/SATA 的 4K 随机水平），预读也合并不出大请求。
             // 这里按偏移直接整块 ReadFile，请求大小就是调用方要的字节数。
@@ -1876,6 +1895,10 @@ namespace fastllm {
                 "SafeTensorItem.ReadRawData error: destination size does not match tensor " +
                 this->tensorName + ".");
 #if defined(_WIN32) || defined(_WIN64)
+            if (SkipLoadRead()) {
+                memset(output, 0, outputBytes);
+                return;
+            }
             // 这里原来每次 fopen + fread：CRT 默认 4KB 缓冲，等于把整块读拆成
             // 一串 4KB 请求，九万多个张量都走这条路径。
             if (ReadFileAtOffset(fileName, data_offsets[0], output, outputBytes)) {
@@ -6937,7 +6960,8 @@ namespace fastllm {
                                         convMark = gWeightLoadProfile.Now();
                                     }
                                     Data &loadedWeight = model->weight[weightName];
-                                    if (!TryAdoptSafeTensorBuffer(
+                                    if (!SkipWeightBuild() &&
+                                        !TryAdoptSafeTensorBuffer(
                                             loadedWeight, tensor, oriDataType,
                                             tensorMap[tensorName].size() == 1,
                                             it.second == DATA_AUTO_CONV,
