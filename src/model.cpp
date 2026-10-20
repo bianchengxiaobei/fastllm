@@ -5561,6 +5561,106 @@ namespace fastllm {
     }
 #endif
 
+    // 加载过程中的「穷人的采样剖析器」：每个 worker 在自己当前所处的步骤上打一个
+    // 标签，看门狗线程每几毫秒把 16 个 worker 的标签各计一次数。阶段耗时+CPU 占比
+    // 只能说明「在等」，这个直方图直接给出在等哪一行。
+    static const int kLoadStepSlots = 32;
+    static std::atomic<const char *> gLoadStepLabels[kLoadStepSlots];
+    static std::atomic<int> gLoadStepSlotCount{0};
+    static thread_local int gLoadStepSlot = -1;
+
+    static inline void SetLoadStep(const char *label) {
+        int slot = gLoadStepSlot;
+        if (slot < 0) {
+            slot = gLoadStepSlotCount.fetch_add(1);
+            if (slot >= kLoadStepSlots) {
+                slot = kLoadStepSlots - 1;
+            }
+            gLoadStepSlot = slot;
+        }
+        gLoadStepLabels[slot].store(label, std::memory_order_relaxed);
+    }
+
+    // 看门狗：每 2ms 给所有 worker 的当前步骤各记一票，停止时按票数从多到少打印。
+    struct LoadStepSampler {
+        std::atomic<bool> stopFlag{false};
+        std::thread worker;
+        std::mutex lock;
+        std::map<const char *, long long> counts;
+        bool started = false;
+
+        void Run() {
+            while (!stopFlag.load(std::memory_order_relaxed)) {
+                const int slots = gLoadStepSlotCount.load(std::memory_order_relaxed);
+                std::map<const char *, long long> local;
+                for (int i = 0; i < slots && i < kLoadStepSlots; i++) {
+                    const char *label =
+                        gLoadStepLabels[i].load(std::memory_order_relaxed);
+                    if (label != nullptr) {
+                        local[label]++;
+                    }
+                }
+                if (!local.empty()) {
+                    std::lock_guard<std::mutex> guard(lock);
+                    for (auto &it : local) {
+                        counts[it.first] += it.second;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+
+        void Start() {
+            if (started) {
+                return;
+            }
+            stopFlag.store(false);
+            started = true;
+            worker = std::thread([this]() { Run(); });
+        }
+
+        void StopAndReport() {
+            if (!started) {
+                return;
+            }
+            stopFlag.store(true);
+            if (worker.joinable()) {
+                worker.join();
+            }
+            long long total = 0;
+            {
+                std::lock_guard<std::mutex> guard(lock);
+                for (auto &it : counts) {
+                    total += it.second;
+                }
+            }
+            if (total <= 0) {
+                return;
+            }
+            std::vector<std::pair<long long, std::string> > rows;
+            {
+                std::lock_guard<std::mutex> guard(lock);
+                for (auto &it : counts) {
+                    rows.push_back(std::make_pair(it.second, std::string(it.first)));
+                }
+            }
+            std::sort(rows.begin(), rows.end(),
+                      [](const std::pair<long long, std::string> &a,
+                         const std::pair<long long, std::string> &b) {
+                          return a.first > b.first;
+                      });
+            printf("[fastllm-load-profile] sampled:");
+            for (auto &row : rows) {
+                printf(" %s=%.1f%%", row.second.c_str(),
+                       100.0 * row.first / total);
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+    };
+
+    static LoadStepSampler gLoadStepSampler;
+
     struct WeightLoadProfile {
         struct Entry {
             std::string name;
@@ -6658,6 +6758,7 @@ namespace fastllm {
                         phaseMark = now;
                     };
                     for (int i = st; i < end; i++) {
+                        SetLoadStep("loop");
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
                         const double loadProfileStart = gWeightLoadProfile.enabled ?
@@ -6666,6 +6767,7 @@ namespace fastllm {
                             GetThreadCpuSeconds() : 0.0;
                         if (prefetchWindowBytes == 0 || !prefetchStarted ||
                             tensor.data_offsets[0] >= prefetchNextOffset) {
+                            SetLoadStep("prefetch");
                             tensor.Prefetch(prefetchWindowBytes);
                             prefetchStarted = true;
                             prefetchNextOffset = tensor.data_offsets[0] +
@@ -6682,6 +6784,7 @@ namespace fastllm {
                             continue;
                         }
                         markPhase(0);
+                        SetLoadStep("lookup");
                         std::string scaleTensorName = "";
                         std::string qzeroTensorName = "";
                         PackedInt4GroupInfo packedInt4Info;
@@ -6866,6 +6969,7 @@ namespace fastllm {
                                     }
                                 }
                             } else {
+                                SetLoadStep("tempBuf");
                                 if (isInt8PerChannel) {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                     scaleTensor.CreateBuffer(DataType::FLOAT32);
@@ -7010,6 +7114,7 @@ namespace fastllm {
                                             gWeightLoadProfile.Now() - convMark);
                                         convMark = gWeightLoadProfile.Now();
                                     }
+                                    SetLoadStep("oriData");
                                     Data &loadedWeight = model->weight[weightName];
                                     if (!SkipWeightBuild() &&
                                         !TryAdoptSafeTensorBuffer(
@@ -7030,9 +7135,11 @@ namespace fastllm {
                                         convMark = gWeightLoadProfile.Now();
                                     }
                                 }
+                                SetLoadStep("calcSum");
                                 if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
                                     model->weight[weightName].CalcWeightSum();
                             }
+                            SetLoadStep("clearBuf");
                             tensor.ClearBuffer();
                             if (gWeightLoadProfile.enabled) {
                                 gWeightLoadProfile.AddPhase(9,
@@ -7067,6 +7174,7 @@ namespace fastllm {
                             }
 
                             markPhase(1);
+                            SetLoadStep("lock");
                             const double lockWaitStart = gWeightLoadProfile.enabled ?
                                 gWeightLoadProfile.Now() : 0.0;
                             locker.lock();
@@ -7142,6 +7250,7 @@ namespace fastllm {
                                 }
 
                                 locker.unlock();
+                                SetLoadStep("merge");
                                 for (auto &it : rule.rules) {
                                     if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
                                         continue;
@@ -7344,10 +7453,14 @@ namespace fastllm {
         for (int i = 0; i < threadNum; i++) {
             threads.push_back(new std::thread(loadSafeTensorRange, parts[i].first, parts[i].second));
         }
+        if (gWeightLoadProfile.enabled) {
+            gLoadStepSampler.Start();
+        }
         for (int i = 0; i < threads.size(); i++) {
             threads[i]->join();
             delete threads[i];
         }
+        gLoadStepSampler.StopAndReport();
         finishLoadSection("parallel");
         model->OnWeightLoadGroupFinished();
         model->OnModelWeightsLoaded();
