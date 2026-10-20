@@ -5838,7 +5838,7 @@ namespace fastllm {
 #endif
             fflush(stdout);
         }
-        std::exit(0);
+        std::_Exit(0);
     }
 
     // 从hf文件夹读取，仅支持safetensor格式的模型
@@ -6423,6 +6423,9 @@ namespace fastllm {
             }
         }
         std::atomic<uint64_t> loadLimitDoneBytes{0};
+        // 多个 worker 会同时越过阈值，必须只让一个线程出报告：否则一个线程的
+        // std::exit 开始析构全局对象，另一个线程还在里面 printf，进程会直接闪退。
+        std::atomic<bool> loadLimitReported{false};
         auto printLoadingProgress = [&](uint64_t tensorBytes) {
             int current = 0;
             uint64_t currentBytes = 0;
@@ -6936,10 +6939,13 @@ namespace fastllm {
                             if (loadLimitBytes > 0) {
                                 uint64_t limitDoneBytes = loadLimitDoneBytes.fetch_add(
                                     tensor.bytes) + tensor.bytes;
-                                if (limitDoneBytes >= loadLimitBytes) {
+                                if (limitDoneBytes >= loadLimitBytes &&
+                                    !loadLimitReported.exchange(true)) {
                                     gWeightLoadProfile.Report();
                                     fflush(stdout);
-                                    std::exit(0);
+                                    // 别的线程还在读盘/分配，走正常 exit 会析构掉它们
+                                    // 正在用的全局对象；这里直接退。
+                                    std::_Exit(0);
                                 }
                             }
 
