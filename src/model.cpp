@@ -1286,6 +1286,10 @@ namespace fastllm {
     };
 
     static thread_local SafeTensorBlockPool safeTensorBlockPool;
+    static std::atomic<long long> gSafeTensorBlockHits{0};
+    static std::atomic<long long> gSafeTensorBlockMisses{0};
+    static std::atomic<long long> gSafeTensorBlockPooledFrees{0};
+    static std::atomic<long long> gSafeTensorBlockDirectFrees{0};
 
     static bool UseSafeTensorBlockPool() {
         static const bool enabled = []() {
@@ -1307,8 +1311,10 @@ namespace fastllm {
             it->second.pop_back();
             pool.cachedBytes -= bytes;
             pool.blockBytes[p] = bytes;
+            gSafeTensorBlockHits.fetch_add(1, std::memory_order_relaxed);
             return p;
         }
+        gSafeTensorBlockMisses.fetch_add(1, std::memory_order_relaxed);
         uint8_t *p = new uint8_t[bytes];
         pool.blockBytes[p] = bytes;
         return p;
@@ -1321,6 +1327,7 @@ namespace fastllm {
         SafeTensorBlockPool &pool = safeTensorBlockPool;
         auto it = pool.blockBytes.find(p);
         if (it == pool.blockBytes.end()) {
+            gSafeTensorBlockDirectFrees.fetch_add(1, std::memory_order_relaxed);
             delete[] p;
             return;
         }
@@ -1328,9 +1335,11 @@ namespace fastllm {
         pool.blockBytes.erase(it);
         if (bytes < kSafeTensorBlockMinBytes || bytes > kSafeTensorBlockMaxBytes ||
             pool.cachedBytes + bytes > kSafeTensorBlockThreadBytes) {
+            gSafeTensorBlockDirectFrees.fetch_add(1, std::memory_order_relaxed);
             delete[] p;
             return;
         }
+        gSafeTensorBlockPooledFrees.fetch_add(1, std::memory_order_relaxed);
         pool.freeLists[bytes].push_back(p);
         pool.cachedBytes += bytes;
     }
@@ -5437,6 +5446,58 @@ namespace fastllm {
     // FASTLLM_PROFILE_LOAD=1: 逐个权重记录加载耗时，并按秒统计已完成字节，
     // 用来判断“加载中途速度掉下来”是读盘、转换还是设备搬运造成的。
     // 只在显式设置环境变量时收集，正常启动没有额外开销。
+#if defined(_WIN32) || defined(_WIN64)
+    // 进程级内存/分页指标：加载全程线程 CPU 只有 6~10%，说明在等；
+    // 页错误数和换页量能区分「等内核分配/零页」和「等锁」。
+    struct WinProcessMemoryCounters {
+        DWORD cb;
+        DWORD PageFaultCount;
+        size_t PeakWorkingSetSize;
+        size_t WorkingSetSize;
+        size_t QuotaPeakPagedPoolUsage;
+        size_t QuotaPagedPoolUsage;
+        size_t QuotaPeakNonPagedPoolUsage;
+        size_t QuotaNonPagedPoolUsage;
+        size_t PagefileUsage;
+        size_t PeakPagefileUsage;
+    };
+
+    static void PrintProcessMemoryStats(const char *tag) {
+        HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+        if (kernel32 == nullptr) {
+            return;
+        }
+        typedef BOOL (WINAPI *GetProcessMemoryInfoFn)(
+            HANDLE, WinProcessMemoryCounters *, DWORD);
+        GetProcessMemoryInfoFn getInfo = (GetProcessMemoryInfoFn)
+            GetProcAddress(kernel32, "K32GetProcessMemoryInfo");
+        if (getInfo == nullptr) {
+            return;
+        }
+        WinProcessMemoryCounters counters;
+        memset(&counters, 0, sizeof(counters));
+        counters.cb = (DWORD)sizeof(counters);
+        if (!getInfo(GetCurrentProcess(), &counters, (DWORD)sizeof(counters))) {
+            return;
+        }
+        IO_COUNTERS io;
+        memset(&io, 0, sizeof(io));
+        GetProcessIoCounters(GetCurrentProcess(), &io);
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        printf("[fastllm-load-profile] %s pageFaults=%lld workingSet=%.2f GiB "
+               "pagefile=%.2f GiB peakPagefile=%.2f GiB ioRead=%.2f GiB\n",
+               tag, (long long)counters.PageFaultCount,
+               (double)counters.WorkingSetSize / gib,
+               (double)counters.PagefileUsage / gib,
+               (double)counters.PeakPagefileUsage / gib,
+               (double)io.ReadTransferCount / gib);
+        fflush(stdout);
+    }
+#else
+    static void PrintProcessMemoryStats(const char *tag) {
+    }
+#endif
+
     struct WeightLoadProfile {
         struct Entry {
             std::string name;
@@ -5532,6 +5593,13 @@ namespace fastllm {
                 totalBytes += it.bytes;
             }
             const double mib = 1024.0 * 1024.0;
+            PrintProcessMemoryStats("mem");
+            printf("[fastllm-load-profile] blockPool: hits=%lld misses=%lld "
+                   "pooledFrees=%lld directFrees=%lld\n",
+                   gSafeTensorBlockHits.load(std::memory_order_relaxed),
+                   gSafeTensorBlockMisses.load(std::memory_order_relaxed),
+                   gSafeTensorBlockPooledFrees.load(std::memory_order_relaxed),
+                   gSafeTensorBlockDirectFrees.load(std::memory_order_relaxed));
             printf("\n[fastllm-load-profile] tensors=%d bytes=%.2f GiB wall=%.2f s avg=%.1f MiB/s\n",
                    (int)snapshot.size(), (double)totalBytes / mib / 1024.0, wall,
                    wall > 0.0 ? (double)totalBytes / mib / wall : 0.0);
