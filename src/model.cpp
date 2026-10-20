@@ -5838,6 +5838,76 @@ namespace fastllm {
 #endif
             fflush(stdout);
         }
+
+        // 多线程版：真实加载是 16 个 worker 同时 new/写/释放，单线程探针测不出
+        // 堆锁被抢到什么程度。这里同样 16 线程、块保持存活（和权重一样不释放）。
+        auto runMulti = [&](const char *tag, bool useArena) {
+            const int threadNum = 16;
+            uint8_t *arena = nullptr;
+            if (useArena) {
+#if defined(_WIN32) || defined(_WIN64)
+                arena = (uint8_t*)VirtualAlloc(nullptr,
+                    (size_t)blockCount * blockBytes, MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE);
+#endif
+                if (arena == nullptr) {
+                    arena = new uint8_t[(size_t)blockCount * blockBytes];
+                }
+            }
+            std::atomic<int> nextBlock{0};
+            std::atomic<int> doneBlocks{0};
+            std::mutex reportLock;
+            double windowBegin = now();
+            uint64_t windowBytes = 0;
+            std::vector<std::vector<uint8_t*> > held(threadNum);
+            std::vector<std::thread> workers;
+            for (int t = 0; t < threadNum; t++) {
+                workers.emplace_back([&, t]() {
+                    while (true) {
+                        int index = nextBlock.fetch_add(1);
+                        if (index >= blockCount) {
+                            break;
+                        }
+                        uint8_t *p = useArena ?
+                            arena + (size_t)index * blockBytes :
+                            new uint8_t[blockBytes];
+                        memset(p, 1, blockBytes);
+                        if (!useArena) {
+                            held[t].push_back(p);
+                        }
+                        const int done = doneBlocks.fetch_add(1) + 1;
+                        std::lock_guard<std::mutex> guard(reportLock);
+                        windowBytes += blockBytes;
+                        if (done % reportEvery == 0) {
+                            const double windowSeconds = now() - windowBegin;
+                            printf("[fastllm-alloc-probe] %s %6d blocks %8.1f MiB/s\n",
+                                   tag, done, windowBytes / mib / windowSeconds);
+                            fflush(stdout);
+                            windowBegin = now();
+                            windowBytes = 0;
+                        }
+                    }
+                });
+            }
+            for (auto &worker : workers) {
+                worker.join();
+            }
+            for (auto &blocks : held) {
+                for (uint8_t *p : blocks) {
+                    delete[] p;
+                }
+            }
+            if (useArena) {
+#if defined(_WIN32) || defined(_WIN64)
+                VirtualFree(arena, 0, MEM_RELEASE);
+#else
+                delete[] arena;
+#endif
+            }
+            fflush(stdout);
+        };
+        runMulti("heap16 ", false);
+        runMulti("arena16", true);
         std::_Exit(0);
     }
 
