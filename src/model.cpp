@@ -5760,6 +5760,87 @@ namespace fastllm {
         fflush(stdout);
     }
 
+    // FASTLLM_ALLOC_PROBE=1：只测内存分配，不加载模型。
+    //
+    // 权重加载会在进程里陆续攒下十九 GB、每块 0.5MB 量级的缓冲，九万多块。
+    // 这里按同样的尺寸和块数分配一遍，打印每 5000 块的速率：如果曲线尾部跟真实
+    // 加载一样掉到几十 MiB/s，掉速就出在分配器身上（块数一多就变慢），跟读盘和
+    // 转换代码无关。后半段改成从一个整段 VirtualAlloc 里切，等于 arena 方案的对照。
+    static void ProbeCpuAllocCurve() {
+        const size_t blockBytes = 512 * 1024;
+        const int blockCount = 93093;
+        const int reportEvery = 5000;
+        const double mib = 1024.0 * 1024.0;
+        auto now = []() {
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        printf("[fastllm-alloc-probe] blocks=%d blockBytes=%d total=%.1f GiB\n",
+               blockCount, (int)blockBytes,
+               (double)blockCount * blockBytes / mib / 1024.0);
+        fflush(stdout);
+
+        {
+            std::vector<uint8_t*> blocks;
+            blocks.reserve(blockCount);
+            double windowBegin = now();
+            uint64_t windowBytes = 0;
+            for (int i = 0; i < blockCount; i++) {
+                uint8_t *p = new uint8_t[blockBytes];
+                memset(p, 1, blockBytes);
+                blocks.push_back(p);
+                windowBytes += blockBytes;
+                if ((i + 1) % reportEvery == 0) {
+                    const double windowSeconds = now() - windowBegin;
+                    printf("[fastllm-alloc-probe] heap  %6d blocks %8.1f MiB/s\n",
+                           i + 1, windowBytes / mib / windowSeconds);
+                    fflush(stdout);
+                    windowBegin = now();
+                    windowBytes = 0;
+                }
+            }
+            const double freeBegin = now();
+            for (uint8_t *p : blocks) {
+                delete[] p;
+            }
+            printf("[fastllm-alloc-probe] heap  free %d blocks in %.2f s\n",
+                   (int)blocks.size(), now() - freeBegin);
+            fflush(stdout);
+        }
+
+        {
+            uint8_t *arena = nullptr;
+#if defined(_WIN32) || defined(_WIN64)
+            arena = (uint8_t*)VirtualAlloc(nullptr, (size_t)blockCount * blockBytes,
+                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#endif
+            if (arena == nullptr) {
+                arena = new uint8_t[(size_t)blockCount * blockBytes];
+            }
+            double windowBegin = now();
+            uint64_t windowBytes = 0;
+            for (int i = 0; i < blockCount; i++) {
+                memset(arena + (size_t)i * blockBytes, 1, blockBytes);
+                windowBytes += blockBytes;
+                if ((i + 1) % reportEvery == 0) {
+                    const double windowSeconds = now() - windowBegin;
+                    printf("[fastllm-alloc-probe] arena %6d blocks %8.1f MiB/s\n",
+                           i + 1, windowBytes / mib / windowSeconds);
+                    fflush(stdout);
+                    windowBegin = now();
+                    windowBytes = 0;
+                }
+            }
+#if defined(_WIN32) || defined(_WIN64)
+            VirtualFree(arena, 0, MEM_RELEASE);
+#else
+            delete[] arena;
+#endif
+            fflush(stdout);
+        }
+        std::exit(0);
+    }
+
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
@@ -5897,6 +5978,9 @@ namespace fastllm {
         SafeTensors safeTensors(stFiles);
         if (std::getenv("FASTLLM_LOAD_PROBE") != nullptr) {
             ProbeSequentialFileRead(stFiles);
+        }
+        if (std::getenv("FASTLLM_ALLOC_PROBE") != nullptr) {
+            ProbeCpuAllocCurve();
         }
 
         // 2. 创建网络基本信息
