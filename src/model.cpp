@@ -131,6 +131,10 @@ namespace fastllm {
     static std::atomic<long long> gLoadReadNanos{0};
     static std::atomic<long long> gLoadReadCalls{0};
     static std::atomic<long long> gLoadReadBytes{0};
+    // ReadFileAtOffset 失败后回退到 fopen/memcpy 的次数：回退路径既不进 readIO
+    // 统计，也没有预读，如果数量大就是加载变慢的真正原因。
+    static std::atomic<long long> gLoadReadFallbacks{0};
+    static std::atomic<long long> gLoadFopenCalls{0};
 
     static bool ReadFileAtOffset(const std::string &fileName, uint64_t offset,
                                  void *dst, size_t len) {
@@ -1447,6 +1451,7 @@ namespace fastllm {
             if (ReadFileAtOffset(fileName, offset, dst, len)) {
                 return;
             }
+            gLoadReadFallbacks.fetch_add(1, std::memory_order_relaxed);
 #endif
             memcpy(dst, fileBase + offset, len);
         }
@@ -1876,7 +1881,9 @@ namespace fastllm {
             if (ReadFileAtOffset(fileName, data_offsets[0], output, outputBytes)) {
                 return;
             }
+            gLoadReadFallbacks.fetch_add(1, std::memory_order_relaxed);
 #endif
+            gLoadFopenCalls.fetch_add(1, std::memory_order_relaxed);
             FILE *file = fopen(this->fileName.c_str(), "rb");
             AssertInFastLLM(
                 file != nullptr,
@@ -5650,11 +5657,14 @@ namespace fastllm {
                 const long long readBytes =
                     gLoadReadBytes.load(std::memory_order_relaxed);
                 printf("[fastllm-load-profile] readIO: calls=%lld total=%.1fs "
-                       "avg=%.2fms bytes=%.2fGiB (%.1f MiB/s)\n",
+                       "avg=%.2fms bytes=%.2fGiB (%.1f MiB/s) "
+                       "fallbacks=%lld fopen=%lld\n",
                        readCalls, readSeconds,
                        readCalls > 0 ? readSeconds * 1000.0 / readCalls : 0.0,
                        readBytes / 1073741824.0,
-                       readSeconds > 0.0 ? readBytes / 1048576.0 / readSeconds : 0.0);
+                       readSeconds > 0.0 ? readBytes / 1048576.0 / readSeconds : 0.0,
+                       gLoadReadFallbacks.load(std::memory_order_relaxed),
+                       gLoadFopenCalls.load(std::memory_order_relaxed));
             }
             {
                 std::lock_guard<std::mutex> guard(lock);
@@ -6496,6 +6506,9 @@ namespace fastllm {
         // 多个 worker 会同时越过阈值，必须只让一个线程出报告：否则一个线程的
         // std::exit 开始析构全局对象，另一个线程还在里面 printf，进程会直接闪退。
         std::atomic<bool> loadLimitReported{false};
+        // 每 30 秒打一行内存/分页指标，和掉速曲线对齐：workingSet 一直在涨说明是
+        // 自己的权重在占内存，停止增长而 pagefile/ioRead 暴涨说明在被换页。
+        std::atomic<long long> lastMemPrintNanos{0};
         auto printLoadingProgress = [&](uint64_t tensorBytes) {
             int current = 0;
             uint64_t currentBytes = 0;
@@ -7016,6 +7029,21 @@ namespace fastllm {
                                     // 别的线程还在读盘/分配，走正常 exit 会析构掉它们
                                     // 正在用的全局对象；这里直接退。
                                     std::_Exit(0);
+                                }
+                            }
+                            if (gWeightLoadProfile.enabled) {
+                                const long long nowNanos = (long long)
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                                long long lastPrinted = lastMemPrintNanos.load(
+                                    std::memory_order_relaxed);
+                                if (nowNanos - lastPrinted > 30000000000LL &&
+                                    lastMemPrintNanos.compare_exchange_strong(
+                                        lastPrinted, nowNanos)) {
+                                    char tag[64];
+                                    snprintf(tag, sizeof(tag), "mem@%.0fs",
+                                             gWeightLoadProfile.Now());
+                                    PrintProcessMemoryStats(tag);
                                 }
                             }
 
