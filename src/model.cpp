@@ -161,6 +161,23 @@ namespace fastllm {
         return enabled;
     }
 
+    // FASTLLM_LOAD_ADOPT=0 关掉「临时块 ownership 转给权重」的零拷贝路径，
+    // 用来二分加载期崩溃是零拷贝引起的还是别的改动引起的。
+    static bool UseWeightBufferAdopt() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_LOAD_ADOPT");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
+    // FASTLLM_LOAD_TRACE=1 逐张量打印 begin/end 到 stderr（不缓冲），
+    // 崩溃时最后一条没有配对的 begin 就是出事的张量。
+    static bool LoadTraceEnabled() {
+        static const bool enabled = std::getenv("FASTLLM_LOAD_TRACE") != nullptr;
+        return enabled;
+    }
+
     struct LoadFileEntry {
         std::string name;
         HANDLE handle = INVALID_HANDLE_VALUE;
@@ -5519,6 +5536,12 @@ namespace fastllm {
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, inputData, offset, scaleOffset);
                                                 } else {
+                                                    // 合并后的字节数一般等于各输入之和，但打包类型按
+                                                    // ceil 换算行字节时，奇数行可能多出 1 字节。越界的
+                                                    // memcpy 会静默踩坏堆，这里显式拦住。
+                                                    AssertInFastLLM(
+                                                        offset + inputData.GetBytes() <= mergeData.GetBytes(),
+                                                        "Merge weight overflow: " + mergeName);
                                                     memcpy(mergeData.cpuData + offset, inputData.cpuData, inputData.GetBytes());
                                                     offset += inputData.GetBytes();
                                                 }
@@ -6919,6 +6942,11 @@ namespace fastllm {
                         SetLoadStep("loop");
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
+                        if (LoadTraceEnabled()) {
+                            fprintf(stderr, "[load-trace] begin %s %llu\n",
+                                    tensorName.c_str(), (unsigned long long)tensor.bytes);
+                            fflush(stderr);
+                        }
                         const double loadProfileStart = gWeightLoadProfile.enabled ?
                             gWeightLoadProfile.Now() : 0.0;
                         const double loadProfileCpuStart = gWeightLoadProfile.enabled ?
@@ -7277,7 +7305,9 @@ namespace fastllm {
                                     const bool noLora =
                                         loraDicts.find(weightName) == loraDicts.end();
                                     if (!SkipWeightBuild() &&
-                                        !(it.second != DATA_AUTO_CONV && noLora &&
+                                        !(UseWeightBufferAdopt() && noLora &&
+                                          it.second != DATA_AUTO_CONV &&
+                                          tensorMap[tensorName].size() == 1 &&
                                           TryAdoptInt4GroupBuffer(
                                               loadedWeight, tensor, oriDataType,
                                               curGroupCnt)) &&
@@ -7502,6 +7532,12 @@ namespace fastllm {
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, inputData, offset, scaleOffset);
                                                 } else {
+                                                    // 合并后的字节数一般等于各输入之和，但打包类型按
+                                                    // ceil 换算行字节时，奇数行可能多出 1 字节。越界的
+                                                    // memcpy 会静默踩坏堆，这里显式拦住。
+                                                    AssertInFastLLM(
+                                                        offset + inputData.GetBytes() <= mergeData.GetBytes(),
+                                                        "Merge weight overflow: " + mergeName);
                                                     memcpy(mergeData.cpuData + offset, inputData.cpuData, inputData.GetBytes());
                                                     offset += inputData.GetBytes();
                                                 }
@@ -7583,6 +7619,10 @@ namespace fastllm {
                         }
 
                         printLoadingProgress(tensor.bytes);
+                        if (LoadTraceEnabled()) {
+                            fprintf(stderr, "[load-trace] end   %s\n", tensorName.c_str());
+                            fflush(stderr);
+                        }
                         gWeightLoadProfile.Record(tensorName, tensor.bytes,
                             loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart,
                             GetThreadCpuSeconds() - loadProfileCpuStart);

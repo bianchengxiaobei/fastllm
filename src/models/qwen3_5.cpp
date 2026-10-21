@@ -9539,6 +9539,8 @@ namespace fastllm {
             AppendVectorInPlace(mergeData.scales, input->scales);
             AppendVectorInPlace(mergeData.mins, input->mins);
             AppendVectorInPlace(mergeData.halfScales, input->halfScales);
+            AssertInFastLLM(offset + input->GetBytes() <= mergeData.GetBytes(),
+                            "Merge weight overflow: " + mergeName);
             memcpy(mergeData.cpuData + offset, input->cpuData, input->GetBytes());
             offset += input->GetBytes();
         }
