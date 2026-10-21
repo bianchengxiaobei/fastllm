@@ -102,7 +102,18 @@ namespace fastllm {
     static std::atomic<int> gLoadStepSlotCount{0};
     static thread_local int gLoadStepSlot = -1;
 
+    // 只有跑诊断时才打标签：正常加载时这里是纯开销（每张量十几次跨线程原子写，
+    // 同一个 32 项数组还有伪共享）。
+    static inline bool LoadStepLabelsEnabled() {
+        static const bool enabled =
+            std::getenv("FASTLLM_PROFILE_LOAD") != nullptr;
+        return enabled;
+    }
+
     static inline void SetLoadStep(const char *label) {
+        if (!LoadStepLabelsEnabled()) {
+            return;
+        }
         int slot = gLoadStepSlot;
         if (slot < 0) {
             slot = gLoadStepSlotCount.fetch_add(1);
