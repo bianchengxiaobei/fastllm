@@ -9533,11 +9533,11 @@ namespace fastllm {
 
         uint64_t offset = 0;
         for (const Data *input : {&input0, &input1}) {
-            mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, input->perChannelsConfigs);
-            mergeData.zeros = AppendVector(mergeData.zeros, input->zeros);
-            mergeData.scales = AppendVector(mergeData.scales, input->scales);
-            mergeData.mins = AppendVector(mergeData.mins, input->mins);
-            mergeData.halfScales = AppendVector(mergeData.halfScales, input->halfScales);
+            AppendVectorInPlace(mergeData.perChannelsConfigs, input->perChannelsConfigs);
+            AppendVectorInPlace(mergeData.zeros, input->zeros);
+            AppendVectorInPlace(mergeData.scales, input->scales);
+            AppendVectorInPlace(mergeData.mins, input->mins);
+            AppendVectorInPlace(mergeData.halfScales, input->halfScales);
             memcpy(mergeData.cpuData + offset, input->cpuData, input->GetBytes());
             offset += input->GetBytes();
         }

@@ -5382,19 +5382,20 @@ namespace fastllm {
                                             bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
                                             const long long appendBegin = NowNanos();
                                             for (auto input : it.inputs) {
-                                                mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
-                                                mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
-                                                mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
-                                                mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
-                                                mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                const Data &inputData = model->weight[input];
+                                                AppendVectorInPlace(mergeData.perChannelsConfigs, inputData.perChannelsConfigs);
+                                                AppendVectorInPlace(mergeData.zeros, inputData.zeros);
+                                                AppendVectorInPlace(mergeData.scales, inputData.scales);
+                                                AppendVectorInPlace(mergeData.mins, inputData.mins);
+                                                AppendVectorInPlace(mergeData.halfScales, inputData.halfScales);
                                                 gMergeAppendNanos.fetch_add(NowNanos() - appendBegin,
                                                     std::memory_order_relaxed);
                                                 const long long copyBegin = NowNanos();
                                                 if (compactNVFP4) {
-                                                    AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
+                                                    AppendCompactNVFP4Weight(mergeData, inputData, offset, scaleOffset);
                                                 } else {
-                                                    memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
-                                                    offset += model->weight[input].GetBytes();
+                                                    memcpy(mergeData.cpuData + offset, inputData.cpuData, inputData.GetBytes());
+                                                    offset += inputData.GetBytes();
                                                 }
                                                 gMergeMemcpyNanos.fetch_add(NowNanos() - copyBegin,
                                                     std::memory_order_relaxed);
@@ -7349,19 +7350,20 @@ namespace fastllm {
                                             bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
                                             const long long appendBegin = NowNanos();
                                             for (auto input : it.inputs) {
-                                                mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
-                                                mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
-                                                mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
-                                                mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
-                                                mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                const Data &inputData = model->weight[input];
+                                                AppendVectorInPlace(mergeData.perChannelsConfigs, inputData.perChannelsConfigs);
+                                                AppendVectorInPlace(mergeData.zeros, inputData.zeros);
+                                                AppendVectorInPlace(mergeData.scales, inputData.scales);
+                                                AppendVectorInPlace(mergeData.mins, inputData.mins);
+                                                AppendVectorInPlace(mergeData.halfScales, inputData.halfScales);
                                                 gMergeAppendNanos.fetch_add(NowNanos() - appendBegin,
                                                     std::memory_order_relaxed);
                                                 const long long copyBegin = NowNanos();
                                                 if (compactNVFP4) {
-                                                    AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
+                                                    AppendCompactNVFP4Weight(mergeData, inputData, offset, scaleOffset);
                                                 } else {
-                                                    memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
-                                                    offset += model->weight[input].GetBytes();
+                                                    memcpy(mergeData.cpuData + offset, inputData.cpuData, inputData.GetBytes());
+                                                    offset += inputData.GetBytes();
                                                 }
                                                 gMergeMemcpyNanos.fetch_add(NowNanos() - copyBegin,
                                                     std::memory_order_relaxed);

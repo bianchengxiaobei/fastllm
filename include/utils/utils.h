@@ -450,6 +450,17 @@ namespace fastllm {
         return ret;
     }
 
+    // 原地追加。AppendVector 会先整份拷贝 a 再返回，用在「取回自己再赋回自己」的
+    // 写法里（mergeData.scales = AppendVector(mergeData.scales, x)）等于每轮输入都把
+    // 已累积的内容重拷一遍，输入多时是 O(n^2)，而且每次都真正分配内存。
+    template <typename T>
+    static void AppendVectorInPlace(std::vector <T> &a, const std::vector <T> &b) {
+        if (b.empty()) {
+            return;
+        }
+        a.insert(a.end(), b.begin(), b.end());
+    }
+
     static std::vector <int> ParseDeviceIds(const std::string &s, const std::string &type, std::map <int, int> &ratios) {
         int i = type.size();
         std::vector <int> ret;
