@@ -178,6 +178,31 @@ namespace fastllm {
         return enabled;
     }
 
+    // FASTLLM_LOAD_HEAPCHECK=1 每个张量处理完校验一次进程堆。堆损坏通常会
+    // 延后到某次无关的 new/delete 才报 0xC0000374，这个开关能把它锁定在真正
+    // 踩坏堆的那一个张量上。HeapValidate 是 O(堆) 的，所以值也可以填间隔
+    // （FASTLLM_LOAD_HEAPCHECK=64 表示每 64 个张量校验一次）。
+    static int LoadHeapCheckInterval() {
+        static const int interval = []() -> int {
+            const char *env = std::getenv("FASTLLM_LOAD_HEAPCHECK");
+            if (env == nullptr) {
+                return 0;
+            }
+            const int n = std::atoi(env);
+            return n > 0 ? n : 1;
+        }();
+        return interval;
+    }
+
+    static bool CheckLoadHeap(const char *tensorName) {
+        if (HeapValidate(GetProcessHeap(), 0, nullptr)) {
+            return true;
+        }
+        fprintf(stderr, "[load-trace] HEAP CORRUPT after %s\n", tensorName);
+        fflush(stderr);
+        return false;
+    }
+
     struct LoadFileEntry {
         std::string name;
         HANDLE handle = INVALID_HANDLE_VALUE;
@@ -1446,9 +1471,12 @@ namespace fastllm {
         size_t cachedBytes = 0;
 
         ~SafeTensorBlockPool() {
+            // 池里的块现在是 AllocCpuDataBlock 给的（可能是 arena 的
+            // VirtualAlloc 内存），线程退出时必须走统一释放入口，直接
+            // delete[] 会立即触发 STATUS_HEAP_CORRUPTION。
             for (auto &it : freeLists) {
                 for (uint8_t *p : it.second) {
-                    delete[] p;
+                    FreeCpuDataBlock(p);
                 }
             }
         }
@@ -7623,7 +7651,13 @@ namespace fastllm {
                             fprintf(stderr, "[load-trace] end   %s\n", tensorName.c_str());
                             fflush(stderr);
                         }
-                        gWeightLoadProfile.Record(tensorName, tensor.bytes,
+                        const int heapCheckInterval = LoadHeapCheckInterval();
+                        if (heapCheckInterval > 0 &&
+                            cnt % heapCheckInterval == 0 &&
+                            !CheckLoadHeap(tensorName.c_str())) {
+                            fflush(stdout);
+                            std::_Exit(3);
+                        }                        gWeightLoadProfile.Record(tensorName, tensor.bytes,
                             loadProfileStart, gWeightLoadProfile.Now() - loadProfileStart,
                             GetThreadCpuSeconds() - loadProfileCpuStart);
                         markPhase(4);
