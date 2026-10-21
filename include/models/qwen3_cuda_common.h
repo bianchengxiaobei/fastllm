@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,26 @@ namespace fastllm {
         return state;
     }
 
+    // 按算子类型拆开: avg 30us 这种量级必须知道是哪些算子在吃, 才能判断是
+    // launch 本身贵, 还是某个算子里带了同步. 只在 DETAIL 开关下累积.
+    struct Qwen3CudaSubmitProfileOp {
+        long long calls = 0;
+        double hostMs = 0.0;
+        double runMs = 0.0;
+    };
+
+    inline bool Qwen3CudaSubmitProfileDetailEnabled() {
+        static const bool enabled =
+            std::getenv("FASTLLM_PROFILE_CUDA_SUBMIT_DETAIL") != nullptr;
+        return enabled;
+    }
+
+    inline std::map<std::string, Qwen3CudaSubmitProfileOp> &
+            Qwen3CudaSubmitProfileDetail() {
+        static thread_local std::map<std::string, Qwen3CudaSubmitProfileOp> ops;
+        return ops;
+    }
+
     inline void Qwen3CudaSubmitProfileFlush() {
         Qwen3CudaSubmitProfileState &state = Qwen3CudaSubmitProfile();
         if (!state.enabled || state.calls == 0) {
@@ -91,6 +112,29 @@ namespace fastllm {
         printf("[fastllm-cuda-submit] calls=%lld host=%.1fms avg=%.1fus\n",
                state.calls, state.hostMs,
                state.hostMs * 1000.0 / (double)state.calls);
+        std::map<std::string, Qwen3CudaSubmitProfileOp> &detail =
+            Qwen3CudaSubmitProfileDetail();
+        if (Qwen3CudaSubmitProfileDetailEnabled() && !detail.empty()) {
+            std::vector<std::pair<std::string, Qwen3CudaSubmitProfileOp> > ordered(
+                detail.begin(), detail.end());
+            std::sort(ordered.begin(), ordered.end(),
+                      [](const std::pair<std::string, Qwen3CudaSubmitProfileOp> &a,
+                         const std::pair<std::string, Qwen3CudaSubmitProfileOp> &b) {
+                          return a.second.hostMs > b.second.hostMs;
+                      });
+            printf("[fastllm-cuda-submit-detail] top ops by host time:\n");
+            int shown = 0;
+            for (auto &it : ordered) {
+                if (shown++ >= 12) {
+                    break;
+                }
+                printf("  %-26s calls=%4lld host=%6.2fms run=%6.2fms avg=%5.1fus\n",
+                       it.first.c_str(), it.second.calls, it.second.hostMs,
+                       it.second.runMs,
+                       it.second.hostMs * 1000.0 / (double)it.second.calls);
+            }
+            detail.clear();
+        }
         fflush(stdout);
         state.calls = 0;
         state.hostMs = 0.0;
@@ -136,11 +180,22 @@ namespace fastllm {
                 AssertInFastLLM(device->CanRun(opType, datas, floatParams, intParams),
                                 "Qwen3 CUDA direct runner can't run " + opType + ".\n");
             }
+            double runBeginMs = Qwen3CudaSubmitProfileDetailEnabled() ?
+                Qwen3CudaSubmitNowMs() : 0.0;
             device->Reshape(opType, datas, floatParams, intParams);
             device->Run(opType, datas, floatParams, intParams);
             if (submitProfile.enabled) {
+                double nowMs = Qwen3CudaSubmitNowMs();
+                double spendMs = nowMs - submitBeginMs;
                 submitProfile.calls++;
-                submitProfile.hostMs += Qwen3CudaSubmitNowMs() - submitBeginMs;
+                submitProfile.hostMs += spendMs;
+                if (runBeginMs > 0.0) {
+                    Qwen3CudaSubmitProfileOp &op =
+                        Qwen3CudaSubmitProfileDetail()[opType];
+                    op.calls++;
+                    op.hostMs += spendMs;
+                    op.runMs += nowMs - runBeginMs;
+                }
             }
         }
 
