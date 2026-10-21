@@ -114,6 +114,17 @@ namespace fastllm {
         gLoadStepLabels[slot].store(label, std::memory_order_relaxed);
     }
 
+    // 单线程全量加载是 100% CPU、190 秒：这是纯 CPU 工作，只是不能并行。
+    // 下面这几个计时器把合并/求和这些看起来是 memcpy 的段拆开，确认 CPU 花在哪。
+    static std::atomic<long long> gMergeAppendNanos{0};
+    static std::atomic<long long> gMergeMemcpyNanos{0};
+    static std::atomic<long long> gWeightSumNanos{0};
+
+    static inline long long NowNanos() {
+        return (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
 #if defined(_WIN32) || defined(_WIN64)
     // FASTLLM_LOAD_READFILE=0 可以退回映射读，方便对照。
     static bool UseLoadReadFile() {
@@ -5369,18 +5380,24 @@ namespace fastllm {
                                             uint64_t offset = 0;
                                             uint64_t scaleOffset = 0;
                                             bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
+                                            const long long appendBegin = NowNanos();
                                             for (auto input : it.inputs) {
                                                 mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
                                                 mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
                                                 mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
                                                 mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
                                                 mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                gMergeAppendNanos.fetch_add(NowNanos() - appendBegin,
+                                                    std::memory_order_relaxed);
+                                                const long long copyBegin = NowNanos();
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
                                                 } else {
                                                     memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
                                                     offset += model->weight[input].GetBytes();
                                                 }
+                                                gMergeMemcpyNanos.fetch_add(NowNanos() - copyBegin,
+                                                    std::memory_order_relaxed);
                                             }
                                             mergeData.CalcWeightSum();
                                         }
@@ -5784,6 +5801,12 @@ namespace fastllm {
                 fflush(stdout);
             }
             PrintCpuAllocProfile(" load");
+            printf("[fastllm-load-profile] detail: mergeAppend=%.2fs mergeMemcpy=%.2fs "
+                   "calcWeightSum=%.2fs\n",
+                   gMergeAppendNanos.load(std::memory_order_relaxed) / 1e9,
+                   gMergeMemcpyNanos.load(std::memory_order_relaxed) / 1e9,
+                   gWeightSumNanos.load(std::memory_order_relaxed) / 1e9);
+            fflush(stdout);
             printf("\n[fastllm-load-profile] tensors=%d bytes=%.2f GiB wall=%.2f s avg=%.1f MiB/s\n",
                    (int)snapshot.size(), (double)totalBytes / mib / 1024.0, wall,
                    wall > 0.0 ? (double)totalBytes / mib / wall : 0.0);
@@ -7139,8 +7162,12 @@ namespace fastllm {
                                     }
                                 }
                                 SetLoadStep("calcSum");
-                                if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
+                                if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV) {
+                                    const long long sumBegin = NowNanos();
                                     model->weight[weightName].CalcWeightSum();
+                                    gWeightSumNanos.fetch_add(NowNanos() - sumBegin,
+                                        std::memory_order_relaxed);
+                                }
                             }
                             SetLoadStep("clearBuf");
                             tensor.ClearBuffer();
@@ -7320,18 +7347,24 @@ namespace fastllm {
                                             uint64_t offset = 0;
                                             uint64_t scaleOffset = 0;
                                             bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
+                                            const long long appendBegin = NowNanos();
                                             for (auto input : it.inputs) {
                                                 mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
                                                 mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
                                                 mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
                                                 mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
                                                 mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                gMergeAppendNanos.fetch_add(NowNanos() - appendBegin,
+                                                    std::memory_order_relaxed);
+                                                const long long copyBegin = NowNanos();
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
                                                 } else {
                                                     memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
                                                     offset += model->weight[input].GetBytes();
                                                 }
+                                                gMergeMemcpyNanos.fetch_add(NowNanos() - copyBegin,
+                                                    std::memory_order_relaxed);
                                             }
 
                                             SetLoadStep("postMerge");
