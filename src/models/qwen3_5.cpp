@@ -17300,6 +17300,9 @@ namespace fastllm {
             ForceDeviceSync();
             Qwen35HostMoeProfileHead(hostMoeHeadBeginMs);
         }
+        if (all1 && !isPrefill) {
+            Qwen3CudaSubmitProfileFlush();
+        }
         mtpWorkerProfileSyncMark(mtpWorkerProfileHeadUs);
         mtpWorkerProfileRecord();
 #endif

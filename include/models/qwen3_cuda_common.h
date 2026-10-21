@@ -3,6 +3,8 @@
 #include "contextconfig.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -59,6 +61,41 @@ namespace fastllm {
         data.lockInCPU = false;
     }
 
+    // CUDA 下发开销诊断: decode 每个 token 的算子个数与主机侧耗时. 内核是异步的,
+    // 所以 Run 里量到的是提交(cudaLaunchKernel / cuBLAS 调用)的时间, 不含 GPU 执行.
+    // 打开 FASTLLM_PROFILE_CUDA_SUBMIT 后由模型在 token 结束时 Flush 打印一次.
+    struct Qwen3CudaSubmitProfileState {
+        bool enabled = false;
+        long long calls = 0;
+        double hostMs = 0.0;
+    };
+
+    inline double Qwen3CudaSubmitNowMs() {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    inline Qwen3CudaSubmitProfileState &Qwen3CudaSubmitProfile() {
+        static const bool enabled =
+            std::getenv("FASTLLM_PROFILE_CUDA_SUBMIT") != nullptr;
+        static thread_local Qwen3CudaSubmitProfileState state;
+        state.enabled = enabled;
+        return state;
+    }
+
+    inline void Qwen3CudaSubmitProfileFlush() {
+        Qwen3CudaSubmitProfileState &state = Qwen3CudaSubmitProfile();
+        if (!state.enabled || state.calls == 0) {
+            return;
+        }
+        printf("[fastllm-cuda-submit] calls=%lld host=%.1fms avg=%.1fus\n",
+               state.calls, state.hostMs,
+               state.hostMs * 1000.0 / (double)state.calls);
+        fflush(stdout);
+        state.calls = 0;
+        state.hostMs = 0.0;
+    }
+
     class Qwen3CudaDirectRunner {
     public:
         explicit Qwen3CudaDirectRunner(int deviceId) : deviceId(deviceId), device((BaseDevice*)&cudaDevice) {
@@ -77,6 +114,8 @@ namespace fastllm {
                  bool checkCanRun = true,
                  bool preserveFakeOutputs = false) {
             FastllmCudaSetDevice(deviceId);
+            Qwen3CudaSubmitProfileState &submitProfile = Qwen3CudaSubmitProfile();
+            double submitBeginMs = submitProfile.enabled ? Qwen3CudaSubmitNowMs() : 0.0;
             for (auto &name : outputs) {
                 auto it = datas.find(name);
                 if (it != datas.end() && it->second != nullptr) {
@@ -99,6 +138,10 @@ namespace fastllm {
             }
             device->Reshape(opType, datas, floatParams, intParams);
             device->Run(opType, datas, floatParams, intParams);
+            if (submitProfile.enabled) {
+                submitProfile.calls++;
+                submitProfile.hostMs += Qwen3CudaSubmitNowMs() - submitBeginMs;
+            }
         }
 
     private:
