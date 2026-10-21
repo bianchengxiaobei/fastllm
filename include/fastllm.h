@@ -668,6 +668,9 @@ namespace fastllm {
         void CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, 
                 int groupCnt = -1, int blockK = -1, int blockM = -1); // 从oriData中创建
 
+        // 只填充 INT4_GROUP 的元数据（group / mins / scales / zeros），不碰权重字节
+        void InitInt4GroupMeta(int groupCnt, const float *oriMins, const float *oriScales);
+
         void CopyFrom(const Data &ori); // 复制
 
         void FakeFrom(const Data &ori, size_t offset); // 将data指针指向ori的data + offset，delete时不销毁
@@ -997,6 +1000,9 @@ namespace fastllm {
     // VirtualAlloc 切出来的），那种指针不能用 delete[]。所有释放 cpuData 的地方
     // 都必须走这个函数，不能直接 delete[]。
     void FreeCpuDataBlock(uint8_t *p);
+
+    // 分配 cpuData / 加载期临时缓冲的统一入口，和 FreeCpuDataBlock 配对。
+    uint8_t *AllocCpuDataBlock(uint64_t bytes);
 
     void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total); // 执行到了current, 一共total，使用deviceMap切换设备
 

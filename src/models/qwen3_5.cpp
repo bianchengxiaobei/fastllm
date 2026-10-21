@@ -9529,7 +9529,8 @@ namespace fastllm {
         mergeData.groupCnt = input0.groupCnt;
         mergeData.blockK = input0.blockK;
         mergeData.blockM = input0.blockM;
-        mergeData.Allocate();
+        // 下面会把 input0 / input1 的字节全部 memcpy 进来，不需要先清零。
+        mergeData.Allocate(false);
 
         uint64_t offset = 0;
         for (const Data *input : {&input0, &input1}) {

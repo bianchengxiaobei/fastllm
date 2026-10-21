@@ -161,28 +161,62 @@ namespace fastllm {
         return enabled;
     }
 
+    struct LoadFileEntry {
+        std::string name;
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        uint64_t size = 0;
+    };
+
     // SetFilePointerEx + ReadFile 共享句柄会互相踩文件指针，所以每线程一套。
-    static HANDLE GetLoadFileHandle(const std::string &fileName) {
-        struct Entry {
-            std::string name;
-            HANDLE handle = INVALID_HANDLE_VALUE;
-        };
-        static thread_local std::vector<Entry> cache;
+    static LoadFileEntry *GetLoadFileEntry(const std::string &fileName) {
+        static thread_local std::vector<LoadFileEntry> cache;
         for (auto &it : cache) {
             if (it.name == fileName) {
-                return it.handle;
+                return &it;
             }
         }
-        HANDLE handle = CreateFileA(
+        LoadFileEntry entry;
+        entry.name = fileName;
+        entry.handle = CreateFileA(
             fileName.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
-        Entry entry;
-        entry.name = fileName;
-        entry.handle = handle;
+        if (entry.handle != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size;
+            size.QuadPart = 0;
+            if (GetFileSizeEx(entry.handle, &size)) {
+                entry.size = (uint64_t)size.QuadPart;
+            }
+        }
         cache.push_back(entry);
-        return handle;
+        return &cache.back();
     }
+
+    // 冷启动时单个张量只有一两百 KB，一次发出去就是一串小请求：既吃不到设备带宽，
+    // 也把 FILE_FLAG_SEQUENTIAL_SCAN 的预读打散。这里每线程维护一个前向窗口，小请求
+    // 按 8MB 对齐顺序读，后续张量多半已经落在窗口里，直接从缓冲里 memcpy 走。
+    // 窗口只往前推不回退，所以最坏情况也只是多读一个窗口，不会退化成随机读。
+    static size_t LoadReadAheadBytes() {
+        static const size_t bytes = []() {
+            const char *env = std::getenv("FASTLLM_LOAD_READAHEAD_MB");
+            long mb = env == nullptr ? 8 : std::atol(env);
+            return mb <= 0 ? (size_t)0 : (size_t)mb * 1048576;
+        }();
+        return bytes;
+    }
+
+    struct LoadReadAheadWindow {
+        std::string fileName;
+        uint64_t start = 0;
+        size_t bytes = 0;
+        std::vector <uint8_t> buffer;
+    };
+
+    static thread_local LoadReadAheadWindow gLoadReadAheadWindow;
+    // 多读进来的字节 / 命中窗口（完全没有磁盘 IO）的请求数 / 填窗口次数
+    static std::atomic<long long> gLoadReadAheadExtraBytes{0};
+    static std::atomic<long long> gLoadReadAheadHits{0};
+    static std::atomic<long long> gLoadReadAheadFills{0};
 
     // 按偏移整块读。整块指这一次调用要的字节数（通常就是一整个张量），
     // 不要退化成 CRT 的 4KB 缓冲读，否则又是一串 4K 随机请求。
@@ -194,16 +228,7 @@ namespace fastllm {
     static std::atomic<long long> gLoadReadFallbacks{0};
     static std::atomic<long long> gLoadFopenCalls{0};
 
-    static bool ReadFileAtOffset(const std::string &fileName, uint64_t offset,
-                                 void *dst, size_t len) {
-        if (!UseLoadReadFile() || dst == nullptr || len == 0) {
-            return false;
-        }
-        auto readBegin = std::chrono::steady_clock::now();
-        HANDLE handle = GetLoadFileHandle(fileName);
-        if (handle == INVALID_HANDLE_VALUE) {
-            return false;
-        }
+    static bool ReadFileExact(HANDLE handle, uint64_t offset, void *dst, size_t len) {
         LARGE_INTEGER position;
         position.QuadPart = (LONGLONG)offset;
         if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
@@ -218,6 +243,68 @@ namespace fastllm {
                 return false;
             }
             done += got;
+        }
+        return true;
+    }
+
+    static bool ReadFileAtOffset(const std::string &fileName, uint64_t offset,
+                                 void *dst, size_t len) {
+        if (!UseLoadReadFile() || dst == nullptr || len == 0) {
+            return false;
+        }
+        auto readBegin = std::chrono::steady_clock::now();
+        LoadFileEntry *entry = GetLoadFileEntry(fileName);
+        if (entry == nullptr || entry->handle == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        const HANDLE handle = entry->handle;
+        uint8_t *cur = (uint8_t*)dst;
+
+        const size_t readAheadBytes = LoadReadAheadBytes();
+        if (readAheadBytes > 0) {
+            LoadReadAheadWindow &window = gLoadReadAheadWindow;
+            // 1) 请求落在当前窗口里：这次完全没有磁盘 IO
+            if (window.fileName == fileName && window.bytes > 0 &&
+                offset >= window.start && offset + len <= window.start + window.bytes) {
+                gLoadReadAheadHits.fetch_add(1, std::memory_order_relaxed);
+                memcpy(cur, window.buffer.data() + (size_t)(offset - window.start), len);
+                return true;
+            }
+            // 2) 小请求且落在窗口前方：整块读一个窗口，再从里面取这次的字节
+            if (len <= (readAheadBytes >> 2) &&
+                (window.fileName != fileName || window.bytes == 0 ||
+                 offset >= window.start + window.bytes)) {
+                const uint64_t windowStart = offset & ~(uint64_t)65535;
+                const uint64_t remain = entry->size > windowStart ?
+                    entry->size - windowStart : 0;
+                size_t windowBytes = (size_t)std::min<uint64_t>(readAheadBytes, remain);
+                if (windowBytes >= len) {
+                    if (window.buffer.size() < windowBytes) {
+                        window.buffer.resize(windowBytes);
+                    }
+                    if (ReadFileExact(handle, windowStart, window.buffer.data(), windowBytes)) {
+                        window.fileName = fileName;
+                        window.start = windowStart;
+                        window.bytes = windowBytes;
+                        gLoadReadAheadFills.fetch_add(1, std::memory_order_relaxed);
+                        gLoadReadAheadExtraBytes.fetch_add(
+                            (long long)(windowBytes - len), std::memory_order_relaxed);
+                        memcpy(cur, window.buffer.data() + (size_t)(offset - windowStart), len);
+                        gLoadReadNanos.fetch_add(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - readBegin).count(),
+                            std::memory_order_relaxed);
+                        gLoadReadCalls.fetch_add(1, std::memory_order_relaxed);
+                        gLoadReadBytes.fetch_add((long long)windowBytes,
+                                                 std::memory_order_relaxed);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if (!ReadFileExact(handle, offset, cur, len)) {
+            return false;
         }
         gLoadReadNanos.fetch_add(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1376,7 +1463,7 @@ namespace fastllm {
         uint8_t *ret = nullptr;
         if (bytes < kSafeTensorBlockMinBytes || bytes > kSafeTensorBlockMaxBytes ||
             !UseSafeTensorBlockPool()) {
-            ret = new uint8_t[bytes];
+            ret = AllocCpuDataBlock(bytes);
         } else {
         SafeTensorBlockPool &pool = safeTensorBlockPool;
         auto it = pool.freeLists.find(bytes);
@@ -1389,7 +1476,7 @@ namespace fastllm {
             ret = p;
         } else {
         gSafeTensorBlockMisses.fetch_add(1, std::memory_order_relaxed);
-        uint8_t *p = new uint8_t[bytes];
+        uint8_t *p = AllocCpuDataBlock(bytes);
         pool.blockBytes[p] = bytes;
         ret = p;
         }
@@ -1411,7 +1498,7 @@ namespace fastllm {
         auto it = pool.blockBytes.find(p);
         if (it == pool.blockBytes.end()) {
             gSafeTensorBlockDirectFrees.fetch_add(1, std::memory_order_relaxed);
-            delete[] p;
+            FreeCpuDataBlock(p);
             gSafeTensorFreeNanos.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - freeBegin).count(),
@@ -1423,7 +1510,7 @@ namespace fastllm {
         if (bytes < kSafeTensorBlockMinBytes || bytes > kSafeTensorBlockMaxBytes ||
             pool.cachedBytes + bytes > kSafeTensorBlockThreadBytes) {
             gSafeTensorBlockDirectFrees.fetch_add(1, std::memory_order_relaxed);
-            delete[] p;
+            FreeCpuDataBlock(p);
             gSafeTensorFreeNanos.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - freeBegin).count(),
@@ -2807,6 +2894,31 @@ namespace fastllm {
         weight.cpuData = tensor.buffer;
         ForgetSafeTensorBlock(tensor.buffer);
         tensor.buffer = nullptr;
+        return true;
+    }
+
+    // INT4_GROUP 的权重读进临时块之后，字节布局已经是最终布局（nibble 交换在
+    // CreateBufferWithPacked* 里做完了），所以可以直接把临时块的 ownership 转给
+    // 权重，省掉一次全量 memcpy 和一块同样大小的新分配。
+    static bool TryAdoptInt4GroupBuffer(Data &weight, SafeTensorItem &tensor,
+                                        DataType sourceDataType, int groupCnt) {
+        if (weight.dataType != DataType::INT4_GROUP ||
+            sourceDataType != DataType::INT4_GROUP ||
+            weight.dims.size() != 2 || groupCnt <= 0 ||
+            weight.dims[1] % groupCnt != 0 ||
+            weight.dataDevice != DataDevice::CPU || weight.cpuData != nullptr ||
+            tensor.buffer == nullptr || tensor.bytes == 0 ||
+            tensor.minsBuffer == nullptr || tensor.scalesBuffer == nullptr ||
+            tensor.bytes != weight.GetBytes()) {
+            return false;
+        }
+        weight.weightType = WeightType::AUTO;
+        weight.expansionSize = weight.Count(0);
+        weight.expansionBytes = weight.GetBytes();
+        weight.cpuData = tensor.buffer;
+        ForgetSafeTensorBlock(tensor.buffer);
+        tensor.buffer = nullptr;
+        weight.InitInt4GroupMeta(groupCnt, tensor.minsBuffer, tensor.scalesBuffer);
         return true;
     }
 
@@ -5386,11 +5498,13 @@ namespace fastllm {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
                                         } else {
                                             SetLoadStep("mergeAlloc");
-                                            mergeData.Allocate();
+                                            bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
+                                            // 非 compactNVFP4 分支是逐 input 完整 memcpy，
+                                            // 清零纯属浪费；compact 分支保持原样以求稳。
+                                            mergeData.Allocate(compactNVFP4);
                                             SetLoadStep("mergeCopy");
                                             uint64_t offset = 0;
                                             uint64_t scaleOffset = 0;
-                                            bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
                                             const long long appendBegin = NowNanos();
                                             for (auto input : it.inputs) {
                                                 const Data &inputData = model->weight[input];
@@ -5877,6 +5991,12 @@ namespace fastllm {
                        readSeconds > 0.0 ? readBytes / 1048576.0 / readSeconds : 0.0,
                        gLoadReadFallbacks.load(std::memory_order_relaxed),
                        gLoadFopenCalls.load(std::memory_order_relaxed));
+                printf("[fastllm-load-profile] readAhead: window=%.0fMiB fills=%lld "
+                       "hits=%lld extra=%.2fGiB\n",
+                       LoadReadAheadBytes() / 1048576.0,
+                       gLoadReadAheadFills.load(std::memory_order_relaxed),
+                       gLoadReadAheadHits.load(std::memory_order_relaxed),
+                       gLoadReadAheadExtraBytes.load(std::memory_order_relaxed) / 1073741824.0);
             }
             {
                 std::lock_guard<std::mutex> guard(lock);
@@ -7154,13 +7274,18 @@ namespace fastllm {
                                     }
                                     SetLoadStep("oriData");
                                     Data &loadedWeight = model->weight[weightName];
+                                    const bool noLora =
+                                        loraDicts.find(weightName) == loraDicts.end();
                                     if (!SkipWeightBuild() &&
+                                        !(it.second != DATA_AUTO_CONV && noLora &&
+                                          TryAdoptInt4GroupBuffer(
+                                              loadedWeight, tensor, oriDataType,
+                                              curGroupCnt)) &&
                                         !TryAdoptSafeTensorBuffer(
                                             loadedWeight, tensor, oriDataType,
                                             tensorMap[tensorName].size() == 1,
                                             it.second == DATA_AUTO_CONV,
-                                            loraDicts.find(weightName) !=
-                                                loraDicts.end())) {
+                                            !noLora)) {
                                         loadedWeight.CreateFromOriData(
                                             WeightType::AUTO, oriDataType,
                                             tensor.buffer, tensor.minsBuffer,
@@ -7325,7 +7450,9 @@ namespace fastllm {
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.isModelWeight = true;
-                                        mergeData.Allocate();
+                                        // 下面会把每个 input 的字节完整 memcpy 进来，
+                                        // 清零只是白白 memset 一遍合并后的大权重。
+                                        mergeData.Allocate(false);
                                         uint64_t offset = 0;
                                         for (auto input : it.inputs) {
                                             memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
@@ -7354,11 +7481,13 @@ namespace fastllm {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
                                         } else {
                                             SetLoadStep("mergeAlloc");
-                                            mergeData.Allocate();
+                                            bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
+                                            // 非 compactNVFP4 分支是逐 input 完整 memcpy，
+                                            // 清零纯属浪费；compact 分支保持原样以求稳。
+                                            mergeData.Allocate(compactNVFP4);
                                             SetLoadStep("mergeCopy");
                                             uint64_t offset = 0;
                                             uint64_t scaleOffset = 0;
-                                            bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
                                             const long long appendBegin = NowNanos();
                                             for (auto input : it.inputs) {
                                                 const Data &inputData = model->weight[input];

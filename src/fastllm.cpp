@@ -734,11 +734,29 @@ namespace fastllm {
         }
         FreeCpuBlock(p);
     }
+    // 和 FreeCpuDataBlock 配对的统一入口：Windows 上优先从 arena 里切，
+    // 避免加载期每块临时缓冲都走一遍 NT 堆。
+    uint8_t *AllocCpuDataBlock(uint64_t bytes) {
+        if (bytes == 0) {
+            return nullptr;
+        }
+        if (UseCpuArena()) {
+            uint8_t *p = CpuArenaAlloc((size_t)bytes);
+            if (p != nullptr) {
+                return p;
+            }
+        }
+        return new uint8_t[bytes];
+    }
 #endif
 
 #if !defined(_WIN32) && !defined(_WIN64)
     void FreeCpuDataBlock(uint8_t *p) {
         delete[] p;
+    }
+
+    uint8_t *AllocCpuDataBlock(uint64_t bytes) {
+        return bytes == 0 ? nullptr : new uint8_t[bytes];
     }
 #endif
 
@@ -2034,6 +2052,53 @@ namespace fastllm {
         }
     };
 
+    // INT4_GROUP 的量化元数据（group / mins / scales / zeros）和权重字节是分开存的，
+    // 零拷贝路径在接管外部缓冲后需要单独补这一步。
+    void Data::InitInt4GroupMeta(int groupCnt, const float *oriMins, const float *oriScales) {
+        int k = this->dims[0], m = this->dims[1], group = (m - 1) / groupCnt + 1;
+        this->group = group;
+        this->groupCnt = groupCnt;
+        this->mins.resize(k * group);
+        this->scales.resize(k * group);
+        memcpy(this->mins.data(), oriMins, k * group * sizeof(float));
+        memcpy(this->scales.data(), oriScales, k * group * sizeof(float));
+        // AWQ stores an integer zero point separately from its FP16
+        // scale.  Keep that integer when the supplied affine metadata
+        // is exactly representable as (q - zero) * scale.  Rebuilding
+        // a FP16 min later introduces an avoidable second rounding and
+        // can accumulate across many recurrent MoE layers.
+        this->zeros.resize(k * group);
+        bool hasIntegerZeroPoints = true;
+        for (int i = 0; i < k * group; i++) {
+            const float scale = this->scales[i];
+            const float minValue = this->mins[i];
+            if (!std::isfinite(scale) || !std::isfinite(minValue)) {
+                hasIntegerZeroPoints = false;
+                break;
+            }
+            if (scale == 0.0f) {
+                if (minValue != 0.0f) {
+                    hasIntegerZeroPoints = false;
+                    break;
+                }
+                this->zeros[i] = 0;
+                continue;
+            }
+            const int zero = (int)std::lroundf(-minValue / scale);
+            const float error = std::fabs(minValue + scale * zero);
+            const float tolerance = std::max(1e-7f, std::fabs(scale) * 1e-4f);
+            if (zero < 0 || zero > 15 || error > tolerance) {
+                hasIntegerZeroPoints = false;
+                break;
+            }
+            this->zeros[i] = zero;
+        }
+        if (!hasIntegerZeroPoints) {
+            this->zeros.clear();
+        }
+        this->perChannelAxis = 0;
+    }
+
     void Data::CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, 
             int groupCnt, int blockK, int blockM) {
         auto &data = *this;
@@ -2077,60 +2142,15 @@ namespace fastllm {
             return;
         }
         data.UpdateUnitSize();
-        data.Allocate();
+        // INT4_GROUP 下面会用 memcpy(GetBytes()) 覆盖整块，原来的清零只是白 memset
+        // 一遍十几 GB 的权重。其它类型保持原来的清零行为。
+        data.Allocate(oriData == nullptr || dataType != DataType::INT4_GROUP);
         if (dataType == oriDataType) {
             if (oriData != nullptr) {
                 memcpy(data.cpuData, oriData, data.GetBytes());
             } 
             if (dataType == DataType::INT4_GROUP) {
-                int k = this->dims[0], m = this->dims[1], group = (m - 1) / groupCnt + 1;
-                this->group = group;
-                this->groupCnt = groupCnt;
-                data.mins.resize(k * group);
-                data.scales.resize(k * group);
-                memcpy(data.mins.data(), oriMins, k * group * sizeof(float));
-                memcpy(data.scales.data(), oriScales, k * group * sizeof(float));
-                // AWQ stores an integer zero point separately from its FP16
-                // scale.  Keep that integer when the supplied affine metadata
-                // is exactly representable as (q - zero) * scale.  Rebuilding
-                // a FP16 min later introduces an avoidable second rounding and
-                // can accumulate across many recurrent MoE layers.
-                data.zeros.resize(k * group);
-                bool hasIntegerZeroPoints = true;
-                for (int i = 0; i < k * group; i++) {
-                    const float scale = data.scales[i];
-                    const float minValue = data.mins[i];
-                    if (!std::isfinite(scale) || !std::isfinite(minValue)) {
-                        hasIntegerZeroPoints = false;
-                        break;
-                    }
-                    if (scale == 0.0f) {
-                        if (minValue != 0.0f) {
-                            hasIntegerZeroPoints = false;
-                            break;
-                        }
-                        data.zeros[i] = 0;
-                        continue;
-                    }
-                    const int zero = (int)std::lroundf(-minValue / scale);
-                    const float error = std::fabs(minValue + scale * zero);
-                    const float tolerance = std::max(1e-7f, std::fabs(scale) * 1e-4f);
-                    if (zero < 0 || zero > 15 || error > tolerance) {
-                        hasIntegerZeroPoints = false;
-                        break;
-                    }
-                    data.zeros[i] = zero;
-                }
-                if (!hasIntegerZeroPoints) {
-                    data.zeros.clear();
-                }
-                data.perChannelAxis = 0;
-                /* data.perChannelsConfigs.resize(k * group);
-                for (int i = 0; i < k * group; i++) {
-                    data.perChannelsConfigs[i] = LowBitConfig(data.mins[i], data.mins[i] + 15 * data.scales[i], 4, 1);
-                    data.perChannelsConfigs[i].min = data.mins[i];
-                    data.perChannelsConfigs[i].scale = data.scales[i];
-                } */
+                data.InitInt4GroupMeta(groupCnt, oriMins, oriScales);
             } else if (dataType == DataType::FP8_E4M3 || dataType == DataType::NVFP4) {
                 this->blockK = blockK;
                 this->blockM = blockM;
