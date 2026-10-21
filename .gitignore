@@ -58,6 +58,8 @@ CLAUDE.md
 /install_manifest.txt
 /build_info.json
 /*.exe
+/scripts/windows/membw.exe
+/scripts/windows/*.obj
 /*.dll
 /*.so
 /*.lib
