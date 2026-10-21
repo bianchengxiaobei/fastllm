@@ -7205,28 +7205,35 @@ namespace fastllm {
                                 }
                                 bool canMerge = true;
                                 for (auto &it : rule.rules) {
-                                    for (auto input : it.inputs) {
-                                        if (model->weight[input].dims.size() == 2) {
-                                            if (model->weight[input].groupCnt > 0 &&
-                                                model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].blockK > 0 &&
-                                                model->weight[input].dims[0] % model->weight[input].blockK != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].blockM > 0 &&
-                                                model->weight[input].dims[1] % model->weight[input].blockM != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].dataType != model->weight[it.inputs[0]].dataType ||
-                                                model->weight[input].dims[1] != model->weight[it.inputs[0]].dims[1]) {
-                                                canMerge = false;
-                                                break;
-                                            }
+                                    for (const auto &input : it.inputs) {
+                                        // 这里原来对每个 input 调 7 次 model->weight[...]，
+                                        // 而 weight 是九万节点的 std::map（节点散在二十 GB 堆上），
+                                        // 每次 [] 都是一次从根到叶的字符串比较 + cache miss。
+                                        // 采样显示这一步占加载时间的 21%。
+                                        Data &inWeight = model->weight[input];
+                                        if (inWeight.dims.size() != 2) {
+                                            continue;
+                                        }
+                                        Data &firstWeight = model->weight[it.inputs[0]];
+                                        if (inWeight.groupCnt > 0 &&
+                                            inWeight.dims[1] % inWeight.groupCnt != 0) {
+                                            canMerge = false;
+                                            break;
+                                        }
+                                        if (inWeight.blockK > 0 &&
+                                            inWeight.dims[0] % inWeight.blockK != 0) {
+                                            canMerge = false;
+                                            break;
+                                        }
+                                        if (inWeight.blockM > 0 &&
+                                            inWeight.dims[1] % inWeight.blockM != 0) {
+                                            canMerge = false;
+                                            break;
+                                        }
+                                        if (inWeight.dataType != firstWeight.dataType ||
+                                            inWeight.dims[1] != firstWeight.dims[1]) {
+                                            canMerge = false;
+                                            break;
                                         }
                                     }
                                 }
@@ -7327,6 +7334,7 @@ namespace fastllm {
                                                 }
                                             }
 
+                                            SetLoadStep("postMerge");
                                             mergeData.CalcWeightSum();
 #ifdef USE_TFACC
                                             try {
