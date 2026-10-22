@@ -625,7 +625,9 @@ namespace fastllm {
     };
 
     static std::mutex gCpuArenaMutex;
-    static std::vector<CpuArenaChunk> gCpuArenaChunks;
+    // 按基址有序，CpuArenaOwns 用它做 O(log n) 的区间查找。加载期有十几万次释放，
+    // 原来的线性扫描（几百个 chunk）每次都要全表走一遍，还要持全局锁。
+    static std::map<uint8_t *, size_t> gCpuArenaChunks;
 
     struct CpuArenaThreadState {
         uint8_t *base = nullptr;
@@ -665,10 +667,7 @@ namespace fastllm {
             }
             {
                 std::lock_guard<std::mutex> guard(gCpuArenaMutex);
-                CpuArenaChunk chunk;
-                chunk.base = p;
-                chunk.bytes = bytes;
-                gCpuArenaChunks.push_back(chunk);
+                gCpuArenaChunks[p] = bytes;
             }
             state.blockBytes[p] = bytes;
             return p;
@@ -682,10 +681,7 @@ namespace fastllm {
             }
             {
                 std::lock_guard<std::mutex> guard(gCpuArenaMutex);
-                CpuArenaChunk item;
-                item.base = chunk;
-                item.bytes = chunkBytes;
-                gCpuArenaChunks.push_back(item);
+                gCpuArenaChunks[chunk] = chunkBytes;
             }
             state.base = chunk;
             state.offset = 0;
@@ -701,14 +697,14 @@ namespace fastllm {
         if (p == nullptr) {
             return false;
         }
+        const uint8_t *target = (const uint8_t *)p;
         std::lock_guard<std::mutex> guard(gCpuArenaMutex);
-        for (auto &chunk : gCpuArenaChunks) {
-            const uint8_t *base = chunk.base;
-            if ((const uint8_t *)p >= base && (const uint8_t *)p < base + chunk.bytes) {
-                return true;
-            }
+        auto it = gCpuArenaChunks.upper_bound((uint8_t *)p);
+        if (it == gCpuArenaChunks.begin()) {
+            return false;
         }
-        return false;
+        --it;
+        return target >= it->first && target < it->first + it->second;
     }
 
     static void CpuArenaFree(uint8_t *p) {

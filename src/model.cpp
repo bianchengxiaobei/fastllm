@@ -251,6 +251,9 @@ namespace fastllm {
         std::string fileName;
         uint64_t start = 0;
         size_t bytes = 0;
+        // 自适应窗口目标：命中就放大，未命中就减半。张量顺序一旦不是按偏移
+        // 递增的，窗口会自己缩到接近请求大小，不会拿 8MB 去换 224KB。
+        size_t target = 0;
         std::vector <uint8_t> buffer;
     };
 
@@ -309,6 +312,7 @@ namespace fastllm {
             if (window.fileName == fileName && window.bytes > 0 &&
                 offset >= window.start && offset + len <= window.start + window.bytes) {
                 gLoadReadAheadHits.fetch_add(1, std::memory_order_relaxed);
+                window.target = std::min(readAheadBytes, window.target + len * 2);
                 memcpy(cur, window.buffer.data() + (size_t)(offset - window.start), len);
                 return true;
             }
@@ -319,8 +323,16 @@ namespace fastllm {
                 const uint64_t windowStart = offset & ~(uint64_t)65535;
                 const uint64_t remain = entry->size > windowStart ?
                     entry->size - windowStart : 0;
-                size_t windowBytes = (size_t)std::min<uint64_t>(readAheadBytes, remain);
-                if (windowBytes >= len) {
+                // 上一个窗口没覆盖到这次请求，说明顺序假设变弱了：目标减半。
+                if (window.fileName == fileName && window.bytes > 0) {
+                    window.target = std::max(len, window.target / 2);
+                } else {
+                    window.target = readAheadBytes;
+                }
+                const size_t targetBytes = std::max(len, window.target);
+                size_t windowBytes = (size_t)std::min<uint64_t>(targetBytes, remain);
+                // 一定要覆盖到 offset 之后的 len 字节（offset 可能不是 64KB 对齐）
+                if (windowBytes >= (offset - windowStart) + len) {
                     if (window.buffer.size() < windowBytes) {
                         window.buffer.resize(windowBytes);
                     }
@@ -5594,12 +5606,15 @@ namespace fastllm {
                                                 } else {
                                                     // 合并后的字节数一般等于各输入之和，但打包类型按
                                                     // ceil 换算行字节时，奇数行可能多出 1 字节。越界的
-                                                    // memcpy 会静默踩坏堆，这里显式拦住。
-                                                    AssertInFastLLM(
-                                                        offset + inputData.GetBytes() <= mergeData.GetBytes(),
-                                                        "Merge weight overflow: " + mergeName);
-                                                    memcpy(mergeData.cpuData + offset, inputData.cpuData, inputData.GetBytes());
-                                                    offset += inputData.GetBytes();
+                                                    // memcpy 会静默踩坏堆，这里显式拦住；只有真越界了
+                                                    // 才拼字符串，别在热路径上无条件构造 std::string。
+                                                    const uint64_t copyBytes = inputData.GetBytes();
+                                                    if (offset + copyBytes > mergeData.GetBytes()) {
+                                                        AssertInFastLLM(false,
+                                                            "Merge weight overflow: " + mergeName);
+                                                    }
+                                                    memcpy(mergeData.cpuData + offset, inputData.cpuData, copyBytes);
+                                                    offset += copyBytes;
                                                 }
                                                 gMergeMemcpyNanos.fetch_add(NowNanos() - copyBegin,
                                                     std::memory_order_relaxed);
@@ -7599,12 +7614,15 @@ namespace fastllm {
                                                 } else {
                                                     // 合并后的字节数一般等于各输入之和，但打包类型按
                                                     // ceil 换算行字节时，奇数行可能多出 1 字节。越界的
-                                                    // memcpy 会静默踩坏堆，这里显式拦住。
-                                                    AssertInFastLLM(
-                                                        offset + inputData.GetBytes() <= mergeData.GetBytes(),
-                                                        "Merge weight overflow: " + mergeName);
-                                                    memcpy(mergeData.cpuData + offset, inputData.cpuData, inputData.GetBytes());
-                                                    offset += inputData.GetBytes();
+                                                    // memcpy 会静默踩坏堆，这里显式拦住；只有真越界了
+                                                    // 才拼字符串，别在热路径上无条件构造 std::string。
+                                                    const uint64_t copyBytes = inputData.GetBytes();
+                                                    if (offset + copyBytes > mergeData.GetBytes()) {
+                                                        AssertInFastLLM(false,
+                                                            "Merge weight overflow: " + mergeName);
+                                                    }
+                                                    memcpy(mergeData.cpuData + offset, inputData.cpuData, copyBytes);
+                                                    offset += copyBytes;
                                                 }
                                                 gMergeMemcpyNanos.fetch_add(NowNanos() - copyBegin,
                                                     std::memory_order_relaxed);
