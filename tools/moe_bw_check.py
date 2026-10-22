@@ -39,6 +39,16 @@ import time
 PROFILE_MOE = "[fastllm-profile-cpu-moe]"
 PROFILE_SPLIT = "[fastllm-host-moe-split]"
 
+MIB = 1048576.0
+GIB = 1073741824.0
+
+
+def bandwidth_gbs(nbytes, cost_ms):
+    """字节 / 毫秒 -> GB/s (十进制, 与 membw 等工具一致)."""
+    if not cost_ms or cost_ms <= 0.0:
+        return 0.0
+    return nbytes / 1e6 / cost_ms
+
 ROUNDS = 15
 
 
@@ -186,32 +196,53 @@ def median_of(rows, key):
 
 
 def probe_membw(size_mb=1024, rounds=5):
-    """用 numpy 读求和粗测机器读带宽, 取多线程最好值."""
+    """用 numpy 多线程读求和粗测机器读带宽, 返回 (GB/s, 线程数).
+
+    注意必须真开线程: numpy 求和在 reduce 里放 GIL, 串行切片测不出多通道带宽.
+    """
     try:
         import numpy as np
     except ImportError:
-        return None
+        return None, 0
+    import threading
+
     count = size_mb * 1024 * 1024 // 8
     buffer = np.ones(count, dtype=np.float64)
-    best = 0.0
-    for threads in (1, 2, 4, 8, 16):
-        if threads > (os.cpu_count() or 1):
-            continue
+    total_bytes = count * 8
+    limit = os.cpu_count() or 1
+    best, best_threads = 0.0, 0
+    for threads in (1, 2, 4, 8, 16, 32):
+        if threads > limit:
+            break
         chunk = count // threads
-        slices = [buffer[i * chunk:(i + 1) * chunk] for i in range(threads)]
-        for _ in range(2):  # 预热, 让页表和缓存状态稳定
-            for piece in slices:
-                piece.sum()
+        pieces = [buffer[i * chunk:(i + 1) * chunk] for i in range(threads)]
+        sink = [0.0] * threads
+
+        def work(index):
+            sink[index] = float(pieces[index].sum())
+
+        for _ in range(2):  # 预热, 让页表与缓存状态稳定
+            warm = [threading.Thread(target=work, args=(i,)) for i in range(threads)]
+            for worker in warm:
+                worker.start()
+            for worker in warm:
+                worker.join()
+
         cost = 0.0
         for _ in range(rounds):
+            batch = [threading.Thread(target=work, args=(i,)) for i in range(threads)]
             begin = time.perf_counter()
-            for piece in slices:
-                piece.sum()
+            for worker in batch:
+                worker.start()
+            for worker in batch:
+                worker.join()
             cost = time.perf_counter() - begin
         if cost <= 0.0:
             continue
-        best = max(best, size_mb / 1024.0 / cost)
-    return best or None
+        rate = total_bytes / 1e9 / cost
+        if rate > best:
+            best, best_threads = rate, threads
+    return (best, best_threads) if best > 0.0 else (None, 0)
 
 
 def verdict(ratio):
@@ -266,8 +297,10 @@ def main():
     geo = moe_geometry(text, log_info)
 
     gate_up_bytes, down_bytes = layer_bytes(geo, bytes_per_param, meta_per_param)
-    cpu_layers = geo["layers"] - geo["dense_layers"] - args.moe_gpu_layers
+    gpu_layers = max(0, args.moe_gpu_layers)
+    cpu_layers = geo["layers"] - geo["dense_layers"] - gpu_layers
     if cpu_layers < 1:
+        gpu_layers = 0
         cpu_layers = max(1, geo["layers"] - geo["dense_layers"])
         print("!! --moe-gpu-layers 过大, 按全部 MoE 层都留在 CPU 计算")
     total_bytes = (gate_up_bytes + down_bytes) * cpu_layers
@@ -278,22 +311,26 @@ def main():
              geo["inter"], geo["shared"] or "无"))
     print("  量化: %.2f 字节/参数 + group 元数据 %.1f%%  (%s)"
           % (bytes_per_param, meta_per_param * 100.0, quant_tag))
-    if geo["dense_layers"] or args.moe_gpu_layers:
+    if geo["dense_layers"] or gpu_layers:
         print("  计入 CPU 的 MoE 层数: %d (总 %d, 稠密层 %d, 专家在显存 %d)"
-              % (cpu_layers, geo["layers"], geo["dense_layers"],
-                 args.moe_gpu_layers))
-    print("  每层每 token 专家字节: gate_up=%.2fMB  down=%.2fMB"
-          % (gate_up_bytes / 1048576.0, down_bytes / 1048576.0))
-    print("  每 token 专家字节合计: %.1fMB  (%.2fGB)"
-          % (total_bytes / 1048576.0, total_bytes / 1073741824.0))
+              % (cpu_layers, geo["layers"], geo["dense_layers"], gpu_layers))
+    print("  每层每 token 专家字节: gate_up=%.2fMiB  down=%.2fMiB"
+          % (gate_up_bytes / MIB, down_bytes / MIB))
+    print("  每 token 专家字节合计: %.1fMiB  (%.2fGiB, %.1fMB)"
+          % (total_bytes / MIB, total_bytes / GIB, total_bytes / 1e6))
 
     ceiling = args.membw
+    probe_threads = 0
     if ceiling <= 0.0:
-        ceiling = probe_membw(args.size) or 0.0
+        probed, probe_threads = probe_membw(args.size)
+        ceiling = probed or 0.0
     if ceiling > 0.0:
-        print("  机器读带宽: %.1fGB/s%s"
-              % (ceiling, "  (现测)" if args.membw <= 0.0 else "  (手动指定)"))
-        per_token_ms = total_bytes / 1048576.0 / ceiling
+        source = "  (手动指定)" if args.membw > 0.0 else (
+            "  (现测, %d 线程)" % probe_threads if probe_threads else "  (现测)")
+        print("  机器读带宽: %.1fGB/s%s" % (ceiling, source))
+        if args.membw <= 0.0:
+            print("  (现测为当前机器的粗测值 +-15%, 服务在别的机器上请用 --membw 传入那边实测值)")
+        per_token_ms = total_bytes / 1e6 / ceiling
         print("  带宽下限: 每层 %.3fms, 每 token %.1fms"
               % (per_token_ms / cpu_layers, per_token_ms))
     else:
@@ -313,18 +350,16 @@ def main():
         gemm_ms = median_of(rows, "total")
         gate_ms = median_of(rows, "gate")
         down_ms = median_of(rows, "down")
-        gate_bytes = gate_up_bytes / 1048576.0
-        down_bytes_mb = down_bytes / 1048576.0
         print("\n== 实测(profile-cpu-moe, %d 层采样, 每层中位数) ==" % len(rows))
         print("  total=%.3fms  gate=%.3fms  down=%.3fms"
               % (gemm_ms, gate_ms or 0.0, down_ms or 0.0))
         if gate_ms:
-            print("  gate 有效带宽: %.1fGB/s" % (gate_bytes / gate_ms))
+            print("  gate 有效带宽: %.1fGB/s" % bandwidth_gbs(gate_up_bytes, gate_ms))
         if down_ms:
-            print("  down 有效带宽: %.1fGB/s" % (down_bytes_mb / down_ms))
+            print("  down 有效带宽: %.1fGB/s" % bandwidth_gbs(down_bytes, down_ms))
         # gate/down 的字节比与实际耗时比是否一致, 一致说明纯按字节计费
         if gate_ms and down_ms:
-            byte_ratio = gate_bytes / down_bytes_mb
+            byte_ratio = gate_up_bytes / down_bytes
             time_ratio = gate_ms / down_ms
             print("  字节比 gate:down = %.2f, 耗时比 = %.2f  -> %s"
                   % (byte_ratio, time_ratio,
@@ -351,13 +386,25 @@ def main():
 
     # 判带宽用 GEMM 本体, 外框开销不属于带宽
     basis = gemm_ms * cpu_layers if gemm_ms else merge_ms
-    effective = total_bytes / 1048576.0 / basis
+    effective = bandwidth_gbs(total_bytes, basis)
     print("\n== 结论 ==")
     print("  MoE 有效带宽: %.1fGB/s  (按 %.1fms/token 计)"
           % (effective, basis))
     if not ceiling:
         return
     ratio = effective / ceiling
+    if ratio > 1.15:
+        print("  占机器读带宽: %.0f%%" % (ratio * 100.0))
+        print("  !! 数据矛盾, 不给结论. 有效带宽超过机器上限, 通常是这两台不是同一台机器:")
+        print("     --log 来自服务机, 而带宽是在本机现测的(本机 %.1fGB/s)."
+              % ceiling)
+        print("     请在服务机上直接跑本脚本, 或用 --membw 传入服务机的实测值"
+              " (本脚本现测值只代表当前这台机器).")
+        return
+    if ratio > 1.0:
+        print("  占机器读带宽: 约 100%% (超出 %.0f%%, 在测量误差内)"
+              % ((ratio - 1.0) * 100.0))
+        ratio = 1.0
     title, advice = verdict(ratio)
     print("  占机器读带宽: %.0f%%" % (ratio * 100.0))
     print("  %s" % title)
