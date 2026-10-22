@@ -20,6 +20,14 @@ struct FastllmCudaRaggedGdnMetadataView {
     int maxPaddedTokens = 0;
 };
 
+// One independently positioned decode request. Tensor storage remains owned
+// by the caller until its CUDA stream has consumed the batch.
+struct FastllmCudaV41AttentionRequest {
+    const fastllm::Data *q, *chunkKV, *ringKV, *compressedKV, *indices;
+    fastllm::Data *output;
+    int startPos;
+};
+
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -83,7 +91,20 @@ typedef void* cublasHandle_t;
 
 std::vector <long long> FastllmCudaGetFreeSizes();
 long long FastllmCudaGetFreeSize();
+bool FastllmCudaGetMemoryInfo(int device, uint64_t &freeBytes, uint64_t &totalBytes);
 std::vector <long long> FastllmCudaGetTotalSizes();
+
+// One owner per serial graph family and GPU. The caller must serialize replay
+// of graphs sharing this workspace; unrelated graph families remain isolated.
+class FastllmCudaLinearGraphScope {
+public:
+    explicit FastllmCudaLinearGraphScope(std::shared_ptr<void> &workspace);
+    ~FastllmCudaLinearGraphScope();
+    FastllmCudaLinearGraphScope(const FastllmCudaLinearGraphScope &) = delete;
+    FastllmCudaLinearGraphScope &operator=(const FastllmCudaLinearGraphScope &) = delete;
+private:
+    std::shared_ptr<void> previous;
+};
 
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 #define FETCH_FLOAT2(pointer) (reinterpret_cast<float2*>(&(pointer))[0])
@@ -145,6 +166,9 @@ bool FastllmCudaGraphBeginCapture();
 bool FastllmCudaGraphPrepareCaptureDevice();
 bool FastllmCudaGraphEndCapture(void **graph);
 bool FastllmCudaGraphInstantiate(void *graph, void **exec);
+// Compose captured children in order, preserving their stream dependencies.
+bool FastllmCudaGraphCompose(const void *const *children, int count,
+                             void **outGraph, void **outExec);
 bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
         int rootDevice, int ranks,
         const void *const *ids, const void *const *scores,
@@ -344,6 +368,11 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   const void *b_scales, void *c,
                                   int size_m, int size_n, int size_k,
                                   int group_size, int *workspace);
+// SM80+ BF16 / E4M3 / E8M0 block-32; preserves generic row-major weights.
+bool FastllmCudaMarlinBFloat16MXFP8Gemm(const void *a, const uint32_t *weight,
+    const uint8_t *scales, void *c, int rows, int columns, int inner, int *workspace);
+bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(const void *input,
+    fastllm::Data &weight, void *output, int rows, int inner, int columns);
 // SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
 // two-stage Turing specialization; SM80+ selects the four-stage kernel.
 // Small-batch residual epilogue: same Marlin FP32 reduction, no temporary output.
@@ -359,6 +388,15 @@ bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a,
                                     int size_m, int size_n, int size_k,
                                     int *workspace, void *c_tmp);
 bool FastllmCudaMarlinNVFP4Supported(int size_n, int size_k);
+// Exclusive disk-expert cache use: reversible, equal-size block32/E8M0 repack.
+// IsRepacked marks this layout only for NVFP4_BLOCK_32_E8M0. No extra persistent
+// allocation is attached to the weight; its cache record remains the owner.
+bool FastllmCudaSetDiskMxfp4MarlinLayout(fastllm::Data &weight, bool enable);
+// Restores the native layout before returning false (including unsafe FP16
+// operand ranges). Repacking happens only after validating the BF16 input.
+bool FastllmCudaTryDiskMxfp4Marlin(const void *input, fastllm::Data &weight,
+    void *output, int rows);
+bool FastllmCudaDiskMxfp4Enabled(const fastllm::Data &weight);
 // Process-start opt-in for measured SM75 M=1..8 shapes. Also used by the
 // single-row dispatcher so its GEMV shortcut cannot bypass the tuned GEMM.
 bool FastllmCudaMarlinNVFP4DecodeTuneEnabled(int size_m, int size_n, int size_k,
@@ -502,8 +540,17 @@ bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
                              const fastllm::Data &gate);
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
 bool FastllmCudaGlm5NextClampedSilu(const fastllm::Data &input, float limit, fastllm::Data &output);
+
+// FP32 routed-expert sum and BF16 shared expert, with an explicit BF16
+// rounding boundary before the HC residual transform.
+bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input,
+    const fastllm::Data &shared, const fastllm::Data &residual,
+    const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output);
+// BF16 routed rows: preserve activation rounding before block-32 FP8 quantization.
+bool FastllmCudaDeepSeekV41BFloat16SwigluQuantized(const void *input, void *output,
+        int rows, int intermediate, float limit, const float *routeScales);
 bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output);
-bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output, const float *routeScales = nullptr);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale = 1.0f);
 bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput, fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData);
@@ -939,7 +986,15 @@ bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, const fastllm
 bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits, const fastllm::Data &embedWeight,
                                        const fastllm::Data &headWeight, int anchorToken, int block,
                                        std::vector<int> &outTokens, fastllm::Data &outEmbeds);
+bool FastllmCudaDeepSeekV41SparseAttentionBatch(
+    const std::vector<FastllmCudaV41AttentionRequest> &requests,
+    fastllm::Data &attnSink, int windowSize, float softmaxScale);
 bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
+                                           const fastllm::Data *ringKV, const fastllm::Data *compressedKV,
+                                           const fastllm::Data *cmpIdx, fastllm::Data &attnSink,
+                                           int windowSize, int startPos, float softmaxScale,
+                                           fastllm::Data &output);
+bool FastllmCudaDeepSeekV41HybridSparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
                                            const fastllm::Data *ringKV, const fastllm::Data *compressedKV,
                                            const fastllm::Data *cmpIdx, fastllm::Data &attnSink,
                                            int windowSize, int startPos, float softmaxScale,
@@ -1802,6 +1857,9 @@ struct FastllmCudaMoeCacheLayer {
     // GLM: BF16 projections, scores before block-128 FP8 down activation,
     // without V4.1's block-32 quantization of the incoming activation.
     bool glm5 = false;
+    // PP cache placement only; -1 permits every device. Expert-distributed
+    // execution supplies its own ownership and does not use this restriction.
+    int cacheDevice = -1;
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.
@@ -1822,7 +1880,7 @@ bool FastllmCudaPrepareMoeCache(
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
-// Snapshot of canonical GGUF or native compact GLM records on this GPU.
+// Snapshot of canonical or native shared expert records on this GPU.
 // create permits lazy allocation of a prepared cache; no admission/eviction
 // is performed. The caller must finish
 // using these pointers before the next decode/cache mutation or cache release.
@@ -1831,7 +1889,9 @@ struct FastllmCudaMoePrefillResidents {
     int weightType = -1;
     int gateType = -1, downType = -1, hidden = 0, inter = 0;
     int ownerRank = 0, ownerCount = 1;
-    bool nativeGlm = false;
+    bool nativeGlm = false; // GGUF grouped backend math compatibility
+    bool nativeWeights = false; // Directly consumed by existing host-prefill kernels.
+    bool sharedWeights = false; // Native or losslessly restored NUMA layout.
 };
 bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
                                   FastllmCudaMoePrefillResidents &view, bool create = false);
@@ -2156,6 +2216,17 @@ bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data
                                        bool scoresOnCuda, int topk, int hidden, int inter);
 
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+// Hopper BF16 Indexer, K=4096 and Q/K/score widths 2048/128/16. Wq owns the
+// packed allocation; Wk/weights borrow its trailing rows. Shapes and separate
+// Linear remain valid. Pack once before graph warmup; keep weights immutable
+// and Wq alive while the slices are used. Unsupported layouts return false.
+bool FastllmCudaPackIndexerWeights(fastllm::Data &wq, fastllm::Data &wk, fastllm::Data &weights);
+// Project all three outputs, preserving BF16 rounding before weights scaling.
+// Scratch may alias a later operator's output, but not input or these outputs.
+// Supports 1..256 rows; unsupported inputs return false without writing outputs.
+bool FastllmCudaIndexerProjection(const fastllm::Data &input,
+    const fastllm::Data &wq, const fastllm::Data &wk, const fastllm::Data &weights,
+    fastllm::Data &query, fastllm::Data &key, fastllm::Data &scores, fastllm::Data &scratch);
 bool FastllmCudaBFloat16MatMulInt4Group32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -2213,9 +2284,13 @@ bool FastllmCudaHalfMergeMOEVllmMarlinBatch1ExpertParallel(
 bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
         fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
-        const float *scores, int topk, int ownerRank, int ownerCount);
+        const float *scores, int topk, int ownerRank, int ownerCount,
+        bool deepSeekV41 = false, float swigluLimit = 0.0f,
+        const fastllm::Data *prequantizedInput = nullptr);
 bool FastllmCudaPrepareNVFP4E4M3Moe(fastllm::Data **weights, int weightsBatch);
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(const fastllm::Data *layerKey);
+// Read-only readiness check: no repacking or allocation during graph capture.
+bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows);
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
 bool FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
         const fastllm::Data &input, fastllm::Data &output,
@@ -2586,5 +2661,22 @@ extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool 
 bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &scores,
     const fastllm::Data &gate, const fastllm::Data &down, fastllm::Data &activation,
     fastllm::Data &output, float limit);
+
+// Stream native NVFP4 records and reduce token-ordered BF16 expert outputs.
+void FastllmCudaPackDiskMxfp4(const void *source, void *destination,
+    int rows, int columns, bool cross, void *stream);
+void FastllmCudaReduceDiskMxfp4(const void *values, float *sum,
+    const int *indices, int rows, int columns);
+
+// Only these two cache-owned projections may adopt the reversible layout.
+// The enclosing disk cache lock protects their storage throughout this scope.
+struct FastllmCudaDiskMxfp4Scope {
+    const fastllm::Data *gate, *down;
+    FastllmCudaDiskMxfp4Scope *previous;
+    FastllmCudaDiskMxfp4Scope(const fastllm::Data *gate, const fastllm::Data *down);
+    ~FastllmCudaDiskMxfp4Scope();
+    FastllmCudaDiskMxfp4Scope(const FastllmCudaDiskMxfp4Scope &) = delete;
+    FastllmCudaDiskMxfp4Scope &operator=(const FastllmCudaDiskMxfp4Scope &) = delete;
+};
 
 #endif // FASTLLM_CUDA_CUH

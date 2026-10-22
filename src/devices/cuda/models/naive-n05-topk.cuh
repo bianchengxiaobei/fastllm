@@ -43,6 +43,15 @@ template <typename Score, typename Count = int>
 __global__ void Select(const Score *scores, Count liveCount, int *partials, int *ties, State *state,
                        Candidates *out) {
     int n = liveCount;
+    if (n <= 0) {
+        // The live count is common to this cooperative grid. All CTAs take
+        // the same branch before any grid barrier or score read.
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            state->selected = 0;
+            state->uniform = 1;
+        }
+        return;
+    }
     constexpr int T = kThreads;
     using Scan = cub::BlockScan<int, T>;
     __shared__ int hist[kBuckets];
@@ -58,7 +67,8 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
     }
     unsigned reference = OrderedScoreBits(scores[0]);
     unsigned prefix = 0, mask = 0;
-    int rank = kTopK, candidates = n, greaterCount = 0, blockCount = 0;
+    const int topK = min(n, kTopK);
+    int rank = topK, candidates = n, greaterCount = 0, blockCount = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
         hist[t] = 0;
         __syncthreads();
@@ -113,7 +123,7 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
                     state->maximum = hi;
                     if (!changed) {
                         state->uniform = 1;
-                        state->selected = kTopK;
+                        state->selected = topK;
                     }
                 }
             }
@@ -125,7 +135,7 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
             if (before < rank && before + total >= rank) {
                 state->prefix = prefix | (unsigned(bucket) << shift);
                 state->rank = rank - before;
-                state->candidates = kTopK - (rank - before) + total;
+                state->candidates = topK - (rank - before) + total;
             }
             __syncthreads();
             if (t == 0)
@@ -195,13 +205,10 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
         offset += total;
     }
 }
-__global__ void Sort(const Candidates *in, const State *state, int *out, int workspaceStride = 0) {
-    in = (const Candidates *)((const char *)in + (size_t)blockIdx.x * workspaceStride);
-    state = (const State *)((const char *)state + (size_t)blockIdx.x * workspaceStride);
-    out += (size_t)blockIdx.x * kTopK;
+__device__ __forceinline__ void SortRow(const Candidates *in, const State *state, int *out) {
     if (state->uniform) {
         for (int i = threadIdx.x; i < kTopK; i += blockDim.x)
-            out[i] = i;
+            out[i] = i < state->selected ? i : -1;
         return;
     }
     constexpr int T = kThreads, Items = kCapacity / T;
@@ -226,5 +233,11 @@ __global__ void Sort(const Candidates *in, const State *state, int *out, int wor
         int j = threadIdx.x * Items + i;
         if (j < kTopK) out[j] = positions[i];
     }
+}
+__global__ void Sort(const Candidates *in, const State *state, int *out, int workspaceStride = 0) {
+    in = (const Candidates *)((const char *)in + (size_t)blockIdx.x * workspaceStride);
+    state = (const State *)((const char *)state + (size_t)blockIdx.x * workspaceStride);
+    out += (size_t)blockIdx.x * kTopK;
+    SortRow(in, state, out);
 }
 } // namespace naive_topk

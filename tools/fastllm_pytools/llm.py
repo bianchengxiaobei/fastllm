@@ -151,6 +151,20 @@ def _discover_nvidia_lib_dirs() -> List[str]:
     # De-duplicate while preserving order
     return list(dict.fromkeys(dirs))
 
+def _find_pip_nccl() -> Optional[str]:
+    """libnccl.so.2 shipped by a pip nvidia-nccl-* wheel, if installed."""
+    try:
+        spec = importlib.util.find_spec("nvidia.nccl")
+    except Exception:
+        return None
+    if spec is None or spec.submodule_search_locations is None:
+        return None
+    for root in spec.submodule_search_locations:
+        candidate = os.path.join(root, "lib", "libnccl.so.2")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
 def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
     # Try system runtime first. If a machine only has pip nvidia-* packages,
     # the fallback search below will preload those shared libraries.
@@ -167,6 +181,21 @@ def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
         "libnccl.so.2",
     ]
     unresolved = set(base_names)
+    # NCCL: prefer the pip wheel (nvidia-nccl-*) when present. That is the copy
+    # torch links against; all libnccl.so.2 share one SONAME, so whichever is
+    # loaded first with RTLD_GLOBAL wins for the whole process. Preloading an
+    # older system NCCL first makes a later `import torch` fail with
+    # "undefined symbol: ncclCommWindowDeregister" (transformers imports torch
+    # to load tokenizers), and the HF tokenizer silently falls back.
+    pip_nccl = _find_pip_nccl()
+    if pip_nccl is not None:
+        try:
+            _load_library(pip_nccl)
+            diagnostics["loaded"].append(pip_nccl)
+            unresolved.discard("libnccl.so.2")
+        except Exception as e:
+            diagnostics["failed"].append(f"{pip_nccl}: {e}")
+            pip_nccl = None
     for libname in [
         "libcuda.so.1",
         "libcudart.so.12", "libcudart.so",
@@ -174,6 +203,8 @@ def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
         "libcublas.so.12", "libcublas.so",
         "libnccl.so.2", "libnccl.so",
     ]:
+        if pip_nccl is not None and libname.startswith("libnccl.so"):
+            continue
         try:
             _load_library(libname)
             diagnostics["loaded"].append(libname)
@@ -433,6 +464,12 @@ fastllm_lib.fetch_response_tokens_batch_llm_model.argtypes = [
 ]
 fastllm_lib.fetch_response_tokens_batch_llm_model.restype = ctypes.c_int
 
+fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int)
+]
+fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model.restype = ctypes.c_int
+
 fastllm_lib.fetch_response_logits_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
 fastllm_lib.fetch_response_logits_llm_model.restype = ctypes.c_int
 
@@ -519,7 +556,11 @@ fastllm_lib.get_kv_cache_token_limit_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_prefill_batching_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
 
+fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
+fastllm_lib.set_model_indexer_dtype.restype = None
 fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
@@ -682,11 +723,35 @@ def set_prefill_moe_gpu(v):
 def set_cuda_slab(mb: int):
     fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
 
-def set_moe_cuda_cache(bytes_: int):
+def set_moe_cuda_cache(bytes_: int, device_bytes=None):
+    """Set cache budgets before loading; a scalar call clears device overrides."""
     bytes_ = int(bytes_)
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
-    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+    budgets = {} if device_bytes is None else {int(d): int(b) for d, b in device_bytes.items()}
+    if any(d < 0 or d > (1 << 31) - 1 or b < 0 or b > bytes_ for d, b in budgets.items()):
+        raise ValueError("Per-device cache budgets must be nonnegative and within the scalar ceiling")
+    setter = getattr(fastllm_lib, "set_moe_cuda_cache_device", None)
+    if budgets and setter is None:
+        raise RuntimeError("Per-device cache planning requires a matching native library")
+    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_))
+    if budgets:
+        setter.argtypes = [ctypes.c_int, ctypes.c_uint64]
+        setter.restype = None
+        for device, budget in budgets.items():
+            setter(device, budget)
+
+def get_cuda_memory_info(device: int):
+    """Return free/total CUDA bytes for a visible ordinal, or fail closed."""
+    query = getattr(fastllm_lib, "get_cuda_memory_info", None)
+    if query is None:
+        raise RuntimeError("Hybrid auto requires a matching native library")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 2)()
+    if not query(int(device), values):
+        raise RuntimeError("Cannot measure memory on CUDA device %d" % device)
+    return {"free": int(values[0]), "total": int(values[1])}
 
 def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
                          max_bytes=0, min_heat=1., margin=1., factor=1.,
@@ -761,6 +826,25 @@ def get_moe_cuda_cache_route_stats(device: int = 0):
     result["hit_rate"] = result["resident_routes"] / routes if routes else None
     result["gpu_fraction"] = result["gpu_routes"] / routes if routes else None
     return result
+
+def get_moe_cuda_cache_prefill_stats(device: int = 0):
+    """Read native host-prefill cache transport counts between requests.
+
+    Includes direct resident aliases and on-device restoration of shared NUMA
+    layouts. Grouped GGUF has a separate path and is not included. Reused bytes
+    count host uploads avoided; temporary on-device conversion is not a hit
+    penalty. Synchronizes the device; subtract snapshots without resetting.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_prefill_stats", None)
+    if query is None:
+        raise RuntimeError("Prefill cache statistics require an updated CUDA build")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 8)()
+    if not query(int(device), values):
+        raise RuntimeError("Could not read prefill cache statistics")
+    return dict(zip(("calls", "gpu_experts", "gpu_routes", "resident_experts", "resident_routes",
+                     "reused_bytes", "uploaded_bytes", "admitted_experts"), values))
 
 def set_moe_cpu_cache(bytes_: int):
     bytes_ = int(bytes_)
@@ -1230,6 +1314,17 @@ def encode_hf_prompt(tokenizer, prompt: str):
     add_special_tokens = not (avoid_duplicate_bos and bos_token and prompt.startswith(bos_token))
     return tokenizer.encode(prompt, add_special_tokens = add_special_tokens)
 
+def _same_template_input(left, right):
+    # Templates can iterate tool properties and arguments in insertion order.
+    # Ordinary dict equality would allow reusing IDs for a different prompt.
+    if isinstance(left, dict) and isinstance(right, dict):
+        return (list(left) == list(right) and
+                all(_same_template_input(left[key], right[key]) for key in left))
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return (len(left) == len(right) and
+                all(_same_template_input(a, b) for a, b in zip(left, right)))
+    return left == right
+
 def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True,
                            tokenize = False, enable_thinking = None, tools = None,
                            thinking_alias = False, thinking_effort = None,
@@ -1332,10 +1427,14 @@ def try_load_hf_tokenizer(path):
                 os.environ.pop("USE_TORCH", None)
             else:
                 os.environ["USE_TORCH"] = original_use_torch
-    except:
+    except Exception as error:
         ret = _load_fast_tokenizer_from_tokenizer_json(path) if _is_step3p5_model_dir(path) else None
         if ret is None:
             print("Load AutoTokenizer failed. (you can try install transformers)")
+            print(f"  reason: {type(error).__name__}: {error}")
+            print("  WARNING: falling back to the FastLLM native tokenizer. For checkpoints that ship "
+                  "tokenizer.json (e.g. DeepSeek-V4/V4.1) it can split text differently from the "
+                  "official tokenizer, which silently degrades output quality.")
             print("Try load fastllm tokenizer.")
         else:
             return ret
@@ -1404,7 +1503,10 @@ class model:
                   external_mtp_path: str = "",
                   mmproj_path: str = "",
                   max_context_length: int = -1,
-                  rope_scaling = None):
+                  rope_scaling = None,
+                  indexer_dtype: str = "auto"):
+        if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
+            raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
                 max_context_length != -1 and not 0 < max_context_length <= 2147483647):
             raise ValueError("max_context_length must be a positive 32-bit integer")
@@ -1674,6 +1776,8 @@ class model:
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
         if (kv_cache_dtype != "" and kv_cache_dtype != "auto"):
             self.set_kv_cache_dtype(kv_cache_dtype)
+        if indexer_dtype != "auto":
+            fastllm_lib.set_model_indexer_dtype(self.model, indexer_dtype.encode())
         self._refresh_context_config()
 
     def _refresh_context_config(self):
@@ -2097,6 +2201,19 @@ class model:
     def eval(self):
         return self;
 
+    def get_vocab_size(self):
+        """Return the output vocabulary bound used by unrestricted sampling."""
+        config = getattr(self, "config", {})
+        text_config = config.get("text_config") or config
+        size = text_config.get("vocab_size")
+        if size is None and self.hf_tokenizer is not None:
+            size = max(self.hf_tokenizer.get_vocab().values(), default=-1) + 1
+        if size is None:
+            size = fastllm_lib.get_tokenizer_vocab_size(self.model)
+        if int(size) <= 0:
+            raise ValueError("Cannot determine vocabulary size for unrestricted sampling")
+        return int(size)
+
     def build_tokenizer_decode_token_cache(self):
         if self.tokenizer_decode_token_cache is not None:
             return
@@ -2362,7 +2479,8 @@ class model:
                          enable_thinking, tools, thinking_effort, tool_choice,
                          chat_template_kwargs],
                         ensure_ascii = False,
-                        sort_keys = True,
+                        # Templates can render tool properties/arguments in
+                        # insertion order; distinct orders must not share IDs.
                         separators = (",", ":"))
                 except (TypeError, ValueError):
                     cache_key = None
@@ -2395,7 +2513,7 @@ class model:
                         tokenize = True,
                         enable_thinking = enable_thinking,
                         tools = tools,
-                        thinking_alias = self._is_kimi_k3(),
+                        thinking_alias = True,
                         thinking_effort = thinking_effort,
                         tool_choice = tool_choice,
                         chat_template_kwargs = chat_template_kwargs)
@@ -2938,6 +3056,7 @@ class model:
                 type = "ChatGLM3"
             if (not(history)):
                 history = [];
+            can_reuse_token_count = False
             if (type == "ChatGLM3"):
                 input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
             else:
@@ -2945,15 +3064,14 @@ class model:
                 direct_template_tokens = None
                 can_reuse_token_count = (
                     conversation is not None and len(conversation) != 0 and
-                    not self.save_history and
                     pending_text_input_token_cache is not None and
-                    pending_text_input_token_cache.get("conversation") == conversation and
+                    _same_template_input(pending_text_input_token_cache.get("conversation"), conversation) and
                     pending_text_input_token_cache.get("add_generation_prompt") == add_generation_prompt and
                     pending_text_input_token_cache.get("enable_thinking") == enable_thinking and
-                    pending_text_input_token_cache.get("tools") == tools and
+                    _same_template_input(pending_text_input_token_cache.get("tools"), tools) and
                     pending_text_input_token_cache.get("thinking_effort") == thinking_effort and
-                    pending_text_input_token_cache.get("tool_choice") == tool_choice and
-                    pending_text_input_token_cache.get("chat_template_kwargs") == chat_template_kwargs)
+                    _same_template_input(pending_text_input_token_cache.get("tool_choice"), tool_choice) and
+                    _same_template_input(pending_text_input_token_cache.get("chat_template_kwargs"), chat_template_kwargs))
                 if can_reuse_token_count:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
@@ -3023,7 +3141,13 @@ class model:
                                                         max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
             if (self.save_history):
-                self.current_tokenizer_cache[handle] = [[prompt], [input]]
+                if can_reuse_token_count:
+                    # Native KV history is independent of this Python text
+                    # cache. Reused IDs have no rendered prompt snapshot; an
+                    # empty snapshot would match unrelated future requests.
+                    self.current_tokenizer_cache.pop(handle, None)
+                else:
+                    self.current_tokenizer_cache[handle] = [[prompt], [input]]
             return handle
         else:
             prompt = ""
@@ -3176,27 +3300,29 @@ class model:
         is_prefill = True
         start_time = time.time()
 
-        def capture_response_statistics():
-            if response_statistics is None:
-                return
-            statistics = self.get_response_statistics(handle)
-            if statistics is not None:
-                response_statistics.update(statistics)
-
         # DSpark commits at most a small speculative block per scheduler turn,
         # but more than one block may be ready when the HTTP consumer is slow.
         # Drain a generous bounded batch through one C call and one scheduler
         # mutex acquisition.
         fetch_batch_capacity = 64
         fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)()
+        fetch_statistics = (ctypes.c_int * 3)()
 
         def fetch_ready_tokens():
-            count = fastllm_lib.fetch_response_tokens_batch_llm_model(
+            count = fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model(
                 self.model, handle, fetch_batch_buffer,
-                fetch_batch_capacity)
+                fetch_batch_capacity, fetch_statistics)
             if count <= 0:
                 return count, []
             return count, [fetch_batch_buffer[i] for i in range(count)]
+
+        def capture_response_statistics():
+            # The terminal fetch releases the handle. Only use the snapshot
+            # returned by that same call; a lookup could read a new request.
+            if response_statistics is not None and fetch_statistics[0] >= 0:
+                response_statistics.update(zip(
+                    ("cached_input_tokens", "missed_input_tokens", "output_tokens"),
+                    fetch_statistics))
 
         if (self._can_apply_hf_chat_template() or
                 self._uses_hf_deepseek_v4_tokenizer()):
@@ -3456,6 +3582,14 @@ class model:
         product (0) and cosine similarity (1) in [0, 1].
         retrieval_interval controls speculative score reuse in committed tokens;
         it need not be page aligned. Use 1 to refresh every verification round.
+        Qwen4/QSA in Hybrid execution mode keeps the original selection and stores
+        exact FP16 KV in pinned host memory, caching at most resident_tokens per layer
+        on its CUDA device. Prefill temporarily stages one full attention layer
+        on each device, reusing that workspace between layers. This also supports
+        PP/TP and CUDA Graph; sink/recent/retrieval policy parameters do not apply
+        to native QSA. Pure GPU and CPU execution modes do not enable Qwen4 KVMem.
+        Qwen4 resident_tokens must be divisible by 4. host_mib covers all target
+        and possible draft KV layers.
         """
         values = (max_tokens, resident_tokens, sink_tokens, prefix_tokens, recent_tokens,
                   retrieval_tokens, prefill_tokens)
@@ -3519,6 +3653,14 @@ class model:
     def set_chunked_prefill_size(self, size: int):
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""
         fastllm_lib.set_chunked_prefill_size_llm_model(self.model, size)
+
+    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0):
+        """启动前设置 prefill 攒批目标和最长等待；目前仅支持 Naive 普通 TP GPU 推理。"""
+        if not all(isinstance(value, int) and 0 <= value <= 2147483647
+                   for value in (tokens, max_wait_ms)) or (max_wait_ms > 0 and tokens == 0):
+            raise ValueError("prefill batching requires non-negative int32 values and a positive token target when waiting")
+        if not fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms):
+            raise ValueError("prefill batching must be configured before serving and currently requires ordinary Naive TP GPU inference")
     
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)

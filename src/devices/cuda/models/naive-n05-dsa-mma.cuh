@@ -1,4 +1,5 @@
 #pragma once
+#include "devices/cuda/naive-n05-kv.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -41,7 +42,7 @@ __device__ __forceinline__ int SelectedKey(const int *indices, int query, int sl
 }
 #endif
 
-__global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, const BF16 *k,
+__global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, FastllmNaiveKV k,
         const int *indices, float *scores, int heads, int kvHeads, int keyStride,
         int keys, int count, int past, bool causal) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -60,8 +61,7 @@ __global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, const BF16 *k,
         int key = SelectedKey(indices, query, first + slot, count, keys, past, causal);
         if (lane == 0) valid[slot] = key >= 0;
         if (lane < kQkDim / 8) {
-            uint4 values = key >= 0 ? *reinterpret_cast<const uint4*>(
-                k + (size_t)key * keyStride + kvHead * kQkDim + lane * 8) : make_uint4(0,0,0,0);
+            uint4 values = key >= 0 ? (k.Row(key, keyStride) + kvHead * kQkDim + lane * 8).Load8() : make_uint4(0,0,0,0);
             *reinterpret_cast<uint4*>(&ks[slot][lane * 8]) = values;
         }
     }
@@ -89,7 +89,7 @@ __global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, const BF16 *k,
 #endif
 }
 
-__global__ __launch_bounds__(kThreads) void Values(const float *prob, const BF16 *v,
+__global__ __launch_bounds__(kThreads) void Values(const float *prob, FastllmNaiveKV v,
         const int *indices, BF16 *out, int heads, int kvHeads,
         int keys, int count, int past, bool causal) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -114,8 +114,7 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, const BF16
         for (int i = threadIdx.x; i < kKeys * (kValueDim / 8); i += kThreads) {
             int slot = i / (kValueDim / 8), col = i % (kValueDim / 8) * 8;
             int key = selected[slot];
-            uint4 values = key >= 0 ? *reinterpret_cast<const uint4*>(
-                v + ((size_t)key * kvHeads + kvHead) * kValueDim + col) : make_uint4(0,0,0,0);
+            uint4 values = key >= 0 ? (v.Row(key, kvHeads * kValueDim) + kvHead * kValueDim + col).Load8() : make_uint4(0,0,0,0);
             *reinterpret_cast<uint4*>(&vs[slot][col]) = values;
         }
         __syncthreads();
@@ -145,8 +144,8 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, const BF16
 
 // Store the original E4M3 quantization result exactly in BF16, with its FP32
 // block scale kept separately. Do not round dequantized FP32 values to BF16.
-__global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
-                                int stride, int offset, bool roundScale = false) {
+__device__ __forceinline__ void QuantizeIndexerRow(const BF16 *input, BF16 *values, float *scales,
+        int stride, int offset, bool roundScale) {
     __shared__ float maximum[128];
     const int d = threadIdx.x, row = blockIdx.x;
     float x = (float)input[(size_t)row * stride + offset + d];
@@ -163,18 +162,24 @@ __global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
     if (d == 0) scales[row] = scale;
 }
 
+__global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
+        int stride, int offset, bool roundScale = false) {
+    QuantizeIndexerRow(input, values, scales, stride, offset, roundScale);
+}
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 // Both scoring kernels read the trailing Indexer K block from the packed cache.
 // Aligned rows use vector loads; partial tiles are zero-filled.
+template<int Threads = kThreads>
 __device__ __forceinline__ void LoadIndexerKeys(
-        BF16 (&tile)[kKeys][kIndexerDim + 8], const BF16 *packedKeys,
+        BF16 (&tile)[kKeys][kIndexerDim + 8], FastllmNaiveKV packedKeys,
         int stride, int first, int keys) {
-    for (int i = threadIdx.x; i < kKeys * (kIndexerDim / 8); i += kThreads) {
+    for (int i = threadIdx.x; i < kKeys * (kIndexerDim / 8); i += Threads) {
         int row = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-        const BF16 *src = packedKeys + (size_t)(first + row) * stride + stride - kIndexerDim + d;
+        const auto src = packedKeys.IndexRow(min(first + row, keys - 1), stride) + d;
         if (stride % 8 == 0) {
             *reinterpret_cast<uint4*>(&tile[row][d]) = first + row < keys
-                ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+                ? src.Load8() : make_uint4(0, 0, 0, 0);
         } else {
             #pragma unroll
             for (int j = 0; j < 8; ++j)
@@ -187,24 +192,16 @@ __device__ __forceinline__ void LoadIndexerKeys(
 // One query: a warp scores eight BF16 keys against all sixteen E4M3 Q heads.
 // Keep FP32 MMA accumulation and ascending weighted-head order. Applying the
 // unchanged Q scales after MMA can change FP32 rounding relative to SIMT.
-template <typename ScoreOutput, typename Length = int, bool Verify = false>
-__global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
+template <typename ScoreOutput>
+__device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, FastllmNaiveKV packedKeys,
         const float *qscale, const BF16 *weights, ScoreOutput scores,
-        int stride, Length liveKeys, int past) {
-    if constexpr (Verify) {
-        const int row = blockIdx.y;
-        q += (size_t)row * kHeads * kIndexerDim;
-        qscale += row * kHeads;
-        weights += row * kHeads;
-        liveKeys.length += row;
-        scores.scoreBits += (size_t)row * (past + 1);
-    }
-    int keys = liveKeys;
+        int stride, int keys, int past, int firstKey = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (keys <= 0) return;
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
     __shared__ float scale[kHeads], weight[kHeads];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int first = blockIdx.x * kKeys;
+    const int first = firstKey + blockIdx.x * kKeys;
     for (int i = tid; i < kHeads * (kIndexerDim / 8); i += kThreads) {
         int row = i / 16, d = i % 16 * 8;
         *reinterpret_cast<uint4*>(&qs[row][d]) =
@@ -242,53 +239,87 @@ __global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
             int key = first + warp * 8 + lane * 2 + i;
-            if (key < keys) scores.Store(key, key <= past ? score[i] : -INFINITY);
+            if (key < keys) scores.Store(key, key <= past ? score[i] * packedKeys.IndexScale(key, stride) : -INFINITY);
         }
     }
 #endif
 }
 
-// 64 queries share each 64-key tile across all sixteen indexer heads.
-// Q uses E4M3 plus an FP32 scale; K uses the original BF16 values.
-// ReLU and weighted head accumulation remain in ascending head order.
-__global__ __launch_bounds__(256) void IndexerScores(const BF16 *q, const BF16 *k,
+template <typename ScoreOutput, typename Length = int, bool Verify = false>
+__global__ void IndexerDecodeScores(const BF16 *q, FastllmNaiveKV packedKeys,
+        const float *qscale, const BF16 *weights, ScoreOutput scores,
+        int stride, Length liveKeys, int past, const void *const *cache = nullptr) {
+    packedKeys.Bind(cache);
+    if constexpr (Verify) {
+        const int row = blockIdx.y;
+        q += (size_t)row * kHeads * kIndexerDim;
+        qscale += row * kHeads;
+        weights += row * kHeads;
+        liveKeys.length += row;
+        scores.scoreBits += (size_t)row * (past + 1);
+    }
+    IndexerDecodeScoresRow(q, packedKeys, qscale, weights, scores, stride, int(liveKeys), past);
+}
+
+// Q keeps E4M3-rounded values and FP32 scales. FP8 K values expand exactly
+// to BF16 for MMA; their per-key scale is applied to the final score.
+// Head accumulation order is unchanged.
+// Hopper overlaps the next head's Q load with MMA using two 32-row buffers.
+// The original 64-row schedule remains available for other CUDA architectures.
+template<bool Pipeline>
+__global__ __launch_bounds__(Pipeline ? 128 : 256) void IndexerScores(const BF16 *q, FastllmNaiveKV k,
         const float *qscale, const BF16 *weights,
         float *scores, int queries, int keys, int past, int keyStride) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    __shared__ __align__(16) BF16 qs[64][136], ks[64][136];
-    __shared__ float qw[64], qsc[64];
-    const int firstQ = blockIdx.y * 64, firstK = blockIdx.x * 64;
+    constexpr int Rows = Pipeline ? 32 : 64, Stages = Pipeline ? 2 : 1;
+    __shared__ __align__(16) BF16 qs[Stages][Rows][136], ks[64][136];
+    __shared__ float qw[Stages][Rows], qsc[Stages][Rows];
+    const int firstQ = blockIdx.y * Rows, firstK = blockIdx.x * 64;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    if (firstK > past + min(queries - 1, firstQ + 63)) {
-        for (int i = tid; i < 64 * 64; i += 256) {
+    if (firstK > past + min(queries - 1, firstQ + Rows - 1)) {
+        for (int i = tid; i < Rows * 64; i += Rows * 4) {
             int row = firstQ + i / 64, col = firstK + i % 64;
             if (row < queries && col < keys) scores[(size_t)row * keys + col] = -INFINITY;
         }
         return;
     }
-    LoadIndexerKeys(ks, k, keyStride, firstK, keys);
-    const int mTile = warp & 3, nHalf = warp >> 2;
+    LoadIndexerKeys<Rows * 4>(ks, k, keyStride, firstK, keys);
+    const int mTile = warp % (Rows / 16), nHalf = warp / (Rows / 16);
     const int aRow = mTile * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
     const int bRow = nHalf * 32 + (lane & 7) + ((lane >> 3) & 1) * 8;
     const int tileCol = (lane >> 4) * 8;
     float acc[2][2][4] = {};
+    auto load = [&](int h) {
+        const int stage = h % Stages;
+        for (int i = tid; i < Rows * 16; i += Rows * 4) {
+            int row = i / 16, d = i % 16 * 8;
+            const BF16 *src = q + ((size_t)min(firstQ + row, queries - 1) * 16 + h) * 128 + d;
+            if constexpr (Pipeline) {
+                unsigned addr = (unsigned)__cvta_generic_to_shared(&qs[stage][row][d]);
+                int bytes = firstQ + row < queries ? 16 : 0;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
+                    "r"(addr), "l"(src), "r"(bytes) : "memory");
+            } else {
+                *reinterpret_cast<uint4 *>(&qs[stage][row][d]) = firstQ + row < queries
+                    ? *reinterpret_cast<const uint4 *>(src) : make_uint4(0, 0, 0, 0);
+            }
+        }
+        if (tid < Rows) {
+            qw[stage][tid] = firstQ + tid < queries ? (float)weights[(firstQ + tid) * 16 + h] : 0.f;
+            qsc[stage][tid] = firstQ + tid < queries ? qscale[(firstQ + tid) * 16 + h] : 0.f;
+        }
+        if constexpr (Pipeline) asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    load(0);
     for (int h = 0; h < 16; ++h) {
+        const int stage = h % Stages;
+        if constexpr (Pipeline) asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
-        for (int i = tid; i < 64 * 16; i += 256) {
-            int row = i / 16, d = (i % 16) * 8;
-            *reinterpret_cast<uint4*>(&qs[row][d]) = firstQ + row < queries
-                ? *reinterpret_cast<const uint4*>(q + ((size_t)(firstQ + row) * 16 + h) * 128 + d)
-                : make_uint4(0, 0, 0, 0);
-        }
-        if (tid < 64) {
-            qw[tid] = firstQ + tid < queries ? (float)weights[(firstQ + tid) * 16 + h] : 0.f;
-            qsc[tid] = firstQ + tid < queries ? qscale[(firstQ + tid) * 16 + h] : 0.f;
-        }
-        __syncthreads();
+        if constexpr (Stages > 1) { if (h + 1 < 16) load(h + 1); }
         float dot[2][2][4] = {};
         #pragma unroll
         for (int d = 0; d < 128; d += 16) {
-            uint32_t a[4]; Load4(a, &qs[aRow][d + tileCol]);
+            uint32_t a[4]; Load4(a, &qs[stage][aRow][d + tileCol]);
             #pragma unroll
             for (int n = 0; n < 2; ++n) {
                 uint32_t b[4]; Load4(b, &ks[bRow + n * 16][d + tileCol]);
@@ -303,10 +334,14 @@ __global__ __launch_bounds__(256) void IndexerScores(const BF16 *q, const BF16 *
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     int row = mTile * 16 + (lane >> 2) + (e / 2) * 8;
-                    float scaled = dot[n][u][e] * qsc[row];
-                    acc[n][u][e] += fmaxf(scaled, 0.f) * qw[row];
+                    float scaled = dot[n][u][e] * qsc[stage][row];
+                    acc[n][u][e] += fmaxf(scaled, 0.f) * qw[stage][row];
                 }
             }
+        }
+        if constexpr (Stages == 1) {
+            __syncthreads();
+            if (h + 1 < 16) load(h + 1);
         }
     }
     #pragma unroll
@@ -318,7 +353,7 @@ __global__ __launch_bounds__(256) void IndexerScores(const BF16 *q, const BF16 *
                 int row = firstQ + mTile * 16 + (lane >> 2) + (e / 2) * 8;
                 int col = firstK + nHalf * 32 + n * 16 + u * 8 + (lane & 3) * 2 + e % 2;
                 if (row < queries && col < keys)
-                    scores[(size_t)row * keys + col] = col <= past + row ? acc[n][u][e] : -INFINITY;
+                    scores[(size_t)row * keys + col] = col <= past + row ? acc[n][u][e] * k.IndexScale(col, keyStride) : -INFINITY;
             }
         }
     }

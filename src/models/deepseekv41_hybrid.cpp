@@ -1,9 +1,14 @@
 // CPU/NUMA experts: overlap, GPU cache, dynamic routing and host staging.
 // Pure GPU deployments never enter this backend.
 #include "deepseekv41_execution.h"
+#include "deepseekv41_hybrid.h"
 #include "baseblock.h"
 #include "utils.h"
+#include "utils/hybrid_parallel.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
+#include "devices/disk/diskdevice.h"
+#include <chrono>
+#include <exception>
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -11,6 +16,25 @@
 #endif
 
 namespace fastllm {
+    DeepSeekV41DecodeWorkspace::DeepSeekV41DecodeWorkspace() = default;
+    DeepSeekV41DecodeWorkspace::~DeepSeekV41DecodeWorkspace() = default;
+
+    void DeepSeekV41Model::OnAutoWarmupFinished() {
+        if (executionMode != ExecutionMode::Hybrid || std::uncaught_exceptions() ||
+            !GetMoeCpuCacheBytes()) return;
+        // Wait until temporary warmup tensors have been released before
+        // filling RAM. Preloading during weight conversion raises its peak.
+        const auto started = std::chrono::steady_clock::now();
+        const uint64_t bytes = PreloadDiskMoeCache(weights);
+        if (bytes) {
+            const double seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            printf("[Fastllm] Disk MoE RAM preload: %.2f GiB in %.3f s (budget %.2f GiB).\n",
+                bytes / double(1ULL << 30), seconds, GetMoeCpuCacheBytes() / double(1ULL << 30));
+            fflush(stdout);
+        }
+    }
+
     void DeepSeekV41Model::BeginHybridMoeStep(
             HybridMoeDecodeStep &step, bool tp, bool single, int seqlen) {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
@@ -19,24 +43,29 @@ namespace fastllm {
             moeExpertCacheAttempted = true;
             bool supported = !V41ReferenceMathEnabled() && GetCudaSharedExpert();
             std::vector<std::vector<Data *>> routedWeights = weights;
-            std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
+            HybridMoeCachePlan cache(HybridMoeMath::DeepSeekV41, swiglu_limit);
             for (int layer = 0; layer < block_cnt; ++layer) {
-                supported &= V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa") &&
-                    quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
+                const auto device = SelectMoeDeviceForLayer(layer);
+                // GPU-resident layers are not members of the host cache.
+                if (!V41DeviceSpecUsesType(device, "numa")) continue;
+                supported &= quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
                 routedWeights[layer][0] = routedWeights[layer][1] = nullptr;
-                cacheLayers.push_back({routedWeights[layer].data(), (int)routedWeights[layer].size(), true, swiglu_limit});
+                cache.Add(routedWeights[layer], device);
             }
-            if (!supported || !FastllmCudaPrepareMoeCache(cacheLayers.data(), block_cnt,
+            if (!supported || !cache.Prepare(
                     [this] { WarmupNumaMoeWeights(); })) {
-                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA NVFP4 block32 or Q2_K/Q4_K R4 experts, "
+                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA FP8 block128, NVFP4 block32 or supported GGUF experts, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
         }
         // A complete decode step spans every layer. Admission runs afterward,
         // outside graph capture, while the attention/shared segments retain
         // their stable graph-owned tensors. Unsupported layouts retain NUMA.
-        if (!tp && single && seqlen == 1 &&
-            V41EnvFlag("FASTLLM_DSV41_MOE_FREQUENCY") && FastllmCudaMoeCacheRequested() &&
+        // Native cache requests (including --auto) enable admission directly.
+        const bool nativeFrequency = weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 ||
+                                     weights[0][2]->dataType == FP8_E4M3_BLOCK_128;
+        if (!tp && single && seqlen == 1 && nativeFrequency &&
+            FastllmCudaMoeCacheRequested() &&
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
             (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&
@@ -47,7 +76,7 @@ namespace fastllm {
 #endif
     }
 
-    bool DeepSeekV41Model::RunHybridMoe(DeepSeekV41MoeContext &ctx) {
+    bool DeepSeekV41Model::RunHybridMoe(DeepSeekV41MoeContext &ctx, HybridMoeDecodeStep *step) {
         auto *ws = &ctx.workspace;
         auto &moeWeights = ctx.moeWeights;
         const auto &tpDevices = ctx.tpDevices;
@@ -64,6 +93,17 @@ namespace fastllm {
         Data &w1 = ws->w1, &w2 = ws->w2, &w3 = ws->w3;
         Data &tempInput = ws->tempInput, &tempOutput = ws->tempOutput;
         Data &moeInputTemp = ws->moeInputTemp, &moeOutputTemp = ws->moeOutputTemp;
+        std::unique_ptr<HybridMoePipelineGuard> pipelineGuard;
+        if (ctx.pipelineHostExperts) {
+            pipelineGuard.reset(new HybridMoePipelineGuard(ffnInput,
+                SelectMoeDeviceForLayer(layer), ctx.pipelineHostExperts, ctx.pipelineFirstLayer));
+        }
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        const std::vector<int> stageDevice{FastllmCudaGetDevice()};
+        std::optional<NumasMoeCudaAssistScope> stageAssist;
+        if (ctx.pipelineHostExperts)
+            stageAssist.emplace(&stageDevice);
+#endif
         // Copy CPU expert inputs before launching the shared expert. A
         // device-to-host copy after that launch would wait for all shared
         // GPU work, serializing the two otherwise independent branches.
@@ -73,18 +113,27 @@ namespace fastllm {
         overlapShared = hasSharedExpertOut &&
             !V41EnvFlag("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP") &&
             (V41DeviceSpecUsesType(overlapMoeDevice, "cpu") ||
+             (!tp && single && seqlen <= 8 && V41DeviceSpecUsesType(overlapMoeDevice, "disk")) ||
              (V41DeviceSpecUsesType(overlapMoeDevice, "numa") &&
               (tp || (single && seqlen == 1 && !FastllmCudaMoeCacheRequested()))));
 #endif
         bool tpCacheHandled = false;
         bool singleCacheHandled = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (ctx.step && hasSharedExpertOut &&
+        // Verification runs between graph segments too. Use the same stable
+        // staging as decode, rather than migrating tensors owned by a graph.
+        // Its multi-row scheduler is independent of the single-token step.
+        const bool singleStageCache = graphActive && !tp && single &&
+            (seqlen == 1 || (dsparkVerify && ctx.verifyAllTokens && seqlen > 1 && seqlen <= 8)) && FastllmCudaMoeCacheRequested() &&
+            !dumpDebug && !V41ReferenceMathEnabled() &&
+            V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa");
+        if (((step && *step) || singleStageCache) && hasSharedExpertOut &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
             FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
             const int device = FastllmCudaGetDevice();
-            auto &cache = ws->moeCache[device];
+            if (!ws->hybrid) ws->hybrid.reset(new DeepSeekV41HybridWorkspace());
+            auto &cache = ws->hybrid->moeCache[device];
             // The router may return CPU tensors. Stage only its small
             // result, never migrate the input/output of a captured segment.
             V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
@@ -93,7 +142,7 @@ namespace fastllm {
             cache.score.ToDevice(DataDevice::CUDA, {device}, true);
             Data input;
             input.FakeFrom(ffnInput, 0);
-            input.Resize({1, dim});
+            input.Resize({seqlen, dim});
             input.dataDeviceIds = {device};
             singleCacheHandled = fastllm::RunHybridMoe(
                 input, cache.index, cache.score, ffnOut,
@@ -114,7 +163,8 @@ namespace fastllm {
             FastllmCudaSetDevice(cacheDevice);
             if (local != ffnInput.multiDeviceDatas.end() && local->second && local->second->cudaData &&
                 FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
-                auto &cache = ws->moeCache[cacheDevice];
+                if (!ws->hybrid) ws->hybrid.reset(new DeepSeekV41HybridWorkspace());
+                auto &cache = ws->hybrid->moeCache[cacheDevice];
                 V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
                 V41ReplicaToCpu(cache.score, expertScore, tpDevices);
                 cache.index.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
@@ -156,6 +206,16 @@ namespace fastllm {
         }
         ctx.releaseSharedScratch();
 
+        // Add in the routed result's precision, then round once at the MoE
+        // boundary. Resident GGUF returns FP32 while shared experts may be 16-bit.
+        auto addSharedExpert = [&] {
+            Data *shared = &sharedExpertOut;
+            if (shared->dataType != ffnOut.dataType) {
+                shared = &ws->reductionBuffers["moe_shared_sum"];
+                ToDataType(sharedExpertOut, *shared, ffnOut.dataType);
+            }
+            AddTo(ffnOut, *shared);
+        };
         bool combineFfnPostDispatch = false;
 #ifdef USE_CUDA
         combineFfnPostDispatch = tp && single && hasSharedExpertOut && !dumpDebug &&
@@ -237,7 +297,10 @@ namespace fastllm {
                 if (!(tp && ffnOut.multiDeviceData && sharedExpertOut.multiDeviceData)) {
                     ffnOut.ToDevice(sharedExpertOut.dataDevice);
                 }
-                AddTo(ffnOut, sharedExpertOut);
+                addSharedExpert();
+            }
+            if (!combineFfnPostDispatch && ffnOut.dataType != ffnInput.dataType) {
+                ToDataType(ffnOut, ffnInput.dataType);
             }
 #ifdef USE_CUDA
             if (graphActive && !tp && ffnOut.dataDevice == DataDevice::CPU) {
@@ -249,7 +312,8 @@ namespace fastllm {
         }
         if (singleCacheHandled) {
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
-            AddTo(ffnOut, sharedExpertOut);
+            addSharedExpert();
+            if (ffnOut.dataType != ffnInput.dataType) ToDataType(ffnOut, ffnInput.dataType);
         }
         return combineFfnPostDispatch;
     }
@@ -276,3 +340,127 @@ namespace fastllm {
         return frame.Finish();
     }
 }
+
+namespace fastllm {
+bool DeepSeekV41Model::TryForwardHybridChunkedPrefill(
+        const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+        std::vector<std::pair<Data, Data>> &pastKeyValues,
+        const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+        std::vector<float> *logits, int &outputToken) {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+    // Experimental opt-in. The ordinary GPU and TP forwards never enter here.
+    const int chunkSize = GetChunkedPrefillSize();
+    if (executionMode != ExecutionMode::Hybrid || !V41EnvFlag("FASTLLM_DSV41_HYBRID_PP") ||
+        !generationConfig.IsSimpleGreedy() || saveHistoryChat || GetKVCacheInCPU() ||
+        GetHistoryCacheInCPU() || GetLowMemMode() || GetFastllmEnv().printProfile ||
+        FastllmCudaGraphIsCapturingFast() || FastllmCudaMoeCacheRequested() ||
+        !GetCudaSharedExpert() || v41DsparkEnabled || V41ReferenceMathEnabled() ||
+        V41EnvFlag("FASTLLM_DSV41_ENGRAM_PREFETCH") ||
+        std::getenv("FASTLLM_DSV41_DUMP_DIR") ||
+        decoderSwaTailLayer <= 0 || decoderSwaTailLayer >= block_cnt ||
+        chunkSize <= window_size || pastKeyValues.empty() ||
+        inputIds.dataDevice != CPU || inputIds.dataType != FLOAT32 || !inputIds.cpuData ||
+        inputIds.dims.size() != 2 || inputIds.dims[0] != 1 || inputIds.dims[1] <= chunkSize ||
+        !attentionMask.dims.empty() || positionIds.dataDevice != CPU ||
+        positionIds.dataType != FLOAT32 || !positionIds.cpuData || positionIds.dims != inputIds.dims)
+        return false;
+    const int sequence = inputIds.dims[1];
+    if ((sequence - 1) % chunkSize + 1 <= window_size) return false;
+    const float *tokens = reinterpret_cast<const float*>(inputIds.cpuData);
+    const float *positions = reinterpret_cast<const float*>(positionIds.cpuData);
+    for (int i = 0; i < sequence; ++i)
+        if (positions[i] != i || int(tokens[i]) == image_token_id) return false;
+    for (int layer : engram_layer_ids) if (layer >= decoderSwaTailLayer) return false;
+    for (const auto &kv : pastKeyValues)
+        if (!kv.first.dims.empty() || !kv.second.dims.empty() ||
+            !kv.first.pageIndex.empty() || !kv.second.pageIndex.empty()) return false;
+    std::vector<CudaPrefillStage> stages;
+    if (!BuildCudaPrefillStages(deviceMap, block_cnt, stages)) return false;
+    // A stage must own every shared KV/index/candidate source it consumes.
+    // In particular, arbitrary 10/11-layer splits cannot safely overlap.
+    for (const auto &stage : stages) {
+        if (stage.firstLayer >= decoderSwaTailLayer) return false;
+        for (int layer = stage.firstLayer; layer < stage.endLayer; ++layer) {
+            const auto moe = SelectMoeDeviceForLayer(layer);
+            if (moe != "numa" && moe.rfind("numa:", 0) != 0) return false;
+            if (compress_ratios[layer] > 0 &&
+                (kvSourceOf[layer] < stage.firstLayer || indexSourceOf[layer] < stage.firstLayer ||
+                 (candidate_source_layer_id >= 0 && layer > candidate_source_layer_id &&
+                  candidate_source_layer_id < stage.firstLayer))) return false;
+        }
+    }
+    auto existing = GetStateByFirstKey(&pastKeyValues[0].first);
+    if (existing && (existing->pendingMultimodal || existing->totalLen ||
+                    existing->restoredLen || existing->dspark)) return false;
+    const int callerDevice = FastllmCudaGetDevice();
+    struct RestoreDevice { int device; ~RestoreDevice() { FastllmCudaSetDevice(device); } } restore{callerDevice};
+    PrepareHybridPrefill();
+    auto request = GetOrCreateState(pastKeyValues, true);
+    std::vector<std::shared_ptr<DeepSeekV41RequestState>> states(stages.size());
+    std::vector<HybridPrefillStage> contexts(stages.size());
+    std::vector<int> devices;
+    std::mutex hostExperts;
+    for (int rank = 0; rank < int(stages.size()); ++rank) {
+        states[rank] = std::make_shared<DeepSeekV41RequestState>();
+        contexts[rank].firstLayer = stages[rank].firstLayer;
+        contexts[rank].endLayer = stages[rank].endLayer;
+        contexts[rank].request = request.get();
+        contexts[rank].hostExperts = &hostExperts;
+        devices.push_back(stages[rank].device);
+    }
+    FastllmCudaPeerAccessInit(devices);
+    HybridPrefillScope hybrid(devices, true);
+    CudaChunkedPrefillPipeline pipeline;
+    const int chunks = 1 + (sequence - 1) / chunkSize;
+    if (verbose) {
+        printf("[Prompt] DeepSeek hybrid pipelined prefill: %zu stages, %d chunks, %d tokens/chunk.\n",
+            stages.size(), chunks, chunkSize);
+        for (const auto &stage : stages)
+            printf("[DSV41 PP] device=%d layers=[%d,%d)\n", stage.device, stage.firstLayer, stage.endLayer);
+        fflush(stdout);
+    }
+    std::vector<std::pair<Data*, Data*>> sampling;
+    for (auto &kv : pastKeyValues) sampling.emplace_back(&kv.first, &kv.second);
+    pipeline.Run(devices, chunks, BFLOAT16, {1, chunkSize, hc_mult * (embed_dim + 2)},
+        [&](int rank, int chunk, Data &payload) {
+            if (chunk == 0) hybrid.BindWorker(rank);
+            const int start = chunk * chunkSize, count = std::min(chunkSize, sequence - start);
+            Data ids(FLOAT32, {1, count}, std::vector<float>(tokens + start, tokens + start + count));
+            std::vector<DeepSeekV41Segment> segments(1);
+            segments[0].state = states[rank];
+            segments[0].startPos = start;
+            segments[0].seqlen = count;
+            segments[0].prefillCacheOnly = chunk + 1 < chunks;
+            auto &context = contexts[rank];
+            context.payload = &payload;
+            context.sampleOutput = rank + 1 == int(stages.size()) && chunk + 1 == chunks;
+            std::vector<GenerationConfig> configs{generationConfig};
+            std::vector<std::vector<float>*> results{logits};
+            ForwardState frame(*this, segments, ids, nullptr, nullptr, configs, lastTokens,
+                context.sampleOutput ? &results : nullptr, sampling, &context);
+            // Only the first stage embeds. CPU embedding uses the same pool as MoE.
+            {
+                std::lock_guard<std::mutex> lock(hostExperts);
+                frame.PrepareInputs();
+            }
+            for (int layer = context.firstLayer; layer < frame.Layers(); ++layer) {
+                frame.BeginLayer(layer);
+                frame.HybridExperts(layer);
+                frame.EndLayer(layer);
+            }
+            const auto output = frame.Finish();
+            if (context.sampleOutput) outputToken = output.front();
+        });
+    // Run has joined all CUDA streams. Layer storage already belongs to request;
+    // commit the identical token history and logical position exactly once.
+    for (const auto &state : states)
+        AssertInFastLLM(state->totalLen == sequence && state->engramHistory == states.front()->engramHistory,
+            "DeepSeek hybrid PP stage history mismatch.");
+    request->totalLen = sequence;
+    request->engramHistory = std::move(states.front()->engramHistory);
+    return true;
+#else
+    return false;
+#endif
+}
+} // namespace fastllm

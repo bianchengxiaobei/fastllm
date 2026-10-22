@@ -247,8 +247,9 @@ namespace fastllm {
         }
 
         auto *pool = GetAlivePool();
-        int workerCount = std::min(
-            (int)pool->threads.size(), (int)tasks.size());
+        const int first = pool->curActivateThreadInterval.first;
+        const int available = pool->curActivateThreadInterval.second - first;
+        int workerCount = std::min(available, (int)tasks.size());
         std::atomic<int> next(workerCount);
         std::vector<MultiThreadDeepSeekV4MoeTaskQueueOp> workers;
         workers.reserve(workerCount);
@@ -256,10 +257,10 @@ namespace fastllm {
             workers.emplace_back(&tasks, &next, i);
         }
         for (int i = 0; i < workerCount; i++) {
-            pool->PushOp(i, &workers[i]);
+            pool->PushOp(first + i, &workers[i]);
         }
         for (int i = 0; i < workerCount; i++) {
-            pool->Wait(i);
+            pool->Wait(first + i);
         }
         if (deleteTasks) {
             for (auto *task : tasks) {
@@ -4023,6 +4024,7 @@ namespace fastllm {
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
         float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
                             floatParams.find("swigluLimit")->second : 0.0f;
+        const bool compactDecode = intParams.count("diskMoeDecode") && intParams.at("diskMoeDecode");
         bool deepSeekV4Mode = intParams.find("deepSeekV4Mode") != intParams.end() &&
                               intParams.find("deepSeekV4Mode")->second != 0;
         int activationQuantBlock = intParams.count("activationQuantBlock") ? intParams.at("activationQuantBlock") : 128;
@@ -5274,7 +5276,7 @@ namespace fastllm {
                             if (cpuInstructInfo.hasAVX512BF16) {
                                 LaunchLinearBFloat16NVFP4(expertBf16Input(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                             } else {
-                                LaunchLinearFloat32NVFP4(expertFloatInput(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                                LaunchLinearFloat32NVFP4(expertFloatInput(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread, compactDecode);
                             }
                         } else if (weight->dataType == DataType::BFLOAT16) {
                             LaunchLinearBFloat16BFloat16(expertBf16Input(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
@@ -5399,7 +5401,7 @@ namespace fastllm {
                             if (cpuInstructInfo.hasAVX512BF16) {
                                 LaunchLinearBFloat16NVFP4((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                             } else {
-                                LaunchLinearFloat32NVFP4(swigluResults[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                                LaunchLinearFloat32NVFP4(swigluResults[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread, compactDecode);
                             }
                         } else if (weightDown->dataType == DataType::BFLOAT16) {
                             LaunchLinearBFloat16BFloat16((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
@@ -5430,9 +5432,9 @@ namespace fastllm {
                     fLastOutput = tempOutput.data();
                 }
                 if (useDeepSeekV4MoeFast) {
+                    const int first = pool->curActivateThreadInterval.first;
                     int reduceThreads = std::min(
-                        {(int)pool->threads.size(),
-                         16, m});
+                        {pool->curActivateThreadInterval.second - first, 16, m});
                     std::vector<MultiThreadDeepSeekV4MoeReduceOp> reduceOps;
                     reduceOps.reserve(reduceThreads);
                     int per = m / reduceThreads;
@@ -5449,10 +5451,10 @@ namespace fastllm {
                         cur = end;
                     }
                     for (int i = 0; i < reduceThreads; i++) {
-                        pool->PushOp(i, &reduceOps[i]);
+                        pool->PushOp(first + i, &reduceOps[i]);
                     }
                     for (int i = 0; i < reduceThreads; i++) {
-                        pool->Wait(i);
+                        pool->Wait(first + i);
                     }
                 } else for (int j = 0; j < v.size(); j++) {
                     float value = deepSeekV4Mode ? 1.0f : v[j].second;
@@ -15771,17 +15773,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
 
         std::vector<int> previewNewPages;
-        previewNewPages.reserve(newPageCount);
-        if (newPageCount > 0) {
-            std::lock_guard<std::mutex> guard(manager.pageIndexLocker);
-            for (int i = 0; i < newPageCount && i < (int)manager.freePages.size(); i++) {
-                previewNewPages.push_back(manager.freePages[(int)manager.freePages.size() - 1 - i]);
-            }
-            int trieOffset = newPageCount - (int)previewNewPages.size();
-            for (int i = 0; i < trieOffset && i < (int)manager.triePages.size(); i++) {
-                previewNewPages.push_back(manager.triePages[(int)manager.triePages.size() - 1 - i]);
-            }
-        }
+        manager.PreviewUnusedPageIndices(newPageCount, previewNewPages);
         AssertInFastLLM((int)previewNewPages.size() >= newPageCount,
                         "CpuGenerateAppendPagedCacheBatchParamsOp: no enough pages for batch append.\n");
 

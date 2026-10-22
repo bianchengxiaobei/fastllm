@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
 #include "devices/cuda/cudaworkspace.h"
@@ -522,6 +523,19 @@ long long FastllmCudaGetFreeSize() {
     size_t totalBytes = 0;
     const cudaError_t error = cudaMemGetInfo(&freeBytes, &totalBytes);
     return error == cudaSuccess ? (long long)freeBytes : 0;
+}
+
+bool FastllmCudaGetMemoryInfo(int device, uint64_t &freeBytes, uint64_t &totalBytes) {
+    int previous = -1;
+    if (device < 0 || cudaGetDevice(&previous) != cudaSuccess) return false;
+    if (cudaSetDevice(device) != cudaSuccess) return false;
+    size_t free = 0, total = 0;
+    const auto error = cudaMemGetInfo(&free, &total);
+    const auto restored = cudaSetDevice(previous);
+    if (error != cudaSuccess || restored != cudaSuccess) return false;
+    freeBytes = free;
+    totalBytes = total;
+    return total > 0 && free <= total;
 }
 
 std::vector <long long> FastllmCudaGetTotalSizes() {
@@ -1146,7 +1160,9 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
             !FastllmCudaGraphGetAdjacentNodes(m.join, true, joinRoots)) {
             return -1;
         }
-        if (forkDependencies.empty() || sharedRoots.empty() || sharedTails.empty() ||
+        // A fork may be the graph root. Destroying its marker then makes
+        // both independent branches roots; no incoming edge is required.
+        if (sharedRoots.empty() || sharedTails.empty() ||
             routedRoots.empty() || routedTails.empty() || joinRoots.empty()) {
             fastllmCudaGraphLastError = "Qwen3.5 MoE graph marker adjacency is empty for layer " +
                                         std::to_string(it.first);
@@ -1213,7 +1229,7 @@ namespace {
     }
 }
 
-static bool FastllmCudaGraphQwen35MoeParallelSelfTest() {
+static bool FastllmCudaGraphQwen35MoeParallelSelfTest(bool rootFork = false) {
     int *shared = nullptr;
     int *routed = nullptr;
     int *output = nullptr;
@@ -1236,9 +1252,11 @@ static bool FastllmCudaGraphQwen35MoeParallelSelfTest() {
         cleanup();
         return false;
     }
-    cudaMemsetAsync(shared, 0, sizeof(int), cudaStreamPerThread);
-    cudaMemsetAsync(routed, 0, sizeof(int), cudaStreamPerThread);
-    cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
+    if (!rootFork) {
+        cudaMemsetAsync(shared, 0, sizeof(int), cudaStreamPerThread);
+        cudaMemsetAsync(routed, 0, sizeof(int), cudaStreamPerThread);
+        cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
+    }
     FastllmCudaGraphMarkQwen35MoeFork(0);
     FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(shared, 11);
     FastllmCudaGraphMarkQwen35MoeSharedDone(0);
@@ -1261,8 +1279,11 @@ static bool FastllmCudaGraphQwen35MoeParallelSelfTest() {
         return false;
     }
     int result = 0;
+    size_t rootCount = 0;
     bool ok = cudaMemcpy(&result, output, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess &&
               result == 42;
+    if (rootFork)
+        ok &= cudaGraphGetRootNodes(graph, nullptr, &rootCount) == cudaSuccess && rootCount == 2;
     cleanup();
     return ok;
 }
@@ -1381,6 +1402,7 @@ static bool FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest() {
 
 bool FastllmCudaGraphQwen35MoeSelfTest() {
     return FastllmCudaGraphQwen35MoeParallelSelfTest() &&
+           FastllmCudaGraphQwen35MoeParallelSelfTest(true) &&
            FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest();
 }
 
@@ -5427,8 +5449,18 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
     }
 }
 
+static thread_local std::vector<size_t> *fastllmCudaAllocationRecorder = nullptr;
+std::vector<size_t> *FastllmCudaSetAllocationRecorder(std::vector<size_t> *requests) {
+    auto *previous = fastllmCudaAllocationRecorder;
+    fastllmCudaAllocationRecorder = requests;
+    return previous;
+}
+
 static void *FastllmCudaMallocImpl(
         size_t size, FastllmCudaTryMallocResult *tryResult) {
+    if (fastllmCudaAllocationRecorder && size) {
+        fastllmCudaAllocationRecorder->push_back(size);
+    }
     if (tryResult != nullptr) {
         *tryResult = FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
@@ -5680,6 +5712,25 @@ FastllmCudaTryMallocResult FastllmCudaTryMalloc(
         return FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
     return result;
+}
+
+bool FastllmCudaReserveGraphWorkspace(const std::vector<size_t> &requests) {
+    if (FastllmCudaGraphIsCapturingFast()) return false;
+    FastllmCudaAllocationRecorder suspend(nullptr);
+    std::vector<void *> blocks;
+    blocks.reserve(requests.size());
+    bool ok = true;
+    for (size_t size : requests) {
+        if (!size) continue;
+        void *ptr = nullptr;
+        if (FastllmCudaTryMalloc(&ptr, size) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            ok = false;
+            break;
+        }
+        blocks.push_back(ptr);
+    }
+    for (void *ptr : blocks) FastllmCudaFree(ptr);
+    return ok;
 }
 
 void * FastllmCudaMalloc(size_t size) {
@@ -6861,8 +6912,10 @@ template <int THREAD_PER_BLOCK>
 __global__ void FastllmRepeatKernel (void *inputOri, void *outputOri, int outer, int repeatTimes, int inputStride, int outputStride0, int outputStride1, int copyLen) {
     int id = blockIdx.x;
     int i = id / repeatTimes, j = id % repeatTimes;
-    uint8_t *output = (uint8_t*)outputOri + i * outputStride0 + j * outputStride1;
-    uint8_t *input = (uint8_t*)inputOri + i * inputStride;
+    // The repeated tensor may exceed 2 GiB even though each row fits in int.
+    // Promote before multiplication to avoid signed byte-offset overflow.
+    uint8_t *output = (uint8_t*)outputOri + (size_t)i * outputStride0 + (size_t)j * outputStride1;
+    uint8_t *input = (uint8_t*)inputOri + (size_t)i * inputStride;
     for (int x = threadIdx.x; x < copyLen; x += THREAD_PER_BLOCK) {
         output[x] = input[x];
     }
@@ -11903,7 +11956,7 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
     }
 }
 
-// Fixed-shape selection for 512/top-10 and single-row 256/top-8 decode.
+// Fixed-shape selection with a legacy-compatible tie fallback.
 // APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
@@ -11927,7 +11980,8 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
 
     static_assert((EXPERTS == 256 && TOPK == 8) ||
                   (EXPERTS == 512 && TOPK == 10) ||
-                  (!APPLY_SOFTMAX && EXPERTS == 288 && TOPK == 8));
+                  (!APPLY_SOFTMAX && ((EXPERTS == 288 && TOPK == 8) ||
+                                      (EXPERTS == 384 && TOPK == 6))));
     int token = blockIdx.x;
     const float *tokenLogits = logits + (size_t)token * EXPERTS;
     index += (size_t)token * TOPK;
@@ -11973,7 +12027,7 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     int firstExpert = lane * VALUES_PER_LANE;
     float choiceKeys[VALUES_PER_LANE];
     float firstProbabilities[8], secondProbabilities[8];
-    if constexpr (EXPERTS != 288) {
+    if constexpr (EXPERTS != 288 && EXPERTS != 384) {
         FastllmRouterLoad8(probabilityLogits + firstExpert, firstProbabilities);
         if constexpr (VALUES_PER_LANE > 8)
             FastllmRouterLoad8(probabilityLogits + firstExpert + 8, secondProbabilities);
@@ -11982,7 +12036,7 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     for (int part = 0; part < VALUES_PER_LANE; ++part) {
         int expert = firstExpert + part;
         float probability;
-        if constexpr (EXPERTS == 288) probability = probabilityLogits[expert];
+        if constexpr (EXPERTS == 288 || EXPERTS == 384) probability = probabilityLogits[expert];
         else probability = part < 8 ? firstProbabilities[part] : secondProbabilities[part - 8];
         float key = probability + (hasBias ? bias[expert] : 0.0f);
         choiceKeys[part] = isfinite(key) ? key : NEG_INF;
@@ -13341,7 +13395,7 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         return false;
     }
 
-    // Keep decode specializations narrow and preserve the generic kernel's
+    // Keep shape specializations narrow and preserve the generic kernel's
     // original MAXK=50 instantiation exactly: changing
     // its shared-memory row stride changes legacy merge behavior for prefill.
 #ifdef USE_ROCM
@@ -13349,7 +13403,11 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
         topk, hasBias, needNorm, routeScale);
 #else
-    if (n <= 8 && numExperts == 256 && topk == 8) {
+    if (numExperts == 384 && topk == 6) {
+        FastllmSelectExpertFixedTopKKernel<false, 384, 6><<<n, 32>>>(
+            cudaLogits, cudaBias, cudaIndex, cudaScore,
+            hasBias, needNorm, routeScale);
+    } else if (n <= 8 && numExperts == 256 && topk == 8) {
         FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
@@ -25015,4 +25073,34 @@ void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int c
         printf("FastllmCudaPickOutput Error: datatype error.\n");
         exit(0);
     }
+}
+
+
+// Compose already captured segments without recapturing model execution.
+// Child graph nodes preserve each segment's internal stream dependencies.
+extern "C" bool FastllmCudaGraphCompose(const void *const *children, int count,
+                                         void **outGraph, void **outExec) {
+    if (!children || count <= 0 || !outGraph || !outExec) return false;
+    *outGraph = nullptr;
+    *outExec = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cudaGraphNode_t previous = nullptr;
+    cudaError_t result = cudaGraphCreate(&graph, 0);
+    for (int i = 0; i < count && result == cudaSuccess; ++i) {
+        cudaGraphNode_t next = nullptr;
+        result = cudaGraphAddChildGraphNode(&next, graph,
+            previous ? &previous : nullptr, previous ? 1 : 0,
+            reinterpret_cast<cudaGraph_t>(const_cast<void *>(children[i])));
+        previous = next;
+    }
+    if (result == cudaSuccess) result = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    if (result != cudaSuccess) {
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+        return false;
+    }
+    *outGraph = graph;
+    *outExec = exec;
+    return true;
 }

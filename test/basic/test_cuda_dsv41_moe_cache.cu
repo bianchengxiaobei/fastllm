@@ -9,6 +9,8 @@
 #include "devices/numas/numas.h"
 #include "../../src/devices/cuda/moe/fastllm-moe-deepseekv41-cache.cuh"
 #include <cuda_bf16.h>
+#include "cuda_moe_prefill_test.h"
+#include <cuda_fp8.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -107,10 +109,98 @@ static void Compare(const std::vector<float> &actual, const std::vector<float> &
         throw std::runtime_error(label);
     }
 }
+
+// A cache concentrated on one GPU must not disable the other prefill worker.
+// Keep all selected experts resident on GPU 0 and GPU 1 empty, then compare the
+// two-worker result with uncached projections and the same BF16 partial
+// reduction. FT_EXPERT_LIMIT=0 fixes the CPU/GPU split so this tests resident
+// placement independently of calibration.
+static void CheckResidentAssist(std::vector<Data *> &weights) {
+    const int hidden = weights[2]->dims[1], experts = weights.size() / 2 - 1, topk = 6;
+    const std::vector<int> devices{0, 1};
+    std::unordered_set<int> selected;
+    for (int e = 0; e < topk; ++e) selected.insert(e + 1);
+    std::vector<Data *> biases(weights.size(), nullptr);
+    for (int rows : {129, 513, 2048}) {
+        Check(cudaSetDevice(0));
+        Data input(BFLOAT16, {rows, hidden}), index(INT32, {rows, topk}), scores(FLOAT32, {rows, topk});
+        input.Allocate(); index.Allocate(); scores.Allocate();
+        for (int i = 0; i < rows * hidden; ++i)
+            reinterpret_cast<uint16_t *>(input.cpuData)[i] = Float32ToBFloat16RNEBits((i % 37 - 18) / 8.f);
+        for (int r = 0; r < rows; ++r) for (int k = 0; k < topk; ++k) {
+            reinterpret_cast<int *>(index.cpuData)[r * topk + k] = (r + k) % topk;
+            reinterpret_cast<float *>(scores.cpuData)[r * topk + k] = k == 0 ? 0.f : (k + 1) / 16.f;
+        }
+        input.ToDevice(DataDevice::CUDA, {0}, true);
+        Data warm(BFLOAT16, {rows, hidden}), w1, w2, w3;
+        // Equal route counts and a fresh row-count profile yield alternating
+        // experts on the two workers. Reproduce their projection outputs on
+        // one GPU with transport bypassed, including the BF16 partial-sum
+        // boundary used by the multi-GPU reduction.
+        std::vector<float> expected(rows * hidden, 0.f);
+        setenv("FASTLLM_MOE_PREFILL_CACHE", "0", 1);
+        for (int worker = 0; worker < 2; ++worker) {
+            std::unordered_set<int> subset;
+            for (int e = worker; e < topk; e += 2) subset.insert(e + 1);
+            Data partial(BFLOAT16, {rows, hidden});
+            DoCudaMergeMOEFromCPU(input, partial, index, scores, w1, w2, w3, weights.data(),
+                biases.data(), 0, true, subset, true, MoeGateSwiglu, true, 10, 32, false, false);
+            ToDataType(partial, FLOAT32);
+            partial.ToDevice(DataDevice::CPU);
+            for (int i = 0; i < rows * hidden; ++i)
+                expected[i] += reinterpret_cast<float *>(partial.cpuData)[i];
+        }
+        for (float &value : expected) value = Bf(value);
+        unsetenv("FASTLLM_MOE_PREFILL_CACHE");
+        DoCudaMergeMOEFromCPU(input, warm, index, scores, w1, w2, w3, weights.data(),
+            biases.data(), 0, true, selected, true, MoeGateSwiglu, true, 10, 32, false, true);
+        FastllmCudaMoePrefillResidents residents;
+        Require(FastllmCudaGetMoePrefillResidents(weights.data(), experts, residents, true),
+            "resident assist root cache unavailable");
+        for (int e = 0; e < topk; ++e)
+            Require(residents.weights[2 * e] && residents.weights[2 * e + 1], "root expert not resident");
+        Check(cudaSetDevice(1));
+        Require(FastllmCudaGetMoePrefillResidents(weights.data(), experts, residents, true),
+            "resident assist secondary cache unavailable");
+        for (int e = 0; e < topk; ++e)
+            Require(!residents.weights[2 * e] && !residents.weights[2 * e + 1],
+                "secondary cache unexpectedly populated");
+        uint64_t before[2][8], after[2][8];
+        for (int device : devices)
+            Require(fastllm_moe_cuda_cache_prefill_stats(device, before[device]), "assist stats unavailable");
+        Check(cudaSetDevice(0));
+        Data output;
+        {
+            NumasMoeCudaAssistScope assist(&devices);
+            RunNumasMoe(input, index, scores, output, weights, 0);
+        }
+        for (int device : devices) {
+            Require(fastllm_moe_cuda_cache_prefill_stats(device, after[device]), "assist stats unavailable");
+            Require(after[device][1] > before[device][1], "resident affinity left a prefill GPU idle");
+        }
+        Require(after[0][3] > before[0][3], "balanced prefill failed to reuse residents");
+        Require(after[1][6] > before[1][6] && after[1][7] == before[1][7],
+            "assist miss did not stream without cache admission");
+        ToDataType(output, FLOAT32);
+        output.ToDevice(DataDevice::CPU);
+        Require(std::memcmp(output.cpuData, expected.data(), expected.size() * sizeof(float)) == 0,
+            "resident assist changed uncached projection/reduction bits");
+        std::printf("RESIDENT_ASSIST_PASS rows=%d gpu0=%llu gpu1=%llu hits=%llu\n", rows,
+            (unsigned long long)(after[0][1] - before[0][1]),
+            (unsigned long long)(after[1][1] - before[1][1]),
+            (unsigned long long)(after[0][3] - before[0][3]));
+    }
+}
+
 int main(int argc, char **argv) {
     try {
         Require(prctl(PR_SET_DUMPABLE, 0) == 0, "disable test core dumps");
-        const bool dual = argc > 1 && std::string(argv[1]) == "--dual";
+        auto option = [&](const char *name) {
+            for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], name) == 0) return true;
+            return false;
+        };
+        const bool dual = option("--dual"), fp8 = option("--fp8");
+        std::printf("V4.1 cache weights: %s\n", fp8 ? "FP8 block128" : "NVFP4 block32");
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
         Require(!dual || devices >= 2, "--dual requires two CUDA devices");
@@ -211,16 +301,29 @@ int main(int argc, char **argv) {
             for (int e = 0; e < experts; ++e)
                 for (int part = 0; part < 2; ++part) {
                     const int rows = part ? hidden : inter * 2, cols = part ? inter : hidden;
-                    auto w = std::make_unique<Data>(DataType::NVFP4_BLOCK_32_E8M0);
+                    auto w = std::make_unique<Data>(fp8 ? FP8_E4M3_BLOCK_128 : NVFP4_BLOCK_32_E8M0);
                     w->Resize({rows, cols});
                     w->blockK = 1;
-                    w->blockM = 32;
+                    w->blockM = fp8 ? 128 : 32;
                     const size_t pitch = GetDataBytes(w->dataType, 1, cols);
                     std::vector<uint8_t> packed(rows * pitch);
                     auto &matrix = dense[t][e * 2 + part];
                     matrix.resize(rows * cols);
                     const float fp4[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
-                    for (int row = 0; row < rows; ++row)
+                    if (fp8) {
+                        for (int row = 0; row < rows; ++row)
+                            for (int c = 0; c < cols; c += 128) {
+                                uint8_t *block = packed.data() + row * pitch + c / 128 * 132;
+                                const float scale = std::ldexp(1.0f, (row + c / 128 + part + t) % 4 - 5);
+                                memcpy(block + 128, &scale, sizeof(scale));
+                                for (int j = 0; j < 128; ++j) {
+                                    block[j] = uint8_t((rng() % 64) | ((rng() & 1) << 7));
+                                    __nv_fp8_e4m3 value;
+                                    value.__x = block[j];
+                                    matrix[row * cols + c + j] = float(value) * scale;
+                                }
+                            }
+                    } else for (int row = 0; row < rows; ++row)
                         for (int c = 0; c < cols; c += 32) {
                             uint8_t *block = packed.data() + row * pitch + c / 32 * 17;
                             const int exponent = 121 + rng() % 4;
@@ -234,7 +337,7 @@ int main(int argc, char **argv) {
                                 }
                             }
                         }
-                    if (t == 0) {
+                    if (t == 0 && !fp8) {
                         // Source checkpoint layout: separate gate/up halves and
                         // planar UE8M0 scales, with no registered NUMA shards.
                         auto source = std::make_unique<Data>(NVFP4, std::vector<int>{rows, cols});
@@ -271,7 +374,7 @@ int main(int argc, char **argv) {
                 }
             layers[t] = {weights[t].data(), (int)weights[t].size(), true, 10.0f};
         }
-        const size_t record = ((size_t(3) * hidden * inter / 32 * 17 + 127) / 128) * 128;
+        const size_t record = ((weights[0][2]->GetBytes() + weights[0][3]->GetBytes() + 127) / 128) * 128;
         SetMoeCudaCacheBytes(0);
         Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "disabled cache accepted");
         SetMoeCudaCacheBytes(record);
@@ -301,6 +404,14 @@ int main(int argc, char **argv) {
         Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "V4.1 cache preparation failed");
         Require(FastllmCudaCanRunMoeHybrid(weights[0].data(), weights[0].size()), "V4.1 hybrid unavailable");
         Require(!FastllmCudaCanRunMoeCache(weights[0].data(), weights[0].size()), "generic math accepted V4.1");
+        if (option("--prefill")) {
+            if (dual) CheckResidentAssist(weights[0]);
+            fastllm_prefill_test::Run(layers, weights, tables, true, 32);
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            for (void *pointer : shards) Check(cudaFreeHost(pointer));
+            return 0;
+        }
+
         Data input(BFLOAT16, {1, hidden}), index(INT32, {1, topk}), scores(FLOAT32, {1, topk}), output;
         Gpu(input);
         Gpu(index);
@@ -474,12 +585,17 @@ int main(int argc, char **argv) {
                 policy.replacementMargin = 0;
                 SetMoeCacheConfig(policy);
                 Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "frequency cache preparation failed");
-                setenv("FASTLLM_DSV41_MOE_FREQUENCY", "1", 1);
+                // Auto mode must activate admission without a private opt-in.
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "hybrid", 1);
                 unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
-                uint64_t before[8], after[8];
+                uint64_t before[8], after[8], cacheBefore[5], cacheAfter[5];
+                Require(fastllm_moe_cuda_cache_stats(0, cacheBefore, false), "frequency initial cache statistics failed");
+                uint64_t expectedResident = 0;
                 Require(fastllm_moe_cuda_cache_route_stats(0, before), "frequency initial statistics failed");
                 for (int repeat = 0; repeat < 24; ++repeat) {
+                    // One expert is admitted after every two complete steps.
+                    // Temporary GPU execution must not bypass this policy.
+                    expectedResident += std::min(repeat / policy.updateInterval, topk);
                     void *step = FastllmCudaBeginMoeDecode(weights[t].data(), weights[t].size(), topk);
                     Require(step != nullptr, "frequency decode scope rejected");
                     int callbacks = 0;
@@ -491,10 +607,15 @@ int main(int argc, char **argv) {
                     Check(cudaMemcpy(actual.data(), output.cudaData, hidden * 2, cudaMemcpyDeviceToHost));
                     std::vector<float> values(hidden);
                     for (int c = 0; c < hidden; ++c) values[c] = __bfloat162float(actual[c]);
-                    Compare(values, expected, "frequency/staged FP4 oracle mismatch");
+                    Compare(values, expected, "frequency/staged V4.1 oracle mismatch");
                 }
                 Require(fastllm_moe_cuda_cache_route_stats(0, after), "frequency final statistics failed");
                 Require(after[1] - before[1] == 24 * topk, "frequency route count mismatch");
+                Require(after[2] - before[2] == expectedResident, "default frequency admission interval/budget ignored");
+                Require(fastllm_moe_cuda_cache_stats(0, cacheAfter, false), "frequency final cache statistics failed");
+                Require(cacheAfter[0] - cacheBefore[0] == expectedResident, "frequency resident lookup count mismatch");
+                Require(cacheAfter[0] + cacheAfter[1] - cacheBefore[0] - cacheBefore[1] == 24 * topk,
+                    "frequency lookups must include CPU and temporary GPU routes");
                 Require(after[5] > before[5], "frequency CPU misses not exercised");
                 Require(after[6] > before[6], "frequency resident GPU hits not exercised");
                 Require(after[4] - before[4] > after[6] - before[6], "dynamic GPU miss streaming not exercised");
@@ -503,7 +624,6 @@ int main(int argc, char **argv) {
                     (unsigned long long)(after[5] - before[5]),
                     (unsigned long long)(after[6] - before[6]),
                     (unsigned long long)((after[4] - before[4]) - (after[6] - before[6])));
-                unsetenv("FASTLLM_DSV41_MOE_FREQUENCY");
                 SetMoeCacheConfig(MoeCacheConfig{});
             }
             // Full NUMA fallback must obey the same contract as the subset.
@@ -525,7 +645,7 @@ int main(int argc, char **argv) {
                 memcpy(cpuIndex.cpuData, batchIds.data(), rows * topk * 4);
                 Data w1, w2, w3, cpuResult;
                 std::vector<Data *> biases(weights[t].size(), nullptr);
-                if (pass == 0 && rows == 33) {
+                if (!fp8 && pass == 0 && rows == 33) {
                     const auto cacheBytes = GetMoeCudaCacheBytes();
                     SetMoeCudaCacheBytes(0);
                     Data coldInput;

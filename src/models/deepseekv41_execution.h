@@ -1,12 +1,22 @@
 #ifndef FASTLLM_DEEPSEEKV41_EXECUTION_H
 #define FASTLLM_DEEPSEEKV41_EXECUTION_H
-#include "utils/hybrid_moe.h"
 
 #include "deepseekv41.h"
 #include <functional>
 
 namespace fastllm {
+    struct DeepSeekV41HybridWorkspace;
     struct DeepSeekV41DecodeWorkspace {
+        // Reuse request-row views and overwritten indexer outputs across
+        // decode calls. Per-forward validity flags still start empty: retained
+        // storage must never imply that an earlier request's indices are valid.
+        std::vector<Data> segTopK, segCandidate, segQ, segKV, segAttnOut;
+        std::vector<Data> segIndexQ, segIndexWeight;
+        Data compressJoined, compressScores, compressLatents, compressKeys;
+        std::vector<Data> compressLatentViews, compressKeyViews;
+
+        DeepSeekV41DecodeWorkspace();
+        ~DeepSeekV41DecodeWorkspace();
         Data hiddenStates, hiddenTemp, preMix, dsparkPreMix;
         int preMixSeqlen = -1;      // preMix 只在长度变化时重建（内容是常量 one-hot）
         Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
@@ -14,20 +24,20 @@ namespace fastllm {
         Data attnInputFloat, rawKVAll, rawScoreAll, qIdxAll, idxWeights, idxWeightsAll;
         Data ffnInput, ffnOut, gateInput, gateLogits, expertIndex, expertScore;
         Data sharedGateup, sharedSwiglu, sharedExpertOut;
+        bool sharedExpertSharded = false;  // Valid only until the joint MoE collective.
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
-        struct MoeCacheWorkspace { Data index, score, output; };
-        std::map<int, MoeCacheWorkspace> moeCache;
+        std::unique_ptr<DeepSeekV41HybridWorkspace> hybrid;
         Data quantizedActivation;
-        Data attnInputQuantized, qNormQuantized;
+        Data attnInputQuantized, qNormQuantized, ffnInputQuantized;
+        bool ffnInputQuantizedReady = false;
         // TP and CUDA graphs retain one buffer per weight.
         std::map<std::string, Data> quantizedActivations;
+        std::map<std::string, Data> reductionBuffers;
     };
 
-    // A decode policy must end before the head, and also on exception unwinding.
     struct DeepSeekV41MoeContext {
         DeepSeekV41DecodeWorkspace &workspace;
-        HybridMoeDecodeStep &step;
         std::vector<Data *> &moeWeights;
         const std::vector<int> &tpDevices;
         int layer, seqlen;
@@ -35,6 +45,9 @@ namespace fastllm {
         bool verifyAllTokens;
         std::function<void()> runSharedSegment;
         std::function<void()> releaseSharedScratch;
+        std::mutex *pipelineHostExperts = nullptr;
+        int pipelineFirstLayer = -1;
+        bool parallelShared = false;  // Set only after native graph buffers pass validation.
     };
 
     // Tensor-copy helpers shared with attention/KV code. They preserve graph
@@ -52,6 +65,15 @@ namespace fastllm {
 } // namespace fastllm
 
 namespace fastllm {
+// Private to hybrid PP: layers have disjoint owners, while token history and
+// logical positions are per stage. Payload stores BF16 hidden plus FP32 HC pre.
+struct DeepSeekV41Model::HybridPrefillStage {
+    int firstLayer = 0, endLayer = 0;
+    DeepSeekV41RequestState *request = nullptr;
+    Data *payload = nullptr;
+    std::mutex *hostExperts = nullptr;
+    bool sampleOutput = false;
+};
 struct DeepSeekV41Model::ForwardState {
     std::unique_ptr<ForwardWorkspace> work;
     ForwardState(DeepSeekV41Model &model, const std::vector<DeepSeekV41Segment> &inputSegments,
@@ -61,7 +83,8 @@ struct DeepSeekV41Model::ForwardState {
                                                        const std::vector<GenerationConfig> &generationConfigsIn,
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
-                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues);
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues,
+                                                       HybridPrefillStage *prefill = nullptr);
     ~ForwardState();
     int Layers() const;
     void BeginLayer(int layer);
@@ -70,6 +93,7 @@ struct DeepSeekV41Model::ForwardState {
     void HybridExperts(int layer);
     void BeginHybridStep();
     void PrepareInputs();
+    bool FullGraph();
     std::vector<int> Finish();
 };
 }

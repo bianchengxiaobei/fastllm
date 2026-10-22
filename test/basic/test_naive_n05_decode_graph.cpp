@@ -4,6 +4,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "fastllm.h"
+#include "blocks/baseblock.h"
 #include "utils/utils.h"
 #include <algorithm>
 #include <cstdio>
@@ -351,20 +352,274 @@ static void TestDraftAttention(int dim, int rows, int window, bool shortAttentio
     }
 }
 
+// Exercise the production append/attention kernels across multiple wraps, then
+// leave/re-enter the ring as prefill, verification and history restore do.
+static void TestSwaRing(int heads, int kvHeads, bool fused) {
+    const int kc = kvHeads * 192, vc = kvHeads * 128;
+    Data q(BFLOAT16), packed(BFLOAT16), nk(BFLOAT16), nv(BFLOAT16), pos(FLOAT32), live(INT32), sink(FLOAT32);
+    Data oldK(BFLOAT16), oldV(BFLOAT16), ringK(BFLOAT16), ringV(BFLOAT16), expected, actual, none;
+    Upload(q, {1, 1, heads * 192}, 71);
+    Upload(packed, {1, 1, (heads + kvHeads) * 192 + vc}, 72);
+    Upload(nk, {1, 1, kc}, 73); Upload(nv, {1, 1, vc}, 74);
+    Upload(pos, {1, 1}, 75); Upload(live, {1}, 76); Upload(sink, {heads}, 77);
+    Upload(oldK, {1, 256, kc}, 78); Upload(oldV, {1, 256, vc}, 79);
+    oldK.Expansion({1, 256, kc}); oldV.Expansion({1, 256, vc});
+    ringK.CopyFrom(oldK); ringV.CopyFrom(oldV);
+    ringK.Expansion({1, 256, kc}); ringV.Expansion({1, 256, vc});
+    const auto initialK = Read<uint16_t>(oldK), initialV = Read<uint16_t>(oldV);
+    FastllmNaiveDecodeScratch oldScratch, ringScratch;
+    int length = 128;
+    Cuda(cudaMemcpy(live.cudaData, &length, sizeof(length), cudaMemcpyHostToDevice));
+    auto invoke = [&](bool ring) {
+        Data &k = ring ? ringK : oldK, &v = ring ? ringV : oldV;
+        if (fused) Require(FastllmCudaNaiveRopeAppendCache(q, nk, nv, none, pos, k, v,
+            live, heads, kvHeads, 192, 128, 64, 10000.f, .75f, 128, &packed, ring), "fused ring append");
+        else FastllmCudaNaiveAppendDecodeCache(k, v, nk, nv, live, 128, ring);
+        FastllmCudaNaiveDecodeAttention(q, k, v, none, sink, live, 256, heads, kvHeads,
+            192, 128, 128, ring ? ringScratch : oldScratch, ring ? actual : expected, ring);
+        if (!ring) FastllmCudaNaiveTrimDecodeCache(k, v, live, 128);
+    };
+    Graph graph;
+    graph.Capture([&]() { invoke(false); invoke(true); });
+    auto rows = [](const Data &d) {
+        std::vector<uint16_t> result((size_t)d.dims[1] * d.dims[2]);
+        Cuda(cudaMemcpy(result.data(), d.cudaData, result.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        return result;
+    };
+    for (int prefix : {0, 126, 127, 128, 707, 2047}) {
+        for (Data *k : {&oldK, &ringK})
+            Cuda(cudaMemcpy(k->cudaData, initialK.data(), initialK.size() * 2, cudaMemcpyHostToDevice));
+        for (Data *v : {&oldV, &ringV})
+            Cuda(cudaMemcpy(v->cudaData, initialV.data(), initialV.size() * 2, cudaMemcpyHostToDevice));
+        auto resize = [&](int past) {
+            for (Data *k : {&oldK, &ringK}) k->Resize({1, std::min(past, 127), kc});
+            for (Data *v : {&oldV, &ringV}) v->Resize({1, std::min(past, 127), vc});
+        };
+        resize(prefix);
+        FastllmCudaNaiveSwaCacheLayout(ringK, ringV, prefix, true);
+        for (int step = 0; step < 260; ++step) {
+            length = prefix + step + 1;
+            float position = length - 1;
+            Cuda(cudaMemcpy(live.cudaData, &length, sizeof(length), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(pos.cudaData, &position, sizeof(position), cudaMemcpyHostToDevice));
+            graph.Run();
+            Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "SWA ring output mismatch");
+            resize(length);
+            // Conversion itself must preserve every retained row, including at
+            // wrap boundaries. This also simulates leaving/re-entering decode.
+            FastllmCudaNaiveSwaCacheLayout(ringK, ringV, length, false);
+            Require(rows(ringK) == rows(oldK), "SWA ring key mismatch");
+            Require(rows(ringV) == rows(oldV), "SWA ring value mismatch");
+            FastllmCudaNaiveSwaCacheLayout(ringK, ringV, length, true);
+            ++checks;
+        }
+    }
+}
+
+static void TestSwaBatch(int batch, int heads, int kvHeads) {
+    Data query(BFLOAT16), sink(FLOAT32), live(INT32), actual, expected(BFLOAT16), none;
+    Upload(query, {1, batch, heads * 192}, 91);
+    Upload(sink, {heads}, 92);
+    Upload(live, {batch}, 93);
+    Upload(expected, {1, batch, heads * 128}, 94);
+    std::vector<Data> keys(batch, Data(BFLOAT16)), values(batch, Data(BFLOAT16));
+    std::vector<FastllmNaiveSWARow> rows;
+    for (int b = 0; b < batch; ++b) {
+        Upload(keys[b], {1, 128, kvHeads * 192}, 95 + b);
+        Upload(values[b], {1, 128, kvHeads * 128}, 125 + b);
+        rows.push_back({keys[b].cudaData, values[b].cudaData});
+    }
+    std::vector<int> lengths(batch, 128);
+    Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+    Graph graph;
+    graph.Capture([&]() {
+        FastllmCudaNaiveBatchSWADecode(query, sink, rows, live, heads, kvHeads, actual);
+    });
+    for (int prefix : {1, 127, 707}) {
+        for (int b = 0; b < batch; ++b) lengths[b] = prefix + b;
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+        graph.Run();
+        for (int b = 0; b < batch; ++b) {
+            Data q, length, result;
+            q.Resize({1, 1, heads * 192}); q.FakeFrom(query, (size_t)b * heads * 192 * 2);
+            length.Resize({1}); length.FakeFrom(live, b * sizeof(int));
+            result.Resize({1, 1, heads * 128}); result.FakeFrom(expected, (size_t)b * heads * 128 * 2);
+            FastllmNaiveDecodeScratch scratch;
+            FastllmCudaNaiveDecodeAttention(q, keys[b], values[b], none, sink, length,
+                128, heads, kvHeads, 192, 128, 128, scratch, result, true);
+        }
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "batched SWA differs from individual rows");
+        ++checks;
+    }
+}
+
+static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool sparse, bool fp8) {
+    const int capacity = sparse ? 2048 : 128;
+    Data query(BFLOAT16), key(BFLOAT16), value(BFLOAT16), sink(FLOAT32), live(INT32), table(INT32),
+        pages(INT32), indices(INT32), maps(INT32), actual;
+    Upload(query, {1, batch, heads * dim}, 301);
+    Upload(key, {1, capacity, dim}, 302); Upload(value, {1, capacity, vd}, 303);
+    Upload(sink, {heads}, 304); Upload(live, {batch}, 305);
+    if (fp8) {
+        // Every byte is finite E4M3. This test checks masking and bindings,
+        // independently of the numerical conversion used by the writer.
+        Cuda(cudaMemset(key.cudaData, 0x30, capacity * dim));
+        Cuda(cudaMemset(value.cudaData, 0x28, capacity * vd));
+    }
+    Upload(table, {int(batch * 4 * sizeof(void *) / sizeof(int))}, 306);
+    Upload(pages, {1}, 307); Cuda(cudaMemset(pages.cudaData, 0, sizeof(int)));
+    Upload(indices, {2048}, 308);
+    std::vector<int> selected(2048); for (int i = 0; i < 2048; ++i) selected[i] = i;
+    Cuda(cudaMemcpy(indices.cudaData, selected.data(), indices.GetBytes(), cudaMemcpyHostToDevice));
+    if (!fp8 && heads == 8 && dim == 192 && vd == 128 && !sparse && FastllmCudaNaiveDSAMapsSupported()) {
+        Upload(maps, {FastllmNaiveDSAMapBytes / int(sizeof(int))}, 309);
+        alignas(128) unsigned char encoded[FastllmNaiveDSAMapBytes];
+        Require(FastllmCudaNaiveEncodeDSAMaps(encoded, key.cudaData, value.cudaData, capacity, dim), "encode padded maps");
+        Cuda(cudaMemcpy(maps.cudaData, encoded, sizeof(encoded), cudaMemcpyHostToDevice));
+    }
+    std::vector<FastllmNaiveDSARow> rows(batch);
+    std::vector<void *> bindings(batch * 4);
+    std::vector<int> lengths(batch, capacity);
+    for (int b = 0; b < batch; ++b) {
+        auto &r = rows[b];
+        r.key = key.cudaData; r.value = value.cudaData;
+        r.indices = sparse ? (const int *)indices.cudaData : nullptr;
+        r.selectedCount = sparse ? 2048 : 0; r.capacity = capacity; r.keyStride = dim;
+        r.liveKeys = (const int *)live.cudaData + b;
+        r.cache = (const void *const *)table.cudaData + b * 4;
+        r.tensorMaps = maps.cudaData; r.pageLen = capacity; r.fp8 = fp8;
+    }
+    auto bind = [&](int active) {
+        for (int b = 0; b < batch; ++b) {
+            lengths[b] = b < active ? capacity : 0;
+            bindings[b * 4] = b < active ? key.cudaData : nullptr;
+            bindings[b * 4 + 1] = b < active ? value.cudaData : nullptr;
+            bindings[b * 4 + 2] = bindings[b * 4 + 3] = b < active ? pages.cudaData : nullptr;
+        }
+        Cuda(cudaMemcpy(table.cudaData, bindings.data(), bindings.size() * sizeof(void *), cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), lengths.size() * sizeof(int), cudaMemcpyHostToDevice));
+    };
+    bind(batch);
+    FastllmNaiveDecodeScratch scratch;
+    Graph graph;
+    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(query, sink, rows, heads, 1, dim, vd, scratch, actual); });
+    graph.Run(); auto reference = Read<uint16_t>(actual);
+    for (int active : {batch - 1, 1, 0, batch / 2, batch}) {
+        bind(active); graph.Run(); auto result = Read<uint16_t>(actual);
+        for (size_t i = 0; i < result.size(); ++i)
+            Require(result[i] == (i < (size_t)active * heads * vd ? reference[i] : 0),
+                    "padding changed active attention or left inactive output nonzero");
+        ++checks;
+    }
+}
+
+static void TestRouterBatch(int batch, int pattern) {
+    Data input(BFLOAT16), weight(FLOAT32), bias(FLOAT32), actual, expected(FLOAT32);
+    Data indices(INT32), scores(FLOAT32), referenceIndices(INT32), referenceScores(FLOAT32);
+    Upload(input, {1, batch, 4096}, 181); Upload(weight, {256, 4096}, 182);
+    Upload(bias, {256}, 183); Upload(expected, {1, batch, 256}, 184);
+    Upload(indices, {batch, 8}, 185); Upload(scores, {batch, 8}, 186);
+    Upload(referenceIndices, {batch, 8}, 187); Upload(referenceScores, {batch, 8}, 188);
+    if (pattern == 1) {
+        Cuda(cudaMemset(weight.cudaData, 0, weight.GetBytes()));
+        Cuda(cudaMemset(bias.cudaData, 0, bias.GetBytes()));
+    }
+    if (pattern == 2) {
+        auto values = Read<float>(weight);
+        for (auto &value : values) value *= .01f;
+        Cuda(cudaMemcpy(weight.cudaData, values.data(), weight.GetBytes(), cudaMemcpyHostToDevice));
+    }
+    int previous = FastllmCudaGetLinearExactBatchThreshold();
+    FastllmCudaSetLinearExactBatchThreshold(9);
+    Graph graph;
+    graph.Capture([&]() {
+        Require(FastllmCudaNaiveRouterSigmoid(input, weight, actual), "batch router unsupported");
+        Require(FastllmCudaSelectExpert(actual, &bias, indices, scores, 8, true, 1.7f), "batch experts unsupported");
+    });
+    for (int replay = 0; replay < 2; ++replay) {
+        if (replay) Cuda(cudaMemset(input.cudaData, 0, input.GetBytes()));
+        graph.Run();
+        for (int b = 0; b < batch; ++b) {
+            Data row, result;
+            row.Resize({1, 1, 4096}); row.FakeFrom(input, (size_t)b * 4096 * 2);
+            result.Resize({1, 1, 256}); result.FakeFrom(expected, (size_t)b * 256 * 4);
+            Require(FastllmCudaNaiveRouterSigmoid(row, weight, result), "reference router unsupported");
+        }
+        Require(Read<float>(actual) == Read<float>(expected), "batch router probabilities changed");
+        Require(FastllmCudaSelectExpert(expected, &bias, referenceIndices, referenceScores, 8, true, 1.7f), "reference experts unsupported");
+        Require(Read<int>(indices) == Read<int>(referenceIndices), "batch router expert order changed");
+        Require(Read<float>(scores) == Read<float>(referenceScores), "batch router expert scores changed");
+        ++checks;
+    }
+    FastllmCudaSetLinearExactBatchThreshold(previous);
+}
+
+static void TestIndexerKeyNorm(int rows) {
+    Data input(BFLOAT16), weight(FLOAT32), bias(FLOAT32), reference, expected;
+    Upload(input, {1, rows, 128}, 917);
+    Upload(weight, {128}, 918); Upload(bias, {128}, 919);
+    auto original = Read<uint16_t>(input);
+    Graph graph;
+    graph.Capture([&] {
+        Require(FastllmCudaNaiveIndexerKeyNorm(input, weight, bias), "Indexer norm layout rejected");
+    });
+    for (int pattern = 0; pattern < 4; ++pattern) {
+        auto values = original;
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (pattern == 1) values[i] = Float32ToBFloat16RNEBits(2.f);
+            if (pattern == 2) values[i] = Float32ToBFloat16RNEBits((i % 2 ? -1.f : 1.f) * (i % 7 ? .001f : 100.f));
+            if (pattern == 3) values[i] = Float32ToBFloat16RNEBits(1.f + (i % 5) / 128.f);
+        }
+        Cuda(cudaMemcpy(input.cudaData, values.data(), values.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        ToDataType(input, reference, FLOAT32);
+        LayerNorm(reference, weight, bias, -1, reference);
+        ToDataType(reference, expected, BFLOAT16);
+        graph.Run();
+        Require(Read<uint16_t>(input) == Read<uint16_t>(expected), "Indexer BF16 norm differs bitwise");
+        ++checks;
+    }
+    auto before = Read<uint16_t>(input);
+    input.strides[1]++;
+    Require(!FastllmCudaNaiveIndexerKeyNorm(input, weight, bias), "Indexer norm accepted invalid stride");
+    input.strides[1]--;
+    Require(Read<uint16_t>(input) == before, "unsupported Indexer norm changed input");
+}
+
 int main() {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        for (int rows : {1, 2, 3, 4, 8, 33}) TestIndexerKeyNorm(rows);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
+        for (int batch : {8, 40})
+        for (bool sparse : {false, true})
+        for (bool fp8 : {false, true}) {
+            TestPaddedAttention(batch, 8, 192, 128, sparse, fp8);
+            TestPaddedAttention(batch, 2, 64, 256, sparse, fp8);
+        }
+        for (int batch = 1; batch <= 8; ++batch)
+            for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
+        for (int batch : {1, 2, 3, 4, 17})
+            for (int heads : {4, 8, 16})
+                TestSwaBatch(batch, heads, heads == 16 ? 2 : 1);
+        for (int heads : {4, 8, 16})
+            for (bool fused : {false, true}) TestSwaRing(heads, heads == 16 ? 2 : 1, fused);
         for (int ch : {1, 127, 256, 1024, 2048, 4096, 5120})
             TestResidualNorm(ch);
         for (int ch : {127, 256, 4096})
             TestResidualNorm(ch, 8);
         for (int w : {0, 8, 128})
             TestCache(w);
+        // Dense decode uses replay-time length, including decreases and the
+        // 64-key staging tail; keep the optimized path bitwise equal to eager.
+        for (int heads : {1, 8, 16, 32})
+            for (bool sink : {false, true})
+                TestAttention(heads, 192, 128, 0, 896,
+                              {1, 63, 64, 65, 707, 748, 895, 896, 257}, true, sink);
+        TestAttention(8, 192, 128, 0, 2048, {257, 1024, 2047, 2048, 513}, true);
         for (int heads : {2, 4, 8, 16}) {
             for (bool sink : {false, true})
                 TestAttention(heads, 192, 128, 0, 256, {1, 2, 127, 128, 129, 255, 256, 3}, true,

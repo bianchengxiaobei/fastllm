@@ -6,6 +6,13 @@ This guide covers current Qwen3.5, Qwen3.6, and Qwen3.8 models, including GGUF m
 
 Checkpoint layouts may be dense, MoE, FP8, NVFP4, or another quantized format. Keep `--dtype auto` for an initial launch, then tune from measured memory use and throughput.
 
+The dense HF Qwen3.8-27B-FP8 checkpoint supports `--auto`. It prefers all-GPU TP, sets batch 4, enables its embedded MTP5 draft, and chooses the longest native context that fits the memory budget. Other checkpoint formats need separate validation.
+
+~~~bash
+ftllm server /data/models/Qwen3.8-27B-FP8 --auto \
+  --model_name qwen3.8-27b --host 0.0.0.0 --port 8080
+~~~
+
 ## API server quick start
 
 ~~~bash
@@ -89,7 +96,7 @@ ftllm server /data/models/qwen \
   --gpu_mem_ratio 0.9
 ~~~
 
-Extending the model-declared window requires a valid `--rope_scaling` configuration; insufficient calibrated KV capacity fails startup. For Qwen3, specify the original RoPE length explicitly (commonly 32768). See [context extension](context-length-extension-design.md) for examples and validation limits.
+Extending the model-declared window requires a valid `--rope_scaling` configuration; insufficient calibrated KV capacity fails startup. For Qwen3, specify the original RoPE length explicitly (commonly 32768). See [context extension](context-length-extension.md) for examples and validation limits.
 
 ## MTP
 

@@ -20,7 +20,8 @@ constexpr size_t workspaceBytes = 8ull << 20;
 constexpr size_t maxPlans = 64;
 constexpr size_t maxWorkspacesPerDevice = 16; // 128 MiB, including graph-held buffers
 constexpr int maxCandidates = 8;
-constexpr int timingRepeats = 8;
+constexpr int timingRepeats = 32;
+constexpr int timingSamples = 2;
 using Key = std::array<int, 7>; // M, N, K, alignment(A), alignment(B), alignment(C/D), storage type
 
 inline void CheckCuda(cudaError_t status) {
@@ -63,6 +64,20 @@ struct SearchResources {
     }
 };
 
+struct SearchGraph {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    bool capturing = false;
+
+    ~SearchGraph() {
+        // Run may throw while recording a candidate. End that capture before
+        // returning to the caller so its stream remains usable.
+        if (capturing) cudaStreamEndCapture(cudaStreamPerThread, &graph);
+        if (executable) cudaGraphExecDestroy(executable);
+        if (graph) cudaGraphDestroy(graph);
+    }
+};
+
 // Buffers are leased, not permanently assigned to host-thread identities.
 // CUDA user-object callbacks only return a lease; they never call CUDA APIs.
 struct Workspace {
@@ -93,6 +108,17 @@ inline void ReturnWorkspace(Workspace *workspace) {
 
 inline void CUDART_CB ReturnGraphWorkspace(void *ptr) {
     ReturnWorkspace(static_cast<Workspace *>(ptr));
+}
+
+// Opt-in sharing for graphs whose owner already serializes their replay.
+// Unrelated graphs retain independent leases, including across worker teardown.
+inline std::shared_ptr<Workspace> &SerialGraphWorkspace() {
+    static thread_local std::shared_ptr<Workspace> workspace;
+    return workspace;
+}
+
+inline void CUDART_CB ReleaseSharedGraphWorkspace(void *ptr) {
+    delete static_cast<std::shared_ptr<Workspace> *>(ptr);
 }
 
 inline Workspace *AcquireWorkspace(int device) {
@@ -137,13 +163,19 @@ inline Workspace *AcquireWorkspace(int device) {
 
 struct State {
     int device;
+    int arch;
     cublasLtHandle_t handle = nullptr;
     Workspace *eager = nullptr, *spare = nullptr;
     unsigned long long captureId = 0;
     Workspace *captured = nullptr; // borrowed only while captureId is active
     std::map<Key, std::unique_ptr<Plan>> plans;
 
-    explicit State(int device) : device(device) {}
+    explicit State(int device) : device(device) {
+        int major = 0, minor = 0;
+        CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+        arch = major * 10 + minor;
+    }
     ~State() {
         int previous = -1;
         cudaGetDevice(&previous);
@@ -178,10 +210,28 @@ inline State *GetState(int device, bool capture) {
 #if CUDART_VERSION >= 11030
         // Allocate before capture, never within it. One reserve is enough for
         // the next capture; another eager call can prepare the following one.
-        if (!state.spare) state.spare = AcquireWorkspace(device);
+        if (!SerialGraphWorkspace() && !state.spare) state.spare = AcquireWorkspace(device);
 #endif
     }
     return &state;
+}
+
+inline std::shared_ptr<Workspace> CreateSerialGraphWorkspace() {
+#if CUDART_VERSION >= 11030
+    cudaStreamCaptureStatus capture;
+    CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return {};
+    int device = 0;
+    CheckCuda(cudaGetDevice(&device));
+    State *state = GetState(device, false);
+    if (!state) return {};
+    Workspace *workspace = state->spare ? state->spare : AcquireWorkspace(device);
+    if (!workspace) return {};
+    state->spare = nullptr;
+    return std::shared_ptr<Workspace>(workspace, ReturnWorkspace);
+#else
+    return {}; // Graph resource ownership is unavailable on older runtimes.
+#endif
 }
 
 inline void *CaptureWorkspace(State &state) {
@@ -198,14 +248,22 @@ inline void *CaptureWorkspace(State &state) {
     if (status != cudaStreamCaptureStatusActive || !graph)
         throw std::runtime_error("BF16 cuBLASLt capture is not active");
     if (id != state.captureId) {
-        if (!state.spare) return nullptr;
-        Workspace *workspace = state.spare;
-        state.spare = nullptr;
+        const auto &shared = SerialGraphWorkspace();
+        Workspace *workspace = shared ? shared.get() : state.spare;
+        if (!workspace || workspace->device != state.device) return nullptr;
+        void *reference = workspace;
+        cudaHostFn_t release = ReturnGraphWorkspace;
+        if (shared) {
+            // Every graph (and its clones/executables) retains the shared lease.
+            // The model or capture worker may disappear before replay completes.
+            reference = new std::shared_ptr<Workspace>(shared);
+            release = ReleaseSharedGraphWorkspace;
+        } else state.spare = nullptr;
         cudaUserObject_t owner = nullptr;
-        cudaError_t result = cudaUserObjectCreate(&owner, workspace,
-            ReturnGraphWorkspace, 1, cudaUserObjectNoDestructorSync);
+        cudaError_t result = cudaUserObjectCreate(&owner, reference,
+            release, 1, cudaUserObjectNoDestructorSync);
         if (result != cudaSuccess) {
-            ReturnWorkspace(workspace);
+            release(reference);
             CheckCuda(result);
         }
         result = cudaGraphRetainUserObject(graph, owner, 1, cudaGraphUserObjectMove);
@@ -269,17 +327,40 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
     int count = 0;
     if (!CheckBlas(cublasLtMatmulAlgoGetHeuristic(s.handle, p.op, p.a, p.b, p.c, p.c,
             search.preference, maxCandidates, candidates, &count)) || count == 0) return;
-    CheckCuda(cudaEventCreate(&search.begin));
-    CheckCuda(cudaEventCreate(&search.end));
+    // BF16 decode on Hopper values reproducibility across TP ranks and
+    // restarts. Timing near-tied algorithms (especially under a profiler) can
+    // change both latency and the reduction tree. Use the library's first
+    // supported heuristic within the same FP32/workspace/alignment constraints.
+    const bool stableBf16 = dtype == CUDA_R_16BF && (M == 1 || s.arch == 90);
+    if (!stableBf16) {
+        CheckCuda(cudaEventCreate(&search.begin));
+        CheckCuda(cudaEventCreate(&search.end));
+    }
     float best = std::numeric_limits<float>::max();
     for (int i = 0; i < count; ++i) {
         if (candidates[i].state != CUBLAS_STATUS_SUCCESS ||
             candidates[i].workspaceSize > workspaceBytes) continue;
         const auto &algo = candidates[i].algo;
         if (!Run(s, p, algo, weight, input, output, s.eager->data)) continue;
-        // First use only, outside capture. Inputs and weights must not alias
-        // output; each trial overwrites the same Linear output with beta = 0.
-        CheckCuda(cudaEventRecord(search.begin, cudaStreamPerThread));
+        if (stableBf16) {
+            p.algo = algo;
+            p.valid = true;
+            return;
+        }
+        // First use only, before the caller's model capture. Timing individual
+        // launches also measures CPU submission gaps, which can reorder these
+        // few-microsecond GEMMs when TP workers tune concurrently. Submit the
+        // repetitions as one graph, then discard all temporary graph resources.
+        // Inputs/weights must not alias output; every GEMM uses beta = 0 and
+        // shares the existing eager workspace on the same stream.
+        SearchGraph trial;
+        CheckCuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        trial.capturing = true;
+#if CUDART_VERSION >= 11030
+        // Capture real event nodes so host submission gaps are outside the
+        // measured interval, even when cudaGraphLaunch itself is instrumented.
+        CheckCuda(cudaEventRecordWithFlags(search.begin, cudaStreamPerThread, cudaEventRecordExternal));
+#endif
         bool success = true;
         for (int repeat = 0; repeat < timingRepeats; ++repeat) {
             if (!Run(s, p, algo, weight, input, output, s.eager->data)) {
@@ -287,11 +368,42 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
                 break;
             }
         }
-        CheckCuda(cudaEventRecord(search.end, cudaStreamPerThread));
-        CheckCuda(cudaEventSynchronize(search.end));
-        float ms = 0.0f;
-        CheckCuda(cudaEventElapsedTime(&ms, search.begin, search.end));
-        if (success && ms < best) {
+#if CUDART_VERSION >= 11030
+        if (success)
+            CheckCuda(cudaEventRecordWithFlags(search.end, cudaStreamPerThread, cudaEventRecordExternal));
+#endif
+        cudaError_t captured = cudaStreamEndCapture(cudaStreamPerThread, &trial.graph);
+        trial.capturing = false;
+        if (!success && captured == cudaErrorStreamCaptureInvalidated) {
+            // An unsupported BLAS candidate may invalidate its capture. End it
+            // and clear only that expected error before trying another candidate.
+            cudaError_t pending = cudaGetLastError();
+            if (pending != cudaSuccess && pending != cudaErrorStreamCaptureInvalidated)
+                CheckCuda(pending);
+            continue;
+        }
+        CheckCuda(captured);
+        if (!success) continue;
+        CheckCuda(cudaGraphInstantiate(&trial.executable, trial.graph, nullptr, nullptr, 0));
+        // Exclude first-launch graph setup. Repeated samples reduce transient
+        // scheduling noise without adding any persistent device allocation.
+        CheckCuda(cudaGraphLaunch(trial.executable, cudaStreamPerThread));
+        CheckCuda(cudaStreamSynchronize(cudaStreamPerThread));
+        float ms = std::numeric_limits<float>::max();
+        for (int sample = 0; sample < timingSamples; ++sample) {
+#if CUDART_VERSION < 11030
+            CheckCuda(cudaEventRecord(search.begin, cudaStreamPerThread));
+#endif
+            CheckCuda(cudaGraphLaunch(trial.executable, cudaStreamPerThread));
+#if CUDART_VERSION < 11030
+            CheckCuda(cudaEventRecord(search.end, cudaStreamPerThread));
+#endif
+            CheckCuda(cudaStreamSynchronize(cudaStreamPerThread));
+            float elapsed = 0.0f;
+            CheckCuda(cudaEventElapsedTime(&elapsed, search.begin, search.end));
+            ms = std::min(ms, elapsed);
+        }
+        if (ms < best) {
             best = ms;
             p.algo = algo;
             p.valid = true;

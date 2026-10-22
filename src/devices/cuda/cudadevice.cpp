@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
@@ -12,6 +13,8 @@
 #include "devices/cuda/cudadevice.h"
 
 #include "fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-prefill.h"
 
 extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm::Data&,
     const fastllm::Data&, const fastllm::Data&, fastllm::Data&);
@@ -69,6 +72,8 @@ unsigned long long FastllmCudaRealMallocBytes();
 // FastllmEnv 读出来; 用尽或注册失败就退回中转路径.
 static std::atomic<long long> gMoePinHostBudgetBytes(-1);
 static std::atomic<long long> gMoePinHostPinnedBytes(0);
+
+#include "moe/fastllm-mimo-ep8-mega.inc"
 
 namespace fastllm {
     // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
@@ -5555,7 +5560,7 @@ namespace fastllm {
         const int width = indices.dims[1];
         const int sequence = query.dims[1];
         if (sequence > 1) {
-            if (!key.isPagedKVCache && !value.isPagedKVCache &&
+            if (!key.isPagedKVCache && !value.isPagedKVCache && !key.kvMemCache &&
                 FastllmCudaTryTritonQwen4SparseAttention(
                     query, key, value, indices,
                     intParams.find("group")->second,
@@ -7095,13 +7100,18 @@ namespace fastllm {
 
     void CudaDeepSeekV41SparseAttentionOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        if (!FastllmCudaDeepSeekV41SparseAttention(*(datas.find("q")->second), *(datas.find("chunkKV")->second),
-                                                   CudaV41Optional(datas, "ringKV"), CudaV41Optional(datas, "compressedKV"),
-                                                   CudaV41Optional(datas, "cmpIdx"), *(datas.find("attnSink")->second),
-                                                   CudaV41Int(intParams, "windowSize", 128),
-                                                   CudaV41Int(intParams, "startPos", 0),
-                                                   CudaV41Float(floatParams, "softmaxScale", 1.0f),
-                                                   *(datas.find("output")->second))) {
+        auto run = [&](auto attention) {
+            return attention(*datas.at("q"), *datas.at("chunkKV"),
+                             CudaV41Optional(datas, "ringKV"), CudaV41Optional(datas, "compressedKV"),
+                             CudaV41Optional(datas, "cmpIdx"), *datas.at("attnSink"),
+                             CudaV41Int(intParams, "windowSize", 128), CudaV41Int(intParams, "startPos", 0),
+                             CudaV41Float(floatParams, "softmaxScale", 1.0f), *datas.at("output"));
+        };
+        if (CudaV41Int(intParams, "hybrid", 0) && !CudaV41Int(intParams, "multiCudaDispatch", 0)) {
+            if (run(FastllmCudaDeepSeekV41HybridSparseAttention)) return;
+            AssertInFastLLM(!FastllmCudaGetThreadError(), "Hybrid sparse attention failed.\n");
+        }
+        if (!run(FastllmCudaDeepSeekV41SparseAttention)) {
             ErrorInFastLLM("DeepSeekV41SparseAttention CUDA error: kernel rejected input.\n");
         }
     }
@@ -9422,57 +9432,16 @@ namespace fastllm {
         bool hostResidentActive = HostMoeResidentCache::Instance().Plan(
             weights, batch > 1, expertTasks, weights, hostResidentSkipUpload, hostResidentKeep);
 
-        // The existing multi-row GLM kernels consume the same compact NUMA
-        // layout as decode. Borrow resident/admission records without changing
-        // the source weights shared by CPU and CUDA assist workers.
+        // Cache transport is shared across model families. Numerical semantics
+        // remain in the existing projection/activation/reduction code below.
+        // 别名权重由 prefillCache 持有, 上卡/释放都走它, 这里只留原始指针做对照.
         Data **sourceWeights = weights;
-        std::vector<Data *> cachedWeights;
-        std::vector<std::unique_ptr<Data>> cacheAliases;
 #ifndef USE_ROCM
-        FastllmCudaMoePrefillPlan admission;
-        FastllmCudaMoePrefillResidents resident;
-        if (setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
-            deepSeekV4Mode && activationQuantBlock == 128 &&
-            input.dataType == BFLOAT16 && output.dataType == BFLOAT16 &&
-            weights[2] && (weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED ||
-                           weights[2]->dataType == DATA_GGUF_FORMAT) &&
-            FastllmCudaGetMoePrefillResidents(weights, m, resident, cacheAdmission) &&
-            resident.nativeGlm) {
-            // Layer-partitioned models admit only on the root GPU. With
-            // expert ownership, every GPU admits its own experts instead.
-            if (cacheAdmission || resident.ownerCount > 1) FastllmCudaPlanMoePrefill(weights, m, indexData,
-                scoreData, batch, topk, experts, admission);
-            cachedWeights.assign(weights, weights + 2 * (m + 1));
-            for (int e : experts) {
-                if (e <= 0 || e > m || expertTasks[e].empty()) continue;
-                for (int part = 0; part < 2; ++part) {
-                    const int at = 2 * (e - 1) + part;
-                    const void *pointer = resident.weights[at];
-                    if (!pointer && at < int(admission.weights.size())) pointer = admission.weights[at];
-                    if (!pointer) continue;
-                    const Data &source = *weights[2 * e + part];
-                    auto alias = std::make_unique<Data>(source.dataType);
-                    alias->isFake = true;
-                    alias->dims = source.dims;
-                    alias->strides = source.strides;
-                    alias->ggmlType = source.ggmlType;
-                    alias->ggmlTensor = source.ggmlTensor;
-                    alias->isGGUFData = source.isGGUFData;
-                    alias->IsRepacked = source.IsRepacked;
-                    alias->disableGGUFRepack = source.disableGGUFRepack;
-                    alias->forceGGUFFp32Dequant = source.forceGGUFFp32Dequant;
-                    alias->expansionSize = source.Count(0);
-                    alias->UpdateUnitSize();
-                    alias->dataDevice = DataDevice::CUDA;
-                    alias->cudaData = const_cast<void *>(pointer);
-                    alias->cudaDataBorrowed = true;
-                    alias->dataDeviceIds = {curDeviceId};
-                    alias->blockK = source.blockK; alias->blockM = source.blockM;
-                    cachedWeights[2 * e + part] = alias.get();
-                    cacheAliases.push_back(std::move(alias));
-                }
-            }
-            weights = cachedWeights.data();
+        FastllmCudaMoePrefillCache prefillCache;
+        const bool cachedPrefill = setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
+            prefillCache.Begin(weights, m, indexData, scoreData, batch, topk, experts, cacheAdmission);
+        if (cachedPrefill) {
+            weights = prefillCache.Weights();
             // 别名权重指向共享缓存, 常驻记录不再对应它们, 本次调用不参与.
             hostResidentActive = false;
         }
@@ -9749,20 +9718,10 @@ namespace fastllm {
             }
             Data *weight = weights[slot];
 #ifndef USE_ROCM
-            // 别名权重指向共享的 GLM prefill 缓存, 源数据在固定内存的 NUMA 分片里,
-            // 只能按节点异步拷进去, 不能走 host->device 中转.
-            if (weight != sourceWeights[slot]) {
-                if (slot - 2 < int(admission.weights.size()) && admission.weights[slot - 2]) {
-                    const auto &source = *sourceWeights[slot];
-                    const size_t bytes = source.GetBytes() / source.numasData.size();
-                    for (size_t node = 0; node < source.numasData.size(); ++node) {
-                        auto *target = static_cast<uint8_t *>(weight->cudaData) + node * bytes;
-                        if (stream) FastllmCudaCopyFromPinnedHostToDeviceAsync(
-                            target, source.numasData[node], bytes, stream);
-                        else AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
-                            target, source.numasData[node], bytes), "GLM prefill cache upload failed.");
-                    }
-                }
+            // 别名权重指向共享的 prefill 缓存: 常驻记录直接借用, 未常驻的要按目标
+            // 布局在设备上还原; 两种情况都由 prefillCache 负责搬运.
+            if (cachedPrefill && weight != sourceWeights[slot]) {
+                prefillCache.Upload(slot, stream);
                 return;
             }
 #endif
@@ -9820,7 +9779,14 @@ namespace fastllm {
         // 延迟释放: 池里对 reusePending 的块用 cudaEventQuery 挡住复用, 复用要等
         // 该块记录过事件的计算流排空. 于是主机不必替回收显存等事件, 预取的 DMA
         // 也不用排在计算后面, 拷贝可以一直往中转环里灌.
-        auto doReleaseWeight = [pinnedUpload](Data *weight) {
+        auto doReleaseWeight = [&](int slot) {
+            Data *weight = weights[slot];
+#ifndef USE_ROCM
+            if (cachedPrefill && weight != sourceWeights[slot]) {
+                prefillCache.Release(slot);
+                return;
+            }
+#endif
             if (!(weight->cpuData || !weight->numasData.empty())) {
                 return;
             }
@@ -9834,13 +9800,13 @@ namespace fastllm {
             }
             weight->FreeCudaTemporary({}, false);
         };
-        auto releaseWeight = [&](Data *weight) {
+        auto releaseWeight = [&](int slot) {
             if (!profileMoeStream) {
-                doReleaseWeight(weight);
+                doReleaseWeight(slot);
                 return;
             }
             double start = profileNow();
-            doReleaseWeight(weight);
+            doReleaseWeight(slot);
             profileRelease += profileNow() - start;
         };
         // 常驻专家跳过释放: 显存副本(含量化元数据)留给下一 token 复用.
@@ -9849,8 +9815,8 @@ namespace fastllm {
                 hostResidentKeep[expert]) {
                 return;
             }
-            releaseWeight(weights[expert * 2]);
-            releaseWeight(weights[expert * 2 + 1]);
+            releaseWeight(expert * 2);
+            releaseWeight(expert * 2 + 1);
         };
         void *copyStream = FastllmCudaStreamCreate(true);
         void *computeDoneEvent = FastllmCudaEventCreate();
@@ -9864,14 +9830,6 @@ namespace fastllm {
         const bool eventOrderedPrefetch = pinnedUpload || asyncPrefetch;
         bool prefetchPending = false;
         int curExpert = findNextValidExpert(-1);
-
-#ifndef USE_ROCM
-        // GGUF cache admission belongs to the packed host-prefill backend.
-        // Its generic fallback does not have the native NUMA byte layout.
-        if (setZero && isCrossSwiglu && !deepSeekV4Mode && gateType == MoeGateSwiglu &&
-            weights[2]->dataType != DATA_GGUF_FORMAT && !weights[2]->isGGUFData)
-            FastllmCudaPlanMoePrefill(weights, m, indexData, scoreData, batch, topk, experts, admission);
-#endif
 
         if (curExpert >= 0) {
             uploadWeight(curExpert * 2);
@@ -10042,8 +10000,7 @@ namespace fastllm {
                 profileCompute += profileNow() - computeStart;
             }
 #ifndef USE_ROCM
-            if (!resident.nativeGlm)
-                FastllmCudaStoreMoePrefillExpert(admission, i - 1, *weights[i * 2], *weights[i * 2 + 1]);
+            if (cachedPrefill) prefillCache.Store(i - 1);
 #endif
             const double evComputeStart = profileMoeStream ? profileNow() : 0.0;
             FastllmCudaEventRecord(computeDoneEvent);
@@ -10117,10 +10074,7 @@ namespace fastllm {
             }
         }
 #ifndef USE_ROCM
-        FastllmCudaPublishMoePrefill(admission);
-        // DoCudaMergeMOEFromCPU also serves short-lived prefill workers. Their
-        // per-thread stream must publish residency before the worker exits.
-        if (!admission.keys.empty()) FastllmCudaSyncCurrentThreadStream();
+        if (cachedPrefill) prefillCache.Finish();
 #endif
         if (accurateFp8Moe || deepSeekV41Mode) {
             FastllmFloatToBF16(
@@ -11055,8 +11009,134 @@ namespace fastllm {
         return ok;
     }
 
+#ifndef USE_ROCM
+    static bool TryCudaMergeMOEV41Mxfp4Marlin(
+            const Data &input, Data &output, const Data &index, const Data &score,
+            Data &activation, Data **weights, int weightsBatch,
+            float sharedScale, float swigluLimit) {
+        if (input.dataType != DataType::BFLOAT16 ||
+            input.dataDevice != DataDevice::CUDA || input.dims.size() != 2 ||
+            input.dims[0] <= 0 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            index.dims.size() != 2 || index.dims[0] != input.dims[0] ||
+            score.dims != index.dims || index.dims[1] <= 0 || index.dims[1] > 16 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
+            weights[2] == nullptr || weights[2]->dataType != DataType::NVFP4 ||
+            !weights[2]->isModelWeight || !weights[2]->directMemory ||
+            (weights[0] != nullptr && sharedScale != 0.0f)) {
+            return false;
+        }
+        // A PP stage owns every expert in this layer. The existing EP kernel
+        // supports exactly this topology with one owner, without collectives.
+        // deepSeekV41=true preserves W4A8 rounding, clamping, pre-down routing
+        // weights and the FP32 expert sum.
+        const bool ok = FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
+            input, activation, output, weights, weightsBatch,
+            (const int32_t *)index.cudaData, (const float *)score.cudaData,
+            index.dims[1], 0, 1, true, swigluLimit);
+        if (!ok && weights[2]->cudaData == nullptr) {
+            // Repacking transfers ownership to the Marlin cache. Never run
+            // a source-layout fallback after that transfer.
+            FastllmCudaSetThreadError();
+            throw std::runtime_error(
+                "V4.1 MXFP4 Marlin failed after releasing compact expert weights.");
+        }
+        return ok;
+    }
+#endif
+
+    // Architecture-independent V4.1 fallback. Only route metadata is staged
+    // on the host; the original weights and all arithmetic stay on CUDA.
+    // This eager path deliberately does not claim CUDA Graph compatibility.
+    void DoCudaMergeMOEV41Fallback(Data &input, Data &output,
+            Data &index, Data &score, Data **weights, int weightsBatch,
+            float sharedScale, float swigluLimit) {
+        AssertInFastLLM(input.dataType == DataType::BFLOAT16 &&
+            input.dims.size() == 2 && index.dataType == DataType::INT32 &&
+            score.dataType == DataType::FLOAT32 && weightsBatch > 0,
+            "V4.1 CUDA MoE fallback requires BF16 input and typed routes.");
+        cudaMergeMOEUsedGraphUnsafeFallback = true;
+        int device = FastllmCudaGetDevice();
+        int rows = input.dims[0], hidden = input.dims[1], topk = index.dims.back();
+        std::vector<int32_t> ids(rows * topk);
+        std::vector<float> scores(rows * topk);
+        if (index.dataDevice == DataDevice::CUDA)
+            FastllmCudaCopyFromDeviceToHost(ids.data(), index.cudaData, ids.size() * sizeof(int32_t));
+        else std::memcpy(ids.data(), index.cpuData, ids.size() * sizeof(int32_t));
+        if (score.dataDevice == DataDevice::CUDA)
+            FastllmCudaCopyFromDeviceToHost(scores.data(), score.cudaData, scores.size() * sizeof(float));
+        else std::memcpy(scores.data(), score.cpuData, scores.size() * sizeof(float));
+        output.dataType = DataType::FLOAT32;
+        output.UpdateUnitSize();
+        output.Resize(input.dims);
+        output.ToDevice(DataDevice::CUDA, {device}, false);
+        output.Allocate(false);
+        FastllmCudaMemset0(output.cudaData, output.GetBytes());
+        Data gathered, middle, activation, expertOut, floatOut;
+        for (Data *tensor : {&gathered, &middle, &activation, &expertOut, &floatOut}) {
+            tensor->dataDevice = DataDevice::CUDA;
+            tensor->dataDeviceIds = {device};
+        }
+        for (int slot = 0; slot + 1 < weightsBatch; slot += 2) {
+            if (weights[slot] == nullptr || weights[slot + 1] == nullptr) continue;
+            AssertInFastLLM(weights[slot]->cudaData && weights[slot + 1]->cudaData,
+                "V4.1 MoE cannot fall back after discarding source weights. A packed kernel failed.");
+            std::vector<int32_t> selected;
+            std::vector<float> selectedScores;
+            for (int row = 0; row < rows; ++row) {
+                if (slot == 0) {
+                    if (sharedScale != 0.0f) {
+                        selected.push_back(row);
+                        selectedScores.push_back(sharedScale);
+                    }
+                } else for (int j = 0; j < topk; ++j) {
+                    if (ids[row * topk + j] == slot / 2 - 1) {
+                        selected.push_back(row);
+                        selectedScores.push_back(scores[row * topk + j]);
+                    }
+                }
+            }
+            int count = (int)selected.size();
+            if (count == 0) continue;
+            Data rowIds(DataType::INT32, {count});
+            rowIds.Allocate();
+            std::memcpy(rowIds.cpuData, selected.data(), count * sizeof(int32_t));
+            rowIds.ToDevice(DataDevice::CUDA, {device}, true);
+            Data routeScales(DataType::FLOAT32, {count}, selectedScores);
+            routeScales.ToDevice(DataDevice::CUDA, {device}, true);
+            Data unitScales(DataType::FLOAT32, {count}, std::vector<float>(count, 1.0f));
+            unitScales.ToDevice(DataDevice::CUDA, {device}, true);
+            gathered.dataType = DataType::BFLOAT16;
+            gathered.Resize({count, hidden});
+            gathered.ToDevice(DataDevice::CUDA, {device}, false);
+            gathered.Allocate(false);
+            FastllmCudaPickInput((uint8_t *)input.cudaData, (uint8_t *)gathered.cudaData,
+                count, hidden * sizeof(uint16_t), (int *)rowIds.cudaData);
+            AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(gathered, gathered),
+                "V4.1 CUDA MoE input quantization failed.");
+            DoCudaLinearReshape(gathered, *weights[slot], middle);
+            DoCudaLinear(gathered, *weights[slot], *GetEmptyData(), middle);
+            AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwigluQuantized(
+                middle, swigluLimit, activation, (const float *)routeScales.cudaData),
+                "V4.1 CUDA MoE gated activation failed.");
+            DoCudaLinearReshape(activation, *weights[slot + 1], expertOut);
+            DoCudaLinear(activation, *weights[slot + 1], *GetEmptyData(), expertOut);
+            floatOut.dataType = DataType::FLOAT32;
+            floatOut.Resize(expertOut.dims);
+            floatOut.ToDevice(DataDevice::CUDA, {device}, false);
+            floatOut.Allocate(false);
+            FastllmBF16ToFloat(expertOut.cudaData, floatOut.cudaData, expertOut.Count(0));
+            FastllmCudaPickOutputFloat((float *)floatOut.cudaData, (float *)output.cudaData,
+                count, hidden, (int *)rowIds.cudaData, (float *)unitScales.cudaData);
+            // The per-expert route buffers are released before the next group.
+            FastllmCudaSyncDevice(device);
+        }
+    }
+
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-                        Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch, float swigluLimit) {
+                        Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch, float swigluLimit, bool deepSeekV41) {
         int curDeviceId = FastllmCudaGetDevice();
         auto clearIfOnOtherDevice = [curDeviceId](Data &data) {
             if (data.cudaData == nullptr) {
@@ -11074,6 +11154,19 @@ namespace fastllm {
         clearIfOnOtherDevice(w2);
         clearIfOnOtherDevice(w3);
         clearIfOnOtherDevice(output);
+        if (deepSeekV41) {
+            AssertInFastLLM(gateType == MoeGateSwiglu, "V4.1 MoE requires SwiGLU.");
+#ifndef USE_ROCM
+            if (TryCudaMergeMOEV41Mxfp4Marlin(input, output, index, score, w1,
+                    weights, weightsBatch, sharedScale, swigluLimit)) return;
+            // Unsupported formats/batches retain the reference fallback.
+            if (FastllmCudaMergeMOEV41GGUFResident(input, w1, w2, w3, output,
+                    weights, weightsBatch, index, score, sharedScale, swigluLimit)) return;
+#endif
+            DoCudaMergeMOEV41Fallback(input, output, index, score, weights,
+                weightsBatch, sharedScale, swigluLimit);
+            return;
+        }
         {
             int batch = input.dims[0];
 
@@ -11368,8 +11461,11 @@ namespace fastllm {
         const float swigluLimit = floatParams.count("swigluLimit") ? floatParams.at("swigluLimit") : 0.0f;
         AssertInFastLLM(std::isfinite(swigluLimit) && swigluLimit >= 0.0f,
                        "CUDA MoE swigluLimit must be finite and non-negative.");
+        const bool deepSeekV41 = intParams.count("deepSeekV4Mode") &&
+            intParams.at("deepSeekV4Mode") && intParams.count("activationQuantBlock") &&
+            intParams.at("activationQuantBlock") == 32;
         DoCudaMergeMOE (
-            input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch, swigluLimit
+            input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch, swigluLimit, deepSeekV41
         );
     }
 
@@ -11910,17 +12006,7 @@ namespace fastllm {
         }
 
         std::vector<int> previewNewPages;
-        previewNewPages.reserve(newPageCount);
-        if (newPageCount > 0) {
-            std::lock_guard<std::mutex> guard(manager.pageIndexLocker);
-            for (int i = 0; i < newPageCount && i < (int)manager.freePages.size(); i++) {
-                previewNewPages.push_back(manager.freePages[(int)manager.freePages.size() - 1 - i]);
-            }
-            int trieOffset = newPageCount - (int)previewNewPages.size();
-            for (int i = 0; i < trieOffset && i < (int)manager.triePages.size(); i++) {
-                previewNewPages.push_back(manager.triePages[(int)manager.triePages.size() - 1 - i]);
-            }
-        }
+        manager.PreviewUnusedPageIndices(newPageCount, previewNewPages);
         AssertInFastLLM((int)previewNewPages.size() >= newPageCount,
                         "CudaGenerateAppendPagedCacheBatchParamsOp: no enough pages for batch append.\n");
 

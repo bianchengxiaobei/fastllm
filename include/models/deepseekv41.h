@@ -42,6 +42,9 @@
 #include <vector>
 
 namespace fastllm {
+    // Per image: absolute start, ViT height/width, span length, SHA-256 (8 words)
+    // of the normalized FLOAT32 patches, computed by the native Python adapter.
+    using DeepSeekV41ImageCacheKeys = std::vector<std::vector<int>>;
     struct DeepSeekV41DecodeWorkspace;
     // 单层的推理缓存
     struct DeepSeekV41LayerCache {
@@ -132,6 +135,7 @@ namespace fastllm {
     // 前缀缓存的一条记录：某段 token 序列处理完后的完整请求状态（张量放在 CPU）
     struct DeepSeekV41HistoryMemory {
         std::vector<int> tokens;          // 已经进入模型的 token（长度 == totalLen）
+        DeepSeekV41ImageCacheKeys imageKeys;
         int totalLen = 0;
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;
@@ -144,13 +148,14 @@ namespace fastllm {
         int maxRecordNum = 8;
         long long flushTime = 0;
         // Data 没有深拷贝赋值，记录一律通过 shared_ptr 持有，避免隐式拷贝造成别名
-        std::map<std::vector<int>, std::shared_ptr<DeepSeekV41HistoryMemory> > memorys;
+        std::map<std::pair<std::vector<int>, DeepSeekV41ImageCacheKeys>,
+                 std::shared_ptr<DeepSeekV41HistoryMemory>> memorys;
 
         void Record(const std::shared_ptr<DeepSeekV41HistoryMemory> &memory);
         // 按公共前缀长度从长到短列出候选（相同长度时记录更短的在前，更容易满足截断约束）；
         // 可截断性由模型侧检查
         std::vector<std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> > GetCandidates(
-                const std::vector<int> &inputTokens);
+                const std::vector<int> &inputTokens, const DeepSeekV41ImageCacheKeys &imageKeys = {});
     };
 
     // 一次前向中的一个序列片段：属于哪个请求、从哪个位置开始、多少个 token、在拼接输入中的偏移
@@ -161,6 +166,8 @@ namespace fastllm {
         int offset = 0;
         // 非空时本片段处于 DSpark 校验 / 采集模式（见 DeepSeekV41SpecScratch）
         DeepSeekV41SpecScratch *spec = nullptr;
+        // Internal chunked-prefill step: update KV sources, defer the decoder tail/head.
+        bool prefillCacheOnly = false;
     };
 
     // Engram 哈希元数据（由 tokenizer 归一化派生，Python 侧生成 JSON，此处加载）
@@ -190,6 +197,12 @@ namespace fastllm {
                 GetTensorMap(const std::vector<std::string> &tensorNames) override;
 
         void OnModelWeightsLoaded() override;
+
+        // Reuse prefill scratch through decode. The existing pool bounds idle
+        // storage per device and reclaims it on allocation pressure.
+        bool RetainCudaWorkspace() const override {
+            return executionMode == ExecutionMode::Gpu;
+        }
 
         // V4.1 的 mtp.* 由本类自行解析（结构与 DeepSeek-V4 Flash 的内置 DSpark 不同）
         bool UsesEmbeddedV4Dspark() const override { return false; }
@@ -239,12 +252,24 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr) override;
 
+        bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) override;
+
         void WarmUp() override;
+        void OnAutoWarmupFinished() override;
 
         // 每个 token 的长期 KV 缓存字节数（压缩 KV + indexer key），随 kvCacheDataType 变化
         long long KVCacheBytesPerToken() const;
 
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) override;
+        bool TryRestoreMultimodalHistoryCache(ResponseContext *context) override;
+        bool ReadImageCacheKeys(const std::map<std::string, std::vector<Data*>> &input,
+                                DeepSeekV41ImageCacheKeys &keys) const;
+        bool TryRestoreHistoryCacheImpl(std::vector<int> &inputTokens, int &cacheLen,
+                                        const DeepSeekV41ImageCacheKeys &imageKeys);
         void TryRecordHistoryCache(const std::vector<int> &allTokens) override;
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
@@ -260,14 +285,14 @@ namespace fastllm {
         void InitExecutionMode();
         void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen);
         bool RunGpuMoe(DeepSeekV41MoeContext &);
-        bool RunHybridMoe(DeepSeekV41MoeContext &);
+        bool RunHybridMoe(DeepSeekV41MoeContext &, HybridMoeDecodeStep *);
         bool moeExpertCacheAttempted = false;
         // Source FP8/FP4 linears still require block-32 FP8 activations after
         // their weights have been decoded into the requested storage dtype.
         std::set<std::string> quantizedLinearNames;
         void LinearWithActivationQuant(Data &input, const std::string &weightName,
                                        Data &output, bool replicated = false, Data *scratch = nullptr,
-                                       bool inputQuantized = false);
+                                       bool inputQuantized = false, Data *reductionScratch = nullptr);
 
         // -------- 跨层共享 --------
         std::vector<int> kv_source_layer_ids;
@@ -339,6 +364,7 @@ namespace fastllm {
         // 捕获和回放共用互斥量，抢不到锁的前向退回逐算子。
         std::mutex v41CudaGraphMutex;
         std::map<int, std::shared_ptr<void>> v41CudaGraphSlots;
+        bool v41CudaGraphWarmingUp = false;
         // One bounded eager verifier workspace, protected by v41CudaGraphMutex.
         // No graph captures these buffers, so candidate counts can share them.
         std::shared_ptr<DeepSeekV41DecodeWorkspace> v41TpVerifyWorkspace;
@@ -372,10 +398,21 @@ namespace fastllm {
         // RoPE、压缩、indexer、稀疏注意力按片段分别执行。
         // inputEmbeds 非空时直接作为嵌入（[1, tokens, dim]，供视觉输入使用）；
         // imageMask 非空时标记每个 token 是否为图像 token（Engram 历史置 -1，路由改用 gate.bias_vl）。
+        struct HybridPrefillStage;
+        void PrepareForwardWeights();
+        void PrepareHybridPrefill();
+        bool TryForwardHybridChunkedPrefill(const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+            std::vector<float> *logits, int &outputToken);
         struct ForwardWorkspace;
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
         void PrepareForwardInputs(ForwardWorkspace &);
+#ifdef USE_CUDA
+        bool TryFullDecodeGraph(ForwardWorkspace &);
+        void BuildFullDecodeGraph(int batch, const std::vector<std::shared_ptr<DeepSeekV41RequestState>> &states);
+#endif
         void BeginForwardLayer(ForwardWorkspace &, int layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);
         void RunForwardSharedExpert(ForwardWorkspace &, int layer);
@@ -439,7 +476,7 @@ namespace fastllm {
                 const LastTokensManager &lastTokens,
                 std::vector <std::vector <float>*> *logits,
                 const Data *inputEmbeds,
-                const std::vector<int> *imageMask);
+                const std::vector<int> *imageMask, bool prefillCacheOnly = false);
 
         // -------- DSpark 投机解码（src/models/deepseekv41_dspark.cpp）--------
         bool v41DsparkEnabled = false;
@@ -462,6 +499,7 @@ namespace fastllm {
 
         void InitDsparkParams();
         void ApplyDsparkDevice();
+        void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
         void DsparkProjectHead(Data &input, Data &output);
         bool DsparkTensorNeeded(const std::string &name) const;
         // 支持贪心 / CUDA 采样及逐位置工具名、参数名约束

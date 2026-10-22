@@ -1,5 +1,10 @@
 #pragma once
 #include "fastllm.h"
+#include "devices/cuda/naive-n05-dsa.h"
+
+inline bool FastllmNaiveKVType(fastllm::DataType type) {
+    return type == fastllm::BFLOAT16 || type == fastllm::FP8_E4M3;
+}
 
 // Match the full-vocabulary CUDA Top1's 256-lane reduction order on ties.
 // Global IDs are essential: shards need not start at a multiple of 256.
@@ -40,8 +45,10 @@ void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
     int count, bool greedy, float invTemperature,
     fastllm::Data &partial, fastllm::Data &output);
 
-// Model-specific CUDA operations use BF16 activations. Keys/values are packed
-// as [1, tokens, heads * dim (+ indexDim for DSA keys)].
+// Model-specific CUDA operations use BF16 activations and BF16 or unscaled
+// E4M3 KV storage. Keys/values are packed
+// as [1, tokens, heads * dim (+ Indexer tail for DSA keys)].
+// kvCacheFp8Indexer marks a trailing 144-byte scaled E4M3 Indexer block.
 // Per-layer raw projections [1, rows, 2 * heads * dim] and norm weights [dim].
 // Returns false on unsupported layouts without changing cache contents/metadata.
 // No cross-layer weight copies are needed.
@@ -72,6 +79,17 @@ void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &out
 
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
+// Append transformed BF16 rows into allocated BF16/FP8 dense or paged storage.
+void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &output);
+void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start);
+// Read logical cache slices into an existing BF16 staging allocation. Used by
+// history recording; no full-cache dequantization is needed for attention.
+struct FastllmNaiveKVRead {
+    const fastllm::Data *source;
+    void *target;
+    int first, rows;
+};
+void FastllmCudaNaiveReadCache(const std::vector<FastllmNaiveKVRead> &slices);
 // Q/K RoPE and V scaling, preserving eager BF16 rounding. With packedQkv,
 // read [Q, K, V] within each row and write contiguous Q/K/V outputs; otherwise
 // operate in place. Q/K and V may have different head dimensions.
@@ -89,7 +107,32 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
     int rotaryDim, float theta, float valueScale, int window,
-    const fastllm::Data *packedQkv = nullptr);
+    const fastllm::Data *packedQkv = nullptr, bool ring = false);
+// One decode token per independent cache. Descriptors are captured as kernel
+// arguments; optional device indirection updates KV bindings without recapture.
+struct FastllmNaiveRopeCacheRow {
+    fastllm::Data *key, *value;
+    const fastllm::Data *indexKey;
+    const void *const *cache = nullptr;
+};
+bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &positions,
+    const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
+    int heads, int kvHeads, int dim, int valueDim, int rotaryDim, float theta,
+    float valueScale, int window, const fastllm::Data *packedQkv = nullptr, bool ring = false);
+// Hopper TP8 BF16 projection + RoPE + cache append. Unsupported layouts return
+// false without touching outputs, allowing Linear + BatchRopeAppendCache fallback.
+bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
+    const fastllm::Data &weight, const fastllm::Data &bias,
+    fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+    const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
+    const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+    int rotaryDim, float theta, float valueScale, int window, bool ring,
+    fastllm::Data &scratch);
+// Convert the retained suffix between chronological and 128-slot ring layout.
+// Uses shared memory only, preserves allocations and host dimensions.
+void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,
+    int past, bool toRing);
 // Keep the allocation and logical row order when retaining a sliding suffix.
 void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep);
 // Exact descending score / ascending position order for each query row.
@@ -100,12 +143,25 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
 // BF16 storage, with a separate FP32 scale. roundScale selects UE8M0 scales.
 bool FastllmCudaNaiveQuantizeIndexer(const fastllm::Data &input,
     fastllm::Data &values, fastllm::Data &scales, bool roundScale);
-// Only Q is optionally E4M3-rounded; Indexer K always retains its BF16 input.
+// In-place BF16 Indexer K LayerNorm, preserving the FP32 reference reduction,
+// affine arithmetic and final BF16 rounding without conversion buffers.
+bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
+    const fastllm::Data &weight, const fastllm::Data &bias);
+// Q uses blockwise E4M3 quantization when requested. K uses the main KV
+// storage type by default, or its independent scaled E4M3 tail when marked.
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
                             int heads, int dim, int queryStart, int topK,
                             bool fp8Query, fastllm::Data &indices);
+// Restore front/back-paired query shards after AllGather, in the same allocation.
+void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks);
+// Consume front/back-paired Indexer rows directly. False leaves all inputs
+// untouched so callers can restore rows and use the ordinary attention path.
+bool FastllmCudaNaiveBalancedAttention(const fastllm::Data &query,
+    const fastllm::Data &key, const fastllm::Data &value,
+    const fastllm::Data &indices, const fastllm::Data &sink,
+    int heads, int kvHeads, int pastLength, int ranks, fastllm::Data &output);
 void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               const fastllm::Data &key,
                               const fastllm::Data &value,
@@ -133,6 +189,26 @@ struct FastllmNaiveDecodeScratch {
     fastllm::Data indexQuery, indexScale, indexScores, topk;
     fastllm::Data attentionScores, attentionPartial, windowKey, windowValue;
 };
+// One query per independent sequence, up to 2048 selected keys. KV stays in
+// place, and descriptors are kernel arguments. Graph replay reads device lengths
+// and optional KV/TMA tables. Preserve BF16 score/probability rounding. Large
+// batches use Tensor Cores with FP32 accumulation; unsupported shapes retain
+// the existing CUDA kernels.
+void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
+    const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
+    int heads, int kvHeads, int dim, int valueDim,
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+// Independent 128-token SWA rings (QK=192, V=128). Cache descriptors are
+// kernel arguments; liveKeys contains one absolute length per sequence.
+struct FastllmNaiveSWARow {
+    const void *key, *value;
+    const void *const *cache = nullptr;
+    bool fp8 = false;
+};
+void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
+    const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
+    const fastllm::Data &liveKeys, int heads, int kvHeads,
+    fastllm::Data &output);
 bool FastllmCudaNaiveDecodeGraphSupported();
 // BF16 rows; update each residual and preserve RMSNorm rounding.
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
@@ -141,19 +217,39 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
 
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &newKey, const fastllm::Data &newValue,
-    const fastllm::Data &liveKeys, int window);
+    const fastllm::Data &liveKeys, int window, bool ring = false);
 void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &liveKeys, int window);
 void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &packedKeys,
     const fastllm::Data &liveKeys, int capacity, bool fp8Query,
-    FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices);
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices,
+    const void *const *cache = nullptr);
+struct FastllmNaiveIndexerRow {
+    const fastllm::Data *key;
+    FastllmNaiveDecodeScratch *scratch;
+    fastllm::Data *indices;
+    int sequence, capacity;
+    const void *const *cache = nullptr;
+};
+// Independent sequences share launches and reuse their existing scratch.
+// Returning false leaves the caller free to use the single-sequence path.
+bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
+    const fastllm::Data &weights, const fastllm::Data &liveKeys,
+    const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
+    int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr);
+// Collective dispatch must agree across the entire TP group, including mixed GPUs.
+bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices);
+// Merge rank-major (score bits, logical position) pairs after an all-gather.
+void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
+    const std::vector<FastllmNaiveIndexerRow> &rows, const fastllm::Data &exchange,
+    int contextRanks);
 void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
     const fastllm::Data &key, const fastllm::Data &value,
     const fastllm::Data &indices, const fastllm::Data &sink,
     const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
     int dim, int valueDim, int window,
-    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool ring = false);
 
 // Fixed-shape verification graphs keep one live prefix length per query.
 void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
@@ -203,13 +299,10 @@ bool FastllmCudaNaiveExpertPrefill(int device, const uint16_t *input,
     const float *siluLookup, float *perRouteOutput);
 void FastllmCudaNaiveClearExpertPrefill();
 
-// Single-row BF16 input, FP32 4096-column router, including sigmoid.
-// Returns false without changing output when the layout is unsupported.
+// BF16 input, FP32 4096-column router, including sigmoid. Small batches
+// share weights and retain exact single-row arithmetic when requested by the
+// linear precision policy. Unsupported layouts return false without mutation.
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
-    const fastllm::Data &weight, fastllm::Data &output);
-
-// Small multi-row FP32 router with BF16 inputs, preserving exact GEMV arithmetic.
-bool FastllmCudaNaiveRouterVerify(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
 
 // Independent draft subgroup; never replaces the target TP communicators.

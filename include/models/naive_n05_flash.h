@@ -3,12 +3,16 @@
 
 #include "basellm.h"
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <deque>
 #include <random>
 #include "utils/persistent_worker_group.h"
 
+struct FastllmCudaMimoEp8Mega;
+
 namespace fastllm {
+    class CudaWorkspace;
     class NaiveN05FlashModel : public basellm {
     protected:
         struct TargetCapture;
@@ -18,6 +22,7 @@ namespace fastllm {
         NaiveN05FlashModel();
         ~NaiveN05FlashModel() override;
         void InitParams() override;
+        void SetIndexerDataType(DataType dataType) override;
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &names) override;
         int Forward(const Data &inputIds, const Data &attentionMask,
@@ -39,11 +44,18 @@ namespace fastllm {
                               TargetCapture *capture = nullptr, float *candidateResult = nullptr,
                               const LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         bool NeedAttentionMask(int, int) override { return false; }
+        bool SupportsPrefillBatching() const override;
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
-        // The history archive also retains keys discarded by sliding attention.
+        // Prefix reuse requires both resident full-attention pages and a GPU SWA checkpoint.
         bool UseGenericHistoryCache() const override { return false; }
         bool TryRestoreHistoryCache(std::vector<int> &tokens, int &cacheLen) override;
+        bool DeferHistoryCacheRestore() const override { return !tpPagedCaches.empty(); }
+        PagedCacheManager *GetPagedKVCacheManager(int layer, bool key) const override;
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(int layer, bool key) const override;
+        bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
+        int QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const override;
+        bool RestorePagedPrefixCacheExtra(ResponseContext *context, int length) const override;
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
         void OnResponseContextRemoved(ResponseContext *context) override;
@@ -51,6 +63,11 @@ namespace fastllm {
         void AddPromptCache(const std::vector<int> &tokens) override;
         int GetKVCacheRetainedTokens(int layer) const override;
         void WarmUp() override;
+        int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
+            AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
+                           "MiMo EP8 expert loading must use the same ordered eight devices as TP.");
+            return tpDevices.at(expert / 32);
+        }
         std::string MakeInput(const std::string &history, int,
                               const std::string &input) override { return history + input; }
         std::string MakeHistory(const std::string &history, int,
@@ -72,37 +89,58 @@ namespace fastllm {
             Data &Key(int sequence, int layer) const { return *kv[sequence * layers + layer].first; }
             Data &Value(int sequence, int layer) const { return *kv[sequence * layers + layer].second; }
         };
-        struct HistoryChunk {
-            int length = 0;
-            size_t bytes = 0;
-            std::vector<std::pair<Data, Data>> layers;
-            Data draftHidden;
+        // Only window payloads live here; full DSA/indexer KV stays in the page pool.
+        struct PrefixPool {
+            std::mutex mutex;
+            std::vector<int> freeSlots;
+            std::vector<Data> storage;
+            std::vector<size_t> offsets;
+            size_t slotBytes = 0;
         };
-        std::shared_ptr<HistoryChunk> BeginHistoryChunk(
-            const std::vector<std::pair<Data, Data>> &kv, int past, int length);
-        std::shared_ptr<HistoryChunk> BeginHistoryChunk(const Data &key, int past, int length);
-        void FinishHistoryChunk(const Data &key, const std::shared_ptr<HistoryChunk> &chunk);
-        void CopyTensorParallelHistory(const Data &source, Data &target, int length,
-                                       int layer, int rank, bool value);
-        void RestoreTensorParallelHistoryRank(Data &cache, int layer, bool value, int capacity, int rank);
-        static void CopyHistoryTensor(const Data &source, Data &target, int length);
-        void FinishHistoryChunk(const std::vector<std::pair<Data, Data>> &kv,
-                                const std::shared_ptr<HistoryChunk> &chunk);
+        struct PrefixSnapshot {
+            std::shared_ptr<PrefixPool> pool;
+            int slot = -1, length = 0;
+            std::vector<int> tokens;
+            // Observe the resident full-prefix endpoint without pinning KV.
+            // Generation checks prevent a recycled physical page from reviving
+            // a stale window checkpoint.
+            PagedCacheManager *fullPool = nullptr;
+            int fullPage = -1;
+            long long fullGeneration = 0;
+            bool HasResidentPrefix() const {
+                return fullPool && fullPool->IsCachedPage(fullPage, fullGeneration);
+            }
+            ~PrefixSnapshot() {
+                if (pool && slot >= 0) {
+                    std::lock_guard<std::mutex> lock(pool->mutex);
+                    pool->freeSlots.push_back(slot);
+                }
+            }
+        };
+        using PrefixSnapshots = std::vector<std::shared_ptr<PrefixSnapshot>>;
+        void RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &snapshot);
+        PrefixSnapshots BeginPrefixSnapshots(const Data &key, int past, int length);
+        void FinishPrefixSnapshots(const Data &key, const PrefixSnapshots &snapshots, bool prefill);
+        void CopyPrefixWindow(const PrefixSnapshot &snapshot, int rank, int layer,
+                              const Data &key, const Data &value, int first, bool ring);
 
         struct LogitsSelection {
             int count = 0;
             bool greedy = false;
+            bool cudaSampling = false;
             float invTemperature = 1.0f;
             Data candidates; // CPU [rows, count * 2], (global token ID, score).
+            std::vector<int> sampledTokens;
         };
         LogitsSelection SelectLogits(const GenerationConfig &config, bool speculative = false) const;
+        std::vector<int> SampleCudaLogits(Data &logits,
+                                        const std::vector<GenerationConfig> &configs);
         struct TargetCapture {
             LogitsSelection *selection = nullptr;
             bool verifying = false;
             bool collectHidden = true;
             std::map<int, Data> hidden;
-            std::shared_ptr<HistoryChunk> history;
-            std::vector<std::shared_ptr<HistoryChunk>> batchHistory;
+            std::vector<PrefixSnapshots> prefixes;
         };
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
@@ -111,7 +149,6 @@ namespace fastllm {
             int committed = 0;
             std::vector<std::pair<Data, Data>> kv;
             std::shared_ptr<DraftWorkspace> workspace;
-            Data restoredHidden;
             std::deque<std::pair<int, int>> pending;
             std::mt19937_64 random{std::random_device{}()};
             uint64_t rounds = 0, proposed = 0, accepted = 0;
@@ -123,7 +160,9 @@ namespace fastllm {
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,
                        TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
-        static void AppendCache(Data &cache, Data &input, int reserveCapacity = 0);
+        void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0);
+        void ReserveCache(Data &cache, int capacity, int width);
+        void PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -170,23 +209,45 @@ namespace fastllm {
         void RecycleTensorParallelCache(ResponseContext *context);
         bool InitTensorParallel();
         void PrepareTensorParallel();
+        void InitTensorParallelKVPool();
+        void PrepareSwaPrefillWorkspace(int rank, int length);
         struct TPDecodeState;
         std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState;
+        struct TPServingState;
+        std::shared_ptr<TPServingState> tpServingState;
+        std::atomic<uint64_t> tpCacheEpoch{0};
+        bool CanReuseTensorParallelServingCache(const TargetBatch *batch) const;
+        void PrepareTensorParallelServing();
+        bool PrepareTensorParallelServingDecode(const Data &inputIds,
+            const LogitsSelection &selection, std::vector<int *> &cacheLengths,
+            const TargetBatch *batch, bool collectHidden);
         bool HasVerificationGraph() const;
         bool PrepareTensorParallelDecode(const Data &inputIds,
                                         std::vector<std::pair<Data, Data>> &kv, bool verifying,
-                                        const LogitsSelection &selection, const TargetBatch *batch = nullptr,
+                                        const LogitsSelection &selection, std::vector<int *> &cacheLengths,
+                                        const TargetBatch *batch = nullptr,
                                         bool collectHidden = false);
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,
                                         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
-                                        float *candidateResult, const TargetBatch *batch = nullptr);
+                                        float *candidateResult, const TargetBatch *batch = nullptr,
+                                        bool keepCudaLogits = false);
         Data ForwardTensorParallel(const Data &inputIds, const Data &positions,
                                    std::vector<std::pair<Data, Data>> &kv,
                                    const GenerationConfig &config, TargetCapture *capture = nullptr,
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         std::vector<int> tpDevices;
+        std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
+        // One chronological prefill workspace per GPU, reused across layers
+        // and requests. Request-owned SWA storage only holds the sliding window.
+        std::vector<std::pair<Data, Data>> tpSwaPrefillWorkspaces;
+        std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpPagedCaches;
         bool tpPrepared = false;
+        // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
+        // layout. Prefill/eager and verify temporarily use chronological rows.
+        bool tpSwaRingCache = false;
+        bool tpEp8Mega = false;
+        std::shared_ptr<FastllmCudaMimoEp8Mega> tpEp8MegaState;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
         std::vector<Data> tpDraftHeadInputs, tpDraftHeadLogits;
@@ -194,31 +255,14 @@ namespace fastllm {
         PersistentWorkerGroup tpWorkers;
         std::vector<std::vector<std::vector<Data *>>> tpMoeWeights, tpMoeBiases;
         std::vector<std::pair<int, int>> tpVocabRanges;
-        struct HistorySpan {
-            std::shared_ptr<const HistoryChunk> chunk;
-            int length;
+        struct ActivePrefixes {
+            PrefixSnapshots prefill;
+            std::shared_ptr<PrefixSnapshot> decode;
         };
-        struct HistoryMemory {
-            std::vector<int> tokens;
-            std::vector<HistorySpan> spans;
-            int length = 0;
-            size_t bytes = 0;
-        };
-        // Archives use host memory, never a second persistent GPU KV copy.
-        // Bound each record independently so a small auxiliary request does
-        // not evict the main conversation's nearly-full archive.
-        static constexpr size_t historyRecordLimit = 5;
-        // Enough for the usual 32K local-agent context, including draft state.
-        static constexpr size_t historyRecordByteLimit = 8ULL << 30;
-        size_t historyBytesPerToken = 0;
-        std::mutex historyMutex;
-        // Oldest first; completed records and their chunks are immutable.
-        std::vector<std::shared_ptr<const HistoryMemory>> history;
-        // LaunchResponseTokens holds dictLocker across lookup and creation.
-        std::shared_ptr<const HistoryMemory> pendingHistory;
-        // The first key also identifies requests passed through ForwardBatch's
-        // pointer interface; no second request-to-cache lookup is needed.
-        std::map<const Data *, HistoryMemory> activeHistory;
+        std::shared_ptr<PrefixPool> prefixPool;
+        mutable std::mutex historyMutex;
+        PrefixSnapshots prefixHistory; // Oldest first, bounded by GPU pool slots.
+        std::map<const Data *, ActivePrefixes> activePrefixes;
 
         struct AttentionConfig {
             int heads, kvHeads, headDim, valueDim;
@@ -229,6 +273,10 @@ namespace fastllm {
         int window = 128, indexHeads = 16, indexDim = 128, indexTopK = 2048;
         float partialRotary = 0.334f, valueScale = 0.707f;
         bool indexFp8 = true;
+        bool fp8IndexerCache = false;
+        int IndexerCacheWidth(DataType type) const {
+            return fp8IndexerCache ? 144 / (type == FP8_E4M3 ? 1 : 2) : indexDim;
+        }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
     };
 }

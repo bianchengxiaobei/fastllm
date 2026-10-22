@@ -11,6 +11,7 @@
 #include "devices/cpu/alivethreadpool.h"
 #include "persistent_worker_group.h"
 #include "utils/hostbufferreclaim.h"
+#include "utils/hybrid_moe.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -474,7 +475,8 @@ namespace fastllm {
                 const std::vector<int> &gpuDevices,
                 int minSamples,
                 double *outCpuMs, double *outGpuMs,
-                const std::vector<std::vector<uint8_t>> &residents) {
+                const std::vector<std::vector<uint8_t>> &residents,
+                bool nativePrefill) {
             std::vector<double> unitCost;
             double cpuUnit = 0.0;
             {
@@ -516,14 +518,16 @@ namespace fastllm {
                 double cpuRoutes = 0.0;
                 gpuLoads.assign(unitCost.size(), 0.0);
                 for (int e : order) {
-                    bool resident = false;
-                    for (const auto &device : residents) resident |= device[e] != 0;
-                    if (!resident && (int)expertTasks[e].size() < t) {
+                    // Only grouped GGUF pins residents to their owning GPU.
+                    bool pinnedResident = false;
+                    if (!nativePrefill)
+                        for (const auto &device : residents) pinnedResident |= device[e] != 0;
+                    if (!pinnedResident && (int)expertTasks[e].size() < t) {
                         cpuRoutes += (double)expertTasks[e].size();
                     } else {
                         int worker = -1;
                         for (int i = 0; i < int(unitCost.size()); ++i) {
-                            if (resident && !residents[i][e]) continue;
+                            if (pinnedResident && !residents[i][e]) continue;
                             if (worker < 0 || gpuLoads[i] < gpuLoads[worker]) worker = i;
                         }
                         gpuLoads[worker] += unitCost[worker];
@@ -10888,8 +10892,9 @@ namespace fastllm {
                     expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                 }
             }
-            // Resident experts need no PCIe transfer. Keep them on the GPU
-            // that owns their existing record, independently of the miss split.
+            // Native experts retain host backing: keep them eligible for CPU
+            // and assist GPUs even when cached on another GPU. Hard affinity
+            // would idle workers in serial PP. Grouped GGUF keeps its ownership.
             std::vector<bool> residentExperts(m+1, false);
 #ifdef USE_CUDA
             std::vector<std::vector<uint8_t>> residentByDevice(
@@ -10903,10 +10908,11 @@ namespace fastllm {
                     const bool nativeGlm = deepSeekV4Mode && activationQuantBlock == 128 &&
                         input.dataType == BFLOAT16 && weights[2] &&
                         (weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED ||
-                         weights[2]->dataType == DATA_GGUF_FORMAT);
+                         weights[2]->dataType == DATA_GGUF_FORMAT ||
+                         weights[2]->dataType == FP8_E4M3_BLOCK_128);
                     if (!FastllmCudaGetMoePrefillResidents(weights, m, view,
                             nativeGlm && (i == 0 || weights[2]->dataType == DATA_GGUF_FORMAT))) continue;
-                    if (!view.nativeGlm) {
+                    if (!view.sharedWeights) {
                         size_t groupedBytes = 0;
                         if (view.weightType == DATA_GGUF_FORMAT) {
 #ifndef USE_ROCM
@@ -10933,17 +10939,12 @@ namespace fastllm {
             // Feed back whole parallel calls, keyed by the actual weight formats
             // and CPU geometry. Mixed GGUF layers must not share a synthetic
             // single-expert curve simply because their matrix sizes match.
-            const bool measuredNativePrefill = weights[2] && weights[3] &&
-                !deepSeekV4Mode && (IsNumasGroupedNVFP4Weight(weights[2]) ||
-                weights[2]->dataType == FP8_E4M3 ||
-                weights[2]->dataType == FP8_E4M3_BLOCK_128 ||
-                weights[2]->dataType == FP8_E4M3_PERCHANNEL);
+            const auto hybridMath = !deepSeekV4Mode ? HybridMoeMath::Standard :
+                activationQuantBlock == 32 ? HybridMoeMath::DeepSeekV41 : HybridMoeMath::Glm5;
+            const bool measuredNativePrefill = HybridMoeMeasuredNativePrefill(weights[2], weights[3], hybridMath);
             const bool measuredPrefill = measuredNativePrefill || (weights[2] && weights[3] &&
-                (((!deepSeekV4Mode || activationQuantBlock == 128) &&
-                  weights[2]->dataType == DATA_GGUF_FORMAT) ||
-                 (deepSeekV4Mode && activationQuantBlock == 128 &&
-                  weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED &&
-                  weights[3]->dataType == NVFP4_BLOCK_16_E4M3_PACKED)));
+                (!deepSeekV4Mode || activationQuantBlock == 128) &&
+                weights[2]->dataType == DATA_GGUF_FORMAT);
             const bool autoExpertLimit = assistConfig.autoExpertLimit || measuredPrefill;
             const bool balanceGpu = assistConfig.balance || measuredPrefill;
             NumasMoeDeviceSpeedTracker *speedTracker = nullptr;
@@ -10974,7 +10975,7 @@ namespace fastllm {
                     double predictCpuMs = 0.0, predictGpuMs = 0.0;
                     measuredLimit = speedTracker->PredictExpertLimit(
                             expertTasks, weights, weightsBatch, gpuDevices,
-                            2, &predictCpuMs, &predictGpuMs, residentByDevice);
+                            2, &predictCpuMs, &predictGpuMs, residentByDevice, measuredNativePrefill);
                     if (measuredLimit <= 0 && !measuredNativePrefill) {
                         // Sample the two smallest nonresident experts on CPU;
                         // the remaining experts provide simultaneous GPU data.
@@ -11022,7 +11023,7 @@ namespace fastllm {
                     continue;
                 }
                 if (expertTasks[e].empty()) continue;
-                if (!residentExperts[e] && (int)expertTasks[e].size() < expertLimit) {
+                if ((!residentExperts[e] || measuredNativePrefill) && (int)expertTasks[e].size() < expertLimit) {
                     cpuExperts.insert(e);
                 } else {
                     gpuExperts.insert(e);
@@ -11081,7 +11082,7 @@ namespace fastllm {
                 for (int expert : orderedGpuExperts) {
                     int worker = -1;
                     for (int i = 0; i < gpuWorkerCount; ++i) {
-                        if (residentExperts[expert] && !residentByDevice[i][expert]) continue;
+                        if (residentExperts[expert] && !measuredNativePrefill && !residentByDevice[i][expert]) continue;
                         if (!residentExperts[expert] && cacheOwnerCounts[i] > 1 &&
                             (expert - 1) % cacheOwnerCounts[i] != cacheOwnerRanks[i]) continue;
                         if (worker < 0 || predictedMs[i] < predictedMs[worker]) worker = i;

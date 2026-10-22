@@ -6,6 +6,51 @@
 #endif
 
 namespace fastllm {
+bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down, HybridMoeMath math) {
+    if (!gate || !down || gate->dataType != down->dataType) return false;
+    switch (gate->dataType) {
+    case FP8_E4M3_BLOCK_128:
+        return true;
+    case FP8_E4M3: case FP8_E4M3_PERCHANNEL:
+        return math == HybridMoeMath::Standard;
+    case NVFP4_BLOCK_16: case NVFP4_BLOCK_16_E4M3:
+        return math == HybridMoeMath::Standard;
+    case NVFP4_BLOCK_16_E4M3_PACKED:
+        return math == HybridMoeMath::Standard || math == HybridMoeMath::Glm5;
+    case NVFP4_BLOCK_32_E8M0:
+        return math == HybridMoeMath::DeepSeekV41;
+    default:
+        return false;
+    }
+}
+
+void HybridMoeCachePlan::Add(const std::vector<Data *> &weights,
+                            const std::string &device, int cacheDevice) {
+    const bool numa = device == "numa" || device.rfind("numa:", 0) == 0;
+    if (device != "cpu" && !numa) return;
+    layers.push_back({weights.data(), static_cast<int>(weights.size()), cacheDevice});
+    allNuma = allNuma && numa;
+}
+bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeights,
+                                 bool allowStreaming) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+    if (layers.empty()) return false;
+    std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
+    cacheLayers.reserve(layers.size());
+    for (const auto &layer : layers) {
+        cacheLayers.push_back({layer.weights, layer.count,
+            math == HybridMoeMath::DeepSeekV41, swigluLimit, math == HybridMoeMath::Glm5,
+            layer.cacheDevice});
+    }
+    // The backend retains format-dependent snapshot/registration order and
+    // publishes a cache only after validation. Failure leaves host fallback intact.
+    return FastllmCudaPrepareMoeCache(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
+        allNuma ? registerNumaWeights : std::function<void()>{}, allowStreaming);
+#else
+    return false;
+#endif
+}
+
 HybridMoeDecodeStep::~HybridMoeDecodeStep() { Finish(); }
 void HybridMoeDecodeStep::Begin(Data **weights, int count, int topk,
                                const std::vector<int> *devices) {
@@ -28,12 +73,17 @@ HybridMoeDecodeGroup::~HybridMoeDecodeGroup() {
 }
 bool HybridMoeDecodeGroup::Begin(int device, Data **weights, int count, int topk,
                                  const std::vector<int> *devices) {
-    if (Contains(device)) return true;
+    const auto found = steps.find(device);
+    if (found != steps.end()) return bool(found->second);
     HybridMoeDecodeStep step;
     step.Begin(weights, count, topk, devices);
     if (!step) return false;
     steps.emplace(device, std::move(step));
     return true;
+}
+void HybridMoeDecodeGroup::Finish(int device) {
+    const auto found = steps.find(device);
+    if (found != steps.end()) found->second.Finish();
 }
 void HybridMoePrefetch(std::vector<std::vector<Data *>> &weights,
                        int layer, int endLayer, bool pipelinedPrefill,

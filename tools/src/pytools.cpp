@@ -127,6 +127,19 @@ extern "C" {
         fastllm::SetMoeCudaCacheBytes(bytes);
     }
 
+    DLL_EXPORT void set_moe_cuda_cache_device(int device, uint64_t bytes) {
+        fastllm::SetMoeCudaCacheDeviceBytes(device, bytes);
+    }
+
+    // CUDA ordinals obey CUDA_VISIBLE_DEVICES, unlike nvidia-smi indices.
+    DLL_EXPORT bool get_cuda_memory_info(int device, uint64_t *values) {
+#ifdef USE_CUDA
+        return values && FastllmCudaGetMemoryInfo(device, values[0], values[1]);
+#else
+        return false;
+#endif
+    }
+
     DLL_EXPORT bool set_moe_cache_policy(float halfLife, int updateInterval,
             int maxReplacements, uint64_t maxBytes, float minHeat, float margin,
             float factor, int minimumResidence, float prefillPrior, bool rankByBytes) {
@@ -809,6 +822,14 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void set_model_indexer_dtype(int modelId, const char *dtype) {
+        std::string value = dtype;
+        fastllm::AssertInFastLLM(value == "auto" || value == "fp8" || value == "fp8_e4m3",
+                                "indexer_dtype should be auto, fp8 or fp8_e4m3.");
+        models.GetModel(modelId)->SetIndexerDataType(value == "auto"
+            ? fastllm::DATA_AUTO_NONE : fastllm::FP8_E4M3);
+    }
+
     DLL_EXPORT void set_model_kv_cache_dtype(int modelId, char *kv_cache_dtype) {
         auto model = models.GetModel(modelId);
         std::string dtypeStr = kv_cache_dtype;
@@ -1034,6 +1055,11 @@ extern "C" {
         std::vector <float> imageInput;
         std::map <std::string, std::vector <fastllm::Data*> > *multimodalInput = new std::map <std::string, std::vector <fastllm::Data*> > ();
         std::string mode = multimodal_config["mode"].string_value();
+        if (mode == "deepseek_v41") {
+            // V4.1 receives already-expanded image token spans. Speculative
+            // decoding needs the complete prompt length to honor output limits.
+            config.input_token_length = input.size();
+        }
         const float *multimodalFloat = (const float*) multimodal_data;
 
         auto readShape = [](const json11::Json &node) {
@@ -1211,6 +1237,14 @@ extern "C" {
             handleId, output, maxTokens);
     }
 
+    DLL_EXPORT int fetch_response_tokens_batch_with_statistics_llm_model(
+            int modelId, int handleId, int *output, int maxTokens,
+            int *statistics) {
+        auto model = models.GetModel(modelId);
+        return model->FetchResponseTokensBatch(
+            handleId, output, maxTokens, statistics);
+    }
+
     DLL_EXPORT int fetch_response_logits_llm_model(int modelId, int handleId, float *logits) {
         auto model = models.GetModel(modelId);
         std::vector <float> retLogits;
@@ -1308,6 +1342,10 @@ extern "C" {
     DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {
         auto model = models.GetModel(modelId);
         model->SetChunkedPrefillSize(size);
+    }
+
+    DLL_EXPORT bool set_prefill_batching_llm_model(int modelId, int tokens, int maxWaitMs) {
+        return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs);
     }
 
     DLL_EXPORT void set_verbose_llm_model(int modelId, bool verbose) {
