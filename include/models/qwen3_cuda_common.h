@@ -104,6 +104,49 @@ namespace fastllm {
         return ops;
     }
 
+    // 不走 DirectRunner 的裸 FastllmCuda* 调用也要计入: GDN 这一族(输入卷积、
+    // 单 token norm+recurrent、post-norm silu mul)都是直接入口, 漏掉它们会让
+    // 下发总耗时明显小于真实值, 剩下的时间只能错记到"未计时"里.
+    inline void Qwen3CudaSubmitProfileAddDirect(const char *name, double hostMs) {
+        Qwen3CudaSubmitProfileState &state = Qwen3CudaSubmitProfile();
+        if (!state.enabled) {
+            return;
+        }
+        state.calls++;
+        state.hostMs += hostMs;
+        if (Qwen3CudaSubmitProfileDetailEnabled()) {
+            Qwen3CudaSubmitProfileOp &op = Qwen3CudaSubmitProfileDetail()[name];
+            op.calls++;
+            op.hostMs += hostMs;
+            op.runMs += hostMs;
+        }
+    }
+
+    class Qwen3CudaSubmitDirectScope {
+    public:
+        explicit Qwen3CudaSubmitDirectScope(const char *name) :
+                name(name), enabled(Qwen3CudaSubmitProfile().enabled) {
+            if (this->enabled) {
+                this->beginMs = Qwen3CudaSubmitNowMs();
+            }
+        }
+
+        ~Qwen3CudaSubmitDirectScope() {
+            if (this->enabled) {
+                Qwen3CudaSubmitProfileAddDirect(
+                    this->name, Qwen3CudaSubmitNowMs() - this->beginMs);
+            }
+        }
+
+        Qwen3CudaSubmitDirectScope(const Qwen3CudaSubmitDirectScope &) = delete;
+        Qwen3CudaSubmitDirectScope &operator=(const Qwen3CudaSubmitDirectScope &) = delete;
+
+    private:
+        const char *name;
+        bool enabled;
+        double beginMs = 0.0;
+    };
+
     inline void Qwen3CudaSubmitProfileFlush() {
         Qwen3CudaSubmitProfileState &state = Qwen3CudaSubmitProfile();
         if (!state.enabled || state.calls == 0) {
@@ -125,7 +168,7 @@ namespace fastllm {
             printf("[fastllm-cuda-submit-detail] top ops by host time:\n");
             int shown = 0;
             for (auto &it : ordered) {
-                if (shown++ >= 12) {
+                if (shown++ >= 20) {
                     break;
                 }
                 printf("  %-26s calls=%4lld host=%6.2fms run=%6.2fms avg=%5.1fus\n",

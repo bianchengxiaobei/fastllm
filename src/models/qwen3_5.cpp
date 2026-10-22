@@ -15103,6 +15103,7 @@ namespace fastllm {
                 const bool preparedBa = !fusedInputProjection && !hasMergedGdnInLinear &&
                     seqlen >= 1 && seqlen <= 8;
                 if (preparedBa) {
+                    Qwen3CudaSubmitDirectScope profileScope("RMSNormSmallLinear");
                     CudaRMSNormSmallLinearBlock(hiddenStates, inputRmsWeight,
                         *requireLocal(weight[baWeightName], baWeightName),
                         *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
@@ -15127,6 +15128,7 @@ namespace fastllm {
                         *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                         *pastKeyValues[i].first, nullptr, batch);
                 if (projectedConvBlock) {
+                    Qwen3CudaSubmitDirectScope profileScope("GdnInputConv");
                     CudaGdnInputConvBlock(attenInput,
                         *requireLocal(weight[qkvzWeightName], qkvzWeightName),
                         *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"), qkvzWeightName + ".tp_bias"),
@@ -16481,13 +16483,17 @@ namespace fastllm {
                 } else if (isSingleTokenLinearDecode) {
                     ensureConvQkvSplit();
                     ensureBaSplit();
-                    bool fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
-                        q, k, v, a, b,
-                        *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                        *requireLocal(weight[aLogName], aLogName),
-                        *requireLocal(weight[dtBiasName], dtBiasName),
-                        rms_norm_eps, pastValue, coreAttnOut
-                    );
+                    bool fusedSingleDecode = false;
+                    {
+                        Qwen3CudaSubmitDirectScope profileScope("LinearAttnSingleDecode");
+                        fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
+                            q, k, v, a, b,
+                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                            *requireLocal(weight[aLogName], aLogName),
+                            *requireLocal(weight[dtBiasName], dtBiasName),
+                            rms_norm_eps, pastValue, coreAttnOut
+                        );
+                    }
                     if (!fusedSingleDecode) {
                         Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
                                                        *requireLocal(weight[aLogName], aLogName),
@@ -16697,13 +16703,17 @@ namespace fastllm {
                         Qwen3CudaSplit(cudaRunner, v, 1, 1, 2, v1);
                         Qwen3CudaSplit(cudaRunner, a, 1, 1, 2, a1);
                         Qwen3CudaSplit(cudaRunner, b, 1, 1, 2, b1);
-                        bool fusedSecondToken = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
-                            q1, k1, v1, a1, b1,
-                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                            *requireLocal(weight[aLogName], aLogName),
-                            *requireLocal(weight[dtBiasName], dtBiasName),
-                            rms_norm_eps, pastValue, coreAttnOut1
-                        );
+                        bool fusedSecondToken = false;
+                        {
+                            Qwen3CudaSubmitDirectScope profileScope("LinearAttnSingleDecode");
+                            fusedSecondToken = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
+                                q1, k1, v1, a1, b1,
+                                *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                *requireLocal(weight[aLogName], aLogName),
+                                *requireLocal(weight[dtBiasName], dtBiasName),
+                                rms_norm_eps, pastValue, coreAttnOut1
+                            );
+                        }
                         AssertInFastLLM(fusedSecondToken,
                                         "Qwen3.5 two-token linear decode fused first token but failed second token.\n");
                         Qwen3CudaCat(cudaRunner, coreAttnOut0, coreAttnOut1, 1, coreAttnOut);
@@ -16855,14 +16865,17 @@ namespace fastllm {
                         if (!fusedPostLinearAttn) {
                             ensureProjectedZSplit();
                             z.Reshape({-1, z.dims.back()});
-                            fusedPostLinearAttn =
-                                Qwen35TryCudaRMSNormSiluMul(
-                                    coreAttnOut,
-                                    *requireLocal(
-                                        weight[outNormWeightName],
-                                        outNormWeightName),
-                                    z, coreAttnOut,
-                                    rms_norm_eps);
+                            {
+                                Qwen3CudaSubmitDirectScope profileScope("RMSNormSiluMul");
+                                fusedPostLinearAttn =
+                                    Qwen35TryCudaRMSNormSiluMul(
+                                        coreAttnOut,
+                                        *requireLocal(
+                                            weight[outNormWeightName],
+                                            outNormWeightName),
+                                        z, coreAttnOut,
+                                        rms_norm_eps);
+                            }
                         }
                         if (!fusedPostLinearAttn) {
                             Qwen3CudaRMSNorm(
