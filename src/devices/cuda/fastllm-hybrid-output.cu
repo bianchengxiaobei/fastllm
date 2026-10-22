@@ -168,8 +168,8 @@ bool FastllmCudaHybridTop1(const fastllm::Data &input, fastllm::Data &output) {
         input.Count(0) >= (1 << 24)) return false;
     const int size = input.Count(0), count = (size + 4095) / 4096;
     Data partials;
-    Allocate(partials, INT32, {count, 2}, input);
-    Allocate(output, FLOAT32, {1, 2}, input);
+    Allocate(partials, fastllm::DataType::INT32, {count, 2}, input);
+    Allocate(output, fastllm::DataType::FLOAT32, {1, 2}, input);
     HybridTop1Part<<<count, 256, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)input.cudaData, (Maximum*)partials.cudaData, size);
     HybridTop1Finish<<<1, 256, 0, cudaStreamPerThread>>>(

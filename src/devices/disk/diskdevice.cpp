@@ -388,16 +388,18 @@ namespace fastllm {
             uint8_t *buffer = nullptr;
             size_t capacity = 0;
             bool inUse = false;
-            ~Scratch() { if (buffer) munmap(buffer, capacity); }
+            ~Scratch() { Release(); }
+            void Release() {
+                if (buffer) FastllmAlignedFree(buffer);
+                buffer = nullptr;
+                capacity = 0;
+            }
             uint8_t *Acquire(size_t bytes) {
                 if (!bytes || inUse) return nullptr;
                 if (bytes > capacity) {
-                    if (buffer) munmap(buffer, capacity);
-                    buffer = nullptr;
-                    capacity = 0;
-                    void *ptr = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                    if (ptr == MAP_FAILED) return nullptr;
+                    Release();
+                    void *ptr = FastllmAlignedAlloc(4096, bytes);
+                    if (ptr == nullptr) return nullptr;
                     buffer = (uint8_t*)ptr;
                     capacity = bytes;
                 }

@@ -3751,18 +3751,18 @@ bool FastllmCudaHybridDsaSelect(const fastllm::Data &scores, const fastllm::Data
     using namespace fastllm;
     if (scores.dataDevice != DataDevice::CUDA || scores.dataType != FLOAT32 || !scores.cudaData ||
         scores.dims.size() != 3 || scores.dims[0] != 1 || scores.dims[1] != 1 || scores.dims[2] < 512 ||
-        position.dataDevice != DataDevice::CUDA || position.dataType != INT32 || !position.cudaData ||
+        position.dataDevice != DataDevice::CUDA || position.dataType != DataType::INT32 || !position.cudaData ||
         position.Count(0) != 1 || position.dataDeviceIds != scores.dataDeviceIds ||
-        pageTable.dataDevice != DataDevice::CUDA || pageTable.dataType != INT32 || !pageTable.cudaData ||
+        pageTable.dataDevice != DataDevice::CUDA || pageTable.dataType != DataType::INT32 || !pageTable.cudaData ||
         pageTable.dataDeviceIds != scores.dataDeviceIds || pageLen <= 0) return false;
-    Data selected(INT32);
+    Data selected(DataType::INT32);
     selected.Resize({1, 512});
     selected.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
     selected.Allocate(false);
     const auto *meta = (const int32_t *)position.cudaData;
     if (!Qwen4SelectBlocksRaw((const float*)scores.cudaData, (int32_t*)selected.cudaData,
             1, scores.dims[2], 512, -2, 4, meta)) return false;
-    indices.dataType = INT32;
+    indices.dataType = DataType::INT32;
     indices.UpdateUnitSize();
     indices.Resize({1, 2051});
     indices.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
