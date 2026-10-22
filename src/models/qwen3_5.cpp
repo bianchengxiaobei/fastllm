@@ -15175,6 +15175,21 @@ namespace fastllm {
                         localQkvDim, localQkvDim + localVd, z);
                     projectedZSplitReady = true;
                 };
+                auto ensureProjectedQkvZSplit = [&]() {
+                    if (projectedQkvSplitReady && projectedZSplitReady) {
+                        return;
+                    }
+                    if (projectedQkvSplitReady || projectedZSplitReady) {
+                        ensureProjectedQkvSplit();
+                        ensureProjectedZSplit();
+                        return;
+                    }
+                    Qwen3CudaSplitSegments(cudaRunner, gdnMerged, -1, 0,
+                                           {&qkvConvInput, &z},
+                                           {localQkvDim, localVd});
+                    projectedQkvSplitReady = true;
+                    projectedZSplitReady = true;
+                };
                 auto saveReplayActivation = [&](Data &dst, const Data &src) {
                     if (&dst == &src) return;
                     dst.dataType = src.dataType;
@@ -15311,11 +15326,10 @@ namespace fastllm {
                                        localQkvDim + localVd + localValueHeads * 2,
                                        baMerged);
                     } else if (!deferBaSplitForPrefill) {
-                        Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim + localVd,
-                                       localQkvDim + localVd + localValueHeads, b);
-                        Qwen3CudaSplit(cudaRunner, gdnMerged, -1,
-                                       localQkvDim + localVd + localValueHeads,
-                                       localQkvDim + localVd + localValueHeads * 2, a);
+                        Qwen3CudaSplitSegments(cudaRunner, gdnMerged, -1,
+                                               localQkvDim + localVd,
+                                               {&b, &a},
+                                               {localValueHeads, localValueHeads});
                         baSplitReady = true;
                     }
                 } else {
@@ -15328,9 +15342,9 @@ namespace fastllm {
                     }
                     if (!keepCombinedBa &&
                         !deferBaSplitForPrefill) {
-                        Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
-                        Qwen3CudaSplit(cudaRunner, baMerged, -1, localValueHeads,
-                                       localValueHeads * 2, a);
+                        Qwen3CudaSplitSegments(cudaRunner, baMerged, -1, 0,
+                                               {&b, &a},
+                                               {localValueHeads, localValueHeads});
                         baSplitReady = true;
                     }
                 }
@@ -15347,12 +15361,9 @@ namespace fastllm {
                     }
                     AssertInFastLLM(!splitSource->dims.empty(),
                                     "Qwen3.5 linear attention missing combined ba tensor.\n");
-                    Qwen3CudaSplit(cudaRunner, *splitSource, -1,
-                                   splitOffset,
-                                   splitOffset + localValueHeads, b);
-                    Qwen3CudaSplit(cudaRunner, *splitSource, -1,
-                                   splitOffset + localValueHeads,
-                                   splitOffset + localValueHeads * 2, a);
+                    Qwen3CudaSplitSegments(cudaRunner, *splitSource, -1, splitOffset,
+                                           {&b, &a},
+                                           {localValueHeads, localValueHeads});
                     baSplitReady = true;
                 };
 
@@ -15442,11 +15453,16 @@ namespace fastllm {
                 bool combinedGdnZCandidate =
                     (!hasSeparateQkvZGdnInLinear && uniformPrefill) ||
                     mtpCombinedGdnZCandidate;
-                if (!combinedGdnConvCandidate && !directSingleVerifyConv) {
-                    ensureProjectedQkvSplit();
-                }
-                if (!combinedGdnZCandidate) {
-                    ensureProjectedZSplit();
+                if (!combinedGdnConvCandidate && !directSingleVerifyConv &&
+                    !combinedGdnZCandidate) {
+                    ensureProjectedQkvZSplit();
+                } else {
+                    if (!combinedGdnConvCandidate && !directSingleVerifyConv) {
+                        ensureProjectedQkvSplit();
+                    }
+                    if (!combinedGdnZCandidate) {
+                        ensureProjectedZSplit();
+                    }
                 }
                 if (projectedConvBlock) {
                     // The Block does not materialize qkvConvInput.
@@ -15786,9 +15802,8 @@ namespace fastllm {
                     if (convQkvSplitReady) {
                         return;
                     }
-                    Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent, -1, 0, localKd, q);
-                    Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent, -1, localKd, localKd * 2, k);
-                    Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent, -1, localKd * 2, localKd * 2 + localVd, v);
+                    Qwen3CudaSplitSegments(cudaRunner, *convOutputForRecurrent, -1, 0,
+                                           {&q, &k, &v}, {localKd, localKd, localVd});
                     q.Reshape({q.dims[0], q.dims[1], localKeyHeads, head_k_dim});
                     k.Reshape({k.dims[0], k.dims[1], localKeyHeads, head_k_dim});
                     v.Reshape({v.dims[0], v.dims[1], localValueHeads, head_v_dim});

@@ -4618,6 +4618,7 @@ namespace fastllm {
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
+        this->ops["SplitSegments"] = (BaseOperator*)(new CudaSplitSegmentsOp());
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
         this->ops["RepeatAddTo"] = (BaseOperator*)(new CudaRepeatAddToOp());
         this->ops["Copy"] = (BaseOperator*)(new CudaCopyOp());
@@ -6767,6 +6768,57 @@ namespace fastllm {
         int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
         int end = intParams.find("end") != intParams.end() ? intParams.find("end")->second : 0;
         DoCudaSplit(input, axis, start, end, output);
+    }
+
+    void CudaSplitSegmentsOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int count = intParams.find("count") != intParams.end() ? intParams.find("count")->second : 0;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        for (int i = 0; i < count && i < 4; i++) {
+            auto outputIt = datas.find("output" + std::to_string(i));
+            auto lenIt = intParams.find("len" + std::to_string(i));
+            if (outputIt == datas.end() || lenIt == intParams.end()) {
+                break;
+            }
+            std::vector <int> dims = input.dims;
+            dims[axis] = lenIt->second;
+            outputIt->second->dataType = input.dataType;
+            outputIt->second->Resize(dims);
+        }
+    }
+
+    void CudaSplitSegmentsOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
+        int count = intParams.find("count") != intParams.end() ? intParams.find("count")->second : 0;
+
+        fastllm::Data *outputs[4] = {nullptr, nullptr, nullptr, nullptr};
+        int lengths[4] = {0, 0, 0, 0};
+        int segments = 0;
+        for (int i = 0; i < count && i < 4; i++) {
+            auto outputIt = datas.find("output" + std::to_string(i));
+            auto lenIt = intParams.find("len" + std::to_string(i));
+            if (outputIt == datas.end() || lenIt == intParams.end()) {
+                break;
+            }
+            outputIt->second->Allocate(false);
+            outputs[segments] = outputIt->second;
+            lengths[segments] = lenIt->second;
+            segments++;
+        }
+
+        if (!FastllmCudaSplitSegments(input, axis, start, outputs, lengths, segments)) {
+            for (int i = 0; i < segments; i++) {
+                DoCudaSplit(input, axis, start, start + lengths[i], *outputs[i]);
+                start += lengths[i];
+            }
+        }
     }
 
     void CudaRepeatOp::Run(const std::string &opType, const fastllm::DataDict &datas,

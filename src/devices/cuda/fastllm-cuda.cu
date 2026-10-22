@@ -4354,6 +4354,39 @@ __global__ void FastllmSplitBatchKernel(uint8_t *input, uint8_t **outputs, int o
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void FastllmSplitSegmentsKernel(uint8_t *input,
+                                           uint8_t *out0, long long begin0, long long len0,
+                                           uint8_t *out1, long long begin1, long long len1,
+                                           uint8_t *out2, long long begin2, long long len2,
+                                           uint8_t *out3, long long begin3, long long len3,
+                                           long long axisUnits, long long innerUnits, long long unitSize) {
+    int seg = blockIdx.y;
+    uint8_t *curOutput = out0;
+    long long begin = begin0, len = len0;
+    if (seg == 1) {
+        curOutput = out1; begin = begin1; len = len1;
+    } else if (seg == 2) {
+        curOutput = out2; begin = begin2; len = len2;
+    } else if (seg == 3) {
+        curOutput = out3; begin = begin3; len = len3;
+    }
+
+    long long rowBytes = len * innerUnits * unitSize;
+    if (rowBytes <= 0) {
+        return;
+    }
+
+    long long oid = blockIdx.z;
+    const uint8_t *curInput = input + (oid * axisUnits + begin) * innerUnits * unitSize;
+    curOutput += oid * rowBytes;
+
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < rowBytes; i += stride) {
+        curOutput[i] = curInput[i];
+    }
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmCatBatchKernel(uint8_t **inputs, uint8_t *output, int outer, int channels, int inner) {
     int bid = blockIdx.x / outer, oid = blockIdx.x % outer;
     uint8_t *curInput = inputs[bid] + oid * inner;
@@ -18038,6 +18071,55 @@ bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int ax
     delete[] cpuPointers;
 
     DeviceSync();
+    return true;
+}
+
+bool FastllmCudaSplitSegments(fastllm::Data &input, int axis, int start,
+                              fastllm::Data **outputs, const int *lengths, int count) {
+    // Fuse consecutive Split slices sharing one source into a single launch:
+    // on decode shapes each slice is only a few KB, so the WDDM submit cost of
+    // one copy per slice dominates the actual traffic.
+    if (count <= 0 || count > 4 || input.cudaData == nullptr ||
+        input.dims.empty() || input.unitSize <= 0) {
+        return false;
+    }
+
+    int dimsLen = (int)input.dims.size();
+    axis = (axis % dimsLen + dimsLen) % dimsLen;
+    long long axisUnits = input.dims[axis];
+    long long innerUnits = input.strides[axis];
+    long long unitSize = input.unitSize;
+    if (axisUnits <= 0 || innerUnits <= 0) {
+        return false;
+    }
+    int outer = input.Count(0) / input.Count(axis);
+
+    uint8_t *outPtrs[4] = {nullptr, nullptr, nullptr, nullptr};
+    long long begins[4] = {0, 0, 0, 0};
+    long long lens[4] = {0, 0, 0, 0};
+    long long cur = start;
+    long long maxRowBytes = 0;
+    for (int i = 0; i < count; i++) {
+        if (outputs[i] == nullptr || outputs[i]->cudaData == nullptr || lengths[i] <= 0) {
+            return false;
+        }
+        outPtrs[i] = (uint8_t*)outputs[i]->cudaData;
+        begins[i] = cur;
+        lens[i] = lengths[i];
+        cur += lengths[i];
+        maxRowBytes = std::max(maxRowBytes, (long long)lengths[i] * innerUnits * unitSize);
+    }
+
+    int threadPerBlock = 256;
+    int blocksPerRow = (int)std::min<long long>(
+        1024, std::max<long long>(1, (maxRowBytes + threadPerBlock * 4 - 1) / (threadPerBlock * 4)));
+    FastllmSplitSegmentsKernel <256> <<< dim3(blocksPerRow, count, std::max(outer, 1)), 256 >>>
+        ((uint8_t*)input.cudaData,
+         outPtrs[0], begins[0], lens[0],
+         outPtrs[1], begins[1], lens[1],
+         outPtrs[2], begins[2], lens[2],
+         outPtrs[3], begins[3], lens[3],
+         axisUnits, innerUnits, unitSize);
     return true;
 }
 

@@ -815,6 +815,28 @@ namespace fastllm {
                    FloatDict(), IntDict{{"axis", axis}, {"start", start}, {"end", end}}, {"output"});
     }
 
+    // 把一段连续切分合并成一次下发, 避免逐个 Split 各自付一次提交开销
+    inline void Qwen3CudaSplitSegments(Qwen3CudaDirectRunner &runner,
+                                       Data &input, int axis, int start,
+                                       const std::vector<Data*> &outputs,
+                                       const std::vector<int> &lengths) {
+        int count = (int)outputs.size();
+        AssertInFastLLM(count > 0 && count <= 4 && (int)lengths.size() == count,
+                        "Qwen3CudaSplitSegments expects 1~4 outputs with matching lengths.\n");
+        DataDict datas;
+        datas["input"] = &input;
+        IntDict intParams{{"axis", axis}, {"start", start}, {"count", count}};
+        std::vector<std::string> aliases;
+        aliases.reserve(count);
+        for (int i = 0; i < count; i++) {
+            std::string name = "output" + std::to_string(i);
+            datas[name] = outputs[i];
+            intParams["len" + std::to_string(i)] = lengths[i];
+            aliases.push_back(name);
+        }
+        runner.Run("SplitSegments", datas, FloatDict(), intParams, aliases);
+    }
+
     inline void Qwen3CudaCat(Qwen3CudaDirectRunner &runner,
                              Data &input0, Data &input1, int axis, Data &output) {
         runner.Run("Cat",

@@ -1684,6 +1684,8 @@ bool FastllmCudaApplyLognAttn (fastllm::Data &input, fastllm::Data &lognAttn, fa
 bool FastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
                           fastllm::Data **mask, fastllm::Data **output, int group, float scale, int batch);
 bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int axis);
+bool FastllmCudaSplitSegments(fastllm::Data &input, int axis, int start,
+                              fastllm::Data **outputs, const int *lengths, int count);
 bool FastllmCudaCatBatch(fastllm::Data **inputs, fastllm::Data &output, int axis);
 bool FastllmCudaMulBatch(fastllm::Data **inputs, float v, int batch, fastllm::Data **outputs);
 bool FastllmCudaSoftmaxBatch(fastllm::Data **inputs, fastllm::Data **outputs, int axis, int batch);
