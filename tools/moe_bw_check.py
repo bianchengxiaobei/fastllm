@@ -8,6 +8,16 @@
     python tools/moe_bw_check.py --model E:\\models\\xxx
     python tools/moe_bw_check.py --model E:\\models\\xxx --log run.log
     python tools/moe_bw_check.py --model E:\\models\\xxx --log run.log --membw 30.2
+    # 部分层专家在显存(对应 --moe_device_layers N)
+    python tools/moe_bw_check.py --model ... --log run.log --moe-gpu-layers 16
+    # 量化格式认不出来时手动指定字节数
+    python tools/moe_bw_check.py --model ... --bytes-per-param 0.5
+
+覆盖范围: 字段名按常见写法兼容(hidden_size/n_embd, moe_intermediate_size/
+intermediate_size, num_experts/n_routed_experts/num_local_experts,
+shared_expert_intermediate_size 或 n_shared_experts 倍数, first_k_dense_replace);
+量化兼容 compressed-tensors / fp8 / GPTQ-AWQ(顶层 bits) / 未量化 dtype.
+GGUF 这类 config 里没有 bit 宽度的必须用 --bytes-per-param 指定.
 
 --log 里需要 FASTLLM_PROFILE=1 FASTLLM_PROFILE_DETAIL=1 打出的
 [fastllm-profile-cpu-moe] 行, 退一步也可以用 [fastllm-host-moe-split] 的 merge=.
@@ -45,39 +55,82 @@ def read_config(model_dir):
     return cfg, text, quant
 
 
-def quant_bytes_per_param(quant):
-    """返回 (每参数字节, 每个参数的 group 元数据字节)."""
-    weights = None
+def quant_bytes_per_param(quant, dtype=""):
+    """返回 (每参数字节, 每个参数的 group 元数据字节, 来源说明).
+
+    认不出量化格式时首项为 None, 由调用方决定兜底值.
+    """
+    method = str(quant.get("quant_method") or "").lower()
+
+    # compressed-tensors: config_groups[..].weights
     groups = quant.get("config_groups") or {}
     for group in groups.values():
         if isinstance(group, dict) and group.get("weights"):
             weights = group["weights"]
-            break
-    if not weights:
-        # 没有量化信息时按 bf16 估
-        return 2.0, 0.0
-    bits = float(weights.get("num_bits") or 4)
-    group_size = float(weights.get("group_size") or 0)
-    symmetric = bool(weights.get("symmetric"))
-    meta = 0.0
-    if group_size > 0:
-        # 对称量化只存 scale, 非对称再存一份 min
-        meta = (4.0 if symmetric else 8.0) / group_size
-    return bits / 8.0, meta
+            bits = float(weights.get("num_bits") or 4)
+            group_size = float(weights.get("group_size") or 0)
+            symmetric = bool(weights.get("symmetric"))
+            # 对称量化只存 scale, 非对称再存一份 min
+            meta = (4.0 if symmetric else 8.0) / group_size if group_size > 0 else 0.0
+            return bits / 8.0, meta, "compressed-tensors %gbit" % bits
+
+    # FP8: 没有 config_groups, 一个参数就是一字节
+    if method in ("fp8", "fp8_e4m3", "fp8_e5m2", "fbgemm_fp8"):
+        return 1.0, 0.0, "fp8"
+
+    # GPTQ / AWQ / QuIP 等: bits 在顶层
+    bits = quant.get("bits") or quant.get("w_bit") or quant.get("weight_bits")
+    if bits:
+        bits = float(bits)
+        group_size = float(quant.get("group_size") or 0)
+        meta = 8.0 / group_size if group_size > 0 else 0.0
+        return bits / 8.0, meta, "%s %gbit" % (method or "gptq/awq", bits)
+
+    # 完全没有量化配置: 按 config 里的 dtype 算
+    if not quant:
+        bits = {"float32": 32, "fp32": 32, "float16": 16, "fp16": 16,
+                "bfloat16": 16, "bf16": 16}.get(str(dtype).lower())
+        if bits:
+            return bits / 8.0, 0.0, "未量化 %s" % dtype
+
+    # 认不出来: 交给调用方决定兜底值
+    return None, 0.0, "unknown(%s)" % (method or "none")
+
+
+def pick(source, names, default=None):
+    for name in names:
+        value = source.get(name)
+        if value not in (None, "", []):
+            return value
+    return default
 
 
 def moe_geometry(text, log_info):
-    hidden = text.get("hidden_size")
-    inter = text.get("moe_intermediate_size") or text.get("intermediate_size")
-    layers = text.get("num_hidden_layers")
-    topk = text.get("num_experts_per_tok")
-    experts = text.get("num_experts")
-    shared = text.get("shared_expert_intermediate_size") or 0
+    # 各家字段名不统一, 按常见写法依次尝试
+    hidden = pick(text, ("hidden_size", "n_embd", "d_model"))
+    inter = pick(text, ("moe_intermediate_size", "intermediate_size",
+                        "ffn_hidden_size"))
+    layers = pick(text, ("num_hidden_layers", "num_layers", "n_layer"))
+    topk = pick(text, ("num_experts_per_tok", "num_experts_per_token",
+                       "moe_top_k", "top_k_experts"))
+    experts = pick(text, ("num_experts", "n_routed_experts",
+                          "num_local_experts", "moe_num_experts"))
+    dense_layers = pick(text, ("first_k_dense_replace", "num_dense_layers"), 0) or 0
+
+    # 共享专家有两种写法: 直接给中间维, 或者给"几个专家的倍数"
+    shared = pick(text, ("shared_expert_intermediate_size",
+                         "shared_expert_size"), 0) or 0
+    if not shared and inter:
+        shared_count = pick(text, ("n_shared_experts",),
+                            text.get("shared_expert_intermediate_size") and 1 or 0) or 0
+        shared = int(shared_count) * int(inter)
+
     if log_info:
         topk = log_info.get("topk", topk)
     if not hidden or not inter or not layers or not topk:
-        sys.exit("config 里缺少 MoE 结构字段(hidden_size/moe_intermediate_size/"
-                 "num_hidden_layers/num_experts_per_tok), 这个模型可能不是 MoE")
+        sys.exit("config 里缺少 MoE 结构字段(hidden=%s, moe_inter=%s, layers=%s, "
+                 "topk=%s), 这个模型可能不是 MoE"
+                 % (hidden, inter, layers, topk))
     return {
         "hidden": hidden,
         "inter": inter,
@@ -85,6 +138,7 @@ def moe_geometry(text, log_info):
         "topk": topk,
         "experts": experts,
         "shared": shared,
+        "dense_layers": int(dense_layers),
     }
 
 
@@ -182,6 +236,10 @@ def main():
                         help="机器实测读带宽 GB/s; 不填则用 numpy 现测")
     parser.add_argument("--size", type=int, default=1024,
                         help="现测带宽时的缓冲区大小 MB")
+    parser.add_argument("--bytes-per-param", type=float, default=0.0,
+                        help="量化格式认不出来时手动指定, 例如 int4=0.5 int8=1.0 fp8=1.0")
+    parser.add_argument("--moe-gpu-layers", type=int, default=0,
+                        help="有多少层专家在显存里(对应 --moe_device_layers), 这些层不计入 CPU 字节")
     args = parser.parse_args()
 
     log_info = {}
@@ -196,18 +254,34 @@ def main():
                             if k == "topk")
 
     cfg, text, quant = read_config(args.model)
-    bytes_per_param, meta_per_param = quant_bytes_per_param(quant)
+    bytes_per_param, meta_per_param, quant_tag = quant_bytes_per_param(
+        quant, text.get("dtype") or cfg.get("torch_dtype") or "")
+    if args.bytes_per_param > 0.0:
+        bytes_per_param = args.bytes_per_param
+        quant_tag = "手动指定 %g" % bytes_per_param
+    if bytes_per_param is None:
+        print("!! 认不出量化格式(%s). 用 --bytes-per-param 指定,"
+              " 例如 int4=0.5 / int8=1.0 / fp8=1.0 / bf16=2.0" % quant_tag)
+        sys.exit(2)
     geo = moe_geometry(text, log_info)
 
     gate_up_bytes, down_bytes = layer_bytes(geo, bytes_per_param, meta_per_param)
-    total_bytes = (gate_up_bytes + down_bytes) * geo["layers"]
+    cpu_layers = geo["layers"] - geo["dense_layers"] - args.moe_gpu_layers
+    if cpu_layers < 1:
+        cpu_layers = max(1, geo["layers"] - geo["dense_layers"])
+        print("!! --moe-gpu-layers 过大, 按全部 MoE 层都留在 CPU 计算")
+    total_bytes = (gate_up_bytes + down_bytes) * cpu_layers
 
     print("== 模型 ==")
     print("  layers=%d  experts=%s  topk=%d  hidden=%d  moe_inter=%d  共享专家中间维=%s"
           % (geo["layers"], geo["experts"], geo["topk"], geo["hidden"],
              geo["inter"], geo["shared"] or "无"))
-    print("  量化: %.2f 字节/参数 + group 元数据 %.1f%%"
-          % (bytes_per_param, meta_per_param * 100.0))
+    print("  量化: %.2f 字节/参数 + group 元数据 %.1f%%  (%s)"
+          % (bytes_per_param, meta_per_param * 100.0, quant_tag))
+    if geo["dense_layers"] or args.moe_gpu_layers:
+        print("  计入 CPU 的 MoE 层数: %d (总 %d, 稠密层 %d, 专家在显存 %d)"
+              % (cpu_layers, geo["layers"], geo["dense_layers"],
+                 args.moe_gpu_layers))
     print("  每层每 token 专家字节: gate_up=%.2fMB  down=%.2fMB"
           % (gate_up_bytes / 1048576.0, down_bytes / 1048576.0))
     print("  每 token 专家字节合计: %.1fMB  (%.2fGB)"
@@ -221,7 +295,7 @@ def main():
               % (ceiling, "  (现测)" if args.membw <= 0.0 else "  (手动指定)"))
         per_token_ms = total_bytes / 1048576.0 / ceiling
         print("  带宽下限: 每层 %.3fms, 每 token %.1fms"
-              % (per_token_ms / geo["layers"], per_token_ms))
+              % (per_token_ms / cpu_layers, per_token_ms))
     else:
         print("  机器读带宽: 未知(没装 numpy?), 用 --membw 指定, 例如 30.2")
         per_token_ms = None
@@ -262,7 +336,7 @@ def main():
         print("\n== 实测(host-moe-split, %d token 采样) ==" % len(found["split"]))
         print("  merge=%.3fms/token  (含 MergeMOEBlock 外框)" % (split_merge or 0.0))
         if gemm_ms:
-            gemm_total = gemm_ms * geo["layers"]
+            gemm_total = gemm_ms * cpu_layers
             overhead = split_merge - gemm_total
             print("  GEMM 本体 %.1fms, 外框开销 %.1fms (占 merge %.0f%%)"
                   % (gemm_total, overhead,
@@ -276,7 +350,7 @@ def main():
         return
 
     # 判带宽用 GEMM 本体, 外框开销不属于带宽
-    basis = gemm_ms * geo["layers"] if gemm_ms else merge_ms
+    basis = gemm_ms * cpu_layers if gemm_ms else merge_ms
     effective = total_bytes / 1048576.0 / basis
     print("\n== 结论 ==")
     print("  MoE 有效带宽: %.1fGB/s  (按 %.1fms/token 计)"
