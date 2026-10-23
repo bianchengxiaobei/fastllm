@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <deque>
@@ -220,6 +221,12 @@ namespace fastllm {
         int Get(const std::string &fileName, bool direct = false) {
             std::lock_guard<std::mutex> guard(locker);
             int flags = O_RDONLY;
+#ifdef _WIN32
+            // The CRT opens text mode by default: _read() stops at 0x1A
+            // (CTRL+Z) and translates CRLF, which truncates binary shards and
+            // reports a false EOF mid-tensor.
+            flags |= _O_BINARY;
+#endif
 #ifdef O_DIRECT
             if (direct) {
                 flags |= O_DIRECT;
@@ -495,6 +502,27 @@ namespace fastllm {
                                ", errno = " + std::to_string(errno) + "\n");
             }
             if (ret == 0) {
+                if (std::getenv("FASTLLM_DISK_TRACE") != nullptr) {
+                    const long long fileLength =
+#if defined(_WIN32) || defined(_WIN64)
+                        _lseeki64(fd, 0, SEEK_END);
+#else
+                        (long long)lseek(fd, 0, SEEK_END);
+#endif
+                    std::string dims;
+                    for (size_t d = 0; d < part.dims.size(); d++) {
+                        dims += (d == 0 ? "" : ",") + std::to_string(part.dims[d]);
+                    }
+                    printf("[disk-trace] EOF file=%s fileOffset=%lld partBytes=%llu "
+                           "offset=%llu bytes=%llu done=%llu fileLen=%lld "
+                           "srcType=%d dims=[%s]\n",
+                           part.fileName.c_str(), part.fileOffset,
+                           (unsigned long long)part.bytes,
+                           (unsigned long long)offset, (unsigned long long)bytes,
+                           (unsigned long long)done, fileLength,
+                           (int)part.sourceDataType, dims.c_str());
+                    fflush(stdout);
+                }
                 ErrorInFastLLM("Disk device read EOF: " + part.fileName + "\n");
             }
             done += ret;
