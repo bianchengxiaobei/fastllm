@@ -33,6 +33,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <climits>
@@ -54,10 +55,44 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 namespace fastllm {
     namespace {
+        // FASTLLM_V41_HEAPCHECK=N validates the process heap every N layer
+        // boundaries. Heap corruption surfaces at an unrelated later
+        // new/delete, so this narrows it to one layer or one engram gather.
+        void V41CheckHeap(const char *where, int layer) {
+#if defined(_WIN32) || defined(_WIN64)
+            static const int interval = []() -> int {
+                const char *env = std::getenv("FASTLLM_V41_HEAPCHECK");
+                if (env == nullptr) {
+                    return 0;
+                }
+                const int n = std::atoi(env);
+                return n > 0 ? n : 1;
+            }();
+            if (interval <= 0) {
+                return;
+            }
+            static std::atomic<int> calls{0};
+            if (calls.fetch_add(1, std::memory_order_relaxed) % interval != 0) {
+                return;
+            }
+            if (!HeapValidate(GetProcessHeap(), 0, nullptr)) {
+                printf("[v41-heapcheck] HEAP CORRUPT at %s layer=%d\n", where, layer);
+                fflush(stdout);
+                ErrorInFastLLM("[v41-heapcheck] HEAP CORRUPT at " + std::string(where) +
+                               " layer=" + std::to_string(layer) + "\n");
+            }
+#else
+            (void)where;
+            (void)layer;
+#endif
+        }
+
 #ifdef USE_CUDA
         // A one-token slice of a dense [1, tokens, ...] activation is contiguous
         // on every TP rank. Borrow it for this forward instead of copying it.
@@ -2892,6 +2927,7 @@ namespace fastllm {
                 th.join();
             }
         }
+        V41CheckHeap("engram-gather", layer);
     }
 
     void DeepSeekV41Model::RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,
@@ -4406,9 +4442,13 @@ namespace fastllm {
             work->model.decoderSwaTailLayer : work->model.block_cnt;
         return work->prefill ? std::min(end, work->prefill->endLayer) : end;
     }
-    void DeepSeekV41Model::ForwardState::BeginLayer(int layer) { work->model.BeginForwardLayer(*work, layer); }
+    void DeepSeekV41Model::ForwardState::BeginLayer(int layer) {
+        work->model.BeginForwardLayer(*work, layer);
+        V41CheckHeap("layer-begin", layer);
+    }
     void DeepSeekV41Model::ForwardState::EndLayer(int layer) {
         if (work->endedLayerInGraph != layer) work->model.EndForwardLayer(*work, layer);
+        V41CheckHeap("layer-end", layer);
     }
     void DeepSeekV41Model::ForwardState::BeginHybridStep() {
         if (work->model.executionMode == ExecutionMode::Hybrid) {
