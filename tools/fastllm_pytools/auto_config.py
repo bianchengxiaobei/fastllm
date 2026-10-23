@@ -9,6 +9,8 @@ import json
 import math
 import os
 from pathlib import Path
+import struct
+import subprocess
 
 from . import hybrid_auto as memory
 
@@ -58,12 +60,73 @@ def default_kv_dtype(model, metadata):
     return "float16"
 
 
+def cuda_driver():
+    """Load the NVIDIA driver; only the library name differs across platforms."""
+    error = None
+    for name in ("nvcuda.dll", "libcuda.so.1", "libcuda.so"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError as failure:
+            error = failure
+    raise ValueError("--auto requires the NVIDIA CUDA driver "
+                     "(nvcuda.dll on Windows, libcuda.so.1 on Linux)") from error
+
+
+def _pci_key(bus_id):
+    """Compare bus ids without the leading PCI domain width nvidia-smi varies."""
+    return ":".join(str(bus_id).strip().lower().split(":")[-2:])
+
+
+def _query_pcie_links():
+    """Map PCI bus id to negotiated generation/width where sysfs is absent."""
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=pci.bus_id,pcie.link.gen.max,"
+                                 "pcie.link.width.max", "--format=csv,noheader,nounits"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    links = {}
+    if result.returncode != 0:
+        return links
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        try:
+            links[_pci_key(parts[0])] = (int(parts[1]), int(parts[2]))
+        except ValueError:
+            continue
+    return links
+
+
+_PCIE_LINKS = None
+
+
+def pcie_link_bandwidth(pci):
+    """Endpoint bandwidth bound; sysfs on Linux, nvidia-smi where it is absent."""
+    # Idle GPUs downshift their current PCIe generation. Budget with
+    # the endpoint's negotiated-width/max-speed bound, not idle speed.
+    try:
+        path = Path("/sys/bus/pci/devices") / pci
+        speed = float((path / "max_link_speed").read_text().split()[0])
+        lanes = int((path / "current_link_width").read_text())
+        if speed > 0 and lanes > 0:
+            return speed * 1e9 * lanes / 8 * .8
+    except (OSError, ValueError):
+        pass
+    global _PCIE_LINKS
+    if _PCIE_LINKS is None:
+        _PCIE_LINKS = _query_pcie_links()
+    generation, lanes = _PCIE_LINKS.get(_pci_key(pci), (0, 0))
+    # GT/s per lane by generation, matching max_link_speed's Linux units.
+    speed = {1: 2.5, 2: 5., 3: 8., 4: 16., 5: 32., 6: 64.}.get(generation, 0.)
+    return speed * 1e9 * lanes / 8 * .8 if speed and lanes > 0 else 12e9
+
+
 def cuda_hardware():
     """Read visible CUDA ordinals, bandwidth bounds and peer access capability."""
-    try:
-        driver = ctypes.CDLL("libcuda.so.1")
-    except OSError as error:
-        raise ValueError("--auto requires the Linux NVIDIA CUDA driver") from error
+    driver = cuda_driver()
     signatures = {
         "cuInit": [ctypes.c_uint],
         "cuDeviceGetCount": [ctypes.POINTER(ctypes.c_int)],
@@ -91,18 +154,7 @@ def cuda_hardware():
         pci = ""
         if driver.cuDeviceGetPCIBusId(bus, len(bus), handle.value) == 0:
             pci = bus.value.decode("ascii").lower()
-        # sysfs is keyed by PCI identity, never by nvidia-smi's device index.
-        link = 12e9
-        try:
-            path = Path("/sys/bus/pci/devices") / pci
-            # Idle GPUs downshift their current PCIe generation. Budget with
-            # the endpoint's negotiated-width/max-speed bound, not idle speed.
-            speed = float((path / "max_link_speed").read_text().split()[0])
-            lanes = int((path / "current_link_width").read_text())
-            if speed > 0 and lanes > 0:
-                link = speed * 1e9 * lanes / 8 * .8
-        except (OSError, ValueError):
-            pass
+        link = pcie_link_bandwidth(pci)
         devices[ordinal] = {"sm": attr(16, 40), "clock_khz": attr(13, 1000000),
                             "memory_bandwidth": 2 * attr(36, 5000000) * 1000 * attr(37, 256) / 8,
                             "link_bandwidth": link, "capability": attr(75, 7) * 10 + attr(76, 0)}
@@ -112,6 +164,25 @@ def cuda_hardware():
             value = ctypes.c_int()
             peers[a, b] = a == b or (driver.cuDeviceCanAccessPeer(ctypes.byref(value), handles[a], handles[b]) == 0 and bool(value.value))
     return devices, peers
+
+
+def windows_physical_cores():
+    """Count physical cores the way sysfs topology does on Linux, without SMT."""
+    query = ctypes.windll.kernel32.GetLogicalProcessorInformationEx
+    relation_processor_core = 0
+    size = ctypes.c_ulong(0)
+    query(relation_processor_core, None, ctypes.byref(size))
+    if size.value == 0:
+        return 0
+    buffer = ctypes.create_string_buffer(size.value)
+    if not query(relation_processor_core, buffer, ctypes.byref(size)):
+        return 0
+    cores, offset = 0, 0
+    # Each record is {DWORD relationship, WORD size, ...}; size covers one core.
+    while offset + 6 <= size.value:
+        cores += 1
+        offset += struct.unpack_from("<H", buffer.raw, offset + 4)[0]
+    return cores
 
 
 def cpu_threads():
@@ -124,6 +195,9 @@ def cpu_threads():
         if 0 < requested <= nodes:
             nodes = requested
         return int(os.environ["FASTLLM_NUMA_THREADS"]) * nodes
+    if os.name == "nt":
+        cores = windows_physical_cores() or (os.cpu_count() or 1)
+        return max(1, cores - min(4, cores // 4))
     affinity = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else range(os.cpu_count() or 1)
     cores = set()
     for cpu in affinity:

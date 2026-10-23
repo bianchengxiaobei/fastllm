@@ -7,6 +7,7 @@ workspace allowance; they are capacity plans, not throughput autotuning.
 
 import ast
 import copy
+import ctypes
 from dataclasses import dataclass, field
 import json
 import math
@@ -161,12 +162,37 @@ def inventory(path):
     return metadata, tensors
 
 
-def host_memory(proc=Path("/proc")):
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def windows_host_memory():
+    """Physical RAM without cgroup accounting; Windows has no memory cgroups."""
+    status = _MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise ValueError("Hybrid auto: cannot query physical memory")
+    return {"total": int(status.ullTotalPhys), "available": int(status.ullAvailPhys)}
+
+
+def host_memory(proc=None):
     """Effective Linux RAM, including every visible cgroup ancestor limit.
 
     Do not count swap or assume that charged file pages can be reclaimed. A
     parent's current usage includes siblings, which can constrain this process.
     """
+    if proc is None:
+        if os.name == "nt":
+            return windows_host_memory()
+        proc = Path("/proc")
     info = {}
     for line in (proc / "meminfo").read_text().splitlines():
         key, value = line.split(":", 1)
