@@ -2990,7 +2990,9 @@ namespace fastllm {
                            old + o * input1Stride * unitSize,
                            this->dims[axis] * inner * unitSize);
                 }
-                delete[] old;
+                // cpuData 可能来自 CpuArenaAlloc（VirtualAlloc 切片），只能走统一
+                // 释放入口；delete[] 会直接踩坏堆（下一处 new 才报 0xC0000374）。
+                fastllm::FreeCpuDataBlock(old);
             } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
                 uint8_t *old = (uint8_t*)this->cudaData;

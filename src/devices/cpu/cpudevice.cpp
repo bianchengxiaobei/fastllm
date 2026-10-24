@@ -1352,7 +1352,7 @@ namespace fastllm {
             uint16_t *cur = (uint16_t*)data.cpuData;
             int len = data.Count(0);
             Float32ToFloat16(old, cur, len);
-            delete[] old;
+            fastllm::FreeCpuDataBlock((uint8_t*)old);
         } else if (data.dataType == DataType::BFLOAT16) {
             data.dataType = DataType::FLOAT16;
             data.UpdateUnitSize();
@@ -1385,7 +1385,7 @@ namespace fastllm {
             float *cur = (float*)data.cpuData;
             int len = data.Count(0);
             Float16ToFloat32(old, cur, len);
-            delete[] old;
+            fastllm::FreeCpuDataBlock((uint8_t*)old);
         } else if (data.dataType == DataType::BFLOAT16) {
             uint16_t *old = (uint16_t*)data.cpuData;
             data.dataType = DataType::FLOAT32;
@@ -1395,7 +1395,7 @@ namespace fastllm {
             float *cur = (float*)data.cpuData;
             int len = data.Count(0);
             BFloat16ToFloat32(old, cur, len);
-            delete[] old;
+            fastllm::FreeCpuDataBlock((uint8_t*)old);
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -1481,7 +1481,7 @@ namespace fastllm {
             uint16_t *cur = (uint16_t*)data.cpuData;
             int len = data.Count(0);
             Float32ToBFloat16(old, cur, len);
-            delete[] old;
+            fastllm::FreeCpuDataBlock((uint8_t*)old);
         } else if (data.dataType == DataType::FLOAT16) {
             data.dataType = DataType::BFLOAT16;
             data.UpdateUnitSize();
