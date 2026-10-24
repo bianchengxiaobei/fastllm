@@ -2660,6 +2660,13 @@ endif()
 
 add_library(fastllm_tools SHARED tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PRIVATE fastllm)
+if (MSVC)
+    # 崩溃转储里的 fastllm_tools.dll+0x... 需要符号表才能还原成函数名。
+    # 只用 /MAP（不改代码生成、不影响优化），不启用 /DEBUG，避免它把
+    # /OPT 隐式改成 NOREF/NOICF 从而改变二进制布局与性能。
+    target_link_options(fastllm_tools PRIVATE
+        "/MAP:${CMAKE_BINARY_DIR}/fastllm_tools.map")
+endif()
 
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_ROCM "false")
@@ -2698,6 +2705,7 @@ if (${CMAKE_HOST_WIN32})
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_triton_server.py ${CMAKE_BINARY_DIR}/tools/ftllm/fastllm_triton_server.py
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
             COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tools> ${CMAKE_BINARY_DIR}/tools/ftllm/.
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/fastllm_tools.map ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E remove $<TARGET_FILE:fastllm_tools>
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
