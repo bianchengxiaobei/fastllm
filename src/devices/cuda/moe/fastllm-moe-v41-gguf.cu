@@ -9,6 +9,7 @@
 #include <cuda_fp8.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -251,11 +252,21 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
     return cudaGetLastError() == cudaSuccess;
 }
 
+// Defined in fastllm-cuda.cu: H2D upload through a pinned staging ring, which
+// returns false when the tensor does not fit the ring. Declared at global scope
+// because the definition is a plain C++ symbol shared with cudadevice.cpp.
+bool FastllmCudaUploadHostToDevicePinnedStaged(void *dst, const void *src, size_t size, void *stream);
+
 namespace {
 // Pageable host experts only; NUMA/disk keep their own registered pipelines.
 const uint8_t *V41HostStreamBytes(const fastllm::Data &w) {
     if (w.dataType != fastllm::DATA_GGUF_FORMAT || w.isDiskWeight) return nullptr;
     return static_cast<const uint8_t *>(w.cpuData);
+}
+
+double V41HostStreamNowMs() {
+    return (double)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-3;
 }
 
 struct V41HostStreamBuffer {
@@ -442,10 +453,13 @@ bool FastllmCudaRunV41GGUFHostStream(
     std::stable_sort(order.begin(), order.end(), [&counts](int a, int b) {
         return counts[a] != counts[b] ? counts[a] > counts[b] : a < b;
     });
+    // Half of the arena per group: the other half receives the next group while
+    // this one computes.
+    const size_t groupBudget = std::max(expertBytes, arenaBudget / 2);
     std::vector<std::vector<int> > batches(1);
     size_t batchBytes = 0, arenaBytes = 0;
     for (int e : order) {
-        if (!batches.back().empty() && batchBytes + expertBytes > arenaBudget) {
+        if (!batches.back().empty() && batchBytes + expertBytes > groupBudget) {
             arenaBytes = std::max(arenaBytes, batchBytes);
             batches.emplace_back();
             batchBytes = 0;
@@ -455,12 +469,17 @@ bool FastllmCudaRunV41GGUFHostStream(
     }
     arenaBytes = std::max(arenaBytes, batchBytes);
 
-    V41HostStreamBuffer arena, table, indexBuffer, scoreBuffer;
-    arena.ptr = FastllmCudaMalloc(arenaBytes);
-    table.ptr = FastllmCudaMalloc(sizeof(void*) * size_t(experts) * 2);
+    V41HostStreamBuffer arenas[2], tables[2], indexBuffer, scoreBuffer;
+    arenas[0].ptr = FastllmCudaMalloc(arenaBytes);
+    arenas[1].ptr = FastllmCudaMalloc(arenaBytes);
+    // One weight table per arena: the next group rebuilds its own while the
+    // current group is still reading the other.
+    tables[0].ptr = FastllmCudaMalloc(sizeof(void*) * size_t(experts) * 2);
+    tables[1].ptr = FastllmCudaMalloc(sizeof(void*) * size_t(experts) * 2);
     indexBuffer.ptr = FastllmCudaMalloc(size_t(routes) * sizeof(int32_t));
     scoreBuffer.ptr = FastllmCudaMalloc(size_t(routes) * sizeof(float));
-    if (!arena.ptr || !table.ptr || !indexBuffer.ptr || !scoreBuffer.ptr) return false;
+    if (!arenas[0].ptr || !arenas[1].ptr || !tables[0].ptr || !tables[1].ptr ||
+        !indexBuffer.ptr || !scoreBuffer.ptr) return false;
     FastllmCudaCopyFromHostToDevice(indexBuffer.ptr, const_cast<int32_t *>(indices),
         size_t(routes) * sizeof(int32_t));
     FastllmCudaCopyFromHostToDevice(scoreBuffer.ptr, const_cast<float *>(scores),
@@ -468,21 +487,72 @@ bool FastllmCudaRunV41GGUFHostStream(
     const int32_t *deviceIndex = static_cast<const int32_t *>(indexBuffer.ptr);
     const float *deviceScore = static_cast<const float *>(scoreBuffer.ptr);
 
-    std::vector<const void *> pointers(size_t(experts) * 2, nullptr);
-    for (size_t b = 0; b < batches.size(); ++b) {
-        auto *cursor = static_cast<uint8_t *>(arena.ptr);
+    struct V41HostStreamPipeline {
+        cudaStream_t copy = nullptr;
+        cudaEvent_t uploaded[2] = {nullptr, nullptr};
+        cudaEvent_t computed[2] = {nullptr, nullptr};
+        bool ok = false;
+        V41HostStreamPipeline() {
+            ok = cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking) == cudaSuccess;
+            for (int i = 0; ok && i < 2; ++i) {
+                ok = cudaEventCreateWithFlags(&uploaded[i], cudaEventDisableTiming) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&computed[i], cudaEventDisableTiming) == cudaSuccess;
+            }
+        }
+        ~V41HostStreamPipeline() {
+            if (copy != nullptr) cudaStreamDestroy(copy);
+            for (int i = 0; i < 2; ++i) {
+                if (uploaded[i] != nullptr) cudaEventDestroy(uploaded[i]);
+                if (computed[i] != nullptr) cudaEventDestroy(computed[i]);
+            }
+        }
+    } pipeline;
+    if (!pipeline.ok) return reject("pinned copy stream unavailable");
+
+    std::vector<const void *> hostTables[2] = {
+        std::vector<const void *>(size_t(experts) * 2, nullptr),
+        std::vector<const void *>(size_t(experts) * 2, nullptr)};
+    int slotGroup[2] = {-1, -1};
+    size_t uploadedBytes = 0;
+    double uploadMs = 0.0;
+    const auto issueGroup = [&](size_t b) {
+        const int slot = int(b & 1);
+        auto &pointer = hostTables[slot];
+        if (slotGroup[slot] >= 0) {
+            // That group's compute still reads this arena: wait, then drop the
+            // stale entries before the table copy below.
+            cudaStreamWaitEvent(pipeline.copy, pipeline.computed[slot], 0);
+            for (int e : batches[slotGroup[slot]]) pointer[2*e] = pointer[2*e+1] = nullptr;
+        }
+        const double started = V41HostStreamDebug() ? V41HostStreamNowMs() : 0.0;
+        auto *cursor = static_cast<uint8_t *>(arenas[slot].ptr);
         for (int e : batches[b]) {
-            FastllmCudaCopyFromHostToDevice(cursor,
-                const_cast<uint8_t *>(V41HostStreamBytes(*weights[2*e])), gateBytes);
-            pointers[2*e] = cursor;
+            const uint8_t *gateSource = V41HostStreamBytes(*weights[2*e]);
+            const uint8_t *downSource = V41HostStreamBytes(*weights[2*e+1]);
+            // Pinned staging keeps the host from blocking on the whole tensor,
+            // so the copies overlap the previous group's kernels.
+            if (!FastllmCudaUploadHostToDevicePinnedStaged(cursor, gateSource, gateBytes, pipeline.copy))
+                cudaMemcpyAsync(cursor, gateSource, gateBytes, cudaMemcpyHostToDevice, pipeline.copy);
+            pointer[2*e] = cursor;
             cursor += gateBytes;
-            FastllmCudaCopyFromHostToDevice(cursor,
-                const_cast<uint8_t *>(V41HostStreamBytes(*weights[2*e+1])), downBytes);
-            pointers[2*e+1] = cursor;
+            if (!FastllmCudaUploadHostToDevicePinnedStaged(cursor, downSource, downBytes, pipeline.copy))
+                cudaMemcpyAsync(cursor, downSource, downBytes, cudaMemcpyHostToDevice, pipeline.copy);
+            pointer[2*e+1] = cursor;
             cursor += downBytes;
         }
-        FastllmCudaCopyFromHostToDevice(table.ptr, const_cast<void *>(
-            static_cast<const void *>(pointers.data())), pointers.size() * sizeof(void*));
+        cudaMemcpyAsync(tables[slot].ptr, pointer.data(), pointer.size() * sizeof(void*),
+            cudaMemcpyHostToDevice, pipeline.copy);
+        cudaEventRecord(pipeline.uploaded[slot], pipeline.copy);
+        slotGroup[slot] = int(b);
+        uploadedBytes += size_t(cursor - static_cast<uint8_t *>(arenas[slot].ptr));
+        if (V41HostStreamDebug()) uploadMs += V41HostStreamNowMs() - started;
+    };
+
+    issueGroup(0);
+    if (batches.size() > 1) issueGroup(1);
+    for (size_t b = 0; b < batches.size(); ++b) {
+        const int slot = int(b & 1);
+        cudaStreamWaitEvent(cudaStreamPerThread, pipeline.uploaded[slot], 0);
         for (int rowStart = 0; rowStart < rows; rowStart += blockRows) {
             const int count = std::min(blockRows, rows - rowStart);
             fastllm::Data inputView, outputView;
@@ -492,15 +562,20 @@ bool FastllmCudaRunV41GGUFHostStream(
             outputView.Resize({count, hidden});
             const size_t routeOffset = size_t(rowStart) * topk;
             const bool ok = FastllmCudaRunV41GGUF(inputView, gate, activation, workspace,
-                outputView, table.ptr, deviceIndex + routeOffset, deviceScore + routeOffset,
+                outputView, tables[slot].ptr, deviceIndex + routeOffset, deviceScore + routeOffset,
                 gateType, downType, hidden, inter, experts, topk, swigluLimit, true);
             if (!ok) return false;
-            // The arena and the weight table are reused by the next block.
-            if (cudaDeviceSynchronize() != cudaSuccess) return false;
         }
-        // The arena is reused by the next group, so stale entries must not
-        // survive the copy above.
-        for (int e : batches[b]) pointers[2*e] = pointers[2*e+1] = nullptr;
+        cudaEventRecord(pipeline.computed[slot], cudaStreamPerThread);
+        // Two groups ahead: that slot's arena has just been released by the
+        // compute recorded above.
+        if (b + 2 < batches.size()) issueGroup(b + 2);
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    if (V41HostStreamDebug()) {
+        printf("[fastllm-host-moe] groups=%zu block=%d arena=%.0fMB uploaded=%.0fMB upload=%.1fms\n",
+            batches.size(), blockRows, arenaBytes / 1048576.0, uploadedBytes / 1048576.0, uploadMs);
+        fflush(stdout);
     }
     return true;
 }
