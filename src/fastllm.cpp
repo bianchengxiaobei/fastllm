@@ -41,6 +41,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #endif
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#endif
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -1288,7 +1291,31 @@ namespace fastllm {
         return true;
     }
     
-#ifdef USE_MMAP
+#if defined(_WIN32) || defined(_WIN64)
+    // Windows 侧的文件映射：给 GGUF 主机权重用，启动时只建映射不读数据，
+    // 页按需从盘上 fault。FILE_MAP_COPY 保证万一有人往权重里写也只是拷到
+    // 私有页，不会踩坏映射或崩在只读页上。
+    FileMmap::FileMmap(const std::string &path) {
+        HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        AssertInFastLLM(file != INVALID_HANDLE_VALUE, "cannot open file " + path);
+
+        LARGE_INTEGER fileSize;
+        AssertInFastLLM(GetFileSizeEx(file, &fileSize) != 0, "get file size error " + path);
+        size = (size_t)fileSize.QuadPart;
+
+        HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_WRITECOPY, 0, 0, nullptr);
+        AssertInFastLLM(mapping != nullptr, "create file mapping error " + path);
+
+        data = (char *)MapViewOfFile(mapping, FILE_MAP_COPY, 0, 0, 0);
+        AssertInFastLLM(data != nullptr, "map view error " + path);
+
+        AssertInFastLLM(CloseHandle(mapping), "close mapping error " + path);
+        AssertInFastLLM(CloseHandle(file), "close file error " + path);
+    }
+
+    FileMmap::~FileMmap() { UnmapViewOfFile(data); }
+#elif defined(USE_MMAP)
     FileMmap::FileMmap(const std::string &path) {
         int fd = open(path.c_str(), O_RDONLY);
         AssertInFastLLM(fd > 0, "cannot open file ");
@@ -2844,11 +2871,7 @@ namespace fastllm {
         if (this->cpuData != nullptr) {
             // mapFile != nullptr 时 cpuData 指向 mmap 出来的权重区，由
             // mapFile 持有，这里不释放（也不计入分配探针）。
-#ifdef USE_MMAP
             const bool ownsCpuData = this->mapFile == nullptr;
-#else
-            const bool ownsCpuData = true;
-#endif
             if (ownsCpuData) {
                 auto freeSt = profileCpuAlloc ? std::chrono::steady_clock::now() :
                     std::chrono::steady_clock::time_point();
@@ -3070,12 +3093,8 @@ namespace fastllm {
             }
         }
         if (this->cpuData != nullptr)
-#ifdef USE_MMAP
             if (this->mapFile == nullptr)
                 fastllm::FreeCpuDataBlock(this->cpuData);
-#else
-           fastllm::FreeCpuDataBlock(this->cpuData);
-#endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
             if (!this->cudaDataBorrowed) {
@@ -3509,16 +3528,11 @@ namespace fastllm {
                         if (ownedCpuDataCopy) {
                             delete[] cpuData;
                         }
+#endif
                         if ((this->isModelWeight || this->isKVCache) && this->mapFile == nullptr) {
                             fastllm::FreeCpuDataBlock(this->cpuData);
                             this->cpuData = nullptr;
                         }
-#else
-                        if (this->isModelWeight || this->isKVCache) {
-                            fastllm::FreeCpuDataBlock(this->cpuData);
-                            this->cpuData = nullptr;
-                        }
-#endif
                     } else {
                         if (this->cudaData == nullptr) {
                             this->cudaData = CudaMallocForData(*this, expansionBytes);

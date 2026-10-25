@@ -634,8 +634,15 @@ namespace fastllm {
     struct DiskWeightDeleter {
         size_t mappedBytes = 0;
         void operator()(uint8_t *p) const {
-            if (mappedBytes) munmap(p, mappedBytes);
-            else delete[] p;
+            if (mappedBytes == 0) {
+                delete[] p;
+                return;
+            }
+#if defined(_WIN32) || defined(_WIN64)
+            VirtualFree(p, 0, MEM_RELEASE);
+#else
+            munmap(p, mappedBytes);
+#endif
         }
     };
     using DiskWeightAllocation = std::unique_ptr<uint8_t[], DiskWeightDeleter>;
@@ -734,8 +741,17 @@ namespace fastllm {
     }
 
     static size_t DiskHostPageSize() {
+#if defined(_WIN32) || defined(_WIN64)
+        static const size_t bytes = []() {
+            SYSTEM_INFO info;
+            GetSystemInfo(&info);
+            return (size_t)info.dwPageSize;
+        }();
+        return bytes > 0 ? bytes : 4096;
+#else
         static const long bytes = sysconf(_SC_PAGESIZE);
         return bytes > 0 ? static_cast<size_t>(bytes) : 4096;
+#endif
     }
 
     static size_t DiskGGUFAllocationBytes(uint64_t payload) {
@@ -755,8 +771,13 @@ namespace fastllm {
             // Unpooled large records return pages directly, without leaving
             // megabytes in glibc arenas for a later global malloc_trim scan.
             // mmap already provides the alignment needed by direct I/O.
+#if defined(_WIN32) || defined(_WIN64)
+            void *p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (p == nullptr) throw std::bad_alloc();
+#else
             void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p == MAP_FAILED) throw std::bad_alloc();
+#endif
 #ifdef MADV_NOHUGEPAGE
             // Cache misses and GPU demotions allocate on the decode path.
             // Faulting THP here can synchronously compact memory for seconds,

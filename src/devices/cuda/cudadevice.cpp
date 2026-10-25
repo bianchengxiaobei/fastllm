@@ -4553,13 +4553,9 @@ namespace fastllm {
         if (data.cpuData == nullptr) {
             return;
         }
-#ifdef USE_MMAP
-        if (data.name.empty()) {
-        fastllm::FreeCpuDataBlock(data.cpuData);
+        if (data.mapFile == nullptr) {
+            fastllm::FreeCpuDataBlock(data.cpuData);
         }
-#else
-        fastllm::FreeCpuDataBlock(data.cpuData);
-#endif
         data.cpuData = nullptr;
     }
 

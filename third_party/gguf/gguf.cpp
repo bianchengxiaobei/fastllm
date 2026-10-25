@@ -1,6 +1,8 @@
 #include <map>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <cstdlib>
 #include <stdexcept>
 
 #include <assert.h>
@@ -831,6 +833,41 @@ namespace fastllm {
         }
     }
 
+    // GGUF 主机权重默认走文件映射而不是读进堆: 启动时不用把几十上百 GB 读一遍,
+    // 页按需从盘上 fault, 并且留在系统文件缓存里, 下次启动直接命中。
+    // 关掉: FASTLLM_GGUF_MMAP_HOST=0。
+    static bool GGUFHostMmapEnabled() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_GGUF_MMAP_HOST");
+            return env == nullptr || env[0] == '\0' || env[0] != '0';
+        }();
+        return enabled;
+    }
+
+    // 一个分片只映射一次, 由进程持有; Data 只借用指针, 不负责释放。
+    static std::shared_ptr<FileMmap> GGUFMapHostFile(const std::string &fileName) {
+        static std::mutex lock;
+        static std::map<std::string, std::shared_ptr<FileMmap> > files;
+        std::lock_guard<std::mutex> guard(lock);
+        auto it = files.find(fileName);
+        if (it != files.end()) {
+            return it->second;
+        }
+        std::shared_ptr<FileMmap> mapped;
+        try {
+            mapped = std::make_shared<FileMmap>(fileName);
+        } catch (...) {
+            mapped = nullptr;
+        }
+        files[fileName] = mapped;
+        if (mapped != nullptr) {
+            printf("[fastllm-gguf] host weights mapped from %s (%.1f GB), pages load on demand\n",
+                   fileName.c_str(), mapped->size / 1e9);
+            fflush(stdout);
+        }
+        return mapped;
+    }
+
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
         // Keep the source-format marker even when a GGUF tensor is imported as
@@ -850,17 +887,28 @@ namespace fastllm {
             if (weight->dataType != DataType::DATA_GGUF_FORMAT) {
                 weight->Resize(tensor->dims);
                 weight->Allocate();
+                ReadGGUFTensorBytes(fileName, offset, weight->cpuData, ggml_nbytes(tensor));
             } else {
                 weight->dims = tensor->dims;
                 weight->ggmlTensor = (void*)(new ggml_tensor());
                 weight->ggmlType = tensor->type;
 
                 weight->expansionBytes = ggml_nbytes(tensor);
-                weight->cpuData = new uint8_t[ggml_nbytes(tensor)];
                 (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
-            }
 
-            ReadGGUFTensorBytes(fileName, offset, weight->cpuData, ggml_nbytes(tensor));
+                std::shared_ptr<FileMmap> mapped;
+                if (GGUFHostMmapEnabled()) {
+                    mapped = GGUFMapHostFile(fileName);
+                }
+                if (mapped != nullptr && offset + ggml_nbytes(tensor) <= mapped->size) {
+                    // 借用映射区: 不分配也不读, 生命周期归 mapFile。
+                    weight->cpuData = (uint8_t *)mapped->data + offset;
+                    weight->SetMapFile(mapped);
+                } else {
+                    weight->cpuData = new uint8_t[ggml_nbytes(tensor)];
+                    ReadGGUFTensorBytes(fileName, offset, weight->cpuData, ggml_nbytes(tensor));
+                }
+            }
 
         } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
                    replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
