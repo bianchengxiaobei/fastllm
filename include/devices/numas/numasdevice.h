@@ -11,6 +11,22 @@
 #include <mutex>
 
 namespace fastllm {
+    // Placement is independent of expert arithmetic/cache policy. Nested
+    // calls and CUDA CPU coordinators select it from the immutable weights.
+    class HostMoePlacementScope {
+        bool previous;
+    public:
+        explicit HostMoePlacementScope(bool unbound);
+        explicit HostMoePlacementScope(const Data *weight);
+        ~HostMoePlacementScope();
+        HostMoePlacementScope(const HostMoePlacementScope &) = delete;
+        HostMoePlacementScope &operator=(const HostMoePlacementScope &) = delete;
+    };
+    bool HostMoeIsUnbound();
+    bool CanRunHostMoe(const DataDict &datas, const IntDict &params);
+    void RegisterUnboundHostMoe(Data *const *weights, int count);
+    void RegisterHostMoeWeightBatch(const std::vector<std::pair<Data*, std::string>> &weights,
+        bool unbound, const std::function<void(size_t)> &onProgress = {});
     int GetNumasMoeShardCount();
     // Thread-TP models carry their own device set, independently of the
     // process-wide executor map. Borrow it for one synchronous MoE call.
@@ -58,6 +74,7 @@ namespace fastllm {
     };
 
     class NumasMergeMOE : CpuMergeMOE {
+    public:
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -121,6 +138,12 @@ namespace fastllm {
         int topk, int layer, const std::function<void()> &submitGpu,
         const float *routeScores, float swigluLimit, int activationQuantBlock,
         double *cpuElapsedUs);
+
+    // Borrow canonical disk/RAM GGUF records without NUMA registration or
+    // repacking. Reuse whole-layer decode workers; preserve disk V4.1 math.
+    bool HostMoeCanonicalV41Decode(const float *input, float *output,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const float *scores, int topk, float swigluLimit);
 
     // FP32 verifier subset, returning unweighted [row, route, hidden] values.
     // An expert must have the same CPU/GPU ownership in every input row.

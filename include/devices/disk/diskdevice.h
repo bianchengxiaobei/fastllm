@@ -36,6 +36,8 @@ namespace fastllm {
         uint64_t diskBytes = 0, uploads = 0, cpuEvictions = 0, cudaEvictions = 0;
         // Compact hierarchy: retained host/GPU overlap and selected GPU-to-RAM moves.
         uint64_t cpuCudaOverlapBytes = 0, cudaDemotions = 0, cudaDemotionBytes = 0;
+        uint64_t cpuWorkspaceBytes = 0, cpuBufferReuses = 0, cpuBufferAllocations = 0;
+        uint64_t cpuReclaims = 0, asyncMaintenance = 0;
     };
     // CUDA bytes are summed across devices; the configured CUDA budget is per GPU.
     DiskMoeCacheStats GetDiskMoeCacheStats();
@@ -47,6 +49,10 @@ namespace fastllm {
     // Register metadata only. Compact experts stay in their checkpoint files;
     // both bounded cache tiers use the public MoE frequency configuration.
     bool PrepareDiskMoeCache(const std::vector<std::vector<Data*>> &layers);
+
+    // Bounded prediction from previous prefill routes. Hints only overlap I/O;
+    // selected expert IDs and output math are always determined by the router.
+    void PrefetchDiskMoeV41(const std::vector<Data *> &weights, int rows);
 
     // The TP owner submits one host MoE operation, sharing its RAM tier while
     // allowing resident experts on every participating CUDA device to run.
@@ -71,8 +77,14 @@ namespace fastllm {
     };
 
     class DiskMergeMOE : CpuMergeMOE {
-        void RunCached(const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        bool RunCached(const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams,
+                       bool gpuPrefillOnly = false);
     public:
+        // Leaves input/output on CUDA when the complete routed prefill fits.
+        // A false result leaves the caller free to use the ordinary executor.
+        bool RunGpuPrefill(Data &input, Data &index, Data &score, Data &output,
+                           std::vector<Data *> &weights, float swigluLimit);
+
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };

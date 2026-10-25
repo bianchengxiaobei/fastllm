@@ -641,6 +641,8 @@ namespace fastllm {
         bool forceGGUFFp32Dequant = false;
 
         std::vector <uint8_t*> numasData; // numa数据
+        // Registered host-MoE shards may use one unbound CPU domain.
+        bool hostMoeUnbound = false;
         // True only when RegisterNumas has verified that every inline E8M0
         // scale in an NVFP4 block32 shard can absorb the kernel's 2^64
         // compensation without overflow.  Unknown and ineligible weights
@@ -901,6 +903,8 @@ namespace fastllm {
         bool addDummyPrefix = true;   // 是否在首位添加空格
         bool removeExtraWhitespaces = true;   // 是否将多个空格合并为一个
         bool byteAsChar = false;  // 是否将byte变为展示字符
+        std::string preTokenizer;
+        std::unordered_map<std::string, int> bpeMergeRanks;
 
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;

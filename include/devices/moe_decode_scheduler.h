@@ -212,7 +212,12 @@ public:
                 if (!p.timing || counts[r] >= p.capacity) continue;
                 const double next = std::max(gpu[r], (counts[r] + 1) * p.timing->copiedExpert.us) +
                     reuse[i] * p.timing->stagedExpert.us;
-                const double end = next + p.timing->dispatch.us + p.handoffUs;
+                // Decode submits all ranks while CPU workers run. Submission
+                // completion and GPU completion are concurrent bounds; only
+                // the measured delay before DMA starts precedes GPU work.
+                const double end = (decodeCpu && p.timing->decodeLaunch.initialized ?
+                    std::max(p.timing->dispatch.us, p.timing->decodeLaunch.us + next) :
+                    next + p.timing->dispatch.us) + p.handoffUs;
                 if (selected < 0 || end < finish) { selected = r; finish = end; compute = next; }
             }
             if (selected < 0) break;
@@ -295,6 +300,28 @@ public:
             else if (p.selected == p.misses) --p.selected;
         }
     }
+};
+
+// Validate the analytical split against completion of the entire layer,
+// including dispatch, DMA/restore, both GPUs and the CPU-result handoff.
+// Equal miss counts are compared; resident-only layers do not train this policy.
+class MoeDecodeCompletionPolicy {
+public:
+    static constexpr int bound = MoeDecodeScheduler::maxExperts + 1;
+    void Observe(int misses, int staged, double us) {
+        if (misses > 0 && misses < bound && staged >= 0 && staged <= misses && us > 0)
+            completion[misses][staged].Observe(us);
+    }
+    bool Allow(int misses, int staged, uint64_t calls) const {
+        if (staged <= 0 || misses <= 0 || misses >= bound || staged > misses) return true;
+        // Keep sparse probes so changed CPU/PCIe load can recover, without
+        // overwriting a calibrated baseline with a different-sized subset.
+        if (calls % 127 == 126 || calls % 131 == 130) return true;
+        const auto &base = completion[misses][0], &split = completion[misses][staged];
+        return !base.initialized || !split.initialized || split.us < base.us * .97;
+    }
+private:
+    std::array<std::array<MoeDecodeScheduler::Estimate, bound>, bound> completion{};
 };
 
 // Observe every routed expert, including CPU work, in a payload-free LRU with

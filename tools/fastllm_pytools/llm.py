@@ -804,21 +804,30 @@ def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
     result["hit_rate"] = result["hits"] / routes if routes else None
     return result
 
-def get_moe_cuda_cache_route_stats(device: int = 0):
-    """Read cumulative single-GPU hybrid decode/verifier counters between requests.
+def get_moe_cuda_cache_route_stats(device: int = 0, phase: str = None):
+    """Read cumulative hybrid expert-route counters between requests.
 
     Residency is measured across all routed experts before CPU/GPU dispatch,
-    excluding prefetch lookups. Prefill, multi-GPU EP and pure-GPU mode are
-    not counted. Host inference must be idle; this also synchronizes the GPU.
+    excluding prefetch lookups. Includes draft and small-prefill calls through
+    the hybrid backend; grouped prefill, multi-GPU EP and pure-GPU mode are
+    not counted. Optional phase: decode, verify, draft, small_prefill. Phase
+    attribution requires explicit model scopes; untagged calls and deferred
+    cache admissions are excluded. Host inference must be idle; this also
+    synchronizes the GPU.
     Subtract snapshots for per-request counts; cache and scheduler are retained.
     """
-    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_route_stats", None)
+    phases = {"decode": 0, "verify": 1, "draft": 2, "small_prefill": 3}
+    if phase is not None and phase not in phases:
+        raise ValueError("Unknown MoE route phase: " + str(phase))
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_phase_stats" if phase is not None else
+                    "fastllm_moe_cuda_cache_route_stats", None)
     if query is None:
         raise RuntimeError("Full-route expert-cache statistics require an updated CUDA build")
-    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.argtypes = [ctypes.c_int] + ([ctypes.c_int] if phase is not None else []) + [ctypes.POINTER(ctypes.c_uint64)]
     query.restype = ctypes.c_bool
     values = (ctypes.c_uint64 * 8)()
-    if not query(int(device), values):
+    args = [int(device)] + ([phases[phase]] if phase is not None else []) + [values]
+    if not query(*args):
         raise RuntimeError("Could not read full-route expert-cache statistics")
     result = dict(zip(("calls", "routes", "resident_routes", "nonresident_routes",
                        "gpu_routes", "cpu_routes", "resident_gpu_routes", "prefetched_experts"), values))
@@ -853,10 +862,12 @@ def set_moe_cpu_cache(bytes_: int):
     fastllm_lib.set_moe_cpu_cache(ctypes.c_uint64(bytes_))
 
 def get_disk_moe_cache_stats():
-    """Process-wide cumulative route counts and resident expert payload bytes."""
+    """Process-wide route counts, resident bytes and bounded cache workspace stats."""
     names = ("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
              "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
-             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes")
+             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes",
+             "cpu_workspace_bytes", "cpu_buffer_reuses", "cpu_buffer_allocations",
+             "cpu_reclaims", "async_maintenance")
     if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
         values = (ctypes.c_uint64 * len(names))()
         count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
@@ -1001,7 +1012,9 @@ class tokenizer:
         if (id != -99999):
             self.model = id
         else:
-            if os.path.isfile(path):
+            if path.lower().endswith(".gguf") and os.path.isfile(path):
+                self.model = fastllm_lib.create_llm_tokenizer_fromhf(path.encode())
+            elif os.path.isfile(path):
                 self.model = fastllm_lib.create_llm_tokenizer(path.encode());
             elif os.path.isdir(path):
                 self.model = fastllm_lib.create_llm_tokenizer_fromhf(path.encode());
@@ -1608,7 +1621,8 @@ class model:
                 else:
                     report_model_load_progress("tokenizer", 0, 1)
                     try:
-                        self.hf_tokenizer = try_load_gguf_tokenizer(path)
+                        if self.config.get("gguf_architecture") != "deepseek41":
+                            self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
                 if external_mtp_path and mmproj_path:
@@ -1754,6 +1768,13 @@ class model:
             'top_k': 1,
             'temperature': 1.0
         }
+
+        # DeepSeek-V4.1 Flash recommends temperature=1 and top_p=1.
+        # Disable top-k truncation instead of inheriting the greedy top_k=1.
+        if (architecture == "DeepseekV41ForCausalLM" or
+                model_type in ("deepseek_v41", "deepseek_v41_text") or
+                text_model_type == "deepseek_v41_text"):
+            self.default_generation_config.update(top_p=1.0, top_k=0)
 
         # Modern GGUF files can embed the recommended sampler settings.  Use
         # them when there is no Hugging Face generation_config.json sidecar.
@@ -2001,10 +2022,9 @@ class model:
 
         DeepSeek-V4 ships ``encoding_dsv4.py`` instead of a Jinja chat
         template.  Prompt rendering therefore remains model-specific, but the
-        resulting text must still be tokenized by the checkpoint's Hugging
-        Face tokenizer.  FastLLM's generic native BPE path does not currently
-        reproduce every pre-tokenizer rule in this checkpoint and can split an
-        otherwise identical prompt into a different token sequence.
+        resulting text uses the checkpoint's Hugging Face tokenizer when
+        one was loaded. Standalone V4.1 GGUF uses the equivalent native
+        pre-tokenizer and BPE through the ordinary native request path.
         """
         return (
             self._is_deepseek_v4()

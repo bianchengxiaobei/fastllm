@@ -29,16 +29,126 @@ class AutoConfigTest(unittest.TestCase):
         self.hardware = info, {(a, b): True for a in info for b in info}
         self.ram = {'total': 32 * GiB, 'available': 32 * GiB}
 
-    def resolve(self, a):
+    def resolve(self, a, *, use_numa=True):
         with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
                 patch.object(memory, 'geometry', return_value=self.g), \
                 patch.object(memory, 'weight_costs', return_value=self.costs), \
                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
             return auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware,
-                                ram=self.ram, use_numa=True)
+                                ram=self.ram, use_numa=use_numa)
 
     def args(self, *options):
         return make_normal_parser('test').parse_args(['model.gguf', '--auto', *options])
+
+    def mixed_fixture(self):
+        self.g = memory.Geometry('deepseek_v41', 8, 65536, 128, 128, 8, 64,
+                                 [1024] * 8, [1 << 20] * 8, 4, 1024, 1024)
+        self.costs = ([4 * GiB] * 8, [1 << 20] * 8, 1 << 20, 1 << 20, 4 * GiB, False)
+        self.ram = {'total': 32 * GiB, 'available': 30 * GiB}
+
+    def test_disk_cache_ratio_default_alias_and_validation(self):
+        self.assertEqual(self.args().auto_disk_cache_ratio, .5)
+        self.assertEqual(self.args('--auto-disk-cache-ratio', '.7').auto_disk_cache_ratio, .7)
+        for value in (-.1, 1.1, float('nan'), float('inf'), '.5', None, True):
+            a = self.args()
+            a.auto_disk_cache_ratio = value  # Also validate saved JSON values.
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'auto_disk_cache_ratio'):
+                self.resolve(a)
+
+    def test_disk_cache_ratio_changes_only_the_numa_disk_boundary(self):
+        self.mixed_fixture()
+        plans = []
+        for ratio, expected_layers in ((0, 5), (.25, 4), (.5, 2), (.6, 1)):
+            a = self.args('--auto_disk_cache_ratio', str(ratio))
+            p = self.resolve(a)
+            plans.append(p)
+            self.assertEqual(p['numa_layers'], expected_layers)
+            self.assertEqual(p['autotune_placement']['front'], {'numa': expected_layers})
+            self.assertEqual(a.moe_device_layers, 8 - expected_layers)
+            self.assertGreaterEqual(p['moe_cpu_cache'], p['disk_expert_bytes'] * ratio)
+            self.assertEqual(p['disk_expert_bytes'], (8 - expected_layers) * 4 * GiB)
+            self.assertLessEqual(p['host_estimated_bytes'], p['host_budget_bytes'])
+            for d in p['gpu_budget_bytes']:
+                self.assertLessEqual(p['gpu_estimated_bytes'][d], p['gpu_budget_bytes'][d])
+                self.assertLessEqual(p['moe_cuda_cache_per_device'][d], p['moe_cuda_cache'])
+        self.assertEqual(len({(p['device'], p['resident_layers'], p['chunked_prefill_size']) for p in plans}), 1)
+        # Even the all-disk cache cannot cover 75%; retain the existing safe
+        # fallback and explain the unmet recommendation instead of failing.
+        fallback = self.resolve(self.args('--auto_disk_cache_ratio', '.75'))
+        self.assertNotIn('autotune_placement', fallback)
+        self.assertTrue(any('coverage' in note for note in fallback['notes']))
+
+    def test_disk_cache_ratio_preserves_explicit_placement_and_host_only(self):
+        self.mixed_fixture()
+        for option, value in (('moe_device', 'disk'), ('moe_device_layers', '-1'),
+                              ('moe_cuda_cache', '0'), ('moe_cpu_cache', '1g')):
+            with self.subTest(option=option):
+                p = self.resolve(self.args('--' + option, value))
+                self.assertNotIn('autotune_placement', p)
+        self.assertNotIn('autotune_placement', self.resolve(self.args(), use_numa=False))
+        explicit_tp = self.resolve(self.args('--tp', 'cuda:0,1'))
+        self.assertEqual(explicit_tp['mode'], 'tp')
+        self.assertNotIn('autotune_placement', explicit_tp)
+        self.ram = {'total': 64 * GiB, 'available': 64 * GiB}
+        host = self.resolve(self.args())
+        self.assertEqual(host['moe_device'], 'numa')
+        self.assertNotIn('autotune_placement', host)
+
+    def test_mixed_disk_budget_includes_both_transport_pools(self):
+        self.mixed_fixture()
+        a = self.args('--moe_device', 'disk')
+        baseline = self.resolve(a)
+        with patch.object(memory, 'weight_costs', return_value=self.costs):
+            _, original = auto.mixed_disk_plan(a, baseline, {}, [], self.g, self.gpu, self.ram, .5)
+            baseline['expert_transport_bytes_per_device'] += GiB
+            baseline['workspace_bytes_per_device'] += GiB
+            baseline['expert_host_staging_bytes'] += GiB
+            _, mixed = auto.mixed_disk_plan(a, baseline, {}, [], self.g, self.gpu, self.ram, .5)
+        self.assertEqual(original['numa_layers'], mixed['numa_layers'])
+        self.assertEqual(original['moe_cpu_cache'] - mixed['moe_cpu_cache'], GiB)
+        self.assertEqual(mixed['expert_host_staging_bytes'], GiB)
+        self.assertEqual(mixed['expert_transport_bytes_per_device'], GiB)
+        for d in mixed['gpu_budget_bytes']:
+            original_cache = original['moe_cuda_cache'] + original['moe_cuda_cache_per_device'][d]
+            mixed_cache = mixed['moe_cuda_cache'] + mixed['moe_cuda_cache_per_device'][d]
+            self.assertEqual(original_cache - mixed_cache, GiB)
+            self.assertLessEqual(mixed['gpu_estimated_bytes'][d], mixed['gpu_budget_bytes'][d])
+
+    def test_mixed_disk_draft_weights_follow_their_target_layers(self):
+        self.mixed_fixture()
+        self.g.kv += [1024, 1024]
+        self.g.state += [1 << 20, 1 << 20]
+        self.costs = (self.costs[0] + [3 * GiB, GiB], self.costs[1] + [1 << 20, 1 << 20],
+                      *self.costs[2:])
+        p = self.resolve(self.args())
+        boundary = p['resident_layers'] + p['numa_layers']
+        self.assertLessEqual(boundary, 6)
+        self.assertEqual(p['disk_expert_bytes'], (8 - boundary) * 4 * GiB + 4 * GiB)
+        self.assertGreaterEqual(p['disk_cpu_cache_ratio'], .5)
+
+    def test_streamed_disk_gguf_chunk_priority_preserves_host_policy(self):
+        self.g.family = 'deepseek_v41'
+        self.g.disk_prefill = {'canonical_gguf': True, 'streamed_mmq': True}
+        small = dict(chunked_prefill_size=512, resident_layers=0, moe_cuda_cache=2*GiB,
+                     expert_transport_bytes_per_device=256*1024**2)
+        large = dict(small, chunked_prefill_size=2048, moe_cuda_cache=GiB)
+        self.assertGreater(auto._deepseek_priority(large, self.g, 'disk'),
+                           auto._deepseek_priority(small, self.g, 'disk'))
+        prompt = dict(large, chunked_prefill_size=4096, moe_cuda_cache=GiB//2)
+        self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
+                           auto._deepseek_priority(large, self.g, 'disk'))
+        fallback = dict(prompt, chunked_prefill_size=8192, moe_cuda_cache=3*GiB)
+        self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
+                           auto._deepseek_priority(fallback, self.g, 'disk'))
+        # Concurrent decode does not multiply V4.1's streamed prefill rows.
+        self.assertEqual(auto._deepseek_priority(dict(prompt, max_batch=4), self.g, 'disk'),
+                         auto._deepseek_priority(prompt, self.g, 'disk'))
+        for backend in ('numa', 'cpu'):
+            self.assertLess(auto._deepseek_priority(large, self.g, backend),
+                            auto._deepseek_priority(small, self.g, backend))
+        small['expert_transport_bytes_per_device'] = large['expert_transport_bytes_per_device'] = 0
+        self.assertLess(auto._deepseek_priority(large, self.g, 'disk'),
+                        auto._deepseek_priority(small, self.g, 'disk'))
 
     def test_tracking_aliases_zero_and_subcommands(self):
         parser = _AutoArgumentParser()
@@ -81,12 +191,162 @@ class AutoConfigTest(unittest.TestCase):
         self.resolve(full)
         self.assertFalse(full.low_gpu_mem)
 
+    def test_deepseek_hybrid_ratio_default_and_explicit_precedence(self):
+        self.g.family = 'deepseek_v41'
+        for backend in ('numa', 'cpu', 'disk'):
+            for options, ratio in (((), .95), (('--gpu_mem_ratio', '.9'), .9),
+                                   (('--gpu_mem_ratio', '.97'), .97)):
+                with self.subTest(backend=backend, options=options):
+                    a = self.args('--device', 'cuda:0', '--moe_device', backend,
+                                  '--moe_device_layers', '-1', *options)
+                    p = self.resolve(a)
+                    self.assertEqual(a.gpu_mem_ratio, ratio)
+                    self.assertEqual(p['gpu_mem_ratio'], ratio)
+                    self.assertAlmostEqual(p['gpu_budget_bytes'][0], 8 * GiB * ratio, delta=1)
+        capped = self.args('--device', 'cuda:0', '--moe_device_layers', '-1',
+                           '--auto_gpu_memory_limit', '6g')
+        self.assertEqual(self.resolve(capped)['gpu_budget_bytes'][0], 6 * GiB)
+
+    def test_hybrid_ratio_does_not_change_full_gpu_or_other_models(self):
+        self.g.family = 'deepseek_v41'
+        full = self.args('--device', 'cuda:0', '--moe_device_layers', '0')
+        p = self.resolve(full)
+        self.assertEqual(p['resident_layers'], self.g.layers)
+        self.assertEqual((full.gpu_mem_ratio, p['gpu_mem_ratio']), (.9, .9))
+        self.g.family = 'qwen4'
+        other = self.args('--device', 'cuda:0', '--moe_device_layers', '-1')
+        p = self.resolve(other)
+        self.assertEqual((other.gpu_mem_ratio, p['gpu_mem_ratio']), (.9, .9))
+
     def test_deepseek_numa_prefers_largest_feasible_chunk_and_pp(self):
         self.g.family = 'deepseek_v41'
         a = self.args('--moe_device', 'numa', '--moe_device_layers', '-1')
         p = self.resolve(a)
         self.assertEqual((p['mode'], a.chunked_prefill_size), ('pp', 8192))
         self.assertEqual(a.moe_device, 'numa')
+
+    def test_deepseek_gguf_auto_slabs_honor_explicit_opt_out(self):
+        self.g.family = 'deepseek_v41'
+        tensors = [memory.Tensor('layers.0.ffn.experts.0.w2.weight', (256, 256), 1 << 20, 'gguf:12')]
+        with patch.object(memory, 'model_inputs', return_value=({}, tensors, self.g)), \
+                patch.object(memory, 'geometry', return_value=self.g), \
+                patch.object(memory, 'weight_costs', return_value=self.costs), \
+                patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+            for flags, expected in [((), 64), (('--cuda_slab', '0'), 0), (('--cuda_slab', '32'), 32)]:
+                a = self.args(*flags)
+                p = auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware,
+                                 ram=self.ram, use_numa=True)
+                self.assertEqual(a.cuda_slab, expected)
+                self.assertEqual(p['cuda_slab'], expected)
+
+    def deepseek_cache_fixture(self):
+        self.g.family, self.g.experts = 'deepseek_v41', 256
+        self.g.activation_width = 512 * 1024
+        self.costs = ([4 * GiB] * 4, *self.costs[1:])
+        return ('--moe_device', 'numa', '--moe_device_layers', '-1')
+
+    def test_deepseek_cache_target_precedes_larger_chunk(self):
+        options = self.deepseek_cache_fixture()
+        p = self.resolve(self.args(*options))
+        large = self.resolve(self.args(*options, '--chunked_prefill_size', '2048'))
+        small = self.resolve(self.args(*options, '--chunked_prefill_size', '512'))
+        self.assertEqual((p['mode'], p['chunked_prefill_size']), ('pp', 1024))
+        self.assertGreaterEqual(p['moe_cuda_cache'], 3 * GiB)
+        self.assertLess(large['moe_cuda_cache'], 3 * GiB)
+        # Once 3 GiB fits, grow the chunk rather than maximizing cache alone.
+        self.assertGreater(small['moe_cuda_cache'], p['moe_cuda_cache'])
+
+    def test_deepseek_chunk_floor_precedes_cache_target_and_can_fall_back(self):
+        # Keep this boundary case at its original budget as defaults evolve.
+        options = (*self.deepseek_cache_fixture(), '--device', 'cuda:0', '--gpu_mem_ratio', '.9')
+        self.gpu[0]['free'] = 21 * GiB // 4
+        p = self.resolve(self.args(*options))
+        small = self.resolve(self.args(*options, '--chunked_prefill_size', '256'))
+        self.assertEqual(p['chunked_prefill_size'], 512)
+        self.assertLess(p['moe_cuda_cache'], 3 * GiB)
+        self.assertGreaterEqual(small['moe_cuda_cache'], 3 * GiB)
+        # Both targets are soft: retain a safe plan when even 512 cannot fit.
+        self.gpu[0]['free'] = 5 * GiB // 2
+        fallback = self.resolve(self.args(*options))
+        self.assertEqual(fallback['chunked_prefill_size'], 256)
+        self.assertLessEqual(fallback['gpu_estimated_bytes'][0], fallback['gpu_budget_bytes'][0])
+
+    def test_deepseek_cache_targets_keep_explicit_values_and_short_context(self):
+        options = (*self.deepseek_cache_fixture(), '--device', 'cuda:0')
+        cases = [(('--moe_cuda_cache', '0'), 2048, 0),
+                 (('--chunked_prefill_size', '2048'), 2048, None),
+                 (('--chunked_prefill_size', '256', '--moe_cuda_cache', '1g'), 256, GiB),
+                 (('--max_context_length', '128'), 128, None)]
+        for flags, chunk, cache in cases:
+            with self.subTest(flags=flags):
+                a = self.args(*options, *flags)
+                p = self.resolve(a)
+                self.assertEqual(a.chunked_prefill_size, chunk)
+                if cache is not None:
+                    self.assertEqual(a.moe_cuda_cache, cache)
+                if chunk == 128:
+                    self.assertEqual((a.max_context_length, a.tokens), (128, 128))
+                self.assertLessEqual(p['gpu_estimated_bytes'][0], p['gpu_budget_bytes'][0])
+                self.assertLessEqual(p['host_estimated_bytes'], p['host_budget_bytes'])
+
+    def test_deepseek_auto_excludes_tp_even_with_better_cache(self):
+        options = self.deepseek_cache_fixture()
+        original = memory.plan
+        modes = []
+        def plan(args, model, costs, mode, *rest, **kwargs):
+            modes.append(mode)
+            # Present feasible per-topology results whose priorities differ.
+            trial = copy.copy(args)
+            trial.chunked_prefill_size = 2048 if mode == 'pp' else 512
+            trial.moe_cuda_cache = GiB if mode == 'pp' else 3 * GiB
+            return original(trial, model, costs, mode, *rest, **kwargs)
+        with patch.object(memory, 'plan', side_effect=plan):
+            p = self.resolve(self.args(*options))
+            self.assertEqual((p['mode'], p['chunked_prefill_size'], p['moe_cuda_cache']),
+                             ('pp', 2048, GiB))
+            self.assertEqual(set(modes), {'pp'})
+            explicit = self.resolve(self.args(*options, '--tp', '2'))
+            self.assertEqual((explicit['mode'], explicit['chunked_prefill_size'], explicit['moe_cuda_cache']),
+                             ('tp', 512, 3 * GiB))
+
+    def test_deepseek_auto_uses_disk_pp_instead_of_tp_capacity_fallback(self):
+        self.g.family = 'deepseek_v41'
+        original = memory.plan
+        modes = []
+        def plan(args, model, costs, mode, *rest, **kwargs):
+            modes.append(mode)
+            if mode == 'pp' and args.moe_device != 'disk':
+                raise ValueError('Host experts only fit with TP')
+            return original(args, model, costs, mode, *rest, **kwargs)
+        with patch.object(memory, 'plan', side_effect=plan):
+            p = self.resolve(self.args())
+            self.assertEqual((p['moe_device'], p['mode']), ('disk', 'pp'))
+            self.assertEqual(set(modes), {'pp'})
+            with self.assertRaisesRegex(ValueError, 'Host experts only fit with TP'):
+                self.resolve(self.args('--moe_device', 'numa'))
+        a = self.args()
+        with patch.dict(os.environ, {'FASTLLM_TP': '2'}, clear=True):
+            layouts = list(auto.topologies(a, set(a._auto_explicit), self.hardware[0], self.gpu,
+                                          family='deepseek_v41'))
+        self.assertEqual([row[2] for row in layouts], ['tp'])
+
+    def test_deepseek_full_gpu_does_not_need_cache_target(self):
+        self.g.family = 'deepseek_v41'
+        p = self.resolve(self.args('--device', 'cuda:0'))
+        self.assertEqual(p['resident_layers'], self.g.layers)
+        self.assertEqual(p['moe_cuda_cache'], 0)
+
+    def test_deepseek_latency_can_choose_full_gpu_over_larger_hybrid_chunk(self):
+        self.g.family = 'deepseek_v41'
+        self.g.activation_width = 1 << 20
+        self.costs = ([23 * GiB // 4] * 4, *self.costs[1:])
+        self.gpu[0] = dict(total=30 * GiB, free=30 * GiB)
+        # Both candidates meet the chunk/cache targets. A larger hybrid
+        # chunk must not veto the faster full-GPU candidate before ranking.
+        with patch.object(auto, 'latency_score', side_effect=lambda p, *rest:
+                          1 if p['resident_layers'] == self.g.layers else 100):
+            p = self.resolve(self.args('--device', 'cuda:0', '--gpu_mem_ratio', '.9', '--max_batch', '2'))
+        self.assertEqual((p['resident_layers'], p['chunked_prefill_size']), (self.g.layers, 512))
 
     def test_deepseek_implicit_embedding_is_charged_before_chunk_selection(self):
         self.g.family = 'deepseek_v41'
@@ -311,6 +571,90 @@ class AutoConfigTest(unittest.TestCase):
         self.resolve(a)
         self.assertEqual((a.max_batch, a.max_context_length, a.tokens, a.kv_cache_dtype), (4, 8192, 32768, 'fp8_e4m3'))
 
+    def test_unequal_expert_layers_use_weighted_pp_before_disk(self):
+        self.g.family = 'deepseek_v41'
+        self.g.layers = 6
+        self.g.kv = [1024] * 6
+        self.g.state = [1 << 20] * 6
+        self.costs = ([GiB] * 3 + [2 * GiB] * 3, [1 << 20] * 6, 0, 0, 2 * GiB, False)
+        self.gpu = {d: dict(total=4 * GiB, free=4 * GiB) for d in range(3)}
+        info = {d: self.hardware[0][0].copy() for d in self.gpu}
+        self.hardware = info, {(a, b): True for a in info for b in info}
+        self.ram = dict(total=7 * GiB, available=7 * GiB)
+        p = self.resolve(self.args('--max_context_length', '4096'))
+        self.assertEqual(p['moe_device'], 'numa')
+        self.assertEqual(p['mode'], 'pp')
+        self.assertEqual(p['resident_layers'], 5)
+        self.assertEqual(p['device'], "{'cuda:0': 2, 'cuda:1': 2, 'cuda:2': 1}")
+        self.assertEqual(p['moe_cpu_cache'], 0)
+        # An explicit layout must not silently become a different partition.
+        fixed = self.resolve(self.args('--max_context_length', '4096', '--device', 'cudapp=0,1,2'))
+        self.assertEqual(fixed['device'], 'cudapp=0,1,2')
+        self.assertEqual(fixed['moe_device'], 'disk')
+
+    def test_v41_shared_cpu_and_numa_have_identical_capacity_plans(self):
+        self.g.family = 'deepseek_v41'
+        self.g.experts = 128
+        self.g.gguf_expert_bytes = {i: 2 * GiB // 128 for i in range(4)}
+        self.costs = ([2 * GiB] * 4, [1 << 20] * 4, 1 << 20, 1 << 20, 2 * GiB, False)
+        self.gpu = {d: dict(total=6 * GiB, free=6 * GiB) for d in (0, 1)}
+        self.ram = dict(total=int(12.5 * GiB), available=int(12.5 * GiB))
+        plans = [self.resolve(self.args('--max_context_length', '4096', '--moe_device', backend))
+                 for backend in ('cpu', 'numa')]
+        for p in plans:
+            self.assertGreater(p['moe_cuda_cache'], 0)
+            self.assertEqual(p['expert_transport_bytes_per_device'], 96 * (2 * GiB // 128) + 272 * (1 << 20))
+            self.assertLessEqual(p['host_estimated_bytes'], p['host_budget_bytes'])
+        for key in ('device', 'mode', 'resident_layers', 'chunked_prefill_size',
+                    'moe_cuda_cache', 'host_estimated_bytes', 'gpu_estimated_bytes'):
+            self.assertEqual(plans[0][key], plans[1][key], key)
+        legacy = self.resolve(self.args('--max_context_length', '4096'), use_numa=False)
+        self.assertEqual(legacy['moe_device'], 'cpu')
+        self.assertEqual(legacy['moe_cuda_cache'], 0)
+        self.assertEqual(legacy['expert_transport_bytes_per_device'], 0)
+
+    def test_v41_capacity_fallback_does_not_change_other_families(self):
+        for family in ('qwen3', 'qwen4', 'glm5'):
+            with self.subTest(family=family):
+                self.g.family = family
+                backends = []
+                original = memory.prepare
+                def prepare(a, *rest, **kwargs):
+                    backends.append(a.moe_device)
+                    if a.moe_device == 'numa':
+                        raise ValueError('Force existing disk fallback')
+                    return original(a, *rest, **kwargs)
+                with patch.object(memory, 'prepare', side_effect=prepare), \
+                        patch.object(auto, 'capacity_pp_topologies') as weighted:
+                    p = self.resolve(self.args())
+                self.assertEqual(set(backends), {'numa', 'disk'})
+                self.assertEqual(p['moe_device'], 'disk')
+                self.assertNotIn('cuda_slab', p)
+                weighted.assert_not_called()
+
+    def test_shared_cpu_models_use_the_numa_cache_capacity_policy(self):
+        for family in ('qwen4', 'glm5'):
+            with self.subTest(family=family):
+                self.g.family, self.g.experts = family, 128
+                self.costs = ([8 * GiB] * 4, [1 << 20] * 4, 1 << 20, 1 << 20, 8 * GiB, False)
+                self.ram = dict(total=128 * GiB, available=128 * GiB)
+                plans = [self.resolve(self.args('--moe_device', backend))
+                         for backend in ('cpu', 'numa')]
+                self.assertGreater(plans[0]['moe_cuda_cache'], 0)
+                for key in ('mode', 'resident_layers', 'chunked_prefill_size',
+                            'moe_cuda_cache', 'host_estimated_bytes', 'gpu_estimated_bytes'):
+                    self.assertEqual(plans[0][key], plans[1][key], key)
+                legacy = self.resolve(self.args('--moe_device', 'cpu'), use_numa=False)
+                if family == 'glm5':
+                    self.assertEqual(legacy['moe_cuda_cache'], 0)
+
+    def test_capacity_pp_ratios_are_unique_after_normalization(self):
+        layouts = [('cudapp=0,1', 'off', 'pp', {0: 1, 1: 1})]
+        mappings = [mapping for _, _, _, mapping in
+                    auto.capacity_pp_topologies(self.g, self.costs, layouts, self.gpu)]
+        self.assertNotIn({0: 1, 1: 1}, mappings)
+        self.assertEqual(len(mappings), len({tuple(m.items()) for m in mappings}))
+
     def test_default_128k_and_explicit_total_capacity(self):
         self.g.context = 262144
         for options, expected in [((), 131072), (('--tokens', '16384'), 16384),
@@ -429,9 +773,22 @@ class AutoConfigTest(unittest.TestCase):
         self.g.streamed_kv = [8192] * 4
         self.gpu = {d: {'total': 3 * GiB, 'free': 3 * GiB} for d in (0, 1)}
 
-    def test_streaming_preserves_128k_and_budgets_host_and_prefill_staging(self):
+    def streaming_args(self, *options):
+        return self.args('--prefix_cache', 'false', '--cache_history', 'false', *options)
+
+    def test_default_reuse_is_not_disabled_to_fit_memory(self):
         self.streaming_fixture()
         a = self.args('--device', 'cuda:0', '--moe_device', 'numa')
+        before = vars(a).copy()
+        with self.assertRaises(ValueError):
+            self.resolve(a)
+        self.assertEqual(vars(a), before)
+        self.assertTrue(self.resolve(self.streaming_args(
+            '--device', 'cuda:0', '--moe_device', 'numa'))['automatic']['kv_streaming'])
+
+    def test_streaming_preserves_128k_and_budgets_host_and_prefill_staging(self):
+        self.streaming_fixture()
+        a = self.streaming_args('--device', 'cuda:0', '--moe_device', 'numa')
         p = self.resolve(a)
         config = json.loads(a.kvmem)
         self.assertEqual((a.max_context_length, a.tokens, a.max_batch), (131072, 131072, 1))
@@ -447,13 +804,13 @@ class AutoConfigTest(unittest.TestCase):
     def test_streaming_uses_smaller_resident_pool_only_when_needed(self):
         self.streaming_fixture()
         self.gpu[0] = dict(total=int(2.4 * GiB), free=int(2.4 * GiB))
-        a = self.args('--device', 'cuda:0', '--moe_device', 'numa')
+        a = self.streaming_args('--device', 'cuda:0', '--moe_device', 'numa')
         self.resolve(a)
         self.assertEqual(json.loads(a.kvmem)['resident_tokens'], 16384)
 
     def test_streaming_keeps_explicit_tp(self):
         self.streaming_fixture()
-        a = self.args('--tp', '2', '--moe_device', 'numa')
+        a = self.streaming_args('--tp', '2', '--moe_device', 'numa')
         p = self.resolve(a)
         self.assertEqual((p['mode'], set(p['gpu_budget_bytes'])), ('tp', {0, 1}))
         self.assertTrue(p['automatic']['kv_streaming'])
@@ -463,10 +820,10 @@ class AutoConfigTest(unittest.TestCase):
         self.g.experts = 256
         options = ('--device', 'cudapp=2', '--moe_device_layers', '-1', '--chunked_prefill_size', '512')
         with patch.object(auto, 'kv_residencies', return_value=[0]):
-            full = self.resolve(self.args(*options))
+            full = self.resolve(self.streaming_args(*options))
         original = memory.plan
         with patch.object(memory, 'plan', wraps=original) as plans:
-            streamed = self.resolve(self.args(*options))
+            streamed = self.resolve(self.streaming_args(*options))
         self.assertEqual(streamed['kvmem']['resident_tokens'], 32768)
         self.assertGreater(streamed['moe_cuda_cache'], full['moe_cuda_cache'])
         self.assertEqual(streamed['chunked_prefill_size'], full['chunked_prefill_size'])
@@ -479,7 +836,7 @@ class AutoConfigTest(unittest.TestCase):
         for full_score in (9., 10.5, 12.):
             with self.subTest(full_score=full_score), patch.object(auto, 'latency_score',
                     side_effect=lambda p, *unused: 10. if 'kvmem' in p else full_score):
-                result = self.resolve(self.args(*options))
+                result = self.resolve(self.streaming_args(*options))
             self.assertIn('kvmem', result)
 
     def test_full_kv_room_is_checked_per_device(self):
@@ -487,7 +844,7 @@ class AutoConfigTest(unittest.TestCase):
         self.g.experts = 256
         self.gpu = {0: dict(total=5 * GiB, free=5 * GiB),
                     1: dict(total=20 * GiB, free=20 * GiB)}
-        p = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1',
+        p = self.resolve(self.streaming_args('--device', 'cudapp=2', '--moe_device_layers', '-1',
                                    '--chunked_prefill_size', '512'))
         self.assertIn('kvmem', p)
 
@@ -500,7 +857,7 @@ class AutoConfigTest(unittest.TestCase):
                 raise ValueError('32K pool does not fit')
             return original(*args, **kwargs)
         with patch.object(memory, 'plan', side_effect=plan):
-            p = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1',
+            p = self.resolve(self.streaming_args('--device', 'cudapp=2', '--moe_device_layers', '-1',
                                        '--chunked_prefill_size', '512'))
         self.assertEqual(p['kvmem']['resident_tokens'], 16384)
 
@@ -508,12 +865,12 @@ class AutoConfigTest(unittest.TestCase):
         self.streaming_fixture()
         self.gpu = {d: dict(total=12 * GiB, free=12 * GiB) for d in (0, 1)}
         # Do not change a fully resident GPU configuration into hybrid streaming.
-        full = self.resolve(self.args('--device', 'cuda:0'))
+        full = self.resolve(self.streaming_args('--device', 'cuda:0'))
         self.assertEqual(full['resident_layers'], self.g.layers)
         self.assertNotIn('kvmem', full)
         options = ('--device', 'cudapp=2', '--moe_device_layers', '-1', '--moe_cuda_cache', '0')
-        self.assertNotIn('kvmem', self.resolve(self.args(*options)))
-        cached = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1'))
+        self.assertNotIn('kvmem', self.resolve(self.streaming_args(*options)))
+        cached = self.resolve(self.streaming_args('--device', 'cudapp=2', '--moe_device_layers', '-1'))
         self.assertEqual(cached['resident_layers'], 0)
         self.assertNotIn('kvmem', cached)
         original = memory.plan
@@ -522,12 +879,12 @@ class AutoConfigTest(unittest.TestCase):
                 raise ValueError('No room for pinned KV')
             return original(*args, **kwargs)
         with patch.object(memory, 'plan', side_effect=plan):
-            self.assertNotIn('kvmem', self.resolve(self.args('--device', 'cudapp=2')))
+            self.assertNotIn('kvmem', self.resolve(self.streaming_args('--device', 'cudapp=2')))
 
     def test_short_context_does_not_stream_just_to_increase_cache(self):
         self.streaming_fixture()
         with patch.object(memory, 'plan', wraps=memory.plan) as plans:
-            p = self.resolve(self.args('--device', 'cudapp=2', '--max_context_length', '32768'))
+            p = self.resolve(self.streaming_args('--device', 'cudapp=2', '--max_context_length', '32768'))
         self.assertNotIn('kvmem', p)
         self.assertEqual({call.kwargs['kv_resident'] for call in plans.call_args_list}, {0})
 
@@ -564,7 +921,7 @@ class AutoConfigTest(unittest.TestCase):
     def test_streaming_does_not_hide_insufficient_ram_or_mutate_failed_request(self):
         self.streaming_fixture()
         self.ram = dict(total=8 * GiB, available=8 * GiB)
-        a = self.args('--device', 'cuda:0', '--moe_device', 'numa')
+        a = self.streaming_args('--device', 'cuda:0', '--moe_device', 'numa')
         before = vars(a).copy()
         with self.assertRaises(ValueError):
             self.resolve(a)
@@ -579,13 +936,13 @@ class AutoConfigTest(unittest.TestCase):
                 raise ValueError('Full KV leaves too little room for host expert residency')
             return original(args, *rest, **kwargs)
         with patch.object(memory, 'plan', side_effect=plan):
-            p = self.resolve(self.args())
+            p = self.resolve(self.streaming_args())
         self.assertEqual(p['moe_device'], 'numa')
         self.assertTrue(p['automatic']['kv_streaming'])
 
     def test_streaming_preserves_explicit_features_and_supported_model_boundary(self):
         self.streaming_fixture()
-        a = self.args()
+        a = self.streaming_args()
         a.atype = a.kv_cache_dtype = 'float16'
         a.tokens = a.max_context_length = 131072
         a.max_batch = 1
@@ -598,19 +955,28 @@ class AutoConfigTest(unittest.TestCase):
                 trial._auto_explicit = [*a._auto_explicit, *changes]
                 self.assertEqual(auto.kv_residencies(trial, self.g), [0])
         for env in ({'FASTLLM_PREFIX_CACHE': '1'}, {'FASTLLM_SKIP_WARMUP': '1'}):
+            trial = copy.copy(a)
+            if 'FASTLLM_PREFIX_CACHE' in env:
+                trial.prefix_cache = ''
             with patch.dict(os.environ, env, clear=True):
-                self.assertEqual(auto.kv_residencies(a, self.g), [0])
+                self.assertEqual(auto.kv_residencies(trial, self.g), [0])
         self.g.family = 'glm5'
         self.assertEqual(auto.kv_residencies(a, self.g), [0])
 
-    def test_streaming_disables_default_history_and_preserves_explicit_history(self):
+    def test_default_reuse_reaches_runtime_and_streaming_requires_opt_out(self):
         self.streaming_fixture()
         self.gpu = {d: dict(total=8 * GiB, free=8 * GiB) for d in (0, 1)}
         self.costs = ([4 * GiB] * 4, [1 << 20] * 4, 1 << 20, 0, GiB, False)
-        for explicit in (False, True):
-            with self.subTest(explicit=explicit), tempfile.TemporaryDirectory() as d:
+        cases = (
+            ((), True, '', False),
+            (('--cache_history', 'true'), True, '', False),
+            (('--prefix_cache', 'false'), True, 'false', False),
+            (('--cache_history', 'false'), False, '', False),
+            (('--prefix_cache', 'false', '--cache_history', 'false'), False, 'false', True),
+        )
+        for options, history, prefix, streaming in cases:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as d:
                 Path(d, 'config.json').write_text(json.dumps({'model_type': 'qwen4_exp'}))
-                options = ['--cache_history', 'true'] if explicit else []
                 a = make_normal_parser('test').parse_args([d, '--auto', *options])
                 runtime = MagicMock()
                 runtime.get_cuda_memory_info.side_effect = self.gpu.__getitem__
@@ -618,14 +984,16 @@ class AutoConfigTest(unittest.TestCase):
                 model.get_max_input_len.return_value = 131072
                 model.get_max_batch.return_value = 1
                 def warmup():
-                    if explicit:
+                    if streaming:
+                        model.set_kvmem.assert_called_once_with(**json.loads(a.kvmem))
+                    else:
                         model.set_kvmem.assert_not_called()
+                    if history:
                         model.set_save_history.assert_called_once_with(True)
                     else:
-                        model.set_kvmem.assert_called_once_with(**json.loads(a.kvmem))
                         model.set_save_history.assert_not_called()
                         runtime.set_cpu_historycache.assert_not_called()
-                        self.assertEqual(os.environ['FASTLLM_PREFIX_CACHE'], 'false')
+                    self.assertEqual(os.environ.get('FASTLLM_PREFIX_CACHE', ''), prefix)
                 model.warmup.side_effect = warmup
                 with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
                         patch.object(memory, 'geometry', return_value=self.g), \
@@ -635,9 +1003,9 @@ class AutoConfigTest(unittest.TestCase):
                         patch.dict(sys.modules, {'ftllm': types.SimpleNamespace(llm=runtime)}), \
                         patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
                     self.assertIs(make_normal_llm_model(a), model)
-                self.assertEqual(model.hybrid_auto_plan['automatic']['kv_streaming'], not explicit)
-                self.assertEqual(a.cache_history, 'true' if explicit else 'false')
-                self.assertEqual(a.prefix_cache, '' if explicit else 'false')
+                self.assertEqual(model.hybrid_auto_plan['automatic']['kv_streaming'], streaming)
+                self.assertEqual(a.cache_history, 'true' if history else 'false')
+                self.assertEqual(a.prefix_cache, prefix)
                 model.warmup.assert_called_once()
 
     def test_tp_off_and_heterogeneous_gpus_exclude_auto_tp(self):

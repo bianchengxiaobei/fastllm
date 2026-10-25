@@ -37,26 +37,51 @@ static void Equal(const std::vector<uint8_t> &expected, Data &actual, const std:
         }
     throw std::runtime_error(label + ": bitwise mismatch");
 }
+static void EqualPrefill(const std::vector<uint8_t> &expected, Data &actual, const std::string &label) {
+    // The shared SM75 prefill MMA path changes accumulation order. Match its
+    // numerical contract in test_deepseek_v41_prefill (which also has an FP64
+    // oracle); all decode, verify, graph and scalar fallback checks stay exact.
+    const auto &shape = actual.dims;
+    if (shape[0] != 1 || shape[1] < 128 || (shape[2] != 32 && shape[2] != 64)) {
+        Equal(expected, actual, label);
+        return;
+    }
+    const auto got = Bytes(actual);
+    Check(got.size() == expected.size() && actual.dataType == BFLOAT16, label + ": shape/type mismatch");
+    double error = 0, norm = 0, maximum = 0;
+    for (size_t i = 0; i < got.size(); i += 2) {
+        uint16_t a, b;
+        memcpy(&a, got.data() + i, 2); memcpy(&b, expected.data() + i, 2);
+        const double value = BFloat16BitsToFloat32(a), reference = BFloat16BitsToFloat32(b);
+        Check(std::isfinite(value), label + ": nonfinite result");
+        const double delta = std::abs(value - reference);
+        Check(delta <= 1e-5 + std::abs(reference) * .0082, label + ": BF16 rounding bound");
+        error += delta * delta; norm += reference * reference; maximum = std::max(maximum, delta);
+    }
+    const double relative = std::sqrt(error / std::max(norm, 1e-30));
+    Check(relative < .001, label + ": prefill relative RMS difference");
+    if (error) std::printf("%s: relative_rmse=%.8g max_abs=%.8g\n", label.c_str(), relative, maximum);
+}
 struct Case {
     int heads, window, start, width, capacity, ringMode, cmpMode, tokens;
     Data q, chunk, ring, cmp, sink, indices, packedRing, packedCmp, output;
     Case(int heads, int window, int start, int width, int ringMode, int cmpMode, int seed = 1,
-         DataType queryType = BFLOAT16, int tokens = 1)
+         DataType queryType = BFLOAT16, int tokens = 1, int batch = 1)
         : heads(heads), window(window), start(start), width(width), capacity(std::max(64, width)),
           ringMode(ringMode), cmpMode(cmpMode), tokens(tokens),
-          q(Random(queryType, {1,tokens,heads,512}, seed, .1f)),
-          chunk(Random(BFLOAT16, {1,tokens,512}, seed+1)),
-          ring(Random(BFLOAT16, {1,std::max(1,window),512}, seed+2)),
-          cmp(Random(BFLOAT16, {1,capacity,512}, seed+3, seed % 3 ? .5f : 1e-6f)),
+          q(Random(queryType, {batch,tokens,heads,512}, seed, .1f)),
+          chunk(Random(BFLOAT16, {batch,tokens,512}, seed+1)),
+          ring(Random(BFLOAT16, {batch,std::max(1,window),512}, seed+2)),
+          cmp(Random(BFLOAT16, {batch,capacity,512}, seed+3, seed % 3 ? .5f : 1e-6f)),
           sink(Random(FLOAT32, {heads}, seed+4, seed % 2 ? 1.f : 80.f)),
-          indices(INT32, {1,tokens,width}) {
+          indices(INT32, {batch,tokens,width}) {
         if (ringMode) Check(FastllmCudaDeepSeekV41QuantizeKV(ring, packedRing, ringMode,
                             ringMode == 3 ? 16 : 32), "pack ring");
         if (cmpMode) Check(FastllmCudaDeepSeekV41QuantizeKV(cmp, packedCmp, cmpMode,
                             cmpMode == 3 ? 16 : 32), "pack compressed");
         if (width) {
             indices.Allocate();
-            std::vector<int32_t> ids(size_t(tokens) * width);
+            std::vector<int32_t> ids(size_t(batch) * tokens * width);
             for (size_t i=0; i<ids.size(); ++i) ids[i] = i % 17 == 0 ? -1 :
                 (i % 19 == 0 ? capacity : (i / 2 * 13 + seed + i / width * 997) % capacity);
             memcpy(indices.cpuData, ids.data(), ids.size()*sizeof(int32_t));
@@ -75,6 +100,64 @@ struct Case {
     }
 };
 
+static int PrefillChecks() {
+    int checks = 0;
+    const int formats[][2] = {{0,0},{1,3},{0,3},{1,0},{3,3},{2,2},{0,2},{3,0},{1,1}};
+    const int shapes[][3] = {{128,0,0},{128,31,33},{128,127,65},{128,129,512},
+                             {4,3,513},{128,8192,0},{0,0,513}};
+    for (int tokens : {9,31,128}) for (int heads : {1,7,32,64,65,128,129})
+        for (const auto &format : formats) {
+            const auto &shape = shapes[checks % 7];
+            Case c(heads,shape[0],shape[1],shape[2],format[0],format[1],301+checks,BFLOAT16,tokens);
+            auto expected = c.Reference(); c.Run();
+            EqualPrefill(expected,c.output,"prefill case="+std::to_string(checks));
+            ++checks;
+        }
+    // Production chunk size and independent batch rows, including all-invalid
+    // compressed indices and a sink-only softmax (window == 0).
+    for (int tokens : {128,2048}) for (int batch : {1,2}) {
+        Case c(64,128,2048,513,1,3,503+checks,BFLOAT16,tokens,batch);
+        auto expected = c.Reference(); c.Run(); EqualPrefill(expected,c.output,"prefill batch/chunk");
+        ++checks;
+    }
+    Case masked(7,0,0,33,0,3,13,BFLOAT16,31,2);
+    Cuda(cudaMemset(masked.indices.cudaData,0xff,masked.indices.GetBytes()));
+    auto expected = masked.Reference(); masked.Run(); Equal(expected,masked.output,"prefill sink only");
+    Check(Bytes(masked.output) == std::vector<uint8_t>(masked.output.GetBytes(),0),"sink-only output");
+    ++checks;
+
+    // A later KV row must not change earlier queries across a ring wrap.
+    Case causal(7,4,3,65,1,3,17,BFLOAT16,31);
+    causal.Run(); const auto before = Bytes(causal.output);
+    std::vector<uint16_t> future(512,0x4300);
+    Cuda(cudaMemcpy(static_cast<char *>(causal.chunk.cudaData)+30*512*2,
+                    future.data(),future.size()*2,cudaMemcpyHostToDevice));
+    causal.Run(); const auto after = Bytes(causal.output);
+    Check(std::equal(before.begin(),before.begin()+30*7*512*2,after.begin()),"prefill causal mutation");
+    expected = causal.Reference(); causal.Run(); Equal(expected,causal.output,"prefill changed KV");
+    ++checks;
+
+    // The padded kernel needs no scratch allocation and must replay with live
+    // indices rather than values frozen during capture.
+    Case graphCase(65,128,127,513,1,3,19,BFLOAT16,128,2);
+    expected = graphCase.Reference(); graphCase.Run();
+    std::vector<void *> reserved;
+    Check(FastllmCudaGraphMemoryPoolBegin(),"prefill graph pool");
+    Check(FastllmCudaGraphBeginCapture(),"prefill graph capture");
+    graphCase.Run(); void *graph = nullptr;
+    Check(FastllmCudaGraphEndCapture(&graph),"prefill graph end");
+    Check(FastllmCudaGraphMemoryPoolEnd(reserved),"prefill pool end");
+    cudaGraphExec_t exec; Cuda(cudaGraphInstantiate(&exec,(cudaGraph_t)graph,nullptr,nullptr,0));
+    Cuda(cudaGraphLaunch(exec,cudaStreamPerThread)); Equal(expected,graphCase.output,"prefill graph replay");
+    Cuda(cudaMemset(graphCase.indices.cudaData,0xff,graphCase.indices.GetBytes()));
+    expected = graphCase.Reference();
+    Cuda(cudaGraphLaunch(exec,cudaStreamPerThread)); Equal(expected,graphCase.output,"prefill graph updated indices");
+    Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy((cudaGraph_t)graph));
+    FastllmCudaGraphMemoryPoolRelease(reserved);
+    ++checks;
+    return checks;
+}
+
 static void GraphChecks(bool capacityMiss, int tokens = 1) {
     Case cases[] = {{32,128,8440,513,1,3,317,BFLOAT16,tokens},
                     {32,128,0,513,3,2,619,BFLOAT16,tokens == 1 ? 1 : tokens - 1}};
@@ -89,7 +172,8 @@ static void GraphChecks(bool capacityMiss, int tokens = 1) {
         if (capacityMiss) {
             // Exhaust fitting idle blocks; fallback must submit no partial fast path.
             const size_t count = std::min(cases[i].window, cases[i].start + cases[i].tokens) + cases[i].width;
-            const size_t bytes = size_t(cases[i].tokens) * count * (512+32+1) * sizeof(float);
+            // These cases all have >=512 candidates and include coefficient scratch.
+            const size_t bytes = size_t(cases[i].tokens) * (count * (512+3*32+1) + 32) * sizeof(float);
             for (;;) {
                 void *ptr = nullptr; const auto status = FastllmCudaTryMalloc(&ptr, bytes);
                 if (status == FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE) break;
@@ -106,7 +190,7 @@ static void GraphChecks(bool capacityMiss, int tokens = 1) {
         Cuda(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
         if (!capacityMiss) {
             size_t count=0; Cuda(cudaGraphGetNodes(graphs[i], nullptr, &count));
-            Check(count >= 3, "parallel attention was not captured");
+            Check(count >= 4, "parallel attention/coefficient pass was not captured");
         }
     }
     for (void *a : reserved[0]) for (void *b : reserved[1])
@@ -126,6 +210,33 @@ static void GraphChecks(bool capacityMiss, int tokens = 1) {
         Cuda(cudaStreamDestroy(streams[i])); FastllmCudaGraphMemoryPoolRelease(reserved[i]);
         for (void *ptr : held[i]) FastllmCudaFree(ptr);
     }
+}
+static int CoefficientChecks() {
+    int checks = 0;
+    // Odd heads/candidate counts exercise float2 scratch alignment and partial
+    // warps. Cover both sides of the coefficient dispatch and its largest list.
+    for (int tokens : {1,3,4,5,7,8}) for (int width : {32,127,128,511,512,513,4096})
+        for (int pattern : {0,1,2}) {
+            Case c(7,0,0,width,0,3,1009+checks,BFLOAT16,tokens);
+            if (pattern == 0) {
+                std::vector<int32_t> invalid(size_t(tokens)*width,-1);
+                Cuda(cudaMemcpy(c.indices.cudaData,invalid.data(),invalid.size()*sizeof(int32_t),cudaMemcpyHostToDevice));
+            } else if (pattern == 1) {
+                // Large scores, negative/positive sinks, and tied zero scores
+                // must retain the scalar online-softmax result exactly.
+                Data q = Random(BFLOAT16,{1,tokens,7,512},233+checks,10000.f);
+                Data sink = Random(FLOAT32,{7},431+checks,10000.f);
+                Cuda(cudaMemcpy(c.q.cudaData,q.cudaData,q.GetBytes(),cudaMemcpyDeviceToDevice));
+                Cuda(cudaMemcpy(c.sink.cudaData,sink.cudaData,sink.GetBytes(),cudaMemcpyDeviceToDevice));
+            } else {
+                Cuda(cudaMemset(c.q.cudaData,0,c.q.GetBytes()));
+                Cuda(cudaMemset(c.sink.cudaData,0,c.sink.GetBytes()));
+            }
+            auto expected=c.Reference(); c.Run();
+            Equal(expected,c.output,"coefficient boundary case="+std::to_string(checks));
+            ++checks;
+        }
+    return checks;
 }
 static int VerifyChecks(bool smoke) {
     int checks = 0;
@@ -180,6 +291,7 @@ int main(int argc, char **argv) {
             ApplyDeviceMap({{"cuda:"+std::to_string(dev),1}},0,1); FastllmCudaSetDevice(dev);
             if (FastllmCudaRuntimeArch()!=75) continue;
             ++tested;
+            if (mode=="prefill") { checks += PrefillChecks(); continue; }
             const int formats[][2]={{1,3},{0,3},{1,0},{3,3},{2,2},{0,2},{3,0},{1,1}};
             const int shapes[][3]={{128,0,0},{128,31,33},{128,127,65},{128,129,512},
                                    {512,8440,512},{0,0,1024},{128,8192,0},{128,8192,513}};
@@ -192,6 +304,8 @@ int main(int argc, char **argv) {
             }
             checks += VerifyChecks(mode=="smoke");
             if (mode!="smoke") {
+                checks += PrefillChecks();
+                checks += CoefficientChecks();
                 for (int heads : {128,129}) {
                     Case c(heads,128,8192,33,1,3); auto expected=c.Reference();
                     c.Run(); Equal(expected,c.output,"head limit"); ++checks;
@@ -204,7 +318,7 @@ int main(int argc, char **argv) {
             }
         }
         if (!tested) return 77;
-        printf("PASS SM75 packed attention: %d bitwise cases on %d devices; mode=%s\n",checks,tested,mode.c_str());
+        printf("PASS SM75 packed attention: %d cases on %d devices; exact decode/verify/fallback, bounded MMA prefill; mode=%s\n",checks,tested,mode.c_str());
         return 0;
     } catch (const std::exception &e) { fprintf(stderr,"FAIL %s\n",e.what()); return 1; }
 }

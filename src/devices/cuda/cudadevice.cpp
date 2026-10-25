@@ -1,4 +1,5 @@
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
@@ -4761,12 +4762,20 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmFloatToHalf(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::BFLOAT16) {
             data.dataType = DataType::FLOAT16;
             data.UpdateUnitSize();
             int len = data.Count(0);
-            FastllmBF16ToHalf(data.cudaData, data.cudaData, len);
+            void *old = data.cudaData;
+            // A borrowed view must not change its owner's representation or
+            // release the underlying persistent allocation.
+            if (data.cudaDataBorrowed) {
+                data.cudaData = FastllmCudaMalloc(GetConvertedBufferBytes(data));
+                data.cudaDataBorrowed = false;
+            }
+            FastllmBF16ToHalf(old, data.cudaData, len);
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
@@ -4806,7 +4815,8 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmHalfToFloat(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::BFLOAT16) {
             uint16_t *old = (uint16_t*)data.cudaData;
             data.dataType = DataType::FLOAT32;
@@ -4815,7 +4825,8 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmBF16ToFloat(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -4900,12 +4911,20 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmFloatToBF16(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::FLOAT16) {
             data.dataType = DataType::BFLOAT16;
             data.UpdateUnitSize();
             int len = data.Count(0);
-            FastllmHalfToBF16(data.cudaData, data.cudaData, len);
+            void *old = data.cudaData;
+            // A borrowed view must not change its owner's representation or
+            // release the underlying persistent allocation.
+            if (data.cudaDataBorrowed) {
+                data.cudaData = FastllmCudaMalloc(GetConvertedBufferBytes(data));
+                data.cudaDataBorrowed = false;
+            }
+            FastllmHalfToBF16(old, data.cudaData, len);
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
@@ -7124,9 +7143,10 @@ namespace fastllm {
 
     void CudaDeepSeekV41WindowStoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        if (!FastllmCudaDeepSeekV41WindowStore(*(datas.find("chunk")->second), *(datas.find("ring")->second),
+        if (!FastllmCudaDeepSeekV41WindowStorePrefix(*(datas.find("chunk")->second), *(datas.find("ring")->second),
                                                CudaV41Int(intParams, "startPos", 0),
-                                               CudaV41Int(intParams, "windowSize", 128))) {
+                                               CudaV41Int(intParams, "windowSize", 128),
+                                               CudaV41Int(intParams, "rowCount", -1))) {
             ErrorInFastLLM("DeepSeekV41WindowStore CUDA error: kernel rejected input.\n");
         }
     }
@@ -7327,8 +7347,10 @@ namespace fastllm {
             return false;
         }
         int heads = input.dims[2], headDim = input.dims[3];
+        uint64_t weightElements = weight.dims.empty() ? 0 : 1;
+        for (int dim : weight.dims) weightElements *= dim;
         if (heads % groups != 0 ||
-            weight.Count(0) != (uint64_t)groups * oRank * (heads / groups) * headDim) {
+            weightElements != (uint64_t)groups * oRank * (heads / groups) * headDim) {
             return false;
         }
         return input.dataType == DataType::FLOAT32 ||
@@ -7343,6 +7365,39 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
         int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
+        if (weight.dataType == DATA_GGUF_FORMAT) {
+            if (FastllmCudaGGUFGroupedGemv(input, weight, groups, oRank, output)) return;
+            const int tokens = input.dims[0] * input.dims[1];
+            const int columns = input.dims[2] * input.dims[3] / groups;
+            // Transpose activations once; each packed group uses the ordinary
+            // GGUF dispatcher, including bounded/tiled MMQ for long prefill.
+            Data inputView; inputView.FakeFrom(input, 0);
+            inputView.Resize({1, tokens, groups, columns});
+            Data groupedInput(input.dataType, {1, groups, tokens, columns});
+            Data groupedOutput(input.dataType, {1, groups, tokens, oRank});
+            groupedInput.dataDevice = groupedOutput.dataDevice = CUDA;
+            groupedInput.dataDeviceIds = groupedOutput.dataDeviceIds = input.dataDeviceIds;
+            groupedInput.Allocate(false); groupedOutput.Allocate(false);
+            AssertInFastLLM(FastllmCudaPermuteTo(inputView, groupedInput, {0, 2, 1, 3}),
+                            "GGUF grouped output projection input transpose failed.");
+            // Count(0) is the packed ggml byte size. Direct GGUF imports do
+            // not populate Data strides, so GetBytes() is not usable here.
+            const size_t groupBytes = weight.Count(0) / groups;
+            for (int group = 0; group < groups; ++group) {
+                Data x, y, w;
+                x.FakeFrom(groupedInput, size_t(group) * tokens * columns * input.unitSize); x.Resize({tokens, columns});
+                y.FakeFrom(groupedOutput, size_t(group) * tokens * oRank * input.unitSize); y.Resize({tokens, oRank});
+                w.FakeFrom(weight, group * groupBytes); w.ggmlType = weight.ggmlType;
+                w.dims = {oRank, columns}; w.weightType = WeightType::LINEAR;
+                DoCudaLinear(x, w, *GetEmptyData(), y);
+            }
+            output.dataType = input.dataType; output.UpdateUnitSize();
+            output.Resize({1, tokens, groups, oRank}); output.Allocate(false);
+            AssertInFastLLM(FastllmCudaPermuteTo(groupedOutput, output, {0, 2, 1, 3}),
+                            "GGUF grouped output projection result transpose failed.");
+            output.Reshape({input.dims[0], input.dims[1], groups * oRank});
+            return;
+        }
         if (!FastllmCudaDeepSeekV4WoA(input, weight, groups, oRank, output)) {
             ErrorInFastLLM("DeepSeekV4WoA CUDA error: kernel rejected input.\n");
         }
@@ -9438,7 +9493,13 @@ namespace fastllm {
         Data **sourceWeights = weights;
 #ifndef USE_ROCM
         FastllmCudaMoePrefillCache prefillCache;
+        // Native GGUF records belong to the scored model path. Ordinary
+        // projections (including speed probes) may restore a different layout
+        // and must retain their temporary storage instead of aliasing the cache.
+        const bool cacheLayoutCompatible = !weights[2] ||
+            weights[2]->dataType != DATA_GGUF_FORMAT || deepSeekV4Mode;
         const bool cachedPrefill = setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
+            cacheLayoutCompatible &&
             prefillCache.Begin(weights, m, indexData, scoreData, batch, topk, experts, cacheAdmission);
         if (cachedPrefill) {
             weights = prefillCache.Weights();

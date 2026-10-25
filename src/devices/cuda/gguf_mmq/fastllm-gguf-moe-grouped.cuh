@@ -169,10 +169,10 @@ __global__ void Matmul(const uint8_t *const *weights, int part,
     if (packedTile%(Tile/kTile)) return;
     const int localTile = packedTile/(Tile/kTile);
     const int padded = ((columns+255)/256)*256;
-    if constexpr (SelectRows && Type == GGML_TYPE_Q2_K) {
+    if constexpr (SelectRows && !NativeV41 && Type == GGML_TYPE_Q2_K) {
         hybrid_q2_mmq::Compute<Tile>(weights[2*e+part], input+begin,
             output+size_t(begin)*width, padded, width, stride, counts[e], capacity, localTile);
-    } else if constexpr (SelectRows && Type == GGML_TYPE_Q4_K) {
+    } else if constexpr (SelectRows && !NativeV41 && Type == GGML_TYPE_Q4_K) {
         mul_mat_q_process_tile<Type, Tile, MMQ_NWARPS, true, false, hybrid_q4_mmq_type_traits, (Tile > kTile)>(
             reinterpret_cast<const char *>(weights[2*e+part]),
             reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
@@ -282,7 +282,7 @@ static void LaunchMatrix(const uint8_t *const *weights, int part, Workspace &w,
     const int cc = ggml_cuda_info().devices[device].cc;
     constexpr ggml_type SharedType = Type == GGML_TYPE_Q2_0 ? GGML_TYPE_Q8_0 :
         (Type == GGML_TYPE_Q4_K || (NativeV41 && Type == GGML_TYPE_IQ1_S)) ? GGML_TYPE_Q2_K : Type;
-    constexpr bool packedQ2 = SelectRows && Type == GGML_TYPE_Q2_K;
+    constexpr bool packedQ2 = SelectRows && !NativeV41 && Type == GGML_TYPE_Q2_K;
     const int shared = packedQ2 ? (Tile*MMQ_TILE_Y_K + hybrid_q2_mmq::kOutputTile*MMQ_MMA_TILE_X_K_Q2_K)*sizeof(int)
         : mmq_get_shmem<SharedType>(Tile, get_mmq_y_host(cc), cc);
     static std::once_flag initialized[GGML_CUDA_MAX_DEVICES];
@@ -378,6 +378,8 @@ static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weight
     return cudaGetLastError() == cudaSuccess;
 }
 
+#include "fastllm-gguf-moe-v41-native.cuh"
+
 // A bounded compute workspace is shared by all streamed groups. Only the
 // per-route products survive between groups, so final reduction keeps the
 // original top-k order and activation rounding without atomic accumulation.
@@ -386,7 +388,7 @@ struct StreamedWorkspace {
     block_q8_1_mmq *quantized;
     float *products, *routes;
     size_t bytes;
-    StreamedWorkspace(void *base, int rows, int hidden, int inter, int topk, int capacity) {
+    StreamedWorkspace(void *base, int rows, int hidden, int inter, int topk, int capacity, bool nativeV41 = false) {
         size_t used = 0;
         auto take = [&](size_t n) -> void * {
             void *p = base ? static_cast<char *>(base) + used : nullptr;
@@ -400,7 +402,9 @@ struct StreamedWorkspace {
         quantized = static_cast<block_q8_1_mmq *>(take(size_t(capacity) *
             (((std::max(hidden, inter) + 255) / 256) * 2) * sizeof(block_q8_1_mmq)));
         products = static_cast<float *>(take(size_t(capacity) * std::max(2 * inter, hidden) * sizeof(float)));
-        routes = static_cast<float *>(take(size_t(rows) * topk * hidden * sizeof(float)));
+        // Native V4.1 rounds every down projection to BF16 before reduction.
+        routes = static_cast<float *>(take(size_t(rows) * topk * hidden *
+            (nativeV41 ? sizeof(__nv_bfloat16) : sizeof(float))));
         bytes = used;
     }
 };
@@ -455,13 +459,16 @@ __global__ void ReduceStreamed(const float *products, T *output,
 }
 
 #include "fastllm-gguf-moe-glm5-stream.cuh"
+#include "fastllm-gguf-moe-v41-stream.cuh"
 
 template<class T>
 static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *output,
         void *workspace, int capacity, int rows, int hidden, int inter, int topk,
         int gt, int dt, const StreamedMoeBatch &batch, const float *scores,
-        bool glm5, float swigluLimit, const int32_t *indices) {
+        bool glm5, float swigluLimit, const int32_t *indices, bool nativeV41) {
     if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+        if (nativeV41) return RunNativeV41Streamed(phase, input, output, workspace,
+            capacity, rows, hidden, inter, topk, gt, dt, batch, scores, indices, swigluLimit);
         if (glm5) return RunGlm5Streamed(phase, input, gate, output, workspace,
             capacity, rows, hidden, inter, topk, gt, dt, batch, scores, indices, swigluLimit);
     }
