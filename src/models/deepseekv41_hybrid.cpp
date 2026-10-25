@@ -415,6 +415,8 @@ namespace fastllm {
                     *moeIndexPtr, *moeScorePtr, ffnOut, activationQuantBlock, swiglu_limit);
             }
 #endif
+            const bool profileMoeFallback = V41ProfileHostMoe() && !cacheHandled && !hostGpuHandled;
+            const double moeFallbackStarted = profileMoeFallback ? V41HostMoeNowMs() : 0.0;
             if (!cacheHandled && !hostGpuHandled)
                 MergeMOEBlock(moeInputPtr, moeIndexPtr, moeScorePtr, &moeWeights, &biass[layer],
                           &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layer,
@@ -422,6 +424,15 @@ namespace fastllm {
                           MoeGateSwiglu, routedExpertParallel, swiglu_limit, true, nullptr,
                           activationQuantBlock,
                           quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
+            if (profileMoeFallback) {
+                const char *weightDevice = "device";
+                if (moeWeights.size() > 2 && moeWeights[2] != nullptr) {
+                    weightDevice = moeWeights[2]->dataDevice == DataDevice::CUDA ? "cuda" : "cpu";
+                }
+                printf("[fastllm-host-moe] layer=%d cpu-moe rows=%d %.1fms weights=%s\n",
+                    layer, seqlen, V41HostMoeNowMs() - moeFallbackStarted, weightDevice);
+                fflush(stdout);
+            }
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
 #ifdef USE_CUDA
             if (tp && !combineFfnPostDispatch && ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr) {
