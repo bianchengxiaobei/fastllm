@@ -7,17 +7,55 @@
 #include "utils/hybrid_parallel.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "devices/disk/diskdevice.h"
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
 namespace fastllm {
     DeepSeekV41DecodeWorkspace::DeepSeekV41DecodeWorkspace() = default;
     DeepSeekV41DecodeWorkspace::~DeepSeekV41DecodeWorkspace() = default;
+
+#ifdef USE_CUDA
+    namespace {
+        // Host (pageable) GGUF experts on the card during prefill, mirroring the
+        // Qwen3.5 switch: -1 means "on when the experts live in host memory",
+        // 0/1 force it. NUMA and disk keep their own registered pipelines.
+        bool V41PrefillMoeGpuFromHostEnabled(const std::string &moeDevice) {
+            const int configured = GetFastllmEnv().prefillMoeGpu;
+            if (configured >= 0) {
+                return configured != 0;
+            }
+            return moeDevice.find("cpu") != std::string::npos;
+        }
+
+        // Below this many tokens the fixed upload costs more than the CPU pass.
+        int V41PrefillMoeGpuFromHostMinTokens() {
+            static const int minTokens = []() {
+                const char *env = std::getenv("FASTLLM_PREFILL_MOE_GPU_MIN_TOKENS");
+                const int value = env == nullptr ? 64 : atoi(env);
+                return value > 0 ? value : 1;
+            }();
+            return minTokens;
+        }
+
+        bool V41ProfileHostMoe() {
+            static const bool enabled = std::getenv("FASTLLM_PROFILE_HOST_MOE") != nullptr;
+            return enabled;
+        }
+
+        double V41HostMoeNowMs() {
+            return (double)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-3;
+        }
+    }
+#endif
 
     void DeepSeekV41Model::OnAutoWarmupFinished() {
         if (executionMode != ExecutionMode::Hybrid || std::uncaught_exceptions() ||
@@ -75,6 +113,96 @@ namespace fastllm {
         }
 #endif
     }
+
+#ifdef USE_CUDA
+    namespace {
+        // Serve one prefill chunk's routed experts on the card while their
+        // weights stay in host memory. The upload is bounded by free VRAM and
+        // every group accumulates into `output` (FLOAT32), matching the
+        // resident GGUF path the rest of the layer already assumes.
+        bool V41TryPrefillMoeGpuFromHost(DeepSeekV41MoeContext &ctx,
+                const std::string &moeDeviceSpec, Data &input, Data &index, Data &score,
+                Data &output, int activationQuantBlock, float swigluLimit) {
+            if (ctx.tp || ctx.graphActive || ctx.dumpDebug || ctx.seqlen <= 0) return false;
+            if (activationQuantBlock != 32 || !GetCudaSharedExpert()) return false;
+            if (!V41PrefillMoeGpuFromHostEnabled(moeDeviceSpec)) return false;
+            if (ctx.seqlen < V41PrefillMoeGpuFromHostMinTokens()) return false;
+            auto &moeWeights = ctx.moeWeights;
+            if (moeWeights.size() < 4 || moeWeights[0] != nullptr || moeWeights[1] != nullptr) {
+                return false;
+            }
+            const int experts = (int)moeWeights.size() / 2 - 1;
+            if (experts <= 0) return false;
+            if (input.dataType != BFLOAT16 || input.dataDevice != DataDevice::CUDA ||
+                !input.cudaData || input.dims.size() != 2) return false;
+            if (index.dataType != INT32 || score.dataType != FLOAT32 ||
+                index.dims.size() != 2 || score.dims != index.dims) return false;
+            const int topk = index.dims[1];
+            const int64_t slots = index.Count(0);
+            if (topk <= 0 || topk > 32 || slots != int64_t(input.dims[0])*topk ||
+                score.Count(0) != slots) return false;
+
+            // The grouped launch reads plain host arrays; the router may have
+            // produced them on either device.
+            Data hostIndex, hostScore;
+            const Data *indexHost = &index, *scoreHost = &score;
+            if (index.dataDevice != DataDevice::CPU || index.cpuData == nullptr) {
+                hostIndex.dataType = index.dataType;
+                hostIndex.UpdateUnitSize();
+                hostIndex.Resize(index.dims);
+                hostIndex.Allocate();
+                if (!hostIndex.cpuData || index.cudaData == nullptr) return false;
+                FastllmCudaCopyFromDeviceToHost(hostIndex.cpuData, index.cudaData, index.GetBytes());
+                indexHost = &hostIndex;
+            }
+            if (score.dataDevice != DataDevice::CPU || score.cpuData == nullptr) {
+                hostScore.dataType = score.dataType;
+                hostScore.UpdateUnitSize();
+                hostScore.Resize(score.dims);
+                hostScore.Allocate();
+                if (!hostScore.cpuData || score.cudaData == nullptr) return false;
+                FastllmCudaCopyFromDeviceToHost(hostScore.cpuData, score.cudaData, score.GetBytes());
+                scoreHost = &hostScore;
+            }
+            if (indexHost->cpuData == nullptr || scoreHost->cpuData == nullptr) return false;
+
+            const double started = V41ProfileHostMoe() ? V41HostMoeNowMs() : 0.0;
+            bool handled = false;
+            try {
+                handled = FastllmCudaRunV41GGUFHostStream(input, output,
+                    moeWeights.data() + 2, experts * 2,
+                    reinterpret_cast<const int32_t *>(indexHost->cpuData),
+                    reinterpret_cast<const float *>(scoreHost->cpuData),
+                    topk, swigluLimit, 0);
+            } catch (const std::exception &e) {
+                printf("[fastllm] V4.1 prefill MoE on GPU failed: %s, falling back to CPU.\n", e.what());
+                fflush(stdout);
+                handled = false;
+            } catch (...) {
+                printf("[fastllm] V4.1 prefill MoE on GPU failed, falling back to CPU.\n");
+                fflush(stdout);
+                handled = false;
+            }
+            if (handled && V41ProfileHostMoe()) {
+                printf("[fastllm-host-moe] layer=%d host->gpu rows=%d %.1fms\n",
+                    ctx.layer, ctx.seqlen, V41HostMoeNowMs() - started);
+                fflush(stdout);
+            }
+            if (!handled) {
+                // Say it once: silently reverting to the CPU MoE hides a
+                // VRAM/format problem behind a 30x slower prefill.
+                static std::atomic<int> reported{0};
+                if (reported.fetch_add(1) == 0) {
+                    printf("[Fastllm] V4.1 prefill MoE on GPU unavailable for %d rows "
+                        "(host GGUF experts + free VRAM); keeping the CPU MoE path.\n",
+                        ctx.seqlen);
+                    fflush(stdout);
+                }
+            }
+            return handled;
+        }
+    }
+#endif
 
     bool DeepSeekV41Model::RunHybridMoe(DeepSeekV41MoeContext &ctx, HybridMoeDecodeStep *step) {
         auto *ws = &ctx.workspace;
@@ -277,11 +405,21 @@ namespace fastllm {
                     ffnOut, moeWeights.data(), (int)moeWeights.size(), layer);
             }
 #endif
-            if (!cacheHandled) MergeMOEBlock(moeInputPtr, moeIndexPtr, moeScorePtr, &moeWeights, &biass[layer],
+            const int activationQuantBlock =
+                quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128;
+            bool hostGpuHandled = false;
+#ifdef USE_CUDA
+            if (!cacheHandled) {
+                hostGpuHandled = V41TryPrefillMoeGpuFromHost(ctx, moeDeviceSpec, ffnInput,
+                    *moeIndexPtr, *moeScorePtr, ffnOut, activationQuantBlock, swiglu_limit);
+            }
+#endif
+            if (!cacheHandled && !hostGpuHandled)
+                MergeMOEBlock(moeInputPtr, moeIndexPtr, moeScorePtr, &moeWeights, &biass[layer],
                           &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layer,
                           ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
                           MoeGateSwiglu, routedExpertParallel, swiglu_limit, true, nullptr,
-                          quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
+                          activationQuantBlock,
                           quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
 #ifdef USE_CUDA

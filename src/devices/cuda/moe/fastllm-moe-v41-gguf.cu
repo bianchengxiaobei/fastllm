@@ -3,9 +3,13 @@
 #include "../fastllm-gguf-q3-k-gemv.cuh"
 #include "../fastllm-gguf-iq1-dot.cuh"
 #include "fastllm-moe-gguf-q8.cuh"
+#include "fastllm-moe-gguf-common.cuh"
 #include "fastllm-cuda-v41-gguf.h"
 #include "fastllm-cuda.cuh"
 #include <cuda_fp8.h>
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 // The same FP8 block-32 -> BF16 -> Q8_1 boundaries as the ordinary CUDA
@@ -114,7 +118,7 @@ __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output
 }
 
 __global__ void V41GGUFReduce(const __nv_bfloat16 *partial, float *output,
-        const int32_t *indices, int hidden, int topk) {
+        const int32_t *indices, int hidden, int topk, int accumulate) {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= hidden) return;
     const int base = blockIdx.y*topk;
@@ -130,7 +134,8 @@ __global__ void V41GGUFReduce(const __nv_bfloat16 *partial, float *output,
     for (int k = 0; k < topk; ++k)
         sum = __fadd_rn(sum, __bfloat162float(partial[size_t(base+order[k])*hidden+c]));
     // The caller adds the shared expert in FP32 before the BF16 HC boundary.
-    output[size_t(blockIdx.y)*hidden+c] = sum;
+    float *dst = output + size_t(blockIdx.y)*hidden+c;
+    *dst = accumulate ? __fadd_rn(*dst, sum) : sum;
 }
 
 template<bool Gate, class Weights>
@@ -154,7 +159,8 @@ bool FastllmCudaRunV41GGUF(
         const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &activation,
         fastllm::Data &workspace, fastllm::Data &output, const void *weightPointers,
         const int32_t *indices, const float *scores, int gateType, int downType,
-        int hidden, int inter, int experts, int topk, float swigluLimit) {
+        int hidden, int inter, int experts, int topk, float swigluLimit,
+        bool accumulate) {
     const int rows = input.dims[0], routes = rows*topk;
     auto *qInput = static_cast<block_q8_1 *>(workspace.cudaData);
     auto *qGate = qInput + size_t(rows)*(hidden/32);
@@ -180,7 +186,8 @@ bool FastllmCudaRunV41GGUF(
             weights, indices, groupedScratch, rows, hidden, inter, experts, topk)) return false;
     } else Project<false>(downType, qGate, partial, weights, indices, experts, topk, routes, inter, hidden);
     V41GGUFReduce<<<dim3((hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
-        partial, static_cast<float *>(output.cudaData), indices, hidden, topk);
+        partial, static_cast<float *>(output.cudaData), indices, hidden, topk,
+        accumulate ? 1 : 0);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -240,4 +247,195 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
     V41CachePartials<<<(routes*hidden+255)/256, 256, 0, cudaStreamPerThread>>>(
         partial, perExpert, routes*hidden);
     return cudaGetLastError() == cudaSuccess;
+}
+
+namespace {
+// Pageable host experts only; NUMA/disk keep their own registered pipelines.
+const uint8_t *V41HostStreamBytes(const fastllm::Data &w) {
+    if (w.dataType != fastllm::DATA_GGUF_FORMAT || w.isDiskWeight) return nullptr;
+    return static_cast<const uint8_t *>(w.cpuData);
+}
+
+struct V41HostStreamBuffer {
+    void *ptr = nullptr;
+    ~V41HostStreamBuffer() { if (ptr != nullptr) FastllmCudaFree(ptr); }
+};
+}
+
+bool FastllmCudaRunV41GGUFHostStream(
+        const fastllm::Data &input, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int topk, float swigluLimit, size_t budgetBytes) {
+    if (!weights || !indices || !scores || topk < 1 || topk > 32 ||
+        weightsBatch < 2 || input.dims.size() != 2 ||
+        input.dataType != fastllm::BFLOAT16 || !input.cudaData) return false;
+    const int experts = weightsBatch / 2;
+    const int rows = input.dims[0], hidden = input.dims[1], routes = rows*topk;
+    if (experts <= 0 || rows <= 0 || hidden <= 0 || hidden%256 != 0 || hidden > 24576) return false;
+    const int device = FastllmCudaGetDevice();
+    if (input.dataDevice != fastllm::CUDA || input.dataDeviceIds != std::vector<int>{device}) return false;
+
+    // One launch serves the whole layer, so every routed expert of it must share
+    // the same two formats. Anything else keeps the per-expert CPU order.
+    int gateType = -1, downType = -1, inter = 0;
+    for (int e = 0; e < experts; ++e) {
+        const fastllm::Data *gate = weights[2*e], *down = weights[2*e+1];
+        if (!gate || !down || !V41HostStreamBytes(*gate) || !V41HostStreamBytes(*down)) return false;
+        if (gateType < 0) {
+            gateType = gate->ggmlType;
+            downType = down->ggmlType;
+            inter = gate->dims.empty() ? 0 : gate->dims[0] / 2;
+        } else if (gate->ggmlType != gateType || down->ggmlType != downType) {
+            return false;
+        }
+        if (inter <= 0 || gate->dims.size() != 2 || gate->dims[0] != 2*inter ||
+            gate->dims[1] != hidden || down->dims.size() != 2 ||
+            down->dims[0] != hidden || down->dims[1] != inter) return false;
+    }
+    if (inter%256 != 0 || inter > 24576) return false;
+    if (!FastllmCudaV41GGUFSupported(gateType, downType)) return false;
+    const size_t gateBytes = ggml_row_size(static_cast<ggml_type>(gateType), hidden) * size_t(2*inter);
+    const size_t downBytes = ggml_row_size(static_cast<ggml_type>(downType), inter) * size_t(hidden);
+    if (gateBytes == 0 || downBytes == 0) return false;
+
+    std::vector<int> counts(experts, 0);
+    for (int i = 0; i < routes; ++i) {
+        const int expert = indices[i];
+        if (expert < 0 || expert >= experts) return false;
+        counts[expert]++;
+    }
+    std::vector<int> order;
+    order.reserve(experts);
+    for (int e = 0; e < experts; ++e)
+        if (counts[e] > 0) order.push_back(e);
+    if (order.empty()) return false;
+
+    const size_t expertBytes = gateBytes + downBytes;
+    size_t freeBytes = 0, totalBytes = 0;
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess) return false;
+    const size_t reserve = 256ull << 20, minArena = 64ull << 20;
+    if (freeBytes <= reserve) return false;
+    size_t available = freeBytes - reserve;
+    if (budgetBytes > 0 && budgetBytes < available) available = budgetBytes;
+    if (available <= minArena || expertBytes > available - minArena) return false;
+
+    // Rows are blocked as well: the reduction/gate scratch of one 4096-row chunk
+    // is more than a card with mostly dense weights can spare, while the expert
+    // arena has to grow. Both curves bound the resident set independently.
+    const auto blockScratchBytes = [&](int blockRows) -> size_t {
+        const size_t blockRoutes = size_t(blockRows) * size_t(topk);
+        size_t bytes = (size_t(blockRows)*(hidden/32) + blockRoutes*(inter/32))*sizeof(block_q8_1) +
+            blockRoutes*hidden*sizeof(__nv_bfloat16);
+        bytes += blockRoutes*size_t(2*inter)*sizeof(__nv_bfloat16);
+        bytes += blockRoutes*size_t(inter)*sizeof(__nv_bfloat16);
+        bytes += FastllmCudaV41GGUFGroupedWorkspaceBytes(
+            gateType, downType, blockRows, hidden, inter, experts, topk);
+        return bytes;
+    };
+    const int candidates[] = {4096, 2048, 1024, 512, 256, 128, 64};
+    int blockRows = 0;
+    for (int candidate : candidates) {
+        if (candidate > rows) continue;
+        if (blockScratchBytes(candidate) + minArena <= available) {
+            blockRows = candidate;
+            break;
+        }
+    }
+    if (blockRows <= 0) return false;
+    size_t arenaBudget = available - blockScratchBytes(blockRows);
+    if (arenaBudget < expertBytes) return false;
+
+    const size_t blockBase = (size_t(blockRows)*(hidden/32) + size_t(blockRows)*topk*(inter/32))*sizeof(block_q8_1) +
+        size_t(blockRows)*topk*hidden*sizeof(__nv_bfloat16);
+    const size_t workspaceOffset = (blockBase + 255) & ~size_t(255);
+    const size_t groupedBytes = FastllmCudaV41GGUFGroupedWorkspaceBytes(
+        gateType, downType, blockRows, hidden, inter, experts, topk);
+    const int blockRoutes = blockRows * topk;
+    fastllm::Data gate, activation, workspace;
+    fastllm_gguf_moe::AllocateTensor(gate, fastllm::BFLOAT16, {blockRoutes, 2*inter}, device);
+    fastllm_gguf_moe::AllocateTensor(activation, fastllm::BFLOAT16, {blockRoutes, inter}, device);
+    fastllm_gguf_moe::AllocateTensor(workspace, fastllm::INT8,
+        {int(workspaceOffset + groupedBytes)}, device);
+
+    if (output.dataType != fastllm::FLOAT32 || output.dataDevice != fastllm::CUDA ||
+        output.dataDeviceIds != std::vector<int>{device}) {
+        output.FreeSpace();
+        output.dataType = fastllm::FLOAT32;
+        output.UpdateUnitSize();
+        output.dataDevice = fastllm::CUDA;
+        output.dataDeviceIds = {device};
+    }
+    output.Resize({rows, hidden});
+    output.Allocate(false);
+    if (output.cudaData == nullptr) return false;
+    // Groups and row blocks accumulate into this buffer; zero it once here.
+    FastllmCudaMemset0(output.cudaData, output.GetBytes());
+
+    // Route-descending groups keep the grouped tiles dense; ascending ids inside
+    // a group keep the reduction order stable for a given request.
+    std::stable_sort(order.begin(), order.end(), [&counts](int a, int b) {
+        return counts[a] != counts[b] ? counts[a] > counts[b] : a < b;
+    });
+    std::vector<std::vector<int> > batches(1);
+    size_t batchBytes = 0, arenaBytes = 0;
+    for (int e : order) {
+        if (!batches.back().empty() && batchBytes + expertBytes > arenaBudget) {
+            arenaBytes = std::max(arenaBytes, batchBytes);
+            batches.emplace_back();
+            batchBytes = 0;
+        }
+        batches.back().push_back(e);
+        batchBytes += expertBytes;
+    }
+    arenaBytes = std::max(arenaBytes, batchBytes);
+
+    V41HostStreamBuffer arena, table, indexBuffer, scoreBuffer;
+    arena.ptr = FastllmCudaMalloc(arenaBytes);
+    table.ptr = FastllmCudaMalloc(sizeof(void*) * size_t(experts) * 2);
+    indexBuffer.ptr = FastllmCudaMalloc(size_t(routes) * sizeof(int32_t));
+    scoreBuffer.ptr = FastllmCudaMalloc(size_t(routes) * sizeof(float));
+    if (!arena.ptr || !table.ptr || !indexBuffer.ptr || !scoreBuffer.ptr) return false;
+    FastllmCudaCopyFromHostToDevice(indexBuffer.ptr, const_cast<int32_t *>(indices),
+        size_t(routes) * sizeof(int32_t));
+    FastllmCudaCopyFromHostToDevice(scoreBuffer.ptr, const_cast<float *>(scores),
+        size_t(routes) * sizeof(float));
+    const int32_t *deviceIndex = static_cast<const int32_t *>(indexBuffer.ptr);
+    const float *deviceScore = static_cast<const float *>(scoreBuffer.ptr);
+
+    std::vector<const void *> pointers(size_t(experts) * 2, nullptr);
+    for (size_t b = 0; b < batches.size(); ++b) {
+        auto *cursor = static_cast<uint8_t *>(arena.ptr);
+        for (int e : batches[b]) {
+            FastllmCudaCopyFromHostToDevice(cursor,
+                const_cast<uint8_t *>(V41HostStreamBytes(*weights[2*e])), gateBytes);
+            pointers[2*e] = cursor;
+            cursor += gateBytes;
+            FastllmCudaCopyFromHostToDevice(cursor,
+                const_cast<uint8_t *>(V41HostStreamBytes(*weights[2*e+1])), downBytes);
+            pointers[2*e+1] = cursor;
+            cursor += downBytes;
+        }
+        FastllmCudaCopyFromHostToDevice(table.ptr, const_cast<void *>(
+            static_cast<const void *>(pointers.data())), pointers.size() * sizeof(void*));
+        for (int rowStart = 0; rowStart < rows; rowStart += blockRows) {
+            const int count = std::min(blockRows, rows - rowStart);
+            fastllm::Data inputView, outputView;
+            inputView.FakeFrom(input, size_t(rowStart) * hidden * sizeof(uint16_t));
+            inputView.Resize({count, hidden});
+            outputView.FakeFrom(output, size_t(rowStart) * hidden * sizeof(float));
+            outputView.Resize({count, hidden});
+            const size_t routeOffset = size_t(rowStart) * topk;
+            const bool ok = FastllmCudaRunV41GGUF(inputView, gate, activation, workspace,
+                outputView, table.ptr, deviceIndex + routeOffset, deviceScore + routeOffset,
+                gateType, downType, hidden, inter, experts, topk, swigluLimit, true);
+            if (!ok) return false;
+            // The arena and the weight table are reused by the next block.
+            if (cudaDeviceSynchronize() != cudaSuccess) return false;
+        }
+        // The arena is reused by the next group, so stale entries must not
+        // survive the copy above.
+        for (int e : batches[b]) pointers[2*e] = pointers[2*e+1] = nullptr;
+    }
+    return true;
 }

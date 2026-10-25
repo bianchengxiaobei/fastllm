@@ -11,11 +11,24 @@ bool FastllmCudaMergeMOEV41GGUFResident(
     float sharedScale, float swigluLimit);
 
 // Internal launcher; caller validates layouts and owns all scratch tensors.
+// `accumulate` keeps the previous FLOAT32 output and adds this launch's routes,
+// so a chunk can be served by several disjoint expert groups.
 bool FastllmCudaRunV41GGUF(
     const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &activation,
     fastllm::Data &workspace, fastllm::Data &output, const void *weightPointers,
     const int32_t *indices, const float *scores, int gateType, int downType,
-    int hidden, int inter, int experts, int topk, float swigluLimit);
+    int hidden, int inter, int experts, int topk, float swigluLimit,
+    bool accumulate = false);
+
+// Host-resident (pageable) GGUF experts on the GPU: the routed experts are
+// uploaded in VRAM-bounded groups and accumulated, so the card only ever holds
+// part of one layer. `indices`/`scores` are host arrays; `budgetBytes` bounds
+// the staging arena (0 sizes it from the current free VRAM).
+bool FastllmCudaRunV41GGUFHostStream(
+    const fastllm::Data &input, fastllm::Data &output,
+    fastllm::Data **weights, int weightsBatch,
+    const int32_t *indices, const float *scores,
+    int topk, float swigluLimit, size_t budgetBytes);
 
 // Native CUDA activation semantics (Q8_1), distinct from NUMA's Q8_K path.
 size_t FastllmCudaV41GGUFGroupedWorkspaceBytes(

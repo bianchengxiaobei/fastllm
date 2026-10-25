@@ -80,8 +80,32 @@ set FASTLLM_PROFILE_MOE_STREAM=1
 判读顺序：`loop` 大 → 看 `upload` 和 `other` 谁大：
 `upload` 大 = 主机侧 memcpy 是瓶颈；`other` 大 = 设备侧（DMA/计算）是瓶颈。
 
-## 5. 实测结论（RTX 2060 SUPER / PCIe 3.0 x16 / 64GB 主机内存）
+## 5. DeepSeek-V4.1 的 GGUF 主机专家
 
+V4.1 的路由专家走独立后端（Q8_K/FP8 block-32 数学），主机专家路径由
+`--prefill_moe_gpu` 控制，语义与 Qwen3.5 一致：
+
+| 值 | 行为 |
+| --- | --- |
+| `-1`（默认/auto） | 专家在 `cpu` 内存里就开 |
+| `1` | 强制开，条件不满足时每次启动只提示一次并回落 CPU |
+| `0` | 关 |
+
+```bat
+run_ftllm.bat server <模型路径> --moe_device cpu --prefill_moe_gpu 1 ^
+  --chunked_prefill_size 4096 --threads 8
+```
+
+- 一批只上传**当前 chunk 路由到的**专家，显存预算 = 空闲显存 − 256MB − 该行块的工作区；
+- 行数会再分块（4096/2048/…/64），工作区和专家驻留区互相让位，所以显存很小的机器也能跑；
+- 每组、每行块的结果在 FLOAT32 输出上累加，最后由共享专家和 HC 边界按原路径收尾；
+- `FASTLLM_PREFILL_MOE_GPU_MIN_TOKENS`（默认 64）决定多短的输入不值得上传；
+- `FASTLLM_PROFILE_HOST_MOE=1` 打印每层 `host->gpu` 耗时。
+
+约束：单卡、非 graph、专家为 pageable GGUF（`numa`/`disk` 走各自流水线）、
+`--moe_device cpu`。不满足时不会报错，直接保留 CPU MoE。
+
+## 6. 实测结论（RTX 2060 SUPER / PCIe 3.0 x16 / 64GB 主机内存）
 长输入 prefill 从 **181 tok/s 提到 ~484 tok/s（2.7 倍）**，各步贡献：
 
 1. 固定内存中转环 + 事件排序预取（摘掉「副本流等计算」的闸门）
