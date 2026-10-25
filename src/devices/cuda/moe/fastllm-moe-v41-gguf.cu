@@ -8,6 +8,8 @@
 #include "fastllm-cuda.cuh"
 #include <cuda_fp8.h>
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -260,6 +262,22 @@ struct V41HostStreamBuffer {
     void *ptr = nullptr;
     ~V41HostStreamBuffer() { if (ptr != nullptr) FastllmCudaFree(ptr); }
 };
+
+bool V41HostStreamDebug() {
+    static const bool enabled = std::getenv("FASTLLM_PROFILE_HOST_MOE") != nullptr;
+    return enabled;
+}
+
+// Every rejection is silent by default: the CPU MoE path stays authoritative.
+// With FASTLLM_PROFILE_HOST_MOE set, report the first few reasons verbatim.
+void V41HostStreamReject(const char *why, const char *extra = nullptr) {
+    if (!V41HostStreamDebug()) return;
+    static std::atomic<int> printed{0};
+    if (printed.fetch_add(1) >= 8) return;
+    printf("[fastllm-host-moe] skip: %s%s%s\n", why, extra ? " " : "",
+        extra ? extra : "");
+    fflush(stdout);
+}
 }
 
 bool FastllmCudaRunV41GGUFHostStream(
@@ -267,58 +285,94 @@ bool FastllmCudaRunV41GGUFHostStream(
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
         int topk, float swigluLimit, size_t budgetBytes) {
+    const auto reject = [](const char *why, const char *extra = nullptr) {
+        V41HostStreamReject(why, extra);
+        return false;
+    };
     if (!weights || !indices || !scores || topk < 1 || topk > 32 ||
-        weightsBatch < 2 || input.dims.size() != 2 ||
-        input.dataType != fastllm::BFLOAT16 || !input.cudaData) return false;
+        weightsBatch < 2 || input.dims.size() != 2) return reject("bad routes/weights");
+    if (input.dataType != fastllm::BFLOAT16 || !input.cudaData)
+        return reject("input is not BF16 on CUDA");
     const int experts = weightsBatch / 2;
     const int rows = input.dims[0], hidden = input.dims[1], routes = rows*topk;
-    if (experts <= 0 || rows <= 0 || hidden <= 0 || hidden%256 != 0 || hidden > 24576) return false;
+    if (experts <= 0 || rows <= 0 || hidden <= 0 || hidden%256 != 0 || hidden > 24576)
+        return reject("unsupported hidden size");
     const int device = FastllmCudaGetDevice();
-    if (input.dataDevice != fastllm::CUDA || input.dataDeviceIds != std::vector<int>{device}) return false;
+    if (input.dataDevice != fastllm::CUDA || input.dataDeviceIds != std::vector<int>{device})
+        return reject("input is not on the current device");
 
     // One launch serves the whole layer, so every routed expert of it must share
     // the same two formats. Anything else keeps the per-expert CPU order.
     int gateType = -1, downType = -1, inter = 0;
     for (int e = 0; e < experts; ++e) {
         const fastllm::Data *gate = weights[2*e], *down = weights[2*e+1];
-        if (!gate || !down || !V41HostStreamBytes(*gate) || !V41HostStreamBytes(*down)) return false;
+        if (!gate || !down) return reject("missing expert weight");
+        if (!V41HostStreamBytes(*gate) || !V41HostStreamBytes(*down)) {
+            char extra[96];
+            snprintf(extra, sizeof(extra), "expert=%d type=%d/%d host=%d/%d", e,
+                gate->dataType, down->dataType, gate->cpuData != nullptr,
+                down->cpuData != nullptr);
+            return reject("expert weights are not host GGUF", extra);
+        }
         if (gateType < 0) {
             gateType = gate->ggmlType;
             downType = down->ggmlType;
             inter = gate->dims.empty() ? 0 : gate->dims[0] / 2;
         } else if (gate->ggmlType != gateType || down->ggmlType != downType) {
-            return false;
+            return reject("mixed ggml types inside one layer");
         }
         if (inter <= 0 || gate->dims.size() != 2 || gate->dims[0] != 2*inter ||
             gate->dims[1] != hidden || down->dims.size() != 2 ||
-            down->dims[0] != hidden || down->dims[1] != inter) return false;
+            down->dims[0] != hidden || down->dims[1] != inter) {
+            char extra[96];
+            snprintf(extra, sizeof(extra), "gate=%dx%d down=%dx%d inter=%d hidden=%d",
+                gate->dims.empty() ? 0 : gate->dims[0],
+                gate->dims.size() < 2 ? 0 : gate->dims[1],
+                down->dims.empty() ? 0 : down->dims[0],
+                down->dims.size() < 2 ? 0 : down->dims[1], inter, hidden);
+            return reject("unexpected expert shapes", extra);
+        }
     }
-    if (inter%256 != 0 || inter > 24576) return false;
-    if (!FastllmCudaV41GGUFSupported(gateType, downType)) return false;
+    if (inter%256 != 0 || inter > 24576) return reject("unsupported intermediate size");
+    if (!FastllmCudaV41GGUFSupported(gateType, downType)) {
+        char extra[64];
+        snprintf(extra, sizeof(extra), "gate=%d down=%d", gateType, downType);
+        return reject("ggml format not supported on CUDA", extra);
+    }
     const size_t gateBytes = ggml_row_size(static_cast<ggml_type>(gateType), hidden) * size_t(2*inter);
     const size_t downBytes = ggml_row_size(static_cast<ggml_type>(downType), inter) * size_t(hidden);
-    if (gateBytes == 0 || downBytes == 0) return false;
+    if (gateBytes == 0 || downBytes == 0) return reject("bad row size");
 
     std::vector<int> counts(experts, 0);
     for (int i = 0; i < routes; ++i) {
         const int expert = indices[i];
-        if (expert < 0 || expert >= experts) return false;
+        if (expert < 0 || expert >= experts) return reject("route out of range");
         counts[expert]++;
     }
     std::vector<int> order;
     order.reserve(experts);
     for (int e = 0; e < experts; ++e)
         if (counts[e] > 0) order.push_back(e);
-    if (order.empty()) return false;
+    if (order.empty()) return reject("no routed expert");
 
     const size_t expertBytes = gateBytes + downBytes;
     size_t freeBytes = 0, totalBytes = 0;
-    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess) return false;
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess) return reject("cudaMemGetInfo failed");
     const size_t reserve = 256ull << 20, minArena = 64ull << 20;
-    if (freeBytes <= reserve) return false;
+    if (freeBytes <= reserve) {
+        char extra[96];
+        snprintf(extra, sizeof(extra), "free=%.0fMB reserve=%.0fMB",
+            freeBytes / 1048576.0, reserve / 1048576.0);
+        return reject("too little free VRAM", extra);
+    }
     size_t available = freeBytes - reserve;
     if (budgetBytes > 0 && budgetBytes < available) available = budgetBytes;
-    if (available <= minArena || expertBytes > available - minArena) return false;
+    if (available <= minArena || expertBytes > available - minArena) {
+        char extra[128];
+        snprintf(extra, sizeof(extra), "free=%.0fMB available=%.0fMB expert=%.1fMB",
+            freeBytes / 1048576.0, available / 1048576.0, expertBytes / 1048576.0);
+        return reject("not enough free VRAM for experts", extra);
+    }
 
     // Rows are blocked as well: the reduction/gate scratch of one 4096-row chunk
     // is more than a card with mostly dense weights can spare, while the expert
@@ -342,9 +396,20 @@ bool FastllmCudaRunV41GGUFHostStream(
             break;
         }
     }
-    if (blockRows <= 0) return false;
+    if (blockRows <= 0) {
+        char extra[128];
+        snprintf(extra, sizeof(extra), "free=%.0fMB available=%.0fMB scratch4096=%.0fMB",
+            freeBytes / 1048576.0, available / 1048576.0,
+            blockScratchBytes(4096) / 1048576.0);
+        return reject("no row block fits the free VRAM", extra);
+    }
     size_t arenaBudget = available - blockScratchBytes(blockRows);
-    if (arenaBudget < expertBytes) return false;
+    if (arenaBudget < expertBytes) {
+        char extra[128];
+        snprintf(extra, sizeof(extra), "block=%d arena=%.0fMB expert=%.1fMB",
+            blockRows, arenaBudget / 1048576.0, expertBytes / 1048576.0);
+        return reject("arena smaller than one expert", extra);
+    }
 
     const size_t blockBase = (size_t(blockRows)*(hidden/32) + size_t(blockRows)*topk*(inter/32))*sizeof(block_q8_1) +
         size_t(blockRows)*topk*hidden*sizeof(__nv_bfloat16);

@@ -189,13 +189,14 @@ namespace fastllm {
                 fflush(stdout);
             }
             if (!handled) {
-                // Say it once: silently reverting to the CPU MoE hides a
+                // Say it a few times: silently reverting to the CPU MoE hides a
                 // VRAM/format problem behind a 30x slower prefill.
                 static std::atomic<int> reported{0};
-                if (reported.fetch_add(1) == 0) {
+                if (reported.fetch_add(1) < 3) {
                     printf("[Fastllm] V4.1 prefill MoE on GPU unavailable for %d rows "
-                        "(host GGUF experts + free VRAM); keeping the CPU MoE path.\n",
-                        ctx.seqlen);
+                        "at layer %d (host GGUF experts + free VRAM); keeping the CPU MoE "
+                        "path. Set FASTLLM_PROFILE_HOST_MOE=1 for the reason.\n",
+                        ctx.seqlen, ctx.layer);
                     fflush(stdout);
                 }
             }
