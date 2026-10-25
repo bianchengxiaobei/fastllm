@@ -2,6 +2,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -809,8 +810,31 @@ namespace fastllm {
         return true;
     }
 
+    // 归因: 主机 GGUF 权重有多少走映射、多少真的从盘上读了。启动慢先看这两行。
+    static std::atomic<uint64_t> gGGUFHostMappedBytes(0);
+    static std::atomic<uint64_t> gGGUFHostReadBytes(0);
+
+    static void ReportGGUFHostMapped(uint64_t bytes) {
+        if (bytes == 0) return;
+        const uint64_t total = gGGUFHostMappedBytes.fetch_add(bytes) + bytes;
+        if (total / (16ULL << 30) != (total - bytes) / (16ULL << 30)) {
+            printf("[fastllm-gguf] host weights mapped: %.1f GB (no disk read)\n", total / 1e9);
+            fflush(stdout);
+        }
+    }
+
+    static void ReportGGUFHostRead(uint64_t bytes) {
+        if (bytes == 0) return;
+        const uint64_t total = gGGUFHostReadBytes.fetch_add(bytes) + bytes;
+        if (total / (4ULL << 30) != (total - bytes) / (4ULL << 30)) {
+            printf("[fastllm-gguf] host weights read from disk: %.1f GB\n", total / 1e9);
+            fflush(stdout);
+        }
+    }
+
     void ReadGGUFTensorBytes(const std::string &fileName, uint64_t offset,
                              uint8_t *destination, uint64_t bytes) {
+        ReportGGUFHostRead(bytes);
         struct CloseFile { void operator()(FILE *file) const { fclose(file); } };
         std::unique_ptr<FILE, CloseFile> file(fopen(fileName.c_str(), "rb"));
         if (!file) throw std::runtime_error("Cannot open GGUF weight file: " + fileName);
@@ -904,6 +928,7 @@ namespace fastllm {
                     // 借用映射区: 不分配也不读, 生命周期归 mapFile。
                     weight->cpuData = (uint8_t *)mapped->data + offset;
                     weight->SetMapFile(mapped);
+                    ReportGGUFHostMapped(ggml_nbytes(tensor));
                 } else {
                     weight->cpuData = new uint8_t[ggml_nbytes(tensor)];
                     ReadGGUFTensorBytes(fileName, offset, weight->cpuData, ggml_nbytes(tensor));
