@@ -95,6 +95,7 @@ bool FastllmCudaGetMemoryInfo(int device, uint64_t &freeBytes, uint64_t &totalBy
 // Idle bytes the allocator pool already owns on `device`. Freed blocks stay in
 // the pool, so cudaMemGetInfo alone under-reports what the next temporary can reuse.
 size_t FastllmCudaGetPooledIdleBytes(int device);
+size_t FastllmCudaGetLargestPooledIdleBlock(int device);
 std::vector <long long> FastllmCudaGetTotalSizes();
 
 // One owner per serial graph family and GPU. The caller must serialize replay

@@ -4784,6 +4784,24 @@ size_t FastllmCudaGetPooledIdleBytes(int device) {
     return idle;
 }
 
+// Largest single idle block: a request that fits one of them is reused without
+// touching the driver, everything else has to grow the pool.
+size_t FastllmCudaGetLargestPooledIdleBlock(int device) {
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(device);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    size_t largest = 0;
+    auto scan = [&largest](const std::vector<CudaMemoryBuffer> &buffers) {
+        for (auto &buffer : buffers) {
+            if (!buffer.busy && buffer.graphPins == 0 && !buffer.reusePending) {
+                largest = std::max(largest, buffer.size);
+            }
+        }
+    };
+    scan(*view.bigBuffers);
+    scan(*view.smallBuffers);
+    return largest;
+}
+
 static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMemoryBuffer> &bigBuffers) {
     if (FastllmCudaIsProcessExiting()) {
         return 0;

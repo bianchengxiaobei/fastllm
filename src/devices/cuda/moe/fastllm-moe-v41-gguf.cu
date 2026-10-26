@@ -844,31 +844,48 @@ bool FastllmCudaRunV41GGUFHostStream(
     std::stable_sort(order.begin(), order.end(), [&counts](int a, int b) {
         return counts[a] != counts[b] ? counts[a] > counts[b] : a < b;
     });
-    // Half of the arena per group: the other half receives the next group while
-    // this one computes.
-    const size_t groupBudget = std::max(expertBytes, arenaBudget / 2);
-    std::vector<std::vector<int> > batches(1);
-    size_t batchBytes = 0, arenaBytes = 0;
-    for (int e : order) {
-        if (!batches.back().empty() && batchBytes + expertBytes > groupBudget) {
-            arenaBytes = std::max(arenaBytes, batchBytes);
-            batches.emplace_back();
-            batchBytes = 0;
+    // Fill one arena with as many experts as it can take; a second arena only
+    // exists to overlap the next group with the current one.
+    auto buildBatches = [&](size_t budget, std::vector<std::vector<int> > &out, size_t &peak) {
+        out.clear();
+        out.emplace_back();
+        size_t bytes = 0;
+        peak = 0;
+        for (int e : order) {
+            if (!out.back().empty() && bytes + expertBytes > budget) {
+                peak = std::max(peak, bytes);
+                out.emplace_back();
+                bytes = 0;
+            }
+            out.back().push_back(e);
+            bytes += expertBytes;
         }
-        batches.back().push_back(e);
-        batchBytes += expertBytes;
+        peak = std::max(peak, bytes);
+    };
+    std::vector<std::vector<int> > batches;
+    size_t arenaBytes = 0;
+    buildBatches(std::max(expertBytes, arenaBudget), batches, arenaBytes);
+    if (batches.size() > 1) {
+        buildBatches(std::max(expertBytes, arenaBudget / 2), batches, arenaBytes);
     }
-    arenaBytes = std::max(arenaBytes, batchBytes);
-    // Both arenas live at once, so the sticky size only applies while it still
-    // fits the half-budget the two of them share.
+    const int arenaCount = batches.size() > 1 ? 2 : 1;
+    // A single arena may use the whole budget; the half budget only exists
+    // because the two-arena path has to hold both at once.
+    const size_t arenaLimit = arenaCount == 1 ? arenaBudget : arenaBudget / 2;
     const size_t stickyBytes = V41HostStreamArenaBytes(
         device, rows, topk, hidden, inter, experts, arenaBytes);
-    if (stickyBytes <= arenaBudget / 2) arenaBytes = stickyBytes;
+    if (stickyBytes <= arenaLimit) arenaBytes = stickyBytes;
+    // Growing past every idle block means the pool first releases all of them,
+    // which costs tens of seconds per layer on Windows. Only do that when the
+    // driver can actually serve the allocation.
+    const size_t largestIdle = FastllmCudaGetLargestPooledIdleBlock(device);
+    if (arenaBytes > largestIdle && freeBytes < arenaBytes * size_t(arenaCount) + reserve) {
+        char extra[160];
+        snprintf(extra, sizeof(extra), "arena=%.0fMB idle=%.0fMB free=%.0fMB",
+            arenaBytes / 1048576.0, largestIdle / 1048576.0, freeBytes / 1048576.0);
+        return reject("arena growth has no free VRAM", extra);
+    }
 
-    // One group means one arena: allocating the second one only takes VRAM the
-    // chunk cannot use, and a two-arena live set is what pushes the card into
-    // driver-level paging on the reallocation path.
-    const int arenaCount = batches.size() > 1 ? 2 : 1;
     V41HostStreamBuffer arenas[2], tables[2], indexBuffer, scoreBuffer;
     for (int i = 0; i < arenaCount; ++i) arenas[i].ptr = FastllmCudaMalloc(arenaBytes);
     // One weight table per arena: the next group rebuilds its own while the
