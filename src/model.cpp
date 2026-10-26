@@ -2995,6 +2995,82 @@ namespace fastllm {
         return true;
     }
 
+    // fastllm 量化张量在 safetensors 里 = [version][dataType][ggmlType][量化块]。
+    // 主机权重直接借映射区里那块量化块: 启动不读盘也不复制, 页在真正用到时 fault,
+    // 并且留在系统文件缓存里, 下次启动直接命中。映射是 PAGE_WRITECOPY, 万一有人
+    // 往权重里写也只会拷到私有页, 不会踩坏映射。
+    static bool UseLoadMmapBorrow() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_LOAD_MMAP_ADOPT");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
+    // 一个分片只映射一次, 由进程持有; Data 只借用指针。
+    static std::shared_ptr<FileMmap> GetLoadFileMmapForBorrow(const std::string &fileName) {
+        static std::mutex lock;
+        static std::map<std::string, std::shared_ptr<FileMmap> > files;
+        std::lock_guard<std::mutex> guard(lock);
+        auto it = files.find(fileName);
+        if (it != files.end()) {
+            return it->second;
+        }
+        std::shared_ptr<FileMmap> mapped;
+        try {
+            mapped = std::make_shared<FileMmap>(fileName);
+        } catch (...) {
+            mapped = nullptr;
+        }
+        if (mapped != nullptr) {
+            printf("[fastllm-load] borrow host weights from %s (%.1f GB), pages load on demand\n",
+                   fileName.c_str(), mapped->size / 1e9);
+            fflush(stdout);
+        }
+        files[fileName] = mapped;
+        return mapped;
+    }
+
+    static bool TryBorrowFastllmGgufPayload(Data &weight, const SafeTensorItem &tensor,
+                                            const std::shared_ptr<FileMmap> &mapped) {
+        if (mapped == nullptr || tensor.dtype != "fastllm" ||
+            weight.dataDevice != DataDevice::CPU || weight.cpuData != nullptr ||
+            weight.dims.size() < 2 || tensor.bytes < sizeof(int) * 3 ||
+            tensor.data_offsets[0] + tensor.bytes > mapped->size) {
+            return false;
+        }
+        const uint8_t *header = (const uint8_t *)mapped->data + tensor.data_offsets[0];
+        int version = 0, dataType = 0, ggmlType = 0;
+        memcpy(&version, header, sizeof(int));
+        memcpy(&dataType, header + sizeof(int), sizeof(int));
+        memcpy(&ggmlType, header + sizeof(int) * 2, sizeof(int));
+        if (version != 1 || dataType != (int)DataType::DATA_GGUF_FORMAT || ggmlType <= 0) {
+            return false;
+        }
+        const uint64_t payloadBytes = tensor.bytes - sizeof(int) * 3;
+        weight.dataType = DataType::DATA_GGUF_FORMAT;
+        weight.ggmlType = ggmlType;
+        weight.isGGUFData = true;
+        weight.weightType = WeightType::AUTO;
+        const std::vector<int> dims = weight.dims;
+        weight.UpdateUnitSize();
+        weight.Resize(dims);
+        if (weight.GetBytes() != payloadBytes) {
+            return false;
+        }
+        weight.expansionSize = weight.Count(0);
+        weight.expansionBytes = payloadBytes;
+        weight.cpuData = const_cast<uint8_t *>(header) + sizeof(int) * 3;
+        weight.SetMapFile(mapped);
+        static std::atomic<uint64_t> borrowedBytes(0);
+        const uint64_t total = borrowedBytes.fetch_add(payloadBytes) + payloadBytes;
+        if (total / (16ULL << 30) != (total - payloadBytes) / (16ULL << 30)) {
+            printf("[fastllm-load] borrowed %.1f GB of host weights (no disk read)\n", total / 1e9);
+            fflush(stdout);
+        }
+        return true;
+    }
+
     // INT4_GROUP 的权重读进临时块之后，字节布局已经是最终布局（nibble 交换在
     // CreateBufferWithPacked* 里做完了），所以可以直接把临时块的 ownership 转给
     // 权重，省掉一次全量 memcpy 和一块同样大小的新分配。
@@ -7290,6 +7366,15 @@ namespace fastllm {
                             WeightType diskLazyWeightType = GetDiskLazyWeightType(
                                 model, weightName, tensor.bytes, mergeIndex);
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
+                            // 主机 fastllm 量化权重借映射区, 省掉启动时整份读盘。
+                            bool borrowedFastllmPayload = false;
+                            if (!diskLazyWeight && UseLoadMmapBorrow() &&
+                                tensorMap[tensorName].size() == 1 &&
+                                loraDicts.find(weightName) == loraDicts.end()) {
+                                borrowedFastllmPayload = TryBorrowFastllmGgufPayload(
+                                    *destinationWeight, tensor,
+                                    GetLoadFileMmapForBorrow(tensor.fileName));
+                            }
                             if (diskLazyWeight) {
                                 if (packedInt4Info.isAffine) {
                                     ErrorInFastLLM(
@@ -7383,7 +7468,9 @@ namespace fastllm {
                                         packedInt4Info.groupCnt);
                                     scaleTensor.ClearBuffer();
                                 } else if (scaleTensorName == "") {
-                                    tensor.CreateBuffer(oriDataType);
+                                    if (!borrowedFastllmPayload) {
+                                        tensor.CreateBuffer(oriDataType);
+                                    }
                                 } else if(!isAwqModel) {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                     AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" ||
@@ -7486,7 +7573,9 @@ namespace fastllm {
                                 }
 
                                 if (tensor.dtype == "fastllm") {
-                                    destinationWeight->CreateFromFastllmFormat(tensor.buffer, tensor.bytes);
+                                    if (!borrowedFastllmPayload) {
+                                        destinationWeight->CreateFromFastllmFormat(tensor.buffer, tensor.bytes);
+                                    }
                                 } else {
                                     if (it.second == DATA_AUTO_CONV) {
                                         tensor.Transpose(oriDataType);
