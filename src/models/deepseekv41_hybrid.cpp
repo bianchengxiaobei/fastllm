@@ -50,6 +50,10 @@ namespace fastllm {
             return minTokens;
         }
 
+    }
+#endif
+
+    namespace {
         bool V41ProfileHostMoe() {
             static const bool enabled = std::getenv("FASTLLM_PROFILE_HOST_MOE") != nullptr;
             return enabled;
@@ -60,7 +64,6 @@ namespace fastllm {
                 std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-3;
         }
     }
-#endif
 
     void DeepSeekV41Model::OnAutoWarmupFinished() {
         if (executionMode != ExecutionMode::Hybrid || std::uncaught_exceptions() ||
