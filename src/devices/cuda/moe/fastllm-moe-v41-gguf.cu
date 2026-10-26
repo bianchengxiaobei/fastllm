@@ -859,32 +859,28 @@ bool FastllmCudaRunV41GGUFHostStream(
         batchBytes += expertBytes;
     }
     arenaBytes = std::max(arenaBytes, batchBytes);
-    // A dense routed set (the 4096-row chunks) misses the same experts every
-    // layer, give or take a few percent. Size for the whole expert set once so
-    // the growth never happens mid-chunk and one arena serves every layer.
-    if (size_t(order.size()) * 2 >= size_t(experts)) {
-        const size_t denseBytes = expertBytes * size_t(experts);
-        if (denseBytes <= arenaBudget / 2 && denseBytes > arenaBytes) {
-            arenaBytes = denseBytes;
-        }
-    }
     // Both arenas live at once, so the sticky size only applies while it still
     // fits the half-budget the two of them share.
     const size_t stickyBytes = V41HostStreamArenaBytes(
         device, rows, topk, hidden, inter, experts, arenaBytes);
     if (stickyBytes <= arenaBudget / 2) arenaBytes = stickyBytes;
 
+    // One group means one arena: allocating the second one only takes VRAM the
+    // chunk cannot use, and a two-arena live set is what pushes the card into
+    // driver-level paging on the reallocation path.
+    const int arenaCount = batches.size() > 1 ? 2 : 1;
     V41HostStreamBuffer arenas[2], tables[2], indexBuffer, scoreBuffer;
-    arenas[0].ptr = FastllmCudaMalloc(arenaBytes);
-    arenas[1].ptr = FastllmCudaMalloc(arenaBytes);
+    for (int i = 0; i < arenaCount; ++i) arenas[i].ptr = FastllmCudaMalloc(arenaBytes);
     // One weight table per arena: the next group rebuilds its own while the
     // current group is still reading the other.
     tables[0].ptr = FastllmCudaMalloc(sizeof(void*) * size_t(experts) * 2);
-    tables[1].ptr = FastllmCudaMalloc(sizeof(void*) * size_t(experts) * 2);
+    if (arenaCount > 1) tables[1].ptr = FastllmCudaMalloc(sizeof(void*) * size_t(experts) * 2);
     indexBuffer.ptr = FastllmCudaMalloc(size_t(routes) * sizeof(int32_t));
     scoreBuffer.ptr = FastllmCudaMalloc(size_t(routes) * sizeof(float));
-    if (!arenas[0].ptr || !arenas[1].ptr || !tables[0].ptr || !tables[1].ptr ||
-        !indexBuffer.ptr || !scoreBuffer.ptr) return false;
+    for (int i = 0; i < arenaCount; ++i) {
+        if (!arenas[i].ptr || !tables[i].ptr) return false;
+    }
+    if (!indexBuffer.ptr || !scoreBuffer.ptr) return false;
     FastllmCudaCopyFromHostToDevice(indexBuffer.ptr, const_cast<int32_t *>(indices),
         size_t(routes) * sizeof(int32_t));
     FastllmCudaCopyFromHostToDevice(scoreBuffer.ptr, const_cast<float *>(scores),
