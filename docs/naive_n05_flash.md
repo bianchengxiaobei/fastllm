@@ -30,20 +30,37 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
 
 ### 启动时预分配 KV
 
-普通 BF16 KV 的多卡 TP 路径在预热结束时为每张卡建立一个固定容量的 KV 池，
+普通 BF16/FP8 KV 的多卡 TP 路径在预热结束时为每张卡建立固定容量的 KV 池，
 不依赖 Hopper、EP8 或 CUDA Graph，也不需要额外环境变量。`--tokens` 控制全局层
-的总 token 预算；`--max_batch` 与 `--chunked_prefill_size` 控制滑窗层及分块
-prefill 的容量预算。未指定 `--tokens` 时取各 TP 卡中最小空闲显存的 75% 为预算，
-扣除滑窗及对齐空间后计算 token 容量；剩余显存留给工作区。未指定 `--max_batch`
-时按 512 路预留，不会因显存不足自动下调。配置超出预算会在启动时报错。
+的总 token 预算；`--max_batch` 控制请求槽位数量，`--chunked_prefill_size` 控制
+各卡共享的滑窗 prefill 工作区。自动容量以 `--gpu_mem_ratio` 指定的整卡显存比例
+为上限，扣除已用显存、滑窗、前缀快照及页表等开销，再按负担最重的卡计算。
+未指定 `--max_batch` 时按 512 路预留，不会因显存不足自动下调。
+显式 `--tokens` 超出预算会在启动时报错。
 
-请求的 K/V 仍是互不重叠的连续视图，直接复用现有 DSA/SWA 算子。首次请求、
-长上下文扩容及 CPU 历史恢复都从池内领取空间，结束后归还并合并空闲区间；
-运行期间不为这些 KV 调用 `cudaMalloc`。各 TP rank 在进入计算和通信前完成申请；
-池耗尽时终止本轮选中的请求并返回容量错误，后续请求仍可处理，不向池外分配。
-池内采用连续区间，未改为分页 attention；极端混合长度仍可能造成池内碎片。
+全局层使用分页 KV，Indexer K 按配置与主 K 放在同一页中；滑窗层保留固定长度
+的请求窗口。GPU 前缀缓存共享全局页引用，并在预算内保存滑窗快照，不使用 CPU
+KV 历史缓存。页表和滑窗按分配大小使用独立的池，避免请求结束、恢复及冷启动的
+分配顺序不同造成碎片。运行期间不为这些 KV 调用 `cudaMalloc`。
+各 TP rank 在计算和通信前完成申请；池耗尽时返回容量错误，清理受影响请求，
+后续请求仍可处理。解码跨页只更新页表内容，满足复用条件时保留 Graph 和设备表。
 CUDA Graph、采样和临时算子工作区有各自的分配策略，不属于这项 KV 保证。
-CPU、按层串行、非 BF16 KV、草稿模型及跳过预热的直接调用保留原路径。
+CPU、按层串行、其他 KV 类型、草稿模型及跳过预热的直接调用保留原路径。
+
+### Indexer 按层分卡存储
+
+多卡 CUDA TP 可加 `--indexer_tp_storage layer_shard`，将 DSA 层按顺序轮流
+分配给各 TP rank。每层的 Indexer 权重和历史 K 只保存在所属 GPU，由该 GPU
+计算 Indexer，并将整数 TopK 广播给所有 rank；主 attention 的 TP 布局保持原样。
+默认值 `replicated` 保留每卡复制。此参数目前仅支持 Naive/MiMo DSA 模型，
+需要至少两张 TP 卡，并在加载后预热前设置；可与 `--indexer_dtype fp8` 独立组合。
+
+分卡不改变 Indexer 的精度配置。分页缓存和自动容量计算使用各卡实际宽度，
+总 token 容量以负担最重的卡为准。9 个 DSA 层在 TP8 下，一张卡持有 2 层，
+其余各持有 1 层。自动预算会将省下的空间用于更多上下文；固定 `--tokens`
+时则直接降低显存占用。代价是增加 TopK 广播，并停用原先依赖 K 副本的
+Indexer context parallel，长上下文 prefill/decode 可能变慢，需按负载选择。
+批量 decode 每层只广播一次整批 TopK，支持现有的预捕获 Graph 回放。
 
 ### EP8 与内置 MegaMoE
 

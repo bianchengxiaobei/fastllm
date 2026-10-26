@@ -529,7 +529,7 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecord(basellm *model) {
-        if (model->kvMemConfig.enabled) return;
+        if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return;
         if (model->DeferHistoryCacheRestore()) this->TryRecordPagedCache(model);
         else model->TryRecordResponseContext(this);
     }
@@ -620,19 +620,7 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
-        if (model->kvMemConfig.enabled) {
-            // KVMem caches are borrowed sparse views; their pageIndex must never
-            // be recorded into the global paged pool (see kvmem.md). Cross-request
-            // reuse goes through the linear prefix snapshot, which also carries
-            // the full-attention KVMem dumps for this same committed length.
-            if (!this->multimodalInput.empty()) {
-                return;
-            }
-            if (model != nullptr) {
-                model->TryRecordPagedPrefixCacheExtra(this);
-            }
-            return;
-        }
+        if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return;
         if (model->DeferHistoryCacheRestore()) model->TryRecordResponseContext(this);
         if (!this->multimodalInput.empty()) {
             return;
@@ -1341,8 +1329,8 @@ namespace fastllm {
 
     // Both schedulers restore the same page references and model-specific
     // companion state. Called while scheduling is locked, between forwards.
-    static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {
-        if (model->kvMemConfig.enabled || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
+    static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx) {
+        if ((model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
             ctx->intParams.count("paged_prefix_restore_disabled")) return nullptr;
         PagedCacheManager *probeManager = nullptr;
         bool queryUnboundedLayersOnly = false;
@@ -1645,6 +1633,25 @@ namespace fastllm {
         return probeManager;
     }
 
+    static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {
+#ifdef USE_CUDA
+        try {
+#endif
+            return RestoreResidentPrefixImpl(model, ctx);
+#ifdef USE_CUDA
+        } catch (const CudaWorkspaceExhausted &error) {
+            // Prefix restoration runs before Forward's allocation guard. Keep
+            // partial state owned by this failed request until normal removal;
+            // no other request or rank may consume it in a forward.
+            fprintf(stderr, "[Fastllm] Prefix restore failed: %s\n", error.what());
+            ctx->isEnding = true;
+            ctx->error = ResponseContextErrorPromptTooLong;
+            model->dictCV.notify_all();
+            return nullptr;
+        }
+#endif
+    }
+
     static void RestoreDeferredHistory(basellm *model, ResponseContext *ctx) {
         if (ctx->cacheLen == 0 && ctx->multimodalInput.empty() && model->DeferHistoryCacheRestore() &&
             !ctx->intParams.count("deferred_history_checked")) {
@@ -1781,7 +1788,7 @@ namespace fastllm {
         auto collectDecodePageNeeds =
                 [&](const std::vector<ResponseContext*> &contexts) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
-            if (model->kvMemConfig.enabled) return needs;
+            if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return needs;
             bool representativeCachesKnown = true;
             for (auto *ctx : contexts) {
                 if (ctx == nullptr || model->kvCacheId < 0 ||
@@ -1905,7 +1912,7 @@ namespace fastllm {
 
         auto collectPrefillPageNeeds = [&](ResponseContext *ctx, int appendTokens) -> PageNeedState {
             PageNeedState state;
-            if (model->kvMemConfig.enabled) return state;
+            if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return state;
             if (ctx == nullptr || appendTokens <= 0) {
                 return state;
             }
@@ -1961,8 +1968,8 @@ namespace fastllm {
 
         auto *pcm = model->GetPagedKVCacheManager(model->kvCacheId, true);
         if (model->kvMemConfig.enabled) {
-            maxTotalLens = model->kvMemConfig.maxTokens;
-            maxBatch = 1;
+            maxTotalLens = model->SupportsKvMemBatch() ? model->tokensLimit : model->kvMemConfig.maxTokens;
+            if (!model->SupportsKvMemBatch()) maxBatch = 1;
         } else if (pcm != nullptr) {
             totalPages = pcm->maxPages;
             pageLen = pcm->pageLen;
@@ -2084,6 +2091,7 @@ namespace fastllm {
                     continue;
                 }
                 if (it.second->isEnding) {
+                    model->OnResponseContextFinished(it.second);
                     for (int i = 0; i < model->block_cnt; i++) {
                         auto &kvFirst = it.second->pastKeyValues[i].first;
                         auto &kvSecond = it.second->pastKeyValues[i].second;
@@ -2622,6 +2630,7 @@ namespace fastllm {
                                 ctx->intParams["paged_prefix_restore_disabled"] = 1;
                             }
                         }
+                        if (ctx->isEnding) continue;
 
                         // currentActivate already includes every pending
                         // prefill selected earlier in this pass.  Adding
@@ -2934,7 +2943,7 @@ namespace fastllm {
                                tokensManager, logits[0], chunkedPrefillToken)) {
                     ret = {chunkedPrefillToken};
                 } else if (seqLens.size() == 1 && (seqLens[0] > prefillChunkSize ||
-                           (model->kvMemConfig.enabled && seqLens[0] > 1))) {
+                           (model->kvMemConfig.enabled && !model->SupportsKvMemBatch() && seqLens[0] > 1))) {
                     int len = seqLens[0];
                     std::vector <std::pair <Data, Data> > *pastKeyValue1;
                     dictLocker.lock();
@@ -2944,7 +2953,7 @@ namespace fastllm {
                     for (int st = 0; st < len; ) {
                         int curLen = std::min(prefillChunkSize, len - st);
                         // Retrieve with the final prompt query before sampling.
-                        if (model->kvMemConfig.enabled && curLen > 1 && st + curLen == len) {
+                        if (model->kvMemConfig.enabled && !model->SupportsKvMemBatch() && curLen > 1 && st + curLen == len) {
                             --curLen;
                         }
                         auto chunkStartTime = std::chrono::system_clock::now();
@@ -3268,6 +3277,9 @@ namespace fastllm {
                     if (fastDecodeInput) decodePositionIds.reserve(maxBatch);
                     const bool batchPrefill = maxBatch > 1 && model->SupportsPrefillBatching() &&
                                               model->prefillBatchPolicy.targetTokens > 0;
+                    const bool fixedKvSlots = model->kvMemConfig.enabled && model->SupportsKvMemBatch();
+                    const bool sharedKvPool = fixedKvSlots && model->SupportsKvMemPrefixCache();
+                    const int maxPromptTokens = model->max_positions - (sharedKvPool ? 1 : 0);
                     const int prefillChunk = model->GetChunkedPrefillSize();
                     const int prefillBatchLimit = model->GetBatchedPrefillTokenLimit();
                     while (true) {
@@ -3308,6 +3320,9 @@ namespace fastllm {
                             model->RemoveResponseContext(it);
                         }
 
+                        for (auto &entry : model->responseContextDict.dicts)
+                            if (entry.second->isEnding) model->OnResponseContextFinished(entry.second);
+
                         int limit = maxTotalLens;
                         int promptLimit = model->promptLimit;
 
@@ -3342,11 +3357,72 @@ namespace fastllm {
                             }
                         }
                         auto reservePagedAppend = [&](const Data &cache, int append) {
+                            // Shared KVMem reserves growth through the requested
+                            // output limit at admission, using physical pages.
+                            if (sharedKvPool) return true;
                             const long long length = cache.dims.size() > 1 ? cache.dims[1] : 0;
                             const long long required = (length + append + pageLen - 1) / pageLen * pageLen;
                             const long long additional = std::max(0LL, required - allocatedTokens(cache));
                             if (lenSum + additional > pagedTokenLimit) return false;
                             lenSum += additional;
+                            return true;
+                        };
+                        // Count free/reclaimable physical pages once, not every
+                        // request's logical prefix. Shared prefixes may make
+                        // the sum of request lengths much larger than the pool.
+                        auto freePagedPages = [&]() -> long long {
+                            std::lock_guard<std::mutex> guard(pagedManager->pageIndexLocker);
+                            return pagedManager->FreePageCount();
+                        };
+                        auto remainingPages = [&](ResponseContext *ctx) -> long long {
+                            const Data &root = ctx->pastKeyValues[model->kvCacheId].first;
+                            const Data &cache = root.multiDeviceData && !root.multiDeviceDatas.empty()
+                                ? *root.multiDeviceDatas.begin()->second : root;
+                            long long end = model->max_positions;
+                            const int output = ctx->generationConfig.output_token_limit;
+                            if (output > 0)
+                                end = std::min(end, (long long)ctx->allTokens.size() +
+                                                   output - ctx->curTokens);
+                            // The final sampled token does not need its own KV.
+                            const long long pages = (std::max(0LL, end - 1) + pageLen - 1) / pageLen;
+                            long long extra = std::max(0LL, pages - allocatedTokens(root) / pageLen);
+                            if (cache.isPagedKVCache && !cache.pageIndex.empty() &&
+                                cache.dims.size() > 1 && cache.dims[1] % pageLen) {
+                                std::lock_guard<std::mutex> guard(cache.pagedKVCacheData->pageIndexLocker);
+                                extra += cache.pagedKVCacheData->pageRefCount[cache.pageIndex.back()] > 1;
+                            }
+                            return extra;
+                        };
+                        long long reservedPages = 0;
+                        int activeDecode = 0;
+                        if (sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
+                            auto *ctx = entry.second;
+                            if (!ctx->isEnding && ctx->curTokens > 0) {
+                                reservedPages += remainingPages(ctx);
+                                ++activeDecode;
+                            }
+                        }
+                        auto releasePendingPrefix = [&](ResponseContext *ctx) {
+                            if (!ctx->cacheLen) return;
+                            model->OnResponseContextRemoved(ctx);
+                            for (auto &kv : ctx->pastKeyValues) {
+                                ReleasePagedCachePages(kv.first, true);
+                                ReleasePagedCachePages(kv.second, true);
+                            }
+                            ctx->currentTokens = ctx->allTokens;
+                            ctx->cacheLen = ctx->preTokens = 0;
+                            ctx->intParams.clear();
+                            model->OnResponseContextCreated(ctx);
+                        };
+                        auto reserveSharedRequest = [&](ResponseContext *ctx) {
+                            const long long needed = remainingPages(ctx);
+                            if (reservedPages + needed > freePagedPages()) {
+                                // A waiting cache hit must not pin otherwise
+                                // reclaimable pages needed by active decoders.
+                                releasePendingPrefix(ctx);
+                                return false;
+                            }
+                            reservedPages += needed;
                             return true;
                         };
                         std::vector <std::pair <int, int> > orders;
@@ -3369,8 +3445,8 @@ namespace fastllm {
 
                         std::set<int> plannedPrefills;
                         bool deferPrefill = false;
-                        int activeDecode = 0;
                         if (batchPrefill) {
+                            activeDecode = 0;
                             auto oldest = PrefillBatchPolicy::Clock::time_point::max();
                             for (auto &entry : model->responseContextDict.dicts) {
                                 if (entry.second->isEnding) continue;
@@ -3388,19 +3464,24 @@ namespace fastllm {
                                 auto *ctx = model->responseContextDict.dicts.at(order.second);
                                 if (ctx->isEnding || ctx->curTokens != 0) continue;
                                 if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
-                                    ctx->cacheLen + ctx->currentTokens.size() > (size_t)model->max_positions) continue;
+                                    ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
                                 // Count only cache misses. Restore each candidate once in
                                 // this pass; the selection below reuses the same KV owners.
                                 if (model->DeferHistoryCacheRestore()) {
                                     const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
                                     const long long before = allocatedTokens(cache);
                                     RestoreResidentPrefix(model, ctx);
+                                    if (ctx->isEnding) continue;
                                     RestoreDeferredHistory(model, ctx);
                                     lenSum += allocatedTokens(cache) - before;
                                 }
                                 const int count = ctx->currentTokens.size();
                                 const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
-                                if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) break;
+                                if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) {
+                                    if (sharedKvPool) releasePendingPrefix(ctx);
+                                    break;
+                                }
+                                if (sharedKvPool && !reserveSharedRequest(ctx)) continue;
                                 plannedPrefills.insert(order.second);
                                 pendingTokens += count;
                                 singlePrefill = single;
@@ -3441,7 +3522,8 @@ namespace fastllm {
                                 if (it.second->isEnding) {
                                     continue;
                                 }
-                                const bool pendingPrefill = batchPrefill ? it.second->curTokens == 0 : it.second->preTokens == 0;
+                                const bool pendingPrefill = (batchPrefill || sharedKvPool)
+                                    ? it.second->curTokens == 0 : it.second->preTokens == 0;
                                 if (isPrompt && !pendingPrefill) {
                                     continue;
                                 }
@@ -3453,11 +3535,11 @@ namespace fastllm {
                                     if (batchPrefill && !plannedPrefills.count(it.first)) {
                                         // Invalid requests still take the normal error path below.
                                         if (it.second->cacheLen + it.second->currentTokens.size() <= (size_t)maxTotalLens &&
-                                            it.second->cacheLen + it.second->currentTokens.size() <= (size_t)model->max_positions)
+                                            it.second->cacheLen + it.second->currentTokens.size() <= (size_t)maxPromptTokens)
                                             continue;
                                     }
                                     int alive = 0;
-                                    if (batchPrefill) {
+                                    if (batchPrefill || sharedKvPool) {
                                         alive = activeDecode + seqLens.size();
                                     } else for (auto &it: model->responseContextDict.dicts) {
                                         if (it.second->isEnding) {
@@ -3473,7 +3555,8 @@ namespace fastllm {
                                 }
 
                                 if (it.second->cacheLen + it.second->currentTokens.size() > maxTotalLens ||
-                                    it.second->cacheLen + it.second->currentTokens.size() > model->max_positions) {
+                                    it.second->cacheLen + it.second->currentTokens.size() >
+                                        (isPrompt ? maxPromptTokens : model->max_positions)) {
                                     it.second->isEnding = true;
                                     it.second->error = ResponseContextErrorPromptTooLong;
                                     continue;
@@ -3492,6 +3575,7 @@ namespace fastllm {
                                 // A lone request can still make progress and the decode path
                                 // below will stop it when no more KV space is available.
                                 if (isPrompt && currentActivate > 0 &&
+                                    !fixedKvSlots &&
                                     lenSum + it.second->currentTokens.size() +
                                         (currentActivate + 1) * 256 > maxTotalLens) {
                                     continue;
@@ -3501,9 +3585,12 @@ namespace fastllm {
                                     const auto &cache = it.second->pastKeyValues[model->kvCacheId].first;
                                     const long long before = allocatedTokens(cache);
                                     RestoreResidentPrefix(model, it.second);
+                                    if (it.second->isEnding) continue;
                                     RestoreDeferredHistory(model, it.second);
                                     lenSum += allocatedTokens(cache) - before;
                                 }
+                                if (isPrompt && !batchPrefill && sharedKvPool &&
+                                    !reserveSharedRequest(it.second)) continue;
                                 if (!isPrompt) {
                                     if (preallocatedPagedCache) {
                                         if (!reservePagedAppend(it.second->pastKeyValues[model->kvCacheId].first,
@@ -3630,7 +3717,11 @@ namespace fastllm {
                                     // break;
                                 }
 
-                                if (seqLens.size() >= maxBatch || lenSum + seqLens.size() * 128 > limit) {
+                                // Fixed-slot KV already reserves every request's full
+                                // context. Charging another decode reserve here would
+                                // serialize a completely occupied batch.
+                                if (seqLens.size() >= maxBatch ||
+                                    (!fixedKvSlots && lenSum + seqLens.size() * 128 > limit)) {
                                     break;
                                 }
                             }
@@ -3756,7 +3847,7 @@ namespace fastllm {
                                 model->dictCV.notify_all();
                                 ReleasePendingResultLogits(logits);
                                 for (auto *mask : attentionMasks) delete mask;
-                                for (auto *position : positionIds) delete position;
+                                for (auto *position : ownedPositionIds) delete position;
                                 continue;
                             }
 #endif

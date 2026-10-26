@@ -533,6 +533,8 @@ if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
 
+fastllm_lib.supports_kvmem_prefix_cache_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.supports_kvmem_prefix_cache_llm_model.restype = ctypes.c_bool
 fastllm_lib.set_kvmem_llm_model.argtypes = (
     [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 7 +
     [ctypes.c_uint64, ctypes.c_int, ctypes.c_float])
@@ -561,6 +563,9 @@ fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
 
 fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_model_indexer_dtype.restype = None
+if hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
+    fastllm_lib.set_model_indexer_tp_storage.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.set_model_indexer_tp_storage.restype = None
 fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
@@ -1517,9 +1522,14 @@ class model:
                   mmproj_path: str = "",
                   max_context_length: int = -1,
                   rope_scaling = None,
-                  indexer_dtype: str = "auto"):
+                  indexer_dtype: str = "auto",
+                  indexer_tp_storage: str = "replicated"):
         if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
             raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
+        if indexer_tp_storage not in ("replicated", "layer_shard"):
+            raise ValueError("indexer_tp_storage must be replicated or layer_shard")
+        if indexer_tp_storage != "replicated" and not hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
+            raise RuntimeError("The loaded FastLLM library does not support Indexer TP storage; rebuild FastLLM.")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
                 max_context_length != -1 and not 0 < max_context_length <= 2147483647):
             raise ValueError("max_context_length must be a positive 32-bit integer")
@@ -1628,6 +1638,9 @@ class model:
                 if external_mtp_path and mmproj_path:
                     raise ValueError(
                         "external MTP and mmproj cannot be used together")
+                if mmproj_path and self.config.get("gguf_architecture") == "deepseek41":
+                    from .deepseek_v41_gguf import vision_config
+                    self.config.update(vision_config(mmproj_path, self.config))
                 if context_requested:
                     self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
                         path.encode(), ori_model_path.encode(),
@@ -1799,6 +1812,8 @@ class model:
             self.set_kv_cache_dtype(kv_cache_dtype)
         if indexer_dtype != "auto":
             fastllm_lib.set_model_indexer_dtype(self.model, indexer_dtype.encode())
+        if indexer_tp_storage != "replicated":
+            fastllm_lib.set_model_indexer_tp_storage(self.model, indexer_tp_storage.encode())
         self._refresh_context_config()
 
     def _refresh_context_config(self):
@@ -3556,8 +3571,9 @@ class model:
         fastllm_lib.mark_process_exiting()
     
     def set_save_history(self, save: bool):
-        if getattr(self, "kvmem_enabled", False) and save:
-            raise ValueError("KVMem does not support history caching")
+        if (getattr(self, "kvmem_enabled", False) and save and
+                not fastllm_lib.supports_kvmem_prefix_cache_llm_model(self.model)):
+            raise ValueError("This model's KVMem backend does not support history caching")
         self.save_history = bool(save)
         fastllm_lib.set_save_history(self.model, save)
 
@@ -3609,7 +3625,16 @@ class model:
         PP/TP and CUDA Graph; sink/recent/retrieval policy parameters do not apply
         to native QSA. Pure GPU and CPU execution modes do not enable Qwen4 KVMem.
         Qwen4 resident_tokens must be divisible by 4. host_mib covers all target
-        and possible draft KV layers.
+        and possible draft KV layers. Prefix reuse and concurrent requests are
+        disabled in the Qwen4 adapters; the full max_tokens context remains
+        available. MiMo/Naive N0.5 supports CUDA TP with an explicit max_batch
+        set before KVMem, BF16/FP8 KV and CUDA Graph. Its Indexer stays on GPU
+        and preserves exact TopK; prefill stages one layer at a time.
+        MiMo KVMem supports shared paged prefixes and GPU SWA checkpoints; draft
+        models remain disabled. Its global physical pool can be set with
+        set_max_tokens / --tokens before configuring KVMem, independently of the
+        per-request max_tokens limit. host_mib covers all requests, ranks and KV
+        layers (including graph padding).
         """
         values = (max_tokens, resident_tokens, sink_tokens, prefix_tokens, recent_tokens,
                   retrieval_tokens, prefill_tokens)
@@ -3631,7 +3656,7 @@ class model:
         self.kvmem_enabled = enabled
         self.kvmem_prefix_tokens = prefix_tokens if enabled else 0
         self.kvmem_prefix_pin_reported = None
-        if enabled:
+        if enabled and not fastllm_lib.supports_kvmem_prefix_cache_llm_model(self.model):
             self.save_history = False
 
     def set_kv_cache_limit(self, limit: str):
@@ -3652,8 +3677,8 @@ class model:
         fastllm_lib.set_kv_cache_limit_llm_model(self.model, ctypes.c_int64(limit_bytes))
     
     def set_max_batch(self, batch: int):
-        if getattr(self, "kvmem_enabled", False) and batch != 1:
-            raise ValueError("KVMem currently requires max_batch=1")
+        if getattr(self, "kvmem_enabled", False) and batch != self.get_max_batch():
+            raise ValueError("Set max_batch before configuring KVMem")
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
 
     def get_max_batch(self):

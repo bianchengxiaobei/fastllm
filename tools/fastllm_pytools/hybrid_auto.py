@@ -28,9 +28,11 @@ def requested(args):
 
 
 def _memory_limit_bytes(value, label):
-    """Return an optional explicit planner cap in bytes."""
+    """Return an optional explicit planner memory size in bytes."""
     if value is None or str(value).strip().lower() in ("", "auto"):
         return None
+    if isinstance(value, bool):
+        raise ValueError("Hybrid auto: %s is invalid" % label)
     try:
         from .util import _memory_size_bytes
         result = _memory_size_bytes(value)
@@ -39,6 +41,21 @@ def _memory_limit_bytes(value, label):
     if result <= 0:
         raise ValueError("Hybrid auto: %s must be positive" % label)
     return result
+
+
+def host_budget(args, ram):
+    """Return the effective host budget and normalized cap/override options."""
+    limit = _memory_limit_bytes(getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit")
+    override = _memory_limit_bytes(getattr(args, "force_ddr_limit", None), "force_ddr_limit")
+    # Saved JSON settings and direct API calls bypass argparse's exclusivity.
+    if limit is not None and override is not None:
+        raise ValueError("Hybrid auto: --force_ddr_limit and --auto_host_memory_limit are mutually exclusive")
+    budget = ram["available"] - min(4 * GiB, max(GiB, ram["total"] // 10))
+    if override is not None:
+        budget = override
+    elif limit is not None:
+        budget = min(budget, limit)
+    return budget, limit, override
 
 
 @dataclass(frozen=True)
@@ -651,7 +668,11 @@ def _deepseek_v41_weight_sizes(tensors, args):
     for tensor in tensors:
         name = tensor.name
         if tensor.kind.startswith("gguf:"):
-            if name.endswith((".ffn_gate_inp.weight", ".attn_compressor_kv.weight",
+            if name.startswith("vision."):
+                # mmproj linears import as FP16, parameters as FP32. Quantized
+                # projector variants must reserve the converted allocation.
+                sizes[name] = max(tensor.bytes, math.prod(tensor.shape) * (2 if len(tensor.shape) > 1 else 4))
+            elif name.endswith((".ffn_gate_inp.weight", ".attn_compressor_kv.weight",
                               ".attn_compressor_gate.weight", ".engram_q.weight", ".engram_k.weight")):
                 sizes[name] = math.prod(tensor.shape) * 4
             continue
@@ -822,12 +843,16 @@ def weight_costs(tensors, model, args):
             # Text-only auto loads the idle vision tower on the host; it is
             # never replicated onto every decoder pipeline stage.
             host += size
+            if getattr(args, "mmproj", ""):
+                common += size
         elif layer is None:
             common += size
         else:
             dense[layer] += size
         if not is_table:
             largest = max(largest, size)
+    if model.family == "deepseek_v41" and getattr(args, "mmproj", ""):
+        common += 2 * GiB  # vision attention: 16 heads x 1024 queries x <=9216 keys
     if not any(expert) and model.family not in ("qwen3", "qwen35"):
         raise ValueError("Hybrid auto: no routed experts found")
     model.gguf_expert_bytes = {layer: math.ceil(size / model.experts)
@@ -993,12 +1018,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     # The library queries free memory after creating the CUDA contexts. Keep
     # additional space for graphs, allocator granularity and library handles.
     guard = 512 * MiB
-    host_limit = ram["available"] - min(4 * GiB, max(GiB, ram["total"] // 10))
-    host_memory_limit = _memory_limit_bytes(
-        getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit"
-    )
-    if host_memory_limit is not None:
-        host_limit = min(host_limit, host_memory_limit)
+    host_limit, host_memory_limit, host_memory_override = host_budget(args, ram)
     # DeepSeek's prefill path can amortize the indexed attention and MoE
     # dispatch over a larger block for every host-backed expert backend.  The
     # capacity solver still rejects 8192 when the GPU workspace cannot hold it.
@@ -1213,7 +1233,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "expert_transport_bytes_per_device": transport,
                     "expert_host_staging_bytes": len(mapping) * disk_staging,
                     "auto_gpu_memory_limit": gpu_memory_limit,
-                    "auto_host_memory_limit": host_memory_limit}
+                    "auto_host_memory_limit": host_memory_limit,
+                    "force_ddr_limit": host_memory_override}
             if independent and host_experts:
                 candidate["moe_cuda_cache_per_device"] = cache
             if model.family == "deepseek_v41":
@@ -1265,6 +1286,12 @@ def model_inputs(args):
         _, draft_tensors = inventory(draft)
         tensors += [Tensor(t.name if t.name.startswith("mtp.") else "mtp." + t.name,
                            t.shape, t.bytes, t.kind) for t in draft_tensors]
+    mmproj = getattr(args, "mmproj", "")
+    if mmproj and metadata.get("gguf_architecture") == "deepseek41":
+        from .deepseek_v41_gguf import vision_config
+        metadata.update(vision_config(mmproj, metadata))
+        _, vision_tensors = inventory(mmproj)
+        tensors += [Tensor("vision." + t.name, t.shape, t.bytes, t.kind) for t in vision_tensors]
     return metadata, tensors, model
 
 

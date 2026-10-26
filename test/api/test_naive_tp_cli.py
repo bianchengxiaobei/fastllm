@@ -37,7 +37,24 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 self.native_env = dict(os.environ)
             fake.llm.set_cuda_slab.assert_called_once_with(args.cuda_slab)
             self.loaded_model = fake.llm.model.return_value
+            self.model_options = fake.llm.model.call_args.kwargs
             return args
+
+    def test_indexer_tp_storage(self):
+        self.configure(['--tp', '8'])
+        self.assertEqual(self.model_options['indexer_tp_storage'], 'replicated')
+        for options, saved in [(['--tp', '8', '--indexer_tp_storage', 'layer_shard'], None),
+                               ([], {'tp': '4', 'indexer_tp_storage': 'layer_shard'})]:
+            with self.subTest(saved=saved):
+                self.configure(options, saved=saved)
+                self.assertEqual(self.model_options['indexer_tp_storage'], 'layer_shard')
+        for options, model, saved in [([], 'naive_n05_flash', None),
+                                      (['--tp', '1'], 'naive_n05_flash', None),
+                                      (['--tp', '8'], 'llama', None),
+                                      (['--tp', '8'], 'naive_n05_flash', {'indexer_tp_storage': 'invalid'})]:
+            with self.subTest(options=options, model=model), self.assertRaisesRegex(ValueError, '[Ii]ndexer'):
+                self.configure(options + ([] if saved else ['--indexer_tp_storage', 'layer_shard']),
+                               model_type=model, saved=saved)
 
     def test_prefill_batching_cli_and_saved_settings(self):
         for options, saved in [(['--tp', '8', '--prefill_batch_tokens', '16384',
@@ -98,14 +115,15 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         self.assertEqual(args.cuda_slab, 0)
         self.assertEqual(args.atype, "float16")
 
-    def test_ep8_cli_and_saved_settings(self):
-        for options, saved in [(["--tp", "8", "--ep", "8"], None),
-                               ([], {"tp": "8", "ep": 8})]:
-            with self.subTest(saved=saved):
-                args = self.configure(options, saved=saved)
-                self.assertEqual(args.ep, 8)
-                self.assertEqual(self.native_env["FASTLLM_EP"], "8")
-                self.assertEqual(self.native_env["FASTLLM_TP"], "cuda:0,1,2,3,4,5,6,7")
+    def test_ep_cli_and_saved_settings(self):
+        for ep in (4, 8):
+            for options, saved in [(["--tp", str(ep), "--ep", str(ep)], None),
+                                   ([], {"tp": str(ep), "ep": ep})]:
+                with self.subTest(ep=ep, options=options, saved=saved):
+                    args = self.configure(options, saved=saved)
+                    self.assertEqual(args.ep, ep)
+                    self.assertEqual(self.native_env["FASTLLM_EP"], str(ep))
+                    self.assertEqual(self.native_env["FASTLLM_TP"], "cuda:" + ",".join(map(str, range(ep))))
 
     def test_ep_explicit_disable_overrides_environment(self):
         self.configure(["--tp", "8", "--ep", "1"], environment={
@@ -118,16 +136,17 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         self.configure(["--tp", "8", "--ep", "8"], environment={"FASTLLM_EP": "1"})
         self.assertEqual(self.native_env["FASTLLM_EP"], "8")
 
-    def test_ep_requires_eight_tp_devices(self):
-        for tp in (None, "1", "4"):
-            with self.subTest(tp=tp), self.assertRaisesRegex(ValueError, "requires --tp 8"):
-                self.configure(["--ep", "8"] + (["--tp", tp] if tp else []))
+    def test_ep_requires_matching_tp_devices(self):
+        for ep, sizes in ((4, (None, "1", "8")), (8, (None, "1", "4"))):
+            for tp in sizes:
+                with self.subTest(ep=ep, tp=tp), self.assertRaisesRegex(ValueError, f"requires exactly {ep}"):
+                    self.configure(["--ep", str(ep)] + (["--tp", tp] if tp else []))
 
     def test_ep_rejects_unsupported_model_and_saved_value(self):
         with self.assertRaisesRegex(ValueError, "currently supports MiMo"):
             self.configure(["--tp", "8", "--ep", "8"], model_type="llama")
         with self.assertRaisesRegex(ValueError, "supports 1"):
-            self.configure([], saved={"tp": "8", "ep": 4})
+            self.configure([], saved={"tp": "8", "ep": 2})
 
     def test_tp_does_not_enable_ep_implicitly(self):
         args = self.configure(["--tp", "8"])

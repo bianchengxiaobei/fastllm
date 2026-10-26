@@ -544,15 +544,15 @@ def _configure_expert_parallel(args, is_naive_n05_model):
         value = os.environ.get("FASTLLM_EP", "")
     if value == "" or value is None:
         return
-    if str(value) not in ("1", "8"):
-        raise ValueError("--ep supports 1 (MoE TP) or 8 (MiMo MegaMoE EP8)")
+    if str(value) not in ("1", "4", "8"):
+        raise ValueError("--ep supports 1 (MoE TP), 4 or 8 (MiMo MegaMoE EP)")
     ep = int(value)
-    if ep == 8:
+    if ep in (4, 8):
         if not is_naive_n05_model:
-            raise ValueError("--ep 8 currently supports MiMo DSA / Naive-N0.5 FP8 models")
-        if _thread_tp_cuda_device_count(getattr(args, "tp", "")) != 8:
-            raise ValueError("--ep 8 requires --tp 8 (exactly eight TP devices)")
-        print("[ep] --ep 8: 32 complete experts/GPU; built-in MegaMoE W8A8")
+            raise ValueError("--ep 4/8 currently supports MiMo DSA / Naive-N0.5 FP8 models")
+        if _thread_tp_cuda_device_count(getattr(args, "tp", "")) != ep:
+            raise ValueError(f"--ep {ep} requires exactly {ep} TP devices")
+        print(f"[ep] --ep {ep}: {256 // ep} complete experts/GPU; built-in MegaMoE W8A8")
     os.environ["FASTLLM_EP"] = str(ep)
     args.ep = ep
 
@@ -941,9 +941,13 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--auto_gpu_memory_limit', '--auto-gpu-memory-limit',
                         dest='auto_gpu_memory_limit', type=_memory_size_or_auto, default=None,
                         help='自动规划时每张可见GPU的显存上限，如20g；未指定则读取实际可用显存')
-    parser.add_argument('--auto_host_memory_limit', '--auto-host-memory-limit',
+    host_memory = parser.add_mutually_exclusive_group()
+    host_memory.add_argument('--auto_host_memory_limit', '--auto-host-memory-limit',
                         dest='auto_host_memory_limit', type=_memory_size_or_auto, default=None,
-                        help='自动规划时主机内存上限，如128g；未指定则读取实际可用内存')
+                        help='收紧自动规划的主机内存上限，如128g；不能超过检测到的可用预算')
+    host_memory.add_argument('--force_ddr_limit', '--force-ddr-limit',
+                        dest='force_ddr_limit', type=_memory_size_or_auto, default=None,
+                        help='强制指定最终主存规划预算，如114g；替代CMA/cgroup检测及自动预留后的预算，不改变系统硬限制，过大可能OOM；与auto_host_memory_limit互斥')
     parser.add_argument('--auto_disk_cache_ratio', '--auto-disk-cache-ratio', type=float, default=0.5,
                         help='DeepSeek-V4.1自动混合NUMA/disk时，主存缓存覆盖disk专家权重的推荐最低比例（0到1，默认0.5）；仅估算容量')
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
@@ -958,10 +962,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
+    parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard'], default='replicated',
+                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；默认各卡复制')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
-                        help='启用稀疏/主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"prefix_tokens":4096,"retrieval_norm_power":1.0}。prefix_tokens 常驻保留序列开头的 token（chat template 的 system 段），默认 0 表示按 chat template 逐请求自动推导。retrieval_norm_power 取值 [0,1]，0 为原始点积、1 为余弦相似度，默认 0。默认关闭（--auto 可按预算启用 Qwen4 精确换页）；单请求，Qwen3/3.5 单卡稀疏检索或按 KV head 切分的张量并行，Qwen4/QSA 混合推理按 resident_tokens 限制每层显存 KV，保留原生注意力选择')
+                        help='启用稀疏/主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"prefix_tokens":4096,"retrieval_norm_power":1.0}。prefix_tokens 常驻保留序列开头的 token（chat template 的 system 段），默认 0 表示按 chat template 逐请求自动推导。retrieval_norm_power 取值 [0,1]，0 为原始点积、1 为余弦相似度，默认 0。默认关闭（--auto 可按预算启用 Qwen4 精确换页）；单请求，Qwen3/3.5 单卡稀疏检索或按 KV head 切分的张量并行，Qwen4/QSA 混合推理按 resident_tokens 限制每层显存 KV，保留原生注意力选择；MiMo/Naive CUDA TP 支持多请求精确 DSA KV 缓存与共享分页前缀，需先设置 --max_batch')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = _integer_or_auto, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如8192；auto按混推内存预算选择')
@@ -981,9 +987,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
-                             help='启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；该模型的--auto默认开启')
+                             help='开启DeepSeek-V4.1快速 prefill；该模型的--auto默认开启，可用--no_fast_prefill关闭')
     fast_prefill.add_argument('--no_fast_prefill', '--no-fast-prefill', dest='fast_prefill',
-                             action='store_false', help='关闭近似 prefill，包括覆盖--auto默认值')
+                             action='store_false', help='关闭快速 prefill，可覆盖--auto默认的开启设置')
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
@@ -991,8 +997,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
-    parser.add_argument('--ep', type = int, choices = (1, 8), default = None,
-                        help = '专家并行数；1为原MoE TP路径（默认），8为MiMo FP8/H20的EP8，默认使用内置MegaMoE W8A8；需配合--tp 8')
+    parser.add_argument('--ep', type = int, choices = (1, 4, 8), default = None,
+                        help = '专家并行数；1为原MoE TP路径（默认），4/8为MiMo FP8/H20的专家并行，使用内置MegaMoE W8A8；需配合相同大小的--tp')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = _integer_or_auto, default = -1, help = '后面多少层moe使用moe_device，-1表示全部；auto在混推加载前规划GPU驻留前缀')
     parser.add_argument('--moe_front_device', type = str, default = "",
@@ -1463,6 +1469,9 @@ def make_normal_llm_model(args, startup_progress = None):
                     config = json.load(file)
             else:
                 config = gguf_config
+            if getattr(args, "mmproj", "") and config.get("gguf_architecture") == "deepseek41":
+                from .deepseek_v41_gguf import vision_config
+                config.update(vision_config(args.mmproj, config))
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
@@ -1883,6 +1892,14 @@ def make_normal_llm_model(args, startup_progress = None):
     os.environ["FASTLLM_CUDAPP_SERIAL"] = "1" if raw_main_device.lower().startswith("cudapp=") else "0"
 
     tp_arg = getattr(args, "tp", "")
+    indexer_storage = getattr(args, "indexer_tp_storage", "replicated")
+    if indexer_storage not in ("replicated", "layer_shard"):
+        raise ValueError("indexer_tp_storage must be replicated or layer_shard")
+    if indexer_storage == "layer_shard":
+        if not is_naive_n05_model:
+            raise ValueError("Indexer layer_shard storage currently supports Naive DSA models only")
+        if _thread_tp_cuda_device_count(tp_arg or os.environ.get("FASTLLM_TP", "")) < 2:
+            raise ValueError("Indexer layer_shard storage requires --tp with at least two CUDA devices")
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
@@ -2066,7 +2083,8 @@ def make_normal_llm_model(args, startup_progress = None):
                             mmproj_path = args.mmproj,
                             max_context_length = -1 if legacy_context_limit else max_context_length,
                             rope_scaling = rope_scaling,
-                            indexer_dtype = getattr(args, "indexer_dtype", "auto"))
+                            indexer_dtype = getattr(args, "indexer_dtype", "auto"),
+                            indexer_tp_storage = indexer_storage)
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
         llm.report_model_load_progress("weights_finalize", 0, 1)

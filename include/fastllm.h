@@ -547,6 +547,8 @@ namespace fastllm {
         // Pure host bytes (never a Data copy) so it survives Data::CopyFrom's
         // KVMem guard. Reset by the cache after a successful Seed.
         std::shared_ptr<KvMemPrefixData> kvMemSeed;
+        // Optional lifetime lease for model-owned, borrowed KV storage.
+        std::shared_ptr<void> kvStorageOwner;
         int pageLen = 128; // 每个page的长度（token数）
         PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号
