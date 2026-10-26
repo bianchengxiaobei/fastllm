@@ -92,6 +92,9 @@ typedef void* cublasHandle_t;
 std::vector <long long> FastllmCudaGetFreeSizes();
 long long FastllmCudaGetFreeSize();
 bool FastllmCudaGetMemoryInfo(int device, uint64_t &freeBytes, uint64_t &totalBytes);
+// Idle bytes the allocator pool already owns on `device`. Freed blocks stay in
+// the pool, so cudaMemGetInfo alone under-reports what the next temporary can reuse.
+size_t FastllmCudaGetPooledIdleBytes(int device);
 std::vector <long long> FastllmCudaGetTotalSizes();
 
 // One owner per serial graph family and GPU. The caller must serialize replay

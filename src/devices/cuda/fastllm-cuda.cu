@@ -4752,6 +4752,27 @@ static std::vector<FastllmCudaMemPoolView> FastllmSnapshotCudaMemPoolViews() {
     return views;
 }
 
+// Blocks released by FastllmCudaFree only lose their busy flag; the pool keeps
+// the driver allocation so the next same-sized temporary can reuse it. Any
+// admission that compares a temporary against cudaMemGetInfo therefore has to
+// add these idle bytes back, otherwise the second and every later user of a
+// per-layer arena sees "no free VRAM" while the pool holds gigabytes.
+size_t FastllmCudaGetPooledIdleBytes(int device) {
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(device);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    size_t idle = 0;
+    auto accumulate = [&idle](const std::vector<CudaMemoryBuffer> &buffers) {
+        for (auto &buffer : buffers) {
+            if (!buffer.busy && buffer.graphPins == 0 && !buffer.reusePending) {
+                idle += buffer.size;
+            }
+        }
+    };
+    accumulate(*view.bigBuffers);
+    accumulate(*view.smallBuffers);
+    return idle;
+}
+
 static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMemoryBuffer> &bigBuffers) {
     if (FastllmCudaIsProcessExiting()) {
         return 0;

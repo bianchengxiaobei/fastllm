@@ -725,19 +725,25 @@ bool FastllmCudaRunV41GGUFHostStream(
     const size_t expertBytes = gateBytes + downBytes;
     size_t freeBytes = 0, totalBytes = 0;
     if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess) return reject("cudaMemGetInfo failed");
+    // The previous layer's arenas are idle in the allocator pool, not free in
+    // the driver. This layer asks for the same shapes, so it reuses them; budget
+    // against driver-free plus pooled-idle instead of driver-free alone.
+    const size_t pooledBytes = FastllmCudaGetPooledIdleBytes(device);
+    const size_t usableBytes = freeBytes + pooledBytes;
     const size_t reserve = 256ull << 20, minArena = 64ull << 20;
-    if (freeBytes <= reserve) {
-        char extra[96];
-        snprintf(extra, sizeof(extra), "free=%.0fMB reserve=%.0fMB",
-            freeBytes / 1048576.0, reserve / 1048576.0);
+    if (usableBytes <= reserve) {
+        char extra[128];
+        snprintf(extra, sizeof(extra), "free=%.0fMB pooled=%.0fMB reserve=%.0fMB",
+            freeBytes / 1048576.0, pooledBytes / 1048576.0, reserve / 1048576.0);
         return reject("too little free VRAM", extra);
     }
-    size_t available = freeBytes - reserve;
+    size_t available = usableBytes - reserve;
     if (budgetBytes > 0 && budgetBytes < available) available = budgetBytes;
     if (available <= minArena || expertBytes > available - minArena) {
-        char extra[128];
-        snprintf(extra, sizeof(extra), "free=%.0fMB available=%.0fMB expert=%.1fMB",
-            freeBytes / 1048576.0, available / 1048576.0, expertBytes / 1048576.0);
+        char extra[160];
+        snprintf(extra, sizeof(extra), "free=%.0fMB pooled=%.0fMB available=%.0fMB expert=%.1fMB",
+            freeBytes / 1048576.0, pooledBytes / 1048576.0,
+            available / 1048576.0, expertBytes / 1048576.0);
         return reject("not enough free VRAM for experts", extra);
     }
 
@@ -764,10 +770,10 @@ bool FastllmCudaRunV41GGUFHostStream(
         }
     }
     if (blockRows <= 0) {
-        char extra[128];
-        snprintf(extra, sizeof(extra), "free=%.0fMB available=%.0fMB scratch4096=%.0fMB",
-            freeBytes / 1048576.0, available / 1048576.0,
-            blockScratchBytes(4096) / 1048576.0);
+        char extra[160];
+        snprintf(extra, sizeof(extra), "free=%.0fMB pooled=%.0fMB available=%.0fMB scratch4096=%.0fMB",
+            freeBytes / 1048576.0, pooledBytes / 1048576.0,
+            available / 1048576.0, blockScratchBytes(4096) / 1048576.0);
         return reject("no row block fits the free VRAM", extra);
     }
     size_t arenaBudget = available - blockScratchBytes(blockRows);
