@@ -1292,29 +1292,67 @@ namespace fastllm {
     }
     
 #if defined(_WIN32) || defined(_WIN64)
-    // Windows 侧的文件映射：给 GGUF 主机权重用，启动时只建映射不读数据，
-    // 页按需从盘上 fault。FILE_MAP_COPY 保证万一有人往权重里写也只是拷到
-    // 私有页，不会踩坏映射或崩在只读页上。
-    FileMmap::FileMmap(const std::string &path) {
+    // Windows 侧的文件映射：给主机权重用，启动时只建映射不读数据，页按需从盘上 fault。
+    // 用 PAGE_READONLY/FILE_MAP_READ：写时复制(COW)视图会按视图大小向系统提交
+    // commit charge，映射一百多 GB 会被 COMMITMENT_LIMIT 顶掉(MapViewOfFile 失败)。
+    // 权限收紧到只读：真有人往权重里写会当场崩在写入点，比静默分叉好定位。
+    static bool MapFileOnWindows(const std::string &path,
+                                 char *&data, size_t &size, std::string &why) {
+        data = nullptr;
+        size = 0;
         HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        AssertInFastLLM(file != INVALID_HANDLE_VALUE, "cannot open file " + path);
-
+        if (file == INVALID_HANDLE_VALUE) {
+            why = "cannot open file " + path;
+            return false;
+        }
         LARGE_INTEGER fileSize;
-        AssertInFastLLM(GetFileSizeEx(file, &fileSize) != 0, "get file size error " + path);
+        if (GetFileSizeEx(file, &fileSize) == 0) {
+            CloseHandle(file);
+            why = "get file size error " + path;
+            return false;
+        }
+        HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (mapping == nullptr) {
+            why = "create file mapping error " + path +
+                " (err=" + std::to_string((long long)GetLastError()) + ")";
+            CloseHandle(file);
+            return false;
+        }
+        data = (char *)MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        if (data == nullptr) {
+            why = "map view error " + path +
+                " (err=" + std::to_string((long long)GetLastError()) + ")";
+            CloseHandle(mapping);
+            CloseHandle(file);
+            return false;
+        }
         size = (size_t)fileSize.QuadPart;
-
-        HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_WRITECOPY, 0, 0, nullptr);
-        AssertInFastLLM(mapping != nullptr, "create file mapping error " + path);
-
-        data = (char *)MapViewOfFile(mapping, FILE_MAP_COPY, 0, 0, 0);
-        AssertInFastLLM(data != nullptr, "map view error " + path);
-
-        AssertInFastLLM(CloseHandle(mapping), "close mapping error " + path);
-        AssertInFastLLM(CloseHandle(file), "close file error " + path);
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return true;
     }
 
-    FileMmap::~FileMmap() { UnmapViewOfFile(data); }
+    FileMmap::FileMmap(const std::string &path) {
+        std::string why;
+        if (!MapFileOnWindows(path, data, size, why)) {
+            AssertInFastLLM(false, why);
+        }
+    }
+
+    FileMmap::FileMmap(const std::string &path, bool *ok) {
+        std::string why;
+        const bool mapped = MapFileOnWindows(path, data, size, why);
+        if (ok != nullptr) {
+            *ok = mapped;
+        }
+    }
+
+    FileMmap::~FileMmap() {
+        if (data != nullptr) {
+            UnmapViewOfFile(data);
+        }
+    }
 #elif defined(USE_MMAP)
     FileMmap::FileMmap(const std::string &path) {
         int fd = open(path.c_str(), O_RDONLY);
@@ -1330,7 +1368,42 @@ namespace fastllm {
         AssertInFastLLM(close(fd) == 0, "close file error");
     }
 
-    FileMmap::~FileMmap() { AssertInFastLLM(munmap(data, size) == 0, "munmap failed");}
+    FileMmap::~FileMmap() {
+        if (data != nullptr) {
+            AssertInFastLLM(munmap(data, size) == 0, "munmap failed");
+        }
+    }
+
+    FileMmap::FileMmap(const std::string &path, bool *ok) {
+        if (ok != nullptr) {
+            *ok = false;
+        }
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd <= 0) {
+            data = nullptr;
+            size = 0;
+            return;
+        }
+        struct stat sb;
+        if (fstat(fd, &sb) != 0) {
+            close(fd);
+            data = nullptr;
+            size = 0;
+            return;
+        }
+        char *mapped = (char *)mmap(nullptr, sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
+        if (mapped == MAP_FAILED) {
+            data = nullptr;
+            size = 0;
+            return;
+        }
+        data = mapped;
+        size = (size_t)sb.st_size;
+        if (ok != nullptr) {
+            *ok = true;
+        }
+    }
 #endif
     void ModelLoader::seek(int64_t offset, int whence) {
         if (whence == SEEK_SET) {

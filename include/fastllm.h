@@ -490,6 +490,8 @@ namespace fastllm {
     struct FileMmap {
     public:
         FileMmap(const std::string &path);
+        // 失败时置 *ok=false 并保持 data=nullptr，不抛错退出。
+        FileMmap(const std::string &path, bool *ok);
         ~FileMmap();
 
         char *data;

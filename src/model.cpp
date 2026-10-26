@@ -3017,10 +3017,19 @@ namespace fastllm {
             return it->second;
         }
         std::shared_ptr<FileMmap> mapped;
+        bool mappedOk = false;
         try {
-            mapped = std::make_shared<FileMmap>(fileName);
+            std::shared_ptr<FileMmap> candidate = std::make_shared<FileMmap>(fileName, &mappedOk);
+            if (mappedOk) {
+                mapped = candidate;
+            }
         } catch (...) {
             mapped = nullptr;
+        }
+        if (mapped == nullptr) {
+            printf("[fastllm-load] cannot map %s, falling back to reading host weights\n",
+                   fileName.c_str());
+            fflush(stdout);
         }
         if (mapped != nullptr) {
             printf("[fastllm-load] borrow host weights from %s (%.1f GB), pages load on demand\n",

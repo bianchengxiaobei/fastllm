@@ -886,8 +886,12 @@ namespace fastllm {
             return it->second;
         }
         std::shared_ptr<FileMmap> mapped;
+        bool mappedOk = false;
         try {
-            mapped = std::make_shared<FileMmap>(fileName);
+            std::shared_ptr<FileMmap> candidate = std::make_shared<FileMmap>(fileName, &mappedOk);
+            if (mappedOk) {
+                mapped = candidate;
+            }
         } catch (...) {
             mapped = nullptr;
         }
