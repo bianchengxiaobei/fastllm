@@ -13,6 +13,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include "../fastllm-gguf-iq1-grid.cuh"
 #include "../fastllm-gguf-iq2-dot.cuh"
 #include <type_traits>
@@ -630,6 +633,32 @@ struct V41HostStreamBuffer {
     ~V41HostStreamBuffer() { if (ptr != nullptr) FastllmCudaFree(ptr); }
 };
 
+// The arenas are released to the pool after every layer, so the next layer only
+// runs on the GPU when its request lands on the idle blocks the previous one
+// left behind. The routed expert set shifts by a few MB between layers, and a
+// request that outgrows the idle block makes the allocator flush and re-take
+// gigabytes mid-prefill. Keep one quantized high-water size per shape so every
+// layer of a chunk asks for exactly the same blocks.
+size_t V41HostStreamArenaBytes(int device, int rows, int topk, int hidden, int inter,
+                               int experts, size_t bytes) {
+    struct Key {
+        int device, rows, topk, hidden, inter, experts;
+        bool operator<(const Key &other) const {
+            return std::tie(device, rows, topk, hidden, inter, experts) <
+                   std::tie(other.device, other.rows, other.topk, other.hidden,
+                            other.inter, other.experts);
+        }
+    };
+    const size_t quantum = 64ull << 20;
+    const size_t rounded = (bytes + quantum - 1) / quantum * quantum;
+    static std::mutex lock;
+    static std::map<Key, size_t> highWater;
+    std::lock_guard<std::mutex> guard(lock);
+    size_t &slot = highWater[Key{device, rows, topk, hidden, inter, experts}];
+    slot = std::max(slot, rounded);
+    return slot;
+}
+
 bool V41HostStreamDebug() {
     static const bool enabled = std::getenv("FASTLLM_PROFILE_HOST_MOE") != nullptr;
     return enabled;
@@ -830,6 +859,20 @@ bool FastllmCudaRunV41GGUFHostStream(
         batchBytes += expertBytes;
     }
     arenaBytes = std::max(arenaBytes, batchBytes);
+    // A dense routed set (the 4096-row chunks) misses the same experts every
+    // layer, give or take a few percent. Size for the whole expert set once so
+    // the growth never happens mid-chunk and one arena serves every layer.
+    if (size_t(order.size()) * 2 >= size_t(experts)) {
+        const size_t denseBytes = expertBytes * size_t(experts);
+        if (denseBytes <= arenaBudget / 2 && denseBytes > arenaBytes) {
+            arenaBytes = denseBytes;
+        }
+    }
+    // Both arenas live at once, so the sticky size only applies while it still
+    // fits the half-budget the two of them share.
+    const size_t stickyBytes = V41HostStreamArenaBytes(
+        device, rows, topk, hidden, inter, experts, arenaBytes);
+    if (stickyBytes <= arenaBudget / 2) arenaBytes = stickyBytes;
 
     V41HostStreamBuffer arenas[2], tables[2], indexBuffer, scoreBuffer;
     arenas[0].ptr = FastllmCudaMalloc(arenaBytes);
