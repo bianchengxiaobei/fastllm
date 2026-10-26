@@ -4182,6 +4182,11 @@ namespace fastllm {
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
+        // 归因: 这行出现说明走的是 fastllm 格式权重文件(整份读进内存), 不是 GGUF。
+        printf("[fastllm] loading weight file %s (fastllm format, read into memory)\n",
+               fileName.c_str());
+        fflush(stdout);
+        const auto loadFileBegin = std::chrono::steady_clock::now();
 #ifdef USE_MMAP
         std::shared_ptr<FileMmap> mapped_file = std::make_shared<FileMmap>(fileName);
         ModelLoader buffer((char *)mapped_file->data, mapped_file->size);
@@ -4381,6 +4386,9 @@ namespace fastllm {
             ReportModelLoadProgress("weights_load", 1, 1);
         }
         printf("\n");
+        printf("[fastllm] weight file %s loaded in %.1fs\n", fileName.c_str(),
+               std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - loadFileBegin).count());
         fflush(stdout);
         return;
     }

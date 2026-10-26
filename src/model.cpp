@@ -5792,6 +5792,7 @@ namespace fastllm {
                 parallelTensors.push_back(name);
             }
         }
+        const auto ggufLoadBegin = std::chrono::steady_clock::now();
         for (size_t start = 0; start < serialTensors.size();) {
             const int priority = model->GetWeightLoadPriority(serialTensors[start], {});
             size_t end = start + 1;
@@ -5809,6 +5810,12 @@ namespace fastllm {
         }
         loadGGUFWeights(parallelTensors);
         model->OnWeightLoadGroupFinished();
+        // 启动慢先看这一行: mapped 是只建映射没读盘的部分, 读盘量是真正花在磁盘上的。
+        printf("[fastllm-gguf] weights_load %.1fs: mapped %.1f GB, read from disk %.1f GB\n",
+               std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - ggufLoadBegin).count(),
+               GGUFHostMappedBytes() / 1e9, GGUFHostReadBytes() / 1e9);
+        fflush(stdout);
         if (externalMtpGGUF) {
             // qwen4exp-mtp stores raw HF norm weights, unlike target GGUF's
             // effective gamma. Let Qwen4 PrepareWeights apply the HF +1 once.

@@ -832,6 +832,14 @@ namespace fastllm {
         }
     }
 
+    uint64_t GGUFHostMappedBytes() {
+        return gGGUFHostMappedBytes.load(std::memory_order_relaxed);
+    }
+
+    uint64_t GGUFHostReadBytes() {
+        return gGGUFHostReadBytes.load(std::memory_order_relaxed);
+    }
+
     void ReadGGUFTensorBytes(const std::string &fileName, uint64_t offset,
                              uint8_t *destination, uint64_t bytes) {
         ReportGGUFHostRead(bytes);

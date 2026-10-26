@@ -2201,6 +2201,10 @@ namespace fastllm {
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType = GGUFWeightReplaceRule::GGUFWeightReplaceType::GGUFWeightReplaceDirect);
 
+    // 归因: 主机 GGUF 权重累计映射字节(不读盘) / 累计从盘上读的字节。
+    uint64_t GGUFHostMappedBytes();
+    uint64_t GGUFHostReadBytes();
+
     void ReadGGUFMetaData(const std::string &fileName, json11::Json &config);
 
     void AppendGGUFTasks(std::string arch, const std::string &fileName, std::vector <ReadGGUFTask> &tasks);
