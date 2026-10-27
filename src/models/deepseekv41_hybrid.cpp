@@ -293,6 +293,20 @@ namespace fastllm {
 #endif
         const auto &tpDevices = ctx.tpDevices;
         const int layer = ctx.layer, seqlen = ctx.seqlen, dim = embed_dim;
+        // Which layers reach the MoE at all, and how long the whole call took:
+        // the per-path prints below only cover the branches that took them, so a
+        // layer that silently ended in the device cache looked free.
+        const auto entryStart = V41ProfileHostMoe() ? V41HostMoeNowMs() : 0.0;
+        struct HybridMoeExitPrint {
+            int layer, seqlen;
+            double start;
+            ~HybridMoeExitPrint() {
+                if (layer < 0) return;
+                printf("[fastllm-host-moe] layer=%d moe-total rows=%d %.1fms\n",
+                    layer, seqlen, V41HostMoeNowMs() - start);
+                fflush(stdout);
+            }
+        } exitPrint{V41ProfileHostMoe() ? layer : -1, seqlen, entryStart};
         const bool tp = ctx.tp, single = ctx.single, dsparkVerify = ctx.dsparkVerify;
         const bool graphActive = ctx.graphActive, dumpDebug = ctx.dumpDebug;
         const bool hasSharedExpertOut = ctx.hasSharedExpertOut;
