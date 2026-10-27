@@ -3766,7 +3766,9 @@ namespace fastllm {
     }
 
     void Data::Repack() {
-        if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT || this->disableGGUFRepack) {
+        if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT || this->disableGGUFRepack ||
+            this->mapFile != nullptr) {
+            // 映射权重是只读的，就地重排会直接踩崩；按未重排的原格式算。
             return;
         }
         if (GetEnableAMX() && cpuInstructInfo.hasAMX) {

@@ -3070,6 +3070,8 @@ namespace fastllm {
         weight.expansionSize = weight.Count(0);
         weight.expansionBytes = payloadBytes;
         weight.cpuData = const_cast<uint8_t *>(header) + sizeof(int) * 3;
+        // 映射只读：禁止就地重排(Repack 会写 cpuData)。
+        weight.disableGGUFRepack = true;
         weight.SetMapFile(mapped);
         static std::atomic<uint64_t> borrowedBytes(0);
         const uint64_t total = borrowedBytes.fetch_add(payloadBytes) + payloadBytes;
@@ -7378,6 +7380,7 @@ namespace fastllm {
                             // 主机 fastllm 量化权重借映射区, 省掉启动时整份读盘。
                             bool borrowedFastllmPayload = false;
                             if (!diskLazyWeight && UseLoadMmapBorrow() &&
+                                weightName.find(".experts.") != std::string::npos &&
                                 tensorMap[tensorName].size() == 1 &&
                                 loraDicts.find(weightName) == loraDicts.end()) {
                                 borrowedFastllmPayload = TryBorrowFastllmGgufPayload(
