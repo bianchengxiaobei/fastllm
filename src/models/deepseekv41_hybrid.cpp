@@ -642,6 +642,13 @@ namespace fastllm {
             lastTokens, retLogits, samplingPastKeyValues);
         frame.BeginHybridStep();
         frame.PrepareInputs();
+        // The prefill logs stop after layer 20 while the checkpoint ships 40
+        // layers of experts, so report what this forward actually walks.
+        if (V41ProfileHostMoe()) {
+            printf("[fastllm-host-moe] forward-hybrid layers=%d block_cnt=%d segments=%d\n",
+                frame.Layers(), block_cnt, (int)inputSegments.size());
+            fflush(stdout);
+        }
         for (int layer=0; layer<frame.Layers(); ++layer) {
             frame.BeginLayer(layer);
             frame.HybridExperts(layer);

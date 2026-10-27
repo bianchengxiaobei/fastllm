@@ -338,15 +338,18 @@ namespace fastllm {
         }
 
         // ---------------- Engram 表的内存访问提示 ----------------
-        // FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both（默认 off，行为不变）。
+        // FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / mmap / both（默认 off）。
         //   random   ：对常驻表设置 MADV_RANDOM 提示。
         //   hugepage ：常驻模式下改用匿名 mmap + MADV_HUGEPAGE 分配 100 GB 的表，
         //              4 KB 页要 2500 万个 PTE，随机查表几乎每次都 TLB miss；
         //              顺带省掉 std::vector 的 100 GB 清零，加载也更快。
+        //   mmap     ：不再常驻，改成只读文件映射按需缺页。常驻的两张表加起来
+        //              189GB，会挤掉专家权重的页缓存。
 
         struct V41EngramMadviseCfg {
             bool random = false;
             bool hugePage = false;
+            bool mmap = false;
         };
 
         V41EngramMadviseCfg V41EngramMadvise() {
@@ -360,6 +363,7 @@ namespace fastllm {
                          s == "1" || s.find("all") != std::string::npos;
             cfg.hugePage = s.find("huge") != std::string::npos || s.find("both") != std::string::npos ||
                            s.find("all") != std::string::npos;
+            cfg.mmap = s.find("mmap") != std::string::npos || s.find("all") != std::string::npos;
             return cfg;
         }
 
@@ -1860,6 +1864,9 @@ namespace fastllm {
 
         // ---------------- Engram 表 ----------------
 
+        // 映射要在表结构里跨层持有, 释放按平台分开处理, 所以先声明.
+        void V41ReleaseFileMap(void *base, size_t bytes, void *file, void *section);
+
         struct V41EngramTable {
             int64_t rows = 0;
             int dim = 0;
@@ -1877,6 +1884,11 @@ namespace fastllm {
             size_t mmapDataLen = 0;
             void *mmapScale = nullptr;
             size_t mmapScaleLen = 0;
+            // 按需映射的整份 safetensors: data/scale 都指向它里面的偏移.
+            void *mapBase = nullptr;
+            size_t mapBytes = 0;
+            void *mapFile = nullptr;
+            void *mapSection = nullptr;
 
 #ifdef USE_CUDA
             void *gpuTable = nullptr;
@@ -1887,6 +1899,7 @@ namespace fastllm {
 #ifdef USE_CUDA
                 FastllmCudaV41FreeEngram(gpuTable);
 #endif
+                V41ReleaseFileMap(mapBase, mapBytes, mapFile, mapSection);
 #if !defined(_WIN32) && !defined(_WIN64)
                 if (mmapData != nullptr) {
                     munmap(mmapData, mmapDataLen);
@@ -1980,6 +1993,89 @@ namespace fastllm {
                 done += cur;
             }
             fclose(fi);
+        }
+
+        // Engram 表几乎是纯随机的哈希访问: 384M 行里每次只查几十行, 常驻一份 94GB
+        // 只会把专家权重的页缓存挤干净(192GB 机器上实测每层退化成 0.31GB/s 的直读盘).
+        // 映射成只读视图后只有真被查到的页才进内存, Windows 侧的
+        // FILE_FLAG_RANDOM_ACCESS 顺带把顺序预读关掉.
+        bool V41MapFileReadOnly(const std::string &fileName, void *&base, size_t &bytes,
+                                void *&file, void *&section) {
+            base = nullptr;
+            bytes = 0;
+            file = nullptr;
+            section = nullptr;
+#if defined(_WIN32) || defined(_WIN64)
+            HANDLE handle = CreateFileA(fileName.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+            if (handle == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+            LARGE_INTEGER size;
+            if (!GetFileSizeEx(handle, &size) || size.QuadPart <= 0) {
+                CloseHandle(handle);
+                return false;
+            }
+            HANDLE mapping = CreateFileMappingA(handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (mapping == nullptr) {
+                CloseHandle(handle);
+                return false;
+            }
+            void *view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+            if (view == nullptr) {
+                CloseHandle(mapping);
+                CloseHandle(handle);
+                return false;
+            }
+            base = view;
+            bytes = (size_t)size.QuadPart;
+            file = handle;
+            section = mapping;
+            return true;
+#else
+            int fd = open(fileName.c_str(), O_RDONLY);
+            if (fd < 0) {
+                return false;
+            }
+            struct stat st;
+            if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+                close(fd);
+                return false;
+            }
+            void *view = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (view == MAP_FAILED) {
+                return false;
+            }
+#ifdef MADV_RANDOM
+            madvise(view, (size_t)st.st_size, MADV_RANDOM);
+#endif
+            base = view;
+            bytes = (size_t)st.st_size;
+            return true;
+#endif
+        }
+
+        void V41ReleaseFileMap(void *base, size_t bytes, void *file, void *section) {
+#if defined(_WIN32) || defined(_WIN64)
+            if (base != nullptr) {
+                UnmapViewOfFile(base);
+            }
+            if (section != nullptr) {
+                CloseHandle((HANDLE)section);
+            }
+            if (file != nullptr) {
+                CloseHandle((HANDLE)file);
+            }
+#else
+            if (base != nullptr) {
+                munmap(base, bytes);
+            }
+#endif
+            (void)bytes;
+            (void)file;
+            (void)section;
         }
 
         bool V41IsPrime(int64_t x) {
@@ -2802,7 +2898,7 @@ namespace fastllm {
             AssertInFastLLM(table->dim == engram_head_dim && weightInfo.bytes == (uint64_t)table->rows * table->dim &&
                             scaleInfo.bytes == (uint64_t)table->rows * (table->dim / table->scaleBlock),
                             "DeepSeekV41: engram table byte count mismatch for " + base + "weight");
-            printf("[Fastllm] DeepSeek-V4.1: loading engram table for layer %d (%.1f GB, resident%s%s)...\n",
+            printf("[Fastllm] DeepSeek-V4.1: loading engram table for layer %d (%.1f GB%s%s)...\n",
                    layer, (weightInfo.bytes + scaleInfo.bytes) / 1e9,
                    madviseCfg.random ? " +random" : "", madviseCfg.hugePage ? " +hugepage" : "");
             fflush(stdout);
@@ -2810,19 +2906,43 @@ namespace fastllm {
                 // 常驻：默认用 std::vector；开了 hugepage 提示时改用匿名 mmap，
                 // 这样可以在读入之前 madvise(MADV_HUGEPAGE)，还省掉 vector 的清零。
                 uint8_t *dataPtr = nullptr, *scalePtr = nullptr;
-                bool anon = madviseCfg.hugePage &&
+                bool mapped = false;
+                if (madviseCfg.mmap && weightInfo.fileName == scaleInfo.fileName &&
+                    V41MapFileReadOnly(weightInfo.fileName, table->mapBase, table->mapBytes,
+                                       table->mapFile, table->mapSection)) {
+                    const uint64_t end = std::max(weightInfo.offset + weightInfo.bytes,
+                                                  scaleInfo.offset + scaleInfo.bytes);
+                    if (end <= (uint64_t)table->mapBytes) {
+                        dataPtr = (uint8_t*)table->mapBase + weightInfo.offset;
+                        scalePtr = (uint8_t*)table->mapBase + scaleInfo.offset;
+                        mapped = true;
+                    } else {
+                        V41ReleaseFileMap(table->mapBase, table->mapBytes,
+                                          table->mapFile, table->mapSection);
+                        table->mapBase = nullptr;
+                        table->mapBytes = 0;
+                        table->mapFile = nullptr;
+                        table->mapSection = nullptr;
+                    }
+                }
+                bool anon = !mapped && madviseCfg.hugePage &&
                             V41AllocAnon(weightInfo.bytes, true, table->mmapData, table->mmapDataLen, dataPtr) &&
                             V41AllocAnon(scaleInfo.bytes, true, table->mmapScale, table->mmapScaleLen, scalePtr);
-                if (!anon) {
+                if (!mapped && !anon) {
                     table->dataStorage.resize(weightInfo.bytes);
                     table->scaleStorage.resize(scaleInfo.bytes);
                     dataPtr = table->dataStorage.data();
                     scalePtr = table->scaleStorage.data();
                 }
-                V41ReadFileRange(weightInfo.fileName, weightInfo.offset, dataPtr, weightInfo.bytes);
-                V41ReadFileRange(scaleInfo.fileName, scaleInfo.offset, scalePtr, scaleInfo.bytes);
+                if (!mapped) {
+                    V41ReadFileRange(weightInfo.fileName, weightInfo.offset, dataPtr, weightInfo.bytes);
+                    V41ReadFileRange(scaleInfo.fileName, scaleInfo.offset, scalePtr, scaleInfo.bytes);
+                }
                 table->data = dataPtr;
                 table->scale = scalePtr;
+                printf("[Fastllm] DeepSeek-V4.1: engram layer %d %s.\n", layer,
+                       mapped ? "mapped, pages faulted on demand" : "resident in host memory");
+                fflush(stdout);
             }
             if (madviseCfg.random) {
                 // 表是按哈希随机访问的，顺序预读只会白白占用内存带宽 / 页缓存
