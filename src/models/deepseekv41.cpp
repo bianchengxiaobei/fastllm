@@ -2824,14 +2824,18 @@ namespace fastllm {
 
     void DeepSeekV41Model::OnModelWeightsLoaded() {
         if (V41HasKey(this->weight, "gguf_architecture")) LoadEngramMeta();
+        // 这条路径一直是静默的: engram_layer_ids 为空时直接返回, 表到底有没有
+        // 加载、常驻多大, 从日志上都看不出来.
+        printf("[Fastllm] DeepSeek-V4.1: engram layers=%d ngram_device=%s head_dim=%d\n",
+               (int)engram_layer_ids.size(), ngramDevice.c_str(), engram_head_dim);
+        fflush(stdout);
         if (engram_layer_ids.empty()) {
             return;
         }
         AssertInFastLLM(V41HasKey(this->weight, "model_directory"),
                         "DeepSeekV41: model directory is unknown, can't load engram tables.");
         std::string dir = this->weight.dicts["model_directory"];
-        V41EngramMadviseCfg madviseCfg = V41EngramMadvise();
-        engramTables.clear();
+        V41EngramMadviseCfg madviseCfg = V41EngramMadvise();        engramTables.clear();
         for (size_t l = 0; l < engram_layer_ids.size(); l++) {
             int layer = engram_layer_ids[l];
             std::string base = "layers." + std::to_string(layer) + ".engram.embed.";
