@@ -862,27 +862,45 @@ bool FastllmCudaRunV41GGUFHostStream(
         }
         peak = std::max(peak, bytes);
     };
+    // Grouping is what buys the overlap: one group reads the whole 2.4GB of
+    // experts while the card idles, and the compute of that group can only start
+    // after the last byte lands. Smaller groups let the read of group k+1 run
+    // under the kernels of group k, so only the last group's compute is exposed.
+    // More groups hide more compute; only the last group's kernels stay exposed.
+    // Tunable for machines whose kernels are slower than their disk.
+    static const size_t groupsWanted = []() {
+        const char *env = std::getenv("FASTLLM_MOE_UPLOAD_GROUPS");
+        const int value = env == nullptr ? 8 : atoi(env);
+        return (size_t)(value > 0 ? value : 1);
+    }();
+    const size_t routedBytes = size_t(order.size()) * expertBytes;
+    const size_t groupTarget = std::max(expertBytes,
+        std::min(arenaBudget / 2, (routedBytes + groupsWanted - 1) / groupsWanted));
     std::vector<std::vector<int> > batches;
     size_t arenaBytes = 0;
-    buildBatches(std::max(expertBytes, arenaBudget), batches, arenaBytes);
-    if (batches.size() > 1) {
-        buildBatches(std::max(expertBytes, arenaBudget / 2), batches, arenaBytes);
-    }
+    buildBatches(groupTarget, batches, arenaBytes);
     const int arenaCount = batches.size() > 1 ? 2 : 1;
     // A single arena may use the whole budget; the half budget only exists
     // because the two-arena path has to hold both at once.
     const size_t arenaLimit = arenaCount == 1 ? arenaBudget : arenaBudget / 2;
+    const size_t neededBytes = arenaBytes;
     const size_t stickyBytes = V41HostStreamArenaBytes(
-        device, rows, topk, hidden, inter, experts, arenaBytes);
+        device, rows, topk, hidden, inter, experts, neededBytes);
     if (stickyBytes <= arenaLimit) arenaBytes = stickyBytes;
-    // Growing past every idle block means the pool first releases all of them,
-    // which costs tens of seconds per layer on Windows. Only do that when the
-    // driver can actually serve the allocation.
+    // Growing past every idle block makes the pool release them first, which is
+    // the slow path on Windows. An idle block that already holds this layer is
+    // the one the pool hands back, so ask for exactly that instead of the
+    // high-water size, which only exists because some earlier layer had more
+    // free VRAM to fill.
     const size_t largestIdle = FastllmCudaGetLargestPooledIdleBlock(device);
-    if (arenaBytes > largestIdle && freeBytes < arenaBytes * size_t(arenaCount) + reserve) {
+    if (arenaBytes > largestIdle && largestIdle >= neededBytes) arenaBytes = largestIdle;
+    // `usableBytes` counts the pooled idle blocks: they are released to serve a
+    // bigger request, so driver-free alone rejects a growth that can succeed.
+    if (arenaBytes > largestIdle && usableBytes < arenaBytes * size_t(arenaCount) + reserve) {
         char extra[160];
-        snprintf(extra, sizeof(extra), "arena=%.0fMB idle=%.0fMB free=%.0fMB",
-            arenaBytes / 1048576.0, largestIdle / 1048576.0, freeBytes / 1048576.0);
+        snprintf(extra, sizeof(extra), "arena=%.0fMB idle=%.0fMB free=%.0fMB pooled=%.0fMB",
+            arenaBytes / 1048576.0, largestIdle / 1048576.0,
+            freeBytes / 1048576.0, pooledBytes / 1048576.0);
         return reject("arena growth has no free VRAM", extra);
     }
 
