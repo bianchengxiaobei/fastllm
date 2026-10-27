@@ -179,24 +179,48 @@ namespace fastllm {
         bool V41TryPrefillMoeGpuFromHost(DeepSeekV41MoeContext &ctx,
                 const std::string &moeDeviceSpec, Data &input, Data &index, Data &score,
                 Data &output, int activationQuantBlock, float swigluLimit) {
-            if (ctx.tp || ctx.graphActive || ctx.dumpDebug || ctx.seqlen <= 0) return false;
-            if (activationQuantBlock != 32 || !GetCudaSharedExpert()) return false;
-            if (!V41PrefillMoeGpuFromHostEnabled(moeDeviceSpec)) return false;
-            if (ctx.seqlen < V41PrefillMoeGpuFromHostMinTokens()) return false;
+            // These early outs never printed: a layer that silently fell back to
+            // the CPU MoE looked like a healthy "cpu-moe" line while costing ~30x.
+            static std::atomic<int> bailPrinted{0};
+            const auto bail = [](const char *why) {
+                if (V41ProfileHostMoe() && bailPrinted.fetch_add(1) < 8) {
+                    printf("[fastllm-host-moe] host->gpu skip: %s\n", why);
+                    fflush(stdout);
+                }
+                return false;
+            };
+            if (ctx.tp || ctx.graphActive || ctx.dumpDebug || ctx.seqlen <= 0) {
+                return bail("tp/graph/dumpDebug/seqlen");
+            }
+            if (activationQuantBlock != 32 || !GetCudaSharedExpert()) {
+                return bail("activation quant block is not 32 or shared expert off cuda");
+            }
+            if (!V41PrefillMoeGpuFromHostEnabled(moeDeviceSpec)) {
+                return bail("prefill moe on gpu from host disabled for this device");
+            }
+            if (ctx.seqlen < V41PrefillMoeGpuFromHostMinTokens()) {
+                return bail("chunk below FASTLLM_PREFILL_MOE_GPU_MIN_TOKENS");
+            }
             auto &moeWeights = ctx.moeWeights;
             if (moeWeights.size() < 4 || moeWeights[0] != nullptr || moeWeights[1] != nullptr) {
-                return false;
+                return bail("experts are not purely host resident");
             }
             const int experts = (int)moeWeights.size() / 2 - 1;
-            if (experts <= 0) return false;
+            if (experts <= 0) return bail("no routed expert");
             if (input.dataType != BFLOAT16 || input.dataDevice != DataDevice::CUDA ||
-                !input.cudaData || input.dims.size() != 2) return false;
+                !input.cudaData || input.dims.size() != 2) {
+                return bail("moe input is not a cuda bf16 2d tensor");
+            }
             if (index.dataType != INT32 || score.dataType != FLOAT32 ||
-                index.dims.size() != 2 || score.dims != index.dims) return false;
+                index.dims.size() != 2 || score.dims != index.dims) {
+                return bail("router index/score dtype or shape mismatch");
+            }
             const int topk = index.dims[1];
             const int64_t slots = index.Count(0);
             if (topk <= 0 || topk > 32 || slots != int64_t(input.dims[0])*topk ||
-                score.Count(0) != slots) return false;
+                score.Count(0) != slots) {
+                return bail("router slots do not match rows*topk");
+            }
 
             // The grouped launch reads plain host arrays; the router may have
             // produced them on either device.
