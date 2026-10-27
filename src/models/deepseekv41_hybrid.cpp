@@ -650,9 +650,17 @@ namespace fastllm {
             fflush(stdout);
         }
         for (int layer=0; layer<frame.Layers(); ++layer) {
+            const double layerStart = V41ProfileHostMoe() ? V41HostMoeNowMs() : 0.0;
             frame.BeginLayer(layer);
             frame.HybridExperts(layer);
             frame.EndLayer(layer);
+            if (V41ProfileHostMoe()) {
+                // MoE 的耗时由 RunHybridMoe 自己打，这一行是整层（含 attention
+                // 和共享专家），两者相减才是这层非 MoE 的开销。
+                printf("[fastllm-host-moe] layer=%d layer-total rows=%d %.1fms\n",
+                    layer, inputSegments[0].seqlen, V41HostMoeNowMs() - layerStart);
+                fflush(stdout);
+            }
         }
         return frame.Finish();
     }
