@@ -3026,6 +3026,65 @@ namespace fastllm {
         }
 #endif
 
+        // index/score 搬回内存: 两次独立阻塞拷贝在 decode 上是 40 层 x 2 次,
+        // 每次只有 32B 却要 0.1ms 级(WDDM 同步开销). 改成两块异步 DMA 共用一次
+        // 流同步, 再从锁页中转缓冲各拷一份回 CPU 存储.
+        struct Qwen35RouteHostStaging {
+            std::mutex mutex;
+            std::map <int, void*> buffers;
+            std::map <int, size_t> caps;
+
+            void *Ensure(int gpuId, size_t bytes) {
+                std::lock_guard <std::mutex> guard(mutex);
+                void *&buffer = buffers[gpuId];
+                size_t &cap = caps[gpuId];
+                if (buffer == nullptr || cap < bytes) {
+                    if (buffer != nullptr) {
+                        FastllmCudaHostFree(buffer);
+                    }
+                    buffer = FastllmCudaHostMalloc(bytes);
+                    cap = buffer == nullptr ? 0 : bytes;
+                }
+                return buffer;
+            }
+        };
+
+        static void Qwen35FetchRouteToHost(Data &expertIndex, Data &expertScore, int gpuId) {
+            const size_t indexBytes = (size_t)expertIndex.GetBytes();
+            const size_t scoreBytes = (size_t)expertScore.GetBytes();
+            if (indexBytes > 0 && scoreBytes > 0 &&
+                expertIndex.cudaData != nullptr && expertScore.cudaData != nullptr) {
+                static Qwen35RouteHostStaging staging;
+                uint8_t *host = (uint8_t*)staging.Ensure(gpuId, indexBytes + scoreBytes);
+                if (host != nullptr) {
+                    uint8_t *indexHost = host, *scoreHost = host + indexBytes;
+                    const int callerDevice = FastllmCudaGetDevice();
+                    FastllmCudaSetDevice(gpuId);
+                    bool queued =
+                        FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
+                            indexHost, expertIndex.cudaData, indexBytes) &&
+                        FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
+                            scoreHost, expertScore.cudaData, scoreBytes);
+                    if (queued) {
+                        FastllmCudaSyncCurrentThreadStream();
+                    }
+                    FastllmCudaSetDevice(callerDevice);
+                    if (queued) {
+                        // 只分配 CPU 侧存储不拷贝(拷了也是白拷), 再从中转缓冲填.
+                        expertIndex.ToDevice(DataDevice::CPU, false);
+                        expertScore.ToDevice(DataDevice::CPU, false);
+                        if (expertIndex.cpuData != nullptr && expertScore.cpuData != nullptr) {
+                            memcpy(expertIndex.cpuData, indexHost, indexBytes);
+                            memcpy(expertScore.cpuData, scoreHost, scoreBytes);
+                            return;
+                        }
+                    }
+                }
+            }
+            expertIndex.ToDevice(DataDevice::CPU);
+            expertScore.ToDevice(DataDevice::CPU);
+        }
+
         // 成功返回true(此时output是显存上的[tokens, hidden]); 失败返回false, 调用方回落到CPU路径
         static bool Qwen35TryPrefillMoeGpuFromHost(
                 Data &input, Data &expertIndex, Data &expertScore,
@@ -3049,16 +3108,11 @@ namespace fastllm {
             // 路由要在host侧做, 先把index/score拷回内存
             const bool hostMoeD2HProfile = Qwen35HostMoeProfileEnabled();
             double hostMoeD2HMark = hostMoeD2HProfile ? Qwen35HostMoeNowMs() : 0.0;
-            expertIndex.ToDevice(DataDevice::CPU);
+            Qwen35FetchRouteToHost(expertIndex, expertScore, gpuId);
             if (hostMoeD2HProfile) {
-                double now = Qwen35HostMoeNowMs();
-                Qwen35HostMoeD2H().indexMs += now - hostMoeD2HMark;
+                // 两块合并成一次流同步, 耗时统一记在 index 上.
+                Qwen35HostMoeD2H().indexMs += Qwen35HostMoeNowMs() - hostMoeD2HMark;
                 Qwen35HostMoeD2H().indexBytes = (size_t)expertIndex.GetBytes();
-                hostMoeD2HMark = now;
-            }
-            expertScore.ToDevice(DataDevice::CPU);
-            if (hostMoeD2HProfile) {
-                Qwen35HostMoeD2H().scoreMs += Qwen35HostMoeNowMs() - hostMoeD2HMark;
                 Qwen35HostMoeD2H().scoreBytes = (size_t)expertScore.GetBytes();
             }
             if (expertIndex.cpuData == nullptr || expertScore.cpuData == nullptr ||
