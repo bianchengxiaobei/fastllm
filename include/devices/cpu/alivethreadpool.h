@@ -18,7 +18,6 @@
 #include <unistd.h>
 #endif
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
@@ -118,30 +117,6 @@ namespace fastllm {
         return std::max(1, threadNum);
     }
 
-    // 空闲多久之后允许 worker 真正睡下去(微秒), 以及睡多久.
-    // 池里每个 op 都是一次全屏障: worker 一旦睡下去, 下一个 op 就要等它被唤醒.
-    // MoE decode 每层只有 0.5ms 的活, 层间的 GPU 空档足够让整个池睡着, 于是每层
-    // 开头都白付一次唤醒延迟. 默认值维持原行为, 独占机器的场景可以关掉:
-    //   FASTLLM_ALIVE_THREAD_IDLE_SLEEP_US=0 -> 只自旋不睡(最快, 但空转吃 CPU)
-    //   FASTLLM_ALIVE_THREAD_IDLE_GAP_US=N   -> 空闲超过 N 微秒才允许睡
-    static inline double GetAliveThreadIdleGapUs() {
-        static const double gap = []() {
-            const char *env = std::getenv("FASTLLM_ALIVE_THREAD_IDLE_GAP_US");
-            const double value = env == nullptr ? 3.0 : atof(env);
-            return value >= 0.0 ? value : 3.0;
-        }();
-        return gap;
-    }
-
-    static inline int GetAliveThreadIdleSleepUs() {
-        static const int sleepUs = []() {
-            const char *env = std::getenv("FASTLLM_ALIVE_THREAD_IDLE_SLEEP_US");
-            const int value = env == nullptr ? 2000 : atoi(env);
-            return value >= 0 ? value : 2000;
-        }();
-        return sleepUs;
-    }
-
     struct AliveThreadTask {
         std::atomic<uint64_t> publishId;
         std::atomic<uint64_t> doneId;
@@ -172,8 +147,6 @@ namespace fastllm {
             int cnt = 0;
             uint64_t lastRunId = 0;
             auto lastRunTime = std::chrono::system_clock::now();
-            const double idleGapUs = GetAliveThreadIdleGapUs();
-            const int idleSleepUs = GetAliveThreadIdleSleepUs();
             while (true) {
                 uint64_t currentId = task->publishId.load(std::memory_order_acquire);
                 if (currentId != lastRunId) {
@@ -188,8 +161,8 @@ namespace fastllm {
                 if (cnt == 0) {
                     auto duration = std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::system_clock::now() - lastRunTime);
                     double gap = double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
-                    if (gap > idleGapUs && idleSleepUs > 0) {
-                        std::this_thread::sleep_for(std::chrono::microseconds(idleSleepUs));
+                    if (gap > 3) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(2000));
                     }
                 }
             }
