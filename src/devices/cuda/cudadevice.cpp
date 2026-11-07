@@ -4680,13 +4680,23 @@ namespace fastllm {
     }
 
     static bool TryCudaTritonMergeMOEFp8Indexed(
-        Data &, Data &, Data &, Data &, int, int, Data &, Data **, int, float, MoeGateType) {
+            Data &, Data &, Data &, Data &, int, int, Data &, Data **, int, float, MoeGateType) {
         return false;
     }
 
     static bool TryCudaTritonFusedMOEFp8(
-        Data &, Data &, Data &, Data &, Data &, Data &, Data &, Data &,
-        int, int, int, int, int, MoeGateType, float) {
+            Data &, Data &, Data &, Data &, Data &, Data &, Data &, Data &,
+            int, int, int, int, int, MoeGateType, float) {
+        return false;
+    }
+
+    // Triton 编译服务只在非 Windows 构建可用；Windows 下这些入口退化为
+    // false，调用方走既有回退路径。
+    bool TryCudaTritonSmallProjection(const Data &, Data &, Data &, int) {
+        return false;
+    }
+
+    bool CudaTritonMxfp4GroupedEnabled() {
         return false;
     }
 #endif

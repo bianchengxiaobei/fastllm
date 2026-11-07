@@ -627,6 +627,36 @@ namespace fastllm {
         this->layeredMoeDeviceMap = GetLayeredMoeDeviceMap();
         this->moeDeviceLayers = GetMoeDeviceLayers();
         this->ngramDevice = GetNgramDevice();
+        if (const char *resident = std::getenv("FASTLLM_DSV41_ENGRAM_RESIDENT_LAYERS")) {
+            std::stringstream ss(resident);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                const char *p = item.c_str();
+                while (*p == ' ' || *p == '\t') p++;
+                char *end = nullptr;
+                long layer = std::strtol(p, &end, 10);
+                if (end != p && layer >= 0) {
+                    this->ngramResidentLayers.insert((int)layer);
+                }
+            }
+        }
+    }
+
+    bool basellm::IsNgramResidentLayer(const std::string &weightName) const {
+        if (this->ngramResidentLayers.empty()) {
+            return false;
+        }
+        const std::string prefix = "layers.";
+        if (weightName.compare(0, prefix.size(), prefix) != 0) {
+            return false;
+        }
+        const char *p = weightName.c_str() + prefix.size();
+        char *end = nullptr;
+        long layer = std::strtol(p, &end, 10);
+        if (end == p || *end != '.') {
+            return false;
+        }
+        return this->ngramResidentLayers.count((int)layer) > 0;
     }
 
     void basellm::AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId) {
@@ -5254,7 +5284,8 @@ namespace fastllm {
                 "DeepSeek V4.1 GGUF Engram source does not match the backbone.");
             AppendGGUFTasks(arch, engramPath, readGGUFTasks);
             for (const auto &task : readGGUFTasks)
-                if (task.name.find(".engram.embed.") != std::string::npos)
+                if (task.name.find(".engram.embed.") != std::string::npos &&
+                        !model->IsNgramResidentLayer(task.name))
                     model->ngramWeights.insert(task.name);
         }
         if (arch == "deepseek_v41")

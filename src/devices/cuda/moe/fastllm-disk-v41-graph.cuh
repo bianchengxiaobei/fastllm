@@ -119,7 +119,7 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
     if (weightType != DATA_GGUF_FORMAT && !native)
         return {};
     if (input.dataType != BFLOAT16 || input.dims.size() != 2 || input.dims[0] < 1 || input.dims[0] > 32 ||
-        index.dataType != INT32 || score.dataType != FLOAT32 || index.dims != score.dims ||
+        index.dataType != fastllm::INT32 || score.dataType != FLOAT32 || index.dims != score.dims ||
         index.dims.size() != 2 || index.dims[0] != input.dims[0] || index.dims[1] < 1 || index.dims[1] > 16 ||
         (!native && !FastllmCudaV41GGUFSupported(gateType, downType)) || experts < 1 || inter < 1 ||
         input.dims[1] < 1 || input.dims[1] % 32 || inter % 32 || FastllmCudaGraphIsCapturingFast())

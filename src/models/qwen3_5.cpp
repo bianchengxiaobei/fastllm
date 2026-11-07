@@ -1590,6 +1590,24 @@ namespace fastllm {
                config.repeat_penalty > 0.0f;
     }
 
+    // 环境变量整数解析：CUDA 分支、非 CUDA 分支和后文共享代码的前缀快照
+    // 逻辑都要用，放在 USE_CUDA 分岔之前（原先只在 #else 分支里定义，
+    // CUDA 构建找不到标识符）。
+    namespace {
+        static int Qwen35EnvInt(const char *name, int fallback) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == 0) {
+                return fallback;
+            }
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end == value) {
+                return fallback;
+            }
+            return (int)parsed;
+        }
+    }
+
 #ifdef USE_CUDA
     namespace {
         static std::atomic<int> qwen35ThreadTpNextPagedCacheBase(3000000);
@@ -8709,19 +8727,6 @@ namespace fastllm {
         static std::atomic<int> &Qwen35LinearPrefixSnapshotRequestCounter() {
             static auto *counter = new std::atomic<int>(0);
             return *counter;
-        }
-
-        static int Qwen35EnvInt(const char *name, int fallback) {
-            const char *value = std::getenv(name);
-            if (value == nullptr || value[0] == 0) {
-                return fallback;
-            }
-            char *end = nullptr;
-            long parsed = std::strtol(value, &end, 10);
-            if (end == value) {
-                return fallback;
-            }
-            return (int)parsed;
         }
 
         static bool Qwen35LinearPrefixCacheEnabled() {

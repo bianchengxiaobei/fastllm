@@ -164,8 +164,9 @@ namespace fastllm {
                 }
                 AssertInFastLLM(ok, "DeepSeekV41 joint MoE collective failed.\n");
                 if (seqlen > 1) {
+                    // dims 用 int 运算，避免 size_t 混算出 unsigned 收缩转换（C2398）
                     Data view(DataType::BFLOAT16,
-                        {1, (int)tpDevices.size(), seqlen, count / (seqlen * tpDevices.size())},
+                        {1, (int)tpDevices.size(), seqlen, count / (seqlen * (int)tpDevices.size())},
                         DataDevice::CUDA, shared);
                     AssertInFastLLM(FastllmCudaPermuteTo(view, *sharedExpertOut.multiDeviceDatas.at(device),
                         {0, 2, 1, 3}), "DeepSeekV41 shared expert unpack failed.\n");

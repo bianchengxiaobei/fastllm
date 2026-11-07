@@ -553,9 +553,30 @@ DSML 块前的两个模板分隔换行不作为 assistant 正文返回，避免�
 | `FASTLLM_DSV41_PREFIX_CACHE_DEBUG` | 打印命中 / 记录日志 |
 | `FASTLLM_DSV41_PREFIX_CACHE_MIN_TOKENS` | 最短命中长度（默认 16） |
 | `FASTLLM_DSV41_PREFIX_CACHE_MAX_RECORDS` | 最多保留的记录数（默认 8，也可用 `FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS`） |
+| `FASTLLM_DSV41_PREFIX_CACHE_DIR` | 落盘目录；默认 `<model_directory>/fastllm_prefix_cache/`，设 `off` 关闭落盘 |
+| `FASTLLM_DSV41_PREFIX_CACHE_DISK_MIB` | 落盘总预算（MiB，默认 20480，0 不限）；超限按修改时间从旧到新删整条记录 |
 
 迷你模型上精确命中与 T-1 截断命中后的贪心输出与不中断的原请求逐 bit 一致；800 token 提示词的
 首 token 延迟从 39–54 ms 降到 6 ms。
+
+### 前缀缓存落盘（跨进程复用）
+
+内存版前缀缓存随进程退出丢失。落盘层把同一份 `DeepSeekV41HistoryMemory` 快照异步写成
+自包含的记录文件，重启后第一次前缀查询时懒加载回内存缓存，之后的命中 / 截断 / 恢复路径与
+内存版完全一致——同样需要 `--cache_history true`。注意当前实现里
+`FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 沿用"默认开启旗子"的语义：**不设该变量时前缀缓存整体
+处于关闭状态，须显式设 `=0` 才启用**（内存版与落盘版共用这道门）。
+
+- 写入在请求结束后的后台线程进行，文件先写 `.tmp` 再原子替换，不阻塞下一个请求；按
+  （tokens, imageKeys）内容哈希命名，同前缀的重复记录直接覆盖旧文件。
+- 记录文件带几何指纹（层数、滑窗、压缩比、engram、KV dtype 等）；权重或配置变化后旧记录
+  整体作废（加载时跳过并计数），不会把不匹配的状态灌回模型。
+- 模型目录只读时自动回退到 `~/.cache/fastllm/dsv41_prefix_cache/<模型目录名>/`。
+- 进程被强杀时最多丢最后一次请求的记录（写入中/排队中的部分），已落盘的记录不受影响。
+- 磁盘记录回灌同样受 `FASTLLM_DSV41_PREFIX_CACHE_MAX_RECORDS`（内存上限）约束：默认只收
+  最新 8 条，想跨更多会话复用就调大它。
+
+回归测试：`test/basic/test_deepseek_v41_prefix_disk.py`（两进程验证落盘、命中与恢复一致性）。
 
 ## DSpark 投机解码
 

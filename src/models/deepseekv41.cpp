@@ -3043,7 +3043,8 @@ namespace fastllm {
             }
             // 磁盘表复用通用惰性加载；常驻表保留紧凑 UE8M0 scale，避免展开整张 scale 表。
             if (name.find(".engram.embed.") != std::string::npos) {
-                if (this->ngramDevice == "disk" && V41EndsWith(name, ".weight")) {
+                if (this->ngramDevice == "disk" && V41EndsWith(name, ".weight") &&
+                        !this->IsNgramResidentLayer(name)) {
                     result[name].push_back({name, DataType::FP8_E4M3});
                     this->ngramWeights.insert(name);
                 }
@@ -3266,6 +3267,29 @@ namespace fastllm {
 #endif
     }
 
+    // FASTLLM_DSV41_ENGRAM_DISK_CACHE_MB：磁盘 Engram 表的行缓存上限（MB）。
+    // 常见 n-gram 短语在步与步、请求与请求之间重复哈希到相同行，
+    // 行缓存可以直接吸收这些重复的磁盘读；0（默认）保持原行为。
+    static size_t V41EngramDiskCacheBytes() {
+        static size_t bytes = []() {
+            const char *env = std::getenv("FASTLLM_DSV41_ENGRAM_DISK_CACHE_MB");
+            long long mb = env == nullptr ? 0 : std::atoll(env);
+            return mb > 0 ? (size_t)mb * 1024 * 1024 : (size_t)0;
+        }();
+        return bytes;
+    }
+
+    // FASTLLM_DSV41_ENGRAM_DISK_IO_THREADS：磁盘 Engram 表的 I/O worker 数，
+    // 默认 4；NVMe 上提高并发队列深度可以降低行读取延迟。
+    static int V41EngramDiskIoThreads() {
+        static int threads = []() {
+            const char *env = std::getenv("FASTLLM_DSV41_ENGRAM_DISK_IO_THREADS");
+            int v = env == nullptr ? 4 : std::atoi(env);
+            return std::max(1, v);
+        }();
+        return threads;
+    }
+
     void DeepSeekV41Model::OnModelWeightsLoaded() {
         if (V41HasKey(this->weight, "gguf_architecture")) LoadEngramMeta();
         // 这条路径一直是静默的: engram_layer_ids 为空时直接返回, 表到底有没有
@@ -3311,14 +3335,15 @@ namespace fastllm {
                 table->ggufWeight = &embedding;
                 if (embedding.isDiskWeight) {
                     table->diskWeight = &embedding;
-                    table->diskValueReader = std::make_unique<DiskEmbeddingRowReader>(embedding, 0);
+                    table->diskValueReader = std::make_unique<DiskEmbeddingRowReader>(
+                        embedding, V41EngramDiskCacheBytes(), V41EngramDiskIoThreads());
                 } else AssertInFastLLM(embedding.cpuData != nullptr, "GGUF Engram requires host lookup storage.");
                 engramTables.push_back(std::static_pointer_cast<void>(table));
                 printf("[Fastllm] DeepSeek-V4.1: engram table for layer %d ready (IQ4_NL, %s).\n",
                        layer, embedding.isDiskWeight ? "disk" : "CPU");
                 continue;
             }
-            if (this->ngramDevice == "disk") {
+            if (this->ngramDevice == "disk" && !this->ngramResidentLayers.count(layer)) {
                 Data &embedding = this->weight[base + "weight"];
                 AssertInFastLLM(embedding.isDiskWeight && embedding.cpuData == nullptr &&
                                 embedding.dataType == DataType::FP8_E4M3 && embedding.dims.size() == 2 &&
@@ -3340,9 +3365,12 @@ namespace fastllm {
                 table->diskScale.weightType = WeightType::EMBEDDING;
                 table->diskScale.diskWeightParts.push_back(std::move(scalePart));
                 if (executionMode == ExecutionMode::Hybrid) {
-                    // Read values and scales concurrently without a resident row cache.
-                    table->diskValueReader = std::make_unique<DiskEmbeddingRowReader>(embedding, 0);
-                    table->diskScaleReader = std::make_unique<DiskEmbeddingRowReader>(table->diskScale, 0);
+                    // Read values and scales concurrently; the value rows carry
+                    // the payload, so only they get a configurable row cache.
+                    table->diskValueReader = std::make_unique<DiskEmbeddingRowReader>(
+                        embedding, V41EngramDiskCacheBytes(), V41EngramDiskIoThreads());
+                    table->diskScaleReader = std::make_unique<DiskEmbeddingRowReader>(
+                        table->diskScale, 0, V41EngramDiskIoThreads());
                 }
                 printf("[Fastllm] DeepSeek-V4.1: engram table for layer %d ready (disk).\n", layer);
                 engramTables.push_back(std::static_pointer_cast<void>(table));
@@ -4410,6 +4438,8 @@ namespace fastllm {
             if (key[0] < memory->totalLen) memory->imageKeys.push_back(key);
         }
         v41HistoryCache.Record(memory);
+        // 追加一份磁盘拷贝，重启后同一前缀免重 prefill（内部走后台线程，不阻塞）
+        V41PrefixDiskRecord(memory);
         if (V41PrefixCacheDebug()) {
             printf("[fastllm-dsv41-prefix-cache] record tokens=%d records=%d\n",
                    memory->totalLen, (int)v41HistoryCache.memorys.size());
@@ -4438,6 +4468,8 @@ namespace fastllm {
         if (!this->saveHistoryChat || V41PrefixCacheDisabled()) {
             return false;
         }
+        // 首次前缀查询时把上次进程留下的磁盘记录懒加载回内存缓存
+        V41PrefixDiskEnsureLoaded();
         const int minTokens = std::max(1, V41EnvInt("FASTLLM_DSV41_PREFIX_CACHE_MIN_TOKENS", 16));
         if ((int)inputTokens.size() <= minTokens) {
             return false;

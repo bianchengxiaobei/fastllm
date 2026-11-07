@@ -62,7 +62,9 @@ namespace fastllm {
         uint64_t TokenHash(size_t length) {
             AssertInFastLLM(length <= tokens.size(), "Prefix fingerprint exceeds query.");
             constexpr size_t stride = 128;
-            static const uint64_t factor = [] {
+            // MSVC 对 constexpr 局部量的 lambda 隐式读取不放行（C3493），
+            // 显式按值捕获在 MSVC/GCC 下都合法。
+            static const uint64_t factor = [stride] {
                 uint64_t value = 1;
                 for (size_t i = 0; i < stride; ++i) value *= PagedCacheManager::TokenHashMultiplier;
                 return value;
@@ -710,6 +712,11 @@ namespace fastllm {
         // row-wise checkpoint reads (disk).
         std::set <std::string> ngramWeights;
         std::string ngramDevice = "cpu";
+        // FASTLLM_DSV41_ENGRAM_RESIDENT_LAYERS 指定的 Engram 层在 ngram_device=disk
+        // 时仍然常驻内存，其余层保持磁盘按行读取。
+        std::set <int> ngramResidentLayers;
+
+        bool IsNgramResidentLayer(const std::string &weightName) const;
 
         std::vector<std::vector<float> > sin, cos;
 

@@ -136,6 +136,10 @@ namespace fastllm {
 
     struct DeepSeekV41EngramPrefetch;
 
+    // 前缀缓存落盘（deepseekv41_prefix_disk.cpp）：后台线程把 HistoryMemory
+    // 快照写成自包含记录文件，重启后懒加载回 v41HistoryCache。
+    struct DeepSeekV41PrefixDiskStore;
+
     struct DeepSeekV41RequestState {
         // MLA state is replicated only inside this request's attention TP group.
         int attentionGroup = -1;
@@ -398,6 +402,20 @@ namespace fastllm {
         std::shared_ptr<DeepSeekV41RequestState> v41PendingRestoredState;   // TryRestoreHistoryCache 产生，
                                                                              // OnResponseContextCreated 接管
         DeepSeekV41HistoryCacheManager v41HistoryCache;
+
+        // -------- 前缀缓存落盘（跨进程复用，免重 prefill）--------
+        // 记录文件默认写在 <model_directory>/fastllm_prefix_cache/；目录只读时回退
+        // ~/.cache/fastllm/dsv41_prefix_cache/<模型目录名>/。开关与预算：
+        //   FASTLLM_DSV41_PREFIX_CACHE_DIR      自定义目录；设 off/0/false 关闭落盘
+        //   FASTLLM_DSV41_PREFIX_CACHE_DISK_MIB 磁盘总预算，默认 20480，0 不限
+        // 生效前提与内存版前缀缓存一致：--cache_history true，且
+        // FASTLLM_DSV41_DISABLE_PREFIX_CACHE 显式设为 0（上游旗子语义导致不设时整体关闭）。
+        std::shared_ptr<DeepSeekV41PrefixDiskStore> v41PrefixDiskStore;
+        std::once_flag v41PrefixDiskLoadOnce;
+        bool v41PrefixDiskLoaded = false;
+        void V41PrefixDiskRecord(const std::shared_ptr<DeepSeekV41HistoryMemory> &memory);
+        void V41PrefixDiskEnsureLoaded();
+        uint64_t V41PrefixDiskFingerprint() const;
 
         // -------- decode / DSpark 校验的 CUDA Graph --------
         // 每种 token 数一份图与工作区，跨请求复用；KV 更新与回滚留在图外。

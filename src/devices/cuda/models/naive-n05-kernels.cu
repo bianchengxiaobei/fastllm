@@ -2492,7 +2492,9 @@ void UploadDescriptorChunks(const std::vector<Row> &rows, Row *out) {
 }
 template<class Row>
 const Row *DeviceDescriptors(const std::vector<Row> &rows, fastllm::Data &storage) {
-    Output(storage, fastllm::INT32, {int((rows.size() * sizeof(Row) + 3) / 4)});
+    // 本文件 36 行的 #define INT32 会把限定名 fastllm::INT32 撕成非法记号，
+    // 这里沿用文件约定写裸 INT32（宏展开成完整限定名）。
+    Output(storage, INT32, {int((rows.size() * sizeof(Row) + 3) / 4)});
     auto *out = (Row *)storage.cudaData;
 #if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
     if (FastllmCudaRuntimeArch() >= 70) {
@@ -5762,7 +5764,8 @@ void FastllmCudaNaiveVerifyLengths(const fastllm::Data &positions, fastllm::Data
     fastllm::AssertInFastLLM(positions.dataType == fastllm::FLOAT32 &&
         positions.dataDevice == fastllm::DataDevice::CUDA, "Invalid verification positions.");
     const int count = positions.Count(0);
-    Output(lengths, fastllm::INT32, {count});
+    // 同上：避免 fastllm::INT32 撞上本文件的 INT32 宏。
+    Output(lengths, INT32, {count});
     VerifyPositionLengths<<<(count + 255) / 256, 256>>>(
         (const float *)positions.cudaData, (int *)lengths.cudaData, count);
     CheckLaunch();
