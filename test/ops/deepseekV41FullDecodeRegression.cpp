@@ -1,5 +1,5 @@
 // GPU regression for a graph captured once and replayed with changing request
-// lengths, masks and KV pointers. Requires one SM80+ GPU; returns 77 otherwise.
+// lengths, masks and KV pointers. Requires one SM70+ GPU; returns 77 otherwise.
 // The eager attention path is the independent reference. Pass --stress for
 // larger activations. Both modes require bitwise equality with eager decode.
 #include "fastllm.h"
@@ -9,6 +9,7 @@
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -23,15 +24,14 @@ static void Cuda(cudaError_t e) {
 }
 static float amplitude = .3f;
 static bool stress = false;
+static bool fp16Attention = false;
+static double worstAttentionL2 = 0;
 static bool pooled = false;
+static bool longContext = false;
+static bool largeBatch = false;
+static int indexHeads = 32;
 static void Fill(Data &d, const std::vector<int> &dims, int seed,
                  DataType type = DataType::BFLOAT16) {
-    size_t n = 1;
-    for (int v : dims)
-        n *= v;
-    std::vector<float> values(n);
-    for (size_t i = 0; i < n; ++i)
-        values[i] = std::sin(float((i * 17 + seed * 13) % 1009)) * amplitude;
     if (type == DataType::INT32 || type == DataType::INT8) {
         d.dataType = type;
         d.Resize(dims);
@@ -40,6 +40,15 @@ static void Fill(Data &d, const std::vector<int> &dims, int seed,
         d.ToDevice(DataDevice::CUDA, std::vector<int>{0});
         return;
     }
+    size_t n = 1;
+    for (int v : dims)
+        n *= v;
+    std::vector<float> values(n);
+    float pattern[1009];
+    for (int i = 0; i < 1009; ++i)
+        pattern[i] = std::sin(float(i)) * amplitude;
+    for (size_t i = 0; i < n; ++i)
+        values[i] = pattern[(i * 17 + seed * 13) % 1009];
     Data cpu(DataType::FLOAT32, dims, values);
     ToDataType(cpu, type);
     d.CopyFrom(cpu);
@@ -65,7 +74,89 @@ static void Equal(const Data &a, const Data &b, const char *name) {
     if (x != y)
         throw std::runtime_error(std::string("bits changed: ") + name);
 }
+// Tensor Core attention changes the softmax/PV rounding, while every other
+// state update remains byte-exact. Enable only in the explicit FP16 regression.
+static void AttentionEqual(const Data &a, const Data &b, const char *name) {
+    if (!fp16Attention) { Equal(a, b, name); return; }
+    Check(a.GetBytes() == b.GetBytes(), "attention shape");
+    std::vector<__nv_bfloat16> x(a.Count(0)), y(b.Count(0));
+    Cuda(cudaMemcpy(x.data(), a.cudaData, a.GetBytes(), cudaMemcpyDeviceToHost));
+    Cuda(cudaMemcpy(y.data(), b.cudaData, b.GetBytes(), cudaMemcpyDeviceToHost));
+    double error = 0, norm = 0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        double u = __bfloat162float(x[i]), v = __bfloat162float(y[i]);
+        Check(std::isfinite(u) && std::isfinite(v), "attention nonfinite");
+        error += (u-v)*(u-v); norm += v*v;
+    }
+    double l2 = std::sqrt(error / std::max(norm, 1e-30));
+    worstAttentionL2 = std::max(l2, worstAttentionL2);
+    if (l2 > .003163) {
+        std::cerr << name << " relative L2=" << l2 << std::endl;
+        throw std::runtime_error("FP16 attention L2");
+    }
+}
+// Exercise caller-owned candidate storage against the independent eager
+// reference, with a producer that cannot modify the consumer's Q/KV or cache.
+static bool sharedCandidates = false;
+struct CandidateReuseProducer {
+    Data q, kv, iq, out, saved, blocks, counts, q0, kv0, iq0;
+    void *plan = nullptr;
+    ~CandidateReuseProducer() { FastllmCudaV41DestroyFullDecode(plan); }
+    void Setup(const FastllmV41FullDecodeConfig &config, FastllmV41FullDecodeBuffers &b) {
+        if (!sharedCandidates || !config.useCandidates) return;
+        const int n = config.batch;
+        Fill(q, {1, n, config.heads, 512}, 41);
+        Fill(kv, {1, n, 512}, 42);
+        Fill(iq, {1, n, config.indexHeads, 128}, 43);
+        Fill(out, q.dims, 44); Fill(saved, kv.dims, 45);
+        Fill(blocks, {n, (config.maxKeys + config.blockSize - 1) / config.blockSize}, 0, DataType::INT32);
+        Fill(counts, {n}, 0, DataType::INT32);
+        q0.CopyFrom(q); kv0.CopyFrom(kv); iq0.CopyFrom(iq);
+        b.candidateBlocks = blocks.cudaData; b.candidateCounts = counts.cudaData;
+        auto c = config; c.kvSource = false; c.verifying = true;
+        auto producer = b;
+        producer.q = q.cudaData; producer.kv = kv.cudaData; producer.indexQ = iq.cudaData;
+        producer.output = out.cudaData; producer.savedKV = saved.cudaData; producer.requests = nullptr;
+        plan = FastllmCudaV41CreateFullDecode(c, producer);
+        Check(plan, "candidate producer create");
+        b.reuseCandidates = true;
+        auto invalid = b; invalid.candidateCounts = nullptr;
+        Check(!FastllmCudaV41CreateFullDecode(config, invalid), "partial candidate workspace accepted");
+        invalid.candidateBlocks = nullptr;
+        Check(!FastllmCudaV41CreateFullDecode(config, invalid), "reuse without workspace accepted");
+    }
+    bool Upload(const FastllmV41FullDecodeRequest *rows, size_t count) {
+        return !plan || FastllmCudaV41UploadFullDecode(plan, rows, count);
+    }
+    void Validate(const FastllmV41FullDecodeConfig &c, const std::vector<uint8_t> &mask, int position) {
+        if (!plan) return;
+        const int stride = (c.maxKeys + c.blockSize - 1) / c.blockSize;
+        std::vector<int> actual((size_t)c.batch * stride), sizes(c.batch);
+        Cuda(cudaMemcpy(actual.data(), blocks.cudaData, actual.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(sizes.data(), counts.cudaData, sizes.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int row = 0; row < c.batch; ++row) {
+            const int visible = (position + row + 1) / c.ratio;
+            std::vector<int> expected;
+            if (visible > 16384)
+                for (int block = 0; block < (visible + c.blockSize - 1) / c.blockSize; ++block)
+                    if (mask[(size_t)row * stride + block]) expected.push_back(block);
+            const int size = visible <= 16384 || (int)expected.size() * c.blockSize >= visible / 2
+                ? -1 : (int)expected.size();
+            Check(sizes[row] == size, "candidate count / dense fallback oracle");
+            Check(std::equal(expected.begin(), expected.end(), actual.begin() + (size_t)row * stride),
+                  "stable candidate list oracle");
+        }
+    }
+    void Launch() {
+        if (!plan) return;
+        CopyDevice(q, q0); CopyDevice(kv, kv0); CopyDevice(iq, iq0);
+        Check(FastllmCudaV41PrepareFullDecode(plan) && FastllmCudaV41FinishFullDecode(plan),
+              "candidate producer replay");
+    }
+};
 #include "deepseekV41FullVerifyRegression.inc"
+#include "deepseekV41FullDecodeFP8Regression.inc"
+#include "deepseekV41Fp16AttentionRegression.inc"
 
 static void RunAttentionLocalityRegression(int devices) {
     int checks = 0;
@@ -114,40 +205,87 @@ static void RunAttentionLocalityRegression(int devices) {
     std::cout << "PASS " << checks << " attention locality checks; BF16/FP8/FP4" << std::endl;
 }
 
+// Compare the fused transform against the ordinary RoPE kernel, not another
+// call to the fused transform. Include a real BF16 midpoint cancellation.
+static void RunRotaryCrossPathRegression() {
+    int checked = 0;
+    for (int dim : {128, 512}) for (int ropeDim : {64, 128})
+        for (int mode : {0, 1, 2, 3}) for (bool inverse : {false, true})
+            for (int position : {0, 127, 4096, 32767, 1048575}) {
+                std::vector<float> values(64 * dim);
+                for (size_t i = 0; i < values.size(); ++i)
+                    values[i] = std::sin(float(i * 13 % 1009)) * 3.f;
+                const int offset = 32 * dim + dim - ropeDim + 44;
+                values[offset] = -2.515625f;
+                values[offset + 1] = 1.1796875f;
+                Data cpu(DataType::FLOAT32, {1, 1, 64, dim}, values);
+                ToDataType(cpu, DataType::BFLOAT16);
+                Data ordinary, fused;
+                ordinary.CopyFrom(cpu); fused.CopyFrom(cpu);
+                ordinary.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                fused.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                Check(FastllmCudaDeepSeekV41RotaryQuantPosition(ordinary, ropeDim,
+                      160000.f, position, 1, inverse, 65536, 16.f, 32, 1,
+                      mode, dim, 32, nullptr), "ordinary rotary");
+                Check(FastllmCudaV41DecodeTransformsBatch({{&fused, nullptr,
+                      position, mode, inverse}}, ropeDim, 160000.f, 65536,
+                      16.f, 32, 1, 128), "fused rotary");
+                Equal(fused, ordinary, "ordinary/fused rotary");
+                ++checked;
+            }
+    std::cout << "Rotary cross-path passed: " << checked << " cases\n";
+}
+
 int main(int argc, char **argv) {
-    int devices = 0, major = 0;
+    int devices = 0, major = 0, minor = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1 ||
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess ||
-        major < 8)
+        major < 7)
         return 77;
-    bool verify = false, locality = false;
+    bool verify = false, locality = false, fp8 = false, fp4 = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--stress") { stress = true; amplitude = 1.f; }
         if (std::string(argv[i]) == "--pooled") pooled = true;
         if (std::string(argv[i]) == "--verify") verify = true;
+        if (std::string(argv[i]) == "--fp8") fp8 = true;
+        if (std::string(argv[i]) == "--fp4") fp4 = true;
+        if (std::string(argv[i]) == "--fp16-attention") fp16Attention = true;
         if (std::string(argv[i]) == "--locality") locality = true;
+        if (std::string(argv[i]).rfind("--index-heads=", 0) == 0)
+            indexHeads = std::stoi(std::string(argv[i]).substr(14));
+        if (std::string(argv[i]) == "--long-context") longContext = true;
+        if (std::string(argv[i]) == "--large-batch") largeBatch = true;
+        if (std::string(argv[i]) == "--shared-candidates") sharedCandidates = true;
     }
     if (locality && devices < 2) return 77;
+    Cuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0));
+    if (fp16Attention && (major != 7 || minor != 5)) return 77;
     try {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
         if (locality) { RunAttentionLocalityRegression(devices); return 0; }
-        if (verify) { RunVerifyRegression(); return 0; }
+        if (verify) { RunVerifyRegression(fp4 ? 3 : fp8 ? 1 : 0); return 0; }
+        if (fp8 || fp4) { RunPackedDecodeRegression(fp4); return 0; }
+        if (fp16Attention) { RunFp16AttentionRegression(); return 0; }
+        RunRotaryCrossPathRegression();
         int checked = 0;
         for (int batch : {1, 2, 4, 8, 16, 128})
             for (int ratio : {0, 1, 2})
                 for (int maskMode : {0, 1, 2}) {
-                    if ((!ratio && maskMode) || (stress && batch != 1))
+                    if ((!ratio && maskMode) || ((stress || longContext || indexHeads != 32) && batch != 1) ||
+                        (sharedCandidates && (batch != 1 || maskMode != 2)))
                         continue;
-                    const int maxKeys = batch == 128 ? 2048 : 32768;
+                    const int maxKeys = longContext ? 1048576 : batch == 128 ? 2048 : 32768;
                     FastllmV41FullDecodeConfig c;
                     c.batch = batch;
+                    c.indexHeads = indexHeads;
                     c.ratio = ratio;
                     c.maxKeys = maxKeys;
                     c.indexSource = ratio != 0;
                     c.writeCandidates = maskMode == 1;
                     c.useCandidates = maskMode == 2;
                     c.candidateTopK = 16;
+                    if (sharedCandidates || (maskMode == 1 && !stress)) c.blockSize = 8;
                     c.softmaxScale = 1 / std::sqrt(512.f);
                     const int maxBlocks = (maxKeys + c.blockSize - 1) / c.blockSize;
                     Data q, kv, out, iq, iw, sink, top, cand, q0, kv0, iq0, qr, kr, orr, iqr, tr,
@@ -155,8 +293,8 @@ int main(int argc, char **argv) {
                     Fill(q, {1, batch, 8, 512}, 1);
                     Fill(kv, {1, batch, 512}, 2);
                     Fill(out, {1, batch, 8, 512}, 3);
-                    Fill(iq, {1, batch, 32, 128}, 4);
-                    Fill(iw, {1, batch, 32}, 5, DataType::FLOAT32);
+                    Fill(iq, {1, batch, indexHeads, 128}, 4);
+                    Fill(iw, {1, batch, indexHeads}, 5, DataType::FLOAT32);
                     Fill(sink, {8}, 6, DataType::FLOAT32);
                     Fill(top, {1, batch, 512}, 7, DataType::INT32);
                     Fill(cand, {1, batch, maxBlocks}, 8, DataType::INT8);
@@ -210,9 +348,12 @@ int main(int argc, char **argv) {
                     unsupported.ratio = 3;
                     Check(!FastllmCudaV41CreateFullDecode(unsupported, b),
                           "unsupported ratio accepted");
+                    CandidateReuseProducer producer;
+                    producer.Setup(c, b);
                     void *plan = FastllmCudaV41CreateFullDecode(c, b);
                     Check(plan, "plan create");
                     auto upload = [&](const FastllmV41FullDecodeRequest *rows, size_t count) {
+                        if (!producer.Upload(rows, count)) return false;
                         if (!pooled) return FastllmCudaV41UploadFullDecode(plan, rows, count);
                         if (count != size_t(batch)) {
                             void *plans[] = {plan};
@@ -240,6 +381,7 @@ int main(int argc, char **argv) {
                     Check(upload(requests.data(), batch),
                           "initial upload");
                     Cuda(cudaMemsetAsync(cand.cudaData, 1, cand.GetBytes(), cudaStreamPerThread));
+                    producer.Launch();
                     Check(FastllmCudaV41PrepareFullDecode(plan) &&
                               FastllmCudaV41FinishFullDecode(plan),
                           "warmup");
@@ -248,13 +390,15 @@ int main(int argc, char **argv) {
                     cudaGraphExec_t exec;
                     Cuda(cudaStreamBeginCapture(cudaStreamPerThread,
                                                 cudaStreamCaptureModeThreadLocal));
+                    producer.Launch();
                     Check(FastllmCudaV41PrepareFullDecode(plan) &&
                               FastllmCudaV41FinishFullDecode(plan),
                           "capture");
                     Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
                     Cuda(cudaGraphInstantiate(&exec, graph, 0));
-                    for (int position :
-                         {1, 126, 127, 510, 511, 1022, 1023, 2046, 8192, 16384, 32766}) {
+                    for (int position : (longContext
+                         ? std::vector<int>{131071, 131072, 262143, 262144, 1048560}
+                         : std::vector<int>{1, 126, 127, 510, 511, 1022, 1023, 2046, 8192, 16384, 32766})) {
                         if ((position + batch + 1) / (ratio ? ratio : 1) > maxKeys)
                             continue;
                         CopyDevice(q, q0);
@@ -263,8 +407,14 @@ int main(int argc, char **argv) {
                         CopyDevice(qr, q0);
                         CopyDevice(kr, kv0);
                         CopyDevice(iqr, iq0);
-                        Cuda(cudaMemsetAsync(cand.cudaData, 1, cand.GetBytes(),
-                                             cudaStreamPerThread));
+                        std::vector<uint8_t> hostMask(size_t(batch) * maxBlocks, 1);
+                        if (maskMode == 2)
+                            for (int row = 0; row < batch; ++row)
+                                for (int block = 0; block < maxBlocks; ++block)
+                                    hostMask[size_t(row) * maxBlocks + block] = position % 5 == 0 ? 0 :
+                                        position % 3 == 0 ? 1 : (block + row * 3 + position) % 11 < 2;
+                        Cuda(cudaMemcpyAsync(cand.cudaData, hostMask.data(), hostMask.size(),
+                                             cudaMemcpyHostToDevice, cudaStreamPerThread));
                         CopyDevice(cr, cand);
                         std::vector<Data> vq(batch), vk(batch), vo(batch), viq(batch), viw(batch),
                             vkeys(batch), vtop(batch), vcand(batch), vcmp(batch);
@@ -286,8 +436,8 @@ int main(int argc, char **argv) {
                             trans.push_back({&vq[i], nullptr, pos, 0, false});
                             trans.push_back({&vk[i], nullptr, pos, 1, false});
                             if (ratio) {
-                                View(viq[i], iqr, (size_t)i * 32 * 128 * 2, {1, 1, 32, 128});
-                                View(viw[i], iw, (size_t)i * 32 * 4, {1, 1, 32});
+                                View(viq[i], iqr, (size_t)i * indexHeads * 128 * 2, {1, 1, indexHeads, 128});
+                                View(viw[i], iw, (size_t)i * indexHeads * 4, {1, 1, indexHeads});
                                 View(vkeys[i], keys[i], 0, {1, count, 128});
                                 View(vcmp[i], cmps[i], 0, {1, count, 512});
                                 View(vtop[i], tr, (size_t)i * 512 * 4,
@@ -305,15 +455,35 @@ int main(int argc, char **argv) {
                                                                   c.originalSeqLen, c.ropeFactor,
                                                                   c.betaFast, c.betaSlow, c.window),
                               "reference transform");
-                        if (ratio)
-                            Check(FastllmCudaV41DecodeIndexerBatch(
-                                      idx, ratio, c.topK, c.blockSize, c.candidateTopK, c.ropeDim,
-                                      c.ropeBase, c.originalSeqLen, c.ropeFactor, c.betaFast,
-                                      c.betaSlow, true),
-                                  "reference indexer");
-                        Check(FastllmCudaDeepSeekV41SparseAttentionBatch(att, sink, c.window,
-                                                                         c.softmaxScale),
-                              "reference attention");
+                        if (major < 8) {
+                            // SM75 has FP16 Tensor Cores, but the independent
+                            // batched BF16 MMA reference requires SM80.
+                            for (auto &i : idx) {
+                                Check(FastllmCudaDeepSeekV41RotaryQuant(*i.query, c.ropeDim,
+                                    c.ropeBase, i.startPos, 1, false, c.originalSeqLen,
+                                    c.ropeFactor, c.betaFast, c.betaSlow, 2, -1, 32), "reference index rope");
+                                Data scores;
+                                Check(FastllmCudaDeepSeekV41IndexerScore(*i.query, *i.weights,
+                                    *i.keys, ratio, i.startPos, scores), "reference index scores");
+                                if (i.writeCandidates)
+                                    Check(FastllmCudaDeepSeekV41CandidateBlocks(scores, c.blockSize,
+                                        c.candidateTopK, ratio, i.startPos, *i.candidates), "reference candidates");
+                                Check(FastllmCudaDeepSeekV41IndexerTopK(scores, i.useCandidates?i.candidates:nullptr,
+                                    c.topK, ratio, i.startPos, c.blockSize, *i.topk), "reference topk");
+                            }
+                            for (auto &i : att)
+                                Check(FastllmCudaDeepSeekV41SparseAttention(*i.q, *i.chunkKV,
+                                    i.ringKV, i.compressedKV, i.indices, sink, c.window,
+                                    i.startPos, c.softmaxScale, *i.output), "reference attention");
+                        } else {
+                            if (ratio)
+                                Check(FastllmCudaV41DecodeIndexerBatch(
+                                          idx, ratio, c.topK, c.blockSize, c.candidateTopK, c.ropeDim,
+                                          c.ropeBase, c.originalSeqLen, c.ropeFactor, c.betaFast,
+                                          c.betaSlow, true), "reference indexer");
+                            Check(FastllmCudaDeepSeekV41SparseAttentionBatch(att, sink, c.window,
+                                c.softmaxScale), "reference attention");
+                        }
                         Check(FastllmCudaV41DecodeTransformsBatch(finish, c.ropeDim, c.ropeBase,
                                                                   c.originalSeqLen, c.ropeFactor,
                                                                   c.betaFast, c.betaSlow, c.window),

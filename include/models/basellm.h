@@ -3,6 +3,7 @@
 #define FASTLLM_BASELLM_H
 
 #include "fastllm.h"
+#include "utils/paged_cache_batch.h"
 #include "kvmem.h"
 #include "contextconfig.h"
 #include "baseblock.h"
@@ -24,16 +25,75 @@ using RuntimeResult = std::function<void(int index, const char* content)>;
 using RuntimeResultBatch = std::function<void(int index, std::vector <std::string> &contents)>;
 #endif
 
+namespace fastkv { struct Message; }
+
 namespace fastllm {
+    struct PDRuntime;
+    struct PDPending;
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
 
     enum ResponseContextError {
-        ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong
+        ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong, ResponseContextErrorRuntime
     };
 
     class basellm;
+    class MimoToolVocabulary;
+
+    struct PrefillPrefixPreview {
+        // Query identity is checked once per request/pass, not once per layer.
+        std::vector<int> tokens;
+        std::map<int, std::vector<uint64_t>> pageHashes;
+        std::vector<uint64_t> tokenHashes;
+        std::map<PagedCacheManager *, PagedPrefixMatch> matches;
+        PagedPrefixPath budgetPath;
+        std::shared_ptr<void> modelState; // metadata only; never owns KV or checkpoints
+        void Reset(const std::vector<int> &input) {
+            if (tokens != input) {
+                tokens = input;
+                pageHashes.clear();
+                tokenHashes.clear();
+                matches.clear();
+                budgetPath = {};
+                modelState.reset();
+            }
+        }
+        // One fingerprint per 128 tokens keeps the first scan linear in the
+        // prompt, even when history contains many different checkpoint lengths.
+        uint64_t TokenHash(size_t length) {
+            AssertInFastLLM(length <= tokens.size(), "Prefix fingerprint exceeds query.");
+            constexpr size_t stride = 128;
+            static const uint64_t factor = [] {
+                uint64_t value = 1;
+                for (size_t i = 0; i < stride; ++i) value *= PagedCacheManager::TokenHashMultiplier;
+                return value;
+            }();
+            if (tokenHashes.empty()) tokenHashes.push_back(0);
+            while (tokenHashes.size() <= length / stride) {
+                const size_t offset = (tokenHashes.size() - 1) * stride;
+                tokenHashes.push_back(tokenHashes.back() * factor +
+                    PagedCacheManager::HashTokenPage(tokens.data() + offset, stride));
+            }
+            uint64_t hash = tokenHashes[length / stride];
+            for (size_t i = length / stride * stride; i < length; ++i)
+                hash = hash * PagedCacheManager::TokenHashMultiplier + (uint64_t)tokens[i];
+            return hash;
+        }
+        const std::vector<uint64_t> &Hashes(int pageLen) {
+            auto it = pageHashes.find(pageLen);
+            if (it == pageHashes.end()) {
+                std::vector<uint64_t> hashes;
+                for (size_t i = 0; i + pageLen <= tokens.size(); i += pageLen)
+                    hashes.push_back(PagedCacheManager::HashTokenPage(tokens.data() + i, pageLen));
+                it = pageHashes.emplace(pageLen, std::move(hashes)).first;
+            }
+            return it->second;
+        }
+    };
 
     struct ResponseContext {
+        std::shared_ptr<PDPending> pdPending;
+        uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
+        std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
         bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
@@ -66,6 +126,8 @@ namespace fastllm {
     struct ResponseContextDict {
         std::mutex locker;
         std::map <int, ResponseContext*> dicts;
+        int nextHandle = 0;
+        uint64_t nextGeneration = 0;
 
         int CreateHandle();
 
@@ -183,6 +245,10 @@ namespace fastllm {
         // is idempotent so a derived destructor can drop model-specific cache
         // managers only after no request Data object still references them.
         void ShutdownRuntime();
+
+        struct ToolCallConstraintCache;
+        std::shared_ptr<ToolCallConstraintCache> toolCallConstraintCache;
+        std::mutex toolCallConstraintCacheMutex;
 
     public:
 
@@ -354,13 +420,20 @@ namespace fastllm {
                                          const GenerationConfig &generationConfig = GenerationConfig(),
                                          const std::map <std::string, std::vector <Data*> > &multimodalInput = {}); // 启动一个response任务，返回分配的handleId
         
+        // A speculative forward may have already verified more than one token.
+        // Publish these through the normal per-token stop/grammar/history path
+        // before the next scheduling turn. Ordinary models have no pending block.
+        virtual bool PopPendingResponseToken(ResponseContext *context, int previousToken,
+                                              int &token) { return false; }
+
         virtual bool CanFetchResponse(int handleId); // 判断当前是否能fetch到，用于异步操作
 
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 
 
         // Drain several already-generated tokens under one scheduler lock.
         // Returns the number written, -1 on normal completion, or -2 when the
-        // prompt is too long.  Speculative decoders use this to publish an
+        // prompt is too long, or -3 after a native runtime failure.
+        // Speculative decoders use this to publish an
         // accepted block without one Python/ASGI round trip per token.
         virtual int FetchResponseTokensBatch(int handleId, int *output,
                                              int maxTokens);
@@ -455,6 +528,11 @@ namespace fastllm {
         virtual bool SupportsKvMem() const { return false; }
         virtual bool SupportsKvMemBatch() const { return false; }
         virtual bool SupportsKvMemPrefixCache() const { return false; }
+        // Reserve remaining output against physical pages, counting a shared
+        // prefix once. Models without a shared pool keep their existing budget.
+        virtual bool SupportsSharedPagedKVPool() const {
+            return kvMemConfig.enabled && SupportsKvMemBatch() && SupportsKvMemPrefixCache();
+        }
         virtual bool KvMemLayerEligible(int layer) const { return GetKVCacheRetainedTokens(layer) < 0; }
         // Models provide the actual per-layer KV geometry; derived models may
         // shadow legacy head-count fields on basellm.
@@ -502,8 +580,14 @@ namespace fastllm {
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
 
+        // Explicit opt-in: GPU-resident logits alone do not imply pure GPU inference.
+        virtual bool UseGpuToolCallConstraints() const { return false; }
+
         void PrepareToolCallConstraint(GenerationConfig &generationConfig);
         void AdvanceToolCallConstraintText(std::string &text, int tokenId);
+        void AdvanceToolCallGrammar(GenerationConfig &config, int tokenId);
+        std::once_flag toolConstraintVocabularyOnce;
+        std::shared_ptr<const MimoToolVocabulary> toolConstraintVocabulary;
 
         virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 
@@ -544,7 +628,12 @@ namespace fastllm {
         // target preserves the existing scheduler, and zero wait batches only
         // requests already queued. Unsupported models keep their old policy.
         virtual bool SupportsPrefillBatching() const { return false; }
-        bool SetPrefillBatching(int targetTokens, int maxWaitMs);
+        bool SetPrefillBatching(int targetTokens, int maxWaitMs, int targetRequests = 0,
+                               int maxRequests = 0, int minDecodeRequests = 0);
+        virtual int PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
+                                                 PrefillPrefixPreview &) const {
+            return QueryPagedPrefixCacheExtra(context, length);
+        }
 
         virtual void SetDataType(DataType dataType);
 
@@ -631,8 +720,20 @@ namespace fastllm {
 
         ResponseContextDict responseContextDict;
 
+        void ConfigurePD(const json11::Json &config);
+        void StopPD();
+        bool IsPDDecode() const;
+        void BeginPD(ResponseContext *context);
+        bool PollPD(ResponseContext *context);
+        virtual std::string PDLayout() const;
+        virtual fastkv::Message ExportPDState(ResponseContext &context);
+        virtual void ImportPDState(ResponseContext &context, const fastkv::Message &state);
+        std::shared_ptr<PDRuntime> pdRuntime;
+
         void RemoveResponseContext(int handleId);
 
+        // Shared by publication/retirement; tasks finish before request ownership changes.
+        PagedCacheBatchExecutor pagedCacheExecutor;
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker, forwardLocker;
         std::condition_variable dictCV;

@@ -1,9 +1,9 @@
 //
 // DeepSeek-V4.1 DSpark 草稿侧的 CUDA kernel。
 //
-// 只有一个算子：markov head 的整条链。
+// 包括输入准备和 markov head 的设备端链。
 //
-// 语义（与 src/models/deepseekv41_dspark.cpp 里的通用算子实现逐位一致）：
+// 贪心链语义：
 //
 //   token[0] = anchor
 //   for i in 0 .. block-1:
@@ -12,28 +12,26 @@
 //       token[i+1] = argmax_v (logits[i][v] + bias[v])
 //       embeds[i]  = e                                      // confidence head 的输入
 //
-// 这条链天然串行：每一步都要用上一步的 token 去查嵌入。用通用算子拼出来的话，
-// 每一步都要把 token 取回主机（查嵌入 / 切片都需要主机侧的下标），于是每步一次
-// 完整的设备同步；实测在迷你模型上 5 步就要 2.6 ms，比整个目标模型的一次前向还贵，
-// 其中光 [1, rank] x [vocab, rank] 这个 GEMV 就占 0.39 ms（按带宽算只该 20 us，
-// 通用 Linear 在这种「一行输入、又高又窄的权重」上效率很低）。
-//
-// 这里把整条链放到设备上跑：token 始终留在显存里，主机只在最后取回一次。
-// 每一步两个 kernel：分块算分并做块内 argmax，再把各块的结果归约成一个 token。
+// 每步依赖前一步 token。整条链留在设备上，主机只在最后取回一次。
+// 贪心路径分块 argmax；随机路径用 Gumbel 采样并保留实际 q，供完整分布拒绝采样使用。
 //
 
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-dspark.h"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "fastllm.h"
 
 #include <algorithm>
 #include <cfloat>
+#include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
 
 namespace {
     using fastllm::Data;
@@ -44,6 +42,13 @@ namespace {
     constexpr int kDsparkMarkovMaxRank = 512;
     // 分块数：够填满 GPU 就行，太多会让归约那一步变慢
     constexpr int kDsparkMarkovChunks = 128;
+    constexpr int kDsparkMarkovGroupedChunks = 256;
+    constexpr int kDsparkMarkovWarps = kDsparkMarkovThreads / 32;
+
+    bool DsGroupedScore(const Data &weight, int vocab, int rank) {
+        return weight.dataType == DataType::BFLOAT16 && rank == 256 && vocab >= 32768 &&
+            ((uintptr_t)weight.cudaData & 15) == 0;
+    }
 
     __device__ __forceinline__ float DsLoad(const half *p, int i) {
         return __half2float(p[i]);
@@ -55,6 +60,27 @@ namespace {
 
     __device__ __forceinline__ float DsLoad(const float *p, int i) {
         return p[i];
+    }
+
+    // Input construction is pure copying and integer indexing. Keep it in the
+    // graph so each replay only uploads the position and anchor (eight bytes).
+    __global__ void DsparkInputKernel(const uint16_t *embedding, const int *metadata,
+        int noiseToken, int block, int hcMult, int dim, int windowSize,
+        uint16_t *hidden, float *preMix, int *indices, int *tokens) {
+        const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        const int anchor = metadata[1], width = windowSize + block - 1;
+        if (i < (int64_t)block * hcMult * dim) {
+            const int row = i / ((int64_t)hcMult * dim), channel = i % dim;
+            hidden[i] = embedding[(int64_t)(row ? noiseToken : anchor) * dim + channel];
+        }
+        if (i < block * hcMult) preMix[i] = i % hcMult == 0 ? 1.0f : 0.0f;
+        if (i < (int64_t)block * width) {
+            const int row = i / width, col = i % width;
+            const int draft = col - windowSize;
+            indices[i] = col < windowSize ? (metadata[0] - windowSize + col) % windowSize
+                : windowSize + draft + (draft >= row);
+        }
+        if (i == 0) tokens[0] = anchor;
     }
 
     struct DsBest {
@@ -160,6 +186,81 @@ namespace {
         }
     }
 
+    // Four lanes read adjacent 16-byte vectors. Greedy and sampled paths share
+    // the same FP32 accumulation order; lane zero receives the complete dot.
+    __device__ __forceinline__ float DsMarkovGroupedDot(const __nv_bfloat16 *row, const float *e) {
+        const int lane = threadIdx.x % 4;
+        const unsigned mask = 15u << ((threadIdx.x & 31) / 4 * 4);
+        float dot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int d = i * 32 + lane * 8;
+            const uint4 packed = *(const uint4*)(row + d);
+            const __nv_bfloat16 *values = (const __nv_bfloat16*)&packed;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) dot = fmaf(__bfloat162float(values[j]), e[d + j], dot);
+        }
+        dot += __shfl_down_sync(mask, dot, 2, 4);
+        dot += __shfl_down_sync(mask, dot, 1, 4);
+        return dot;
+    }
+
+    __device__ __forceinline__ DsBest DsMarkovGroupedBest(
+        const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
+        const int *tokens, int step, int vocab, int start, int count) {
+        constexpr int lanes = 4, rank = 256, rowsPerBlock = kDsparkMarkovThreads / lanes;
+        __shared__ float e[rank];
+        __shared__ DsBest reduce[kDsparkMarkovThreads];
+        e[threadIdx.x] = __bfloat162float(embed[(int64_t)tokens[step] * rank + threadIdx.x]);
+        __syncthreads();
+        const int lane = threadIdx.x % lanes;
+        const int perChunk = (count + gridDim.x - 1) / gridDim.x;
+        const int begin = blockIdx.x * perChunk, end = min(count, begin + perChunk);
+        DsBest best{-FLT_MAX, vocab};
+        for (int v = begin + threadIdx.x / lanes; v < end; v += rowsPerBlock) {
+            const float dot = DsMarkovGroupedDot(head + (int64_t)v * rank, e);
+            if (lane == 0) {
+                const float score = logits[(int64_t)step * count + v] + dot;
+                if (score > best.value || (score == best.value && start + v < best.index))
+                    best = {score, start + v};
+            }
+        }
+        DsBlockArgmax(best, reduce);
+        return best;
+    }
+
+    __global__ void DsparkMarkovGroupedScoreKernel(
+        const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
+        const int *tokens, int step, int vocab, float *partialValue, int *partialIndex) {
+        const DsBest best = DsMarkovGroupedBest(logits, embed, head, tokens, step, vocab, 0, vocab);
+        if (threadIdx.x == 0) {
+            partialValue[blockIdx.x] = best.value;
+            partialIndex[blockIdx.x] = best.index;
+        }
+    }
+
+    __global__ void MarkovShardScore(
+        const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
+        const int *tokens, int step, int vocab, int start, int count, unsigned long long *bestKey) {
+        const DsBest best = DsMarkovGroupedBest(logits, embed, head, tokens, step, vocab, start, count);
+        if (threadIdx.x == 0) {
+            // Canonicalize signed zero; the low bits prefer the smaller token ID.
+            const float value = best.value == 0.f ? 0.f : best.value;
+            const unsigned bits = __float_as_uint(value);
+            const unsigned ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+            const unsigned long long key = ((unsigned long long)ordered << 32) | (0xffffffffu - (unsigned)best.index);
+            atomicMax(bestKey + step, key);
+        }
+    }
+
+    __global__ void MarkovShardFinish(const unsigned long long *key, const __nv_bfloat16 *embed,
+        int *tokens, int step, float *outEmbeds) {
+        const int previous = tokens[step];
+        if (outEmbeds) outEmbeds[step * 256 + threadIdx.x] =
+            __bfloat162float(embed[(int64_t)previous * 256 + threadIdx.x]);
+        if (threadIdx.x == 0) tokens[step + 1] = int(0xffffffffu - unsigned(key[step]));
+    }
+
     // 第二步：归约各块的结果，写下一个 token；顺便把本步用到的嵌入存给 confidence head
     template <typename WT>
     __global__ void DsparkMarkovReduceKernel(const float *partialValue, const int *partialIndex, int chunks,
@@ -207,20 +308,305 @@ namespace {
                d.dataType == DataType::FLOAT32;
     }
 
+    // The previous sampled token stays on device. Save exactly these scores
+    // before Gumbel sampling so verification uses the same conditional q.
+    __device__ float DsSampleBlockMax(float value, float *shared) {
+        for (int offset = 16; offset; offset >>= 1)
+            value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+        if ((threadIdx.x & 31) == 0) shared[threadIdx.x / 32] = value;
+        __syncthreads();
+        value = threadIdx.x < kDsparkMarkovWarps ? shared[threadIdx.x] : -INFINITY;
+        if (threadIdx.x < 32) {
+            for (int offset = 16; offset; offset >>= 1)
+                value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+            if (threadIdx.x == 0) shared[0] = value;
+        }
+        __syncthreads();
+        return shared[0];
+    }
+
+    template<typename WT, bool GROUPED>
+    __global__ void DsparkMarkovLogitsKernel(const float *logits, const WT *embed,
+        const WT *head, const int *tokens, int step, int vocab, int rank,
+        float *scores, float *maxima, float *outEmbeds, bool roundProjection) {
+        __shared__ float e[kDsparkMarkovMaxRank];
+        __shared__ float reduce[kDsparkMarkovWarps];
+        for (int d = threadIdx.x; d < rank; d += blockDim.x) {
+            e[d] = DsLoad(embed + (int64_t)tokens[step] * rank, d);
+            if (blockIdx.x == 0) outEmbeds[(int64_t)step * rank + d] = e[d];
+        }
+        __syncthreads();
+        constexpr int lanes = GROUPED ? 4 : 1;
+        const int lane = threadIdx.x % lanes;
+        float maximum = -INFINITY;
+        for (int v = blockIdx.x * (blockDim.x / lanes) + threadIdx.x / lanes;
+             v < vocab; v += gridDim.x * (blockDim.x / lanes)) {
+            float dot = 0;
+            if constexpr (GROUPED) {
+                dot = DsMarkovGroupedDot((const __nv_bfloat16*)head + (int64_t)v * 256, e);
+            } else {
+                dot = DsRowDot(head + (int64_t)v * rank, e, rank);
+            }
+            if (lane == 0) {
+                if (roundProjection) {
+                    const WT rounded = static_cast<WT>(dot);
+                    dot = DsLoad(&rounded, 0);
+                }
+                const float score = logits[(int64_t)step * vocab + v] + dot;
+                scores[v] = score;
+                if (maxima) maximum = fmaxf(maximum, score);
+            }
+        }
+        if (maxima) {
+            maximum = DsSampleBlockMax(maximum, reduce);
+            if (threadIdx.x == 0) maxima[blockIdx.x] = maximum;
+        }
+    }
+
+    // Center before dividing by temperature: large common offsets must not
+    // round away Gumbel noise or the log-normalizer's fractional part.
+    __global__ void DsparkCenterScoresKernel(float *scores, const float *maxima,
+        int chunks, int vocab, float temperature) {
+        __shared__ float reduce[kDsparkMarkovWarps];
+        float maximum = DsSampleBlockMax(threadIdx.x < chunks ? maxima[threadIdx.x] : -INFINITY, reduce);
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < vocab) scores[i] = (scores[i] - maximum) / temperature;
+    }
+
+    __global__ void DsparkProposalProbKernel(float *scores, const float *lse, int vocab) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < vocab) scores[i] = expf(scores[i] - *lse);
+    }
+
+    using DsSamplePartial = FastllmDsparkSamplePartial;
+    __device__ DsSamplePartial DsMergeSample(DsSamplePartial a, DsSamplePartial b, float temperature) {
+        if (a.sum == 0) return b;
+        if (b.sum == 0) return a;
+        const float maximum = fmaxf(a.maximum, b.maximum);
+        const float da = (a.maximum - maximum) / temperature;
+        const float db = (b.maximum - maximum) / temperature;
+        a.sum = a.sum * expf(da) + b.sum * expf(db);
+        a.maximum = maximum;
+        a.best += da; b.best += db;
+        if (b.best > a.best || (b.best == a.best && b.token < a.token)) {
+            a.best = b.best; a.token = b.token;
+        }
+        return a;
+    }
+
+    __device__ __forceinline__ DsSamplePartial DsWarpReduceSample(DsSamplePartial value, float temperature) {
+        const int lane = threadIdx.x & 31;
+        for (int offset = 16; offset; offset /= 2) {
+            DsSamplePartial other{__shfl_down_sync(0xffffffffu, value.maximum, offset),
+                __shfl_down_sync(0xffffffffu, value.sum, offset),
+                __shfl_down_sync(0xffffffffu, value.best, offset),
+                __shfl_down_sync(0xffffffffu, value.token, offset)};
+            if (lane + offset < 32) value = DsMergeSample(value, other, temperature);
+        }
+        return value;
+    }
+
+    __device__ DsSamplePartial DsReduceSample(DsSamplePartial value, float temperature) {
+        __shared__ DsSamplePartial warps[kDsparkMarkovWarps];
+        value = DsWarpReduceSample(value, temperature);
+        if ((threadIdx.x & 31) == 0) warps[threadIdx.x / 32] = value;
+        __syncthreads();
+        value = threadIdx.x < kDsparkMarkovWarps ? warps[threadIdx.x] :
+            DsSamplePartial{-INFINITY, 0, -INFINITY, 0x7fffffff};
+        if (threadIdx.x < 32) value = DsWarpReduceSample(value, temperature);
+        return value;
+    }
+
+    // One 64-token tile per CTA. Center each tile before adding random noise;
+    // merging centered statistics also preserves noise at large common offsets.
+    __global__ void DsparkMarkovShardSampleKernel(const float *logits,
+        const __nv_bfloat16 *embed, const __nv_bfloat16 *head, const int *tokens,
+        float *scores, float *outEmbeds, DsSamplePartial *partials,
+        unsigned long long seed, const unsigned long long *counter,
+        int step, int start, int count, int stride, float temperature) {
+        __shared__ float e[256];
+        e[threadIdx.x] = __bfloat162float(embed[(int64_t)max(0, tokens[step]) * 256 + threadIdx.x]);
+        if (blockIdx.x == 0 && outEmbeds) outEmbeds[step * 256 + threadIdx.x] = e[threadIdx.x];
+        __syncthreads();
+        const int lane = threadIdx.x % 4, v = blockIdx.x * 64 + threadIdx.x / 4;
+        float score = -INFINITY;
+        if (v < count) {
+            const float dot = DsMarkovGroupedDot(head + (int64_t)v * 256, e);
+            if (lane == 0) {
+                score = logits[(size_t)step * count + v] + dot;
+                scores[(size_t)step * stride + v] = score;
+            }
+        }
+        DsSamplePartial value{-INFINITY, 0, -INFINITY, 0x7fffffff};
+        if (lane == 0 && isfinite(score)) {
+            curandStatePhilox4_32_10_t rng;
+            curand_init(seed, (unsigned long long)start + v, *counter * 4, &rng);
+            const float u = fminf(fmaxf((float)curand(&rng) * 0x1p-32f, 0x1p-32f), 0x1.fffffep-1f);
+            value = {score, 1, -logf(-log1pf(-u)), start + v};
+        }
+        value = DsReduceSample(value, temperature);
+        if (threadIdx.x == 0) partials[blockIdx.x] = value;
+    }
+
+    __global__ void DsparkMarkovShardSampleFinishKernel(const DsSamplePartial *partials,
+        DsSamplePartial *packet, unsigned long long *counter, int chunks, float temperature) {
+        DsSamplePartial value{-INFINITY, 0, -INFINITY, 0x7fffffff};
+        for (int i = threadIdx.x; i < chunks; i += blockDim.x)
+            value = DsMergeSample(value, partials[i], temperature);
+        value = DsReduceSample(value, temperature);
+        if (threadIdx.x == 0) { *packet = value; ++*counter; }
+    }
+
+    __global__ void DsparkMarkovShardNormalizeKernel(float *scores,
+        const DsSamplePartial *gathered, int *tokens,
+        int ranks, int step, int count, int stride, float temperature) {
+        __shared__ DsSamplePartial total;
+        if (threadIdx.x == 0) {
+            DsSamplePartial value{-INFINITY, 0, -INFINITY, 0x7fffffff};
+            for (int i = 0; i < ranks; ++i) value = DsMergeSample(value, gathered[i], temperature);
+            total = value;
+            if (blockIdx.x == 0) tokens[step + 1] = value.sum > 0 ? value.token : -1;
+        }
+        __syncthreads();
+        const int v = blockIdx.x * blockDim.x + threadIdx.x;
+        if (v < count) {
+            float &score = scores[(size_t)step * stride + v];
+            score = total.sum > 0 ? expf((score - total.maximum) / temperature) / total.sum : 0;
+        }
+    }
+
+    template<typename WT>
+    bool DsLaunchSample(const Data &logits, const Data &embed, const Data &head,
+        int block, float temperature, Data &tokens, Data &probs, Data *scratch, Data &outEmbeds,
+        int topK, float topP, Data *samplingWorkspace) {
+        const int vocab = logits.dims.back(), rank = embed.dims[1];
+        const bool grouped = DsGroupedScore(head, vocab, rank);
+        const int chunks = grouped ? kDsparkMarkovGroupedChunks : kDsparkMarkovChunks;
+        const float unitTemperature = 1.0f;
+        // Steps execute on one stream. Only q and tokens survive to verification;
+        // block maxima and the log-normalizer can share one scratch row.
+        float *lse = scratch ? static_cast<float *>(scratch->cudaData) : nullptr;
+        float *maxima = lse ? lse + 1 : nullptr;
+        for (int step = 0; step < block; ++step) {
+            float *q = (float*)probs.cudaData + (size_t)step * vocab;
+            if (grouped) {
+                DsparkMarkovLogitsKernel<__nv_bfloat16, true><<<chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
+                    (const float*)logits.cudaData, (const __nv_bfloat16*)embed.cudaData,
+                    (const __nv_bfloat16*)head.cudaData, (const int*)tokens.cudaData,
+                    step, vocab, rank, q, maxima, (float*)outEmbeds.cudaData, samplingWorkspace != nullptr);
+            } else {
+                DsparkMarkovLogitsKernel<WT, false><<<chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
+                    (const float*)logits.cudaData, (const WT*)embed.cudaData, (const WT*)head.cudaData,
+                    (const int*)tokens.cudaData, step, vocab, rank, q, maxima, (float*)outEmbeds.cudaData, samplingWorkspace != nullptr);
+            }
+            if (samplingWorkspace) {
+                if (!FastllmCudaMtpSampleDraftDevice(q, q, temperature, topK, topP,
+                        (int*)tokens.cudaData + step + 1, vocab, *samplingWorkspace)) return false;
+                continue;
+            }
+            DsparkCenterScoresKernel<<<(vocab + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                q, maxima, chunks, vocab, std::max(temperature, 1.0e-6f));
+            // Qwen's device counter advances on every replay. No host RNG seed
+            // or token is baked into the graph. Scores are already centered and
+            // temperature-scaled, so sample them at unit temperature.
+            if (!FastllmCudaMtpSampleDraftLogits(q, q, lse, (int*)tokens.cudaData + step + 1,
+                    nullptr, &unitTemperature, 1, vocab)) return false;
+            DsparkProposalProbKernel<<<(vocab + 255) / 256, 256, 0, cudaStreamPerThread>>>(q, lse, vocab);
+        }
+        return cudaGetLastError() == cudaSuccess;
+    }
+
     template <typename WT>
     void DsLaunchChain(const float *logits, const Data &embedWeight, const Data &headWeight,
                        int block, int vocab, int rank, int *tokens,
                        float *partialValue, int *partialIndex, float *outEmbeds) {
         const WT *embedData = (const WT*)embedWeight.cudaData;
         const WT *headData = (const WT*)headWeight.cudaData;
+        const bool grouped = DsGroupedScore(headWeight, vocab, rank);
+        const int chunks = grouped ? kDsparkMarkovGroupedChunks : kDsparkMarkovChunks;
         for (int step = 0; step < block; step++) {
-            DsparkMarkovScoreKernel<WT><<<kDsparkMarkovChunks, kDsparkMarkovThreads>>>(
+            if (grouped) {
+                DsparkMarkovGroupedScoreKernel<<<chunks, kDsparkMarkovThreads>>>(
+                    logits, (const __nv_bfloat16*)embedData, (const __nv_bfloat16*)headData,
+                    tokens, step, vocab, partialValue, partialIndex);
+            } else DsparkMarkovScoreKernel<WT><<<kDsparkMarkovChunks, kDsparkMarkovThreads>>>(
                 logits, embedData, headData, tokens, step, vocab, rank, partialValue, partialIndex);
             DsparkMarkovReduceKernel<WT><<<1, kDsparkMarkovThreads>>>(
-                partialValue, partialIndex, kDsparkMarkovChunks, embedData, tokens, step, rank,
+                partialValue, partialIndex, chunks, embedData, tokens, step, rank,
                 tokens, outEmbeds);
         }
     }
+}
+
+static bool DsMarkovSampleDevice(const Data &logits,
+    const Data &embed, const Data &head, int block, float temperature,
+    Data &tokens, Data &probs, Data *scratch, Data &outEmbeds,
+    int topK, float topP, Data *samplingWorkspace) {
+    const int device = FastllmCudaGetDevice();
+    auto dense = [device](const Data &d) {
+        if (!DsOnCuda(d) || d.dataDeviceIds != std::vector<int>{device} ||
+            d.dims.empty() || d.strides.size() != d.dims.size()) return false;
+        uint64_t stride = 1;
+        for (int i = (int)d.dims.size() - 1; i >= 0; --i) {
+            if (d.dims[i] <= 0 || d.strides[i] != stride) return false;
+            stride *= d.dims[i];
+        }
+        return true;
+    };
+    if (!std::isfinite(temperature) || temperature <= 0 || block < 1 ||
+        !std::isfinite(topP) || topP <= 0 || topP > 1 ||
+        !dense(logits) || logits.dataType != DataType::FLOAT32 || logits.dims.size() != 3 ||
+        logits.dims[0] != 1 || logits.dims[1] < block || !dense(embed) || !dense(head) ||
+        embed.dims.size() != 2 || head.dims.size() != 2 || !DsSupportedWeight(embed) ||
+        embed.dataType != head.dataType || embed.dims[0] < logits.dims[2] ||
+        head.dims[0] < logits.dims[2] || embed.dims[1] != head.dims[1] ||
+        embed.dims[1] > kDsparkMarkovMaxRank || !dense(tokens) ||
+        tokens.dataType != DataType::INT32 || tokens.dims != std::vector<int>{block + 1}) return false;
+    if (!DsPrepareOutput(probs, DataType::FLOAT32, {block, logits.dims[2]}) ||
+        (scratch && !DsPrepareOutput(*scratch, DataType::FLOAT32, {kDsparkMarkovGroupedChunks + 1})) ||
+        !DsPrepareOutput(outEmbeds, DataType::FLOAT32, {1, block, embed.dims[1]})) return false;
+    if (embed.dataType == DataType::BFLOAT16)
+        return DsLaunchSample<__nv_bfloat16>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
+    if (embed.dataType == DataType::FLOAT16)
+        return DsLaunchSample<half>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
+    return DsLaunchSample<float>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41MarkovSampleDevice(const Data &logits,
+    const Data &embed, const Data &head, int block, float temperature,
+    Data &tokens, Data &probs, Data &scratch, Data &outEmbeds) {
+    return DsMarkovSampleDevice(logits, embed, head, block, temperature, tokens, probs, &scratch, outEmbeds, 0, 1, nullptr);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(const Data &logits,
+    const Data &embed, const Data &head, int block, float temperature, int topK, float topP,
+    Data &tokens, Data &probs, Data &outEmbeds, Data &samplingWorkspace) {
+    return DsMarkovSampleDevice(logits, embed, head, block, temperature, tokens, probs,
+        nullptr, outEmbeds, topK, topP, &samplingWorkspace);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41DraftInput(const Data &embedding, const Data &metadata,
+    int noiseToken, int block, int hcMult, int windowSize,
+    Data &hidden, Data &preMix, Data &indices, Data &tokens) {
+    if (!DsOnCuda(embedding) || embedding.dataType != DataType::BFLOAT16 ||
+        (embedding.dataDeviceIds.empty() || embedding.dataDeviceIds.front() != FastllmCudaGetDevice()) ||
+        embedding.dims.size() != 2 || embedding.dims[0] <= noiseToken || noiseToken < 0 ||
+        embedding.dims[1] <= 0 || embedding.strides.size() != 2 ||
+        embedding.strides[0] != embedding.dims[1] || embedding.strides[1] != 1 ||
+        !DsOnCuda(metadata) || metadata.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        metadata.dataType != DataType::INT32 || metadata.dims != std::vector<int>{2} ||
+        metadata.strides.size() != 1 || metadata.strides[0] != 1 ||
+        block <= 0 || hcMult <= 0 || windowSize <= 0 || block > INT_MAX - windowSize) return false;
+    const int dim = embedding.dims[1], width = windowSize + block - 1;
+    if (!DsPrepareOutput(hidden, DataType::BFLOAT16, {1, block, hcMult, dim}) ||
+        !DsPrepareOutput(preMix, DataType::FLOAT32, {1, block, hcMult}) ||
+        !DsPrepareOutput(indices, DataType::INT32, {1, block, width}) ||
+        !DsPrepareOutput(tokens, DataType::INT32, {block + 1})) return false;
+    const int64_t count = std::max((int64_t)block * hcMult * dim, (int64_t)block * width);
+    DsparkInputKernel<<<(count + 255) / 256, 256>>>((const uint16_t*)embedding.cudaData,
+        (const int*)metadata.cudaData, noiseToken, block, hcMult, dim, windowSize,
+        (uint16_t*)hidden.cudaData, (float*)preMix.cudaData, (int*)indices.cudaData, (int*)tokens.cudaData);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 // logits: [1, block, vocab] FLOAT32；embedWeight / headWeight: [vocab, rank] FP16 / BF16 / FP32。
@@ -261,8 +647,10 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChainDevice(const fastllm::Data &log
         return false;
     }
 
-    if (!DsPrepareOutput(values, DataType::FLOAT32, {kDsparkMarkovChunks}) ||
-        !DsPrepareOutput(indices, DataType::INT32, {kDsparkMarkovChunks})) return false;
+    const int chunks = DsGroupedScore(headWeight, vocab, rank)
+        ? kDsparkMarkovGroupedChunks : kDsparkMarkovChunks;
+    if (!DsPrepareOutput(values, DataType::FLOAT32, {chunks}) ||
+        !DsPrepareOutput(indices, DataType::INT32, {chunks})) return false;
     int *tokens = (int*)tokenBuffer.cudaData;
     float *partialValue = (float*)values.cudaData;
     int *partialIndex = (int*)indices.cudaData;
@@ -301,4 +689,46 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits,
     FastllmCudaCopyFromDeviceToHost(outTokens.data(), (int*)tokens.cudaData + 1, block * sizeof(int));
     for (int token : outTokens) if (token < 0 || token >= logits.dims[2]) return false;
     return true;
+}
+
+extern "C" bool FastllmCudaDsparkMarkovShardScore(const float *logits, const void *embed,
+    const void *head, const int *tokens, unsigned long long *keys,
+    int step, int vocab, int start, int count) {
+    MarkovShardScore<<<kDsparkMarkovGroupedChunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(logits,
+        (const __nv_bfloat16*)embed, (const __nv_bfloat16*)head,
+        tokens, step, vocab, start, count, keys);
+    return cudaGetLastError() == cudaSuccess;
+}
+extern "C" bool FastllmCudaDsparkMarkovShardFinish(const unsigned long long *keys,
+    const void *embed, int *tokens, float *outEmbeds, int step) {
+    MarkovShardFinish<<<1, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(keys,
+        (const __nv_bfloat16*)embed, tokens, step, outEmbeds);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" bool FastllmCudaDsparkMarkovShardSample(const float *logits, const void *embed,
+    const void *head, const int *tokens, float *scores, float *outEmbeds,
+    FastllmDsparkSamplePartial *partials, FastllmDsparkSamplePartial *packet,
+    unsigned long long seed, unsigned long long *counter,
+    int step, int start, int count, int stride, float temperature) {
+    if (!logits || !embed || !head || !tokens || !scores || !partials || !packet || !counter ||
+        step < 0 || start < 0 || count <= 0 || stride < count ||
+        !std::isfinite(temperature) || temperature <= 0) return false;
+    temperature = std::max(temperature, 1.0e-6f);
+    const int chunks = (count + 63) / 64;
+    DsparkMarkovShardSampleKernel<<<chunks, 256, 0, cudaStreamPerThread>>>(logits,
+        (const __nv_bfloat16*)embed, (const __nv_bfloat16*)head, tokens, scores, outEmbeds,
+        partials, seed, counter, step, start, count, stride, temperature);
+    DsparkMarkovShardSampleFinishKernel<<<1, 256, 0, cudaStreamPerThread>>>(
+        partials, packet, counter, chunks, temperature);
+    return cudaGetLastError() == cudaSuccess;
+}
+extern "C" bool FastllmCudaDsparkMarkovShardNormalize(float *scores,
+    const FastllmDsparkSamplePartial *gathered, int *tokens,
+    int ranks, int step, int count, int stride, float temperature) {
+    if (!scores || !gathered || !tokens || ranks < 1 || ranks > 8 || step < 0 ||
+        count <= 0 || stride < count || !std::isfinite(temperature) || temperature <= 0) return false;
+    DsparkMarkovShardNormalizeKernel<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        scores, gathered, tokens, ranks, step, count, stride, std::max(temperature, 1.0e-6f));
+    return cudaGetLastError() == cudaSuccess;
 }

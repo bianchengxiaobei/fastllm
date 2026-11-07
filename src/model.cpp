@@ -46,6 +46,7 @@
 #include "qwen4_exp.h"
 #include "kimi_k3.h"
 #include "qwen3_5.h"
+#include "clover.h"
 #include "step3p5.h"
 #include "laguna.h"
 #include "minimax_m2.h"
@@ -529,6 +530,10 @@ namespace fastllm {
     }
 
     void basellm::InitParams() {
+        {
+            std::lock_guard<std::mutex> lock(toolCallConstraintCacheMutex);
+            toolCallConstraintCache.reset();
+        }
         if (this->weight.dicts.find("bos_token_id") != this->weight.dicts.end()) {
             if (this->weight.dicts["bos_token_id"]!="None") {
                 this->bos_token_id = atoi(this->weight.dicts["bos_token_id"].c_str());
@@ -1406,6 +1411,8 @@ namespace fastllm {
         } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
             model = new Qwen3_5Model();
             model->model_type = modelType;
+        } else if (modelType == "clover_moe") {
+            model = new CloverModel();
         } else if (modelType == "step3p5" || modelType == "step3p7") {
             model = new Step3p5Model();
             model->model_type = "step3p5";
@@ -4195,6 +4202,7 @@ namespace fastllm {
                 std::all_of(limits.begin(), limits.end(), [&](const json11::Json &x) { return x == limits[0]; }),
                 "DeepSeek V4.1 GGUF requires a uniform SwiGLU clamp.");
             AddGGUFDictIfMissing(model, "swiglu_limit", GGUFJsonToDictValue(limits[0]));
+            LoadDeepSeekV41UpstreamGGUFConfig(model, params);
         }
 
         if (model->model_struct == "qwen4_exp") {
@@ -4849,14 +4857,30 @@ namespace fastllm {
         std::vector <std::string> ggufFileNames = GenerateGGUFFileList(fileName);
         AssertInFastLLM(ggufFileNames.size() > 0, "0 gguf file found!");
 
-        printf("Load model from files:\n");
-        for (auto &s : ggufFileNames) {
-            printf("%s\n", s.c_str());
-        }
         json11::Json config;
         ReadGGUFMetaData(ggufFileNames[0], config);
         json11::Json params = config["params"];
         std::string arch = params["general.architecture"].string_value();        
+        if (arch == "deepseek41" && !params["deepseek41.ple.layers"].is_null() &&
+            ggufFileNames.size() > 1 && !FileExists(ggufFileNames.back())) {
+            // ISTA distributes the final Engram shard under a shared filename.
+            // Accept it without requiring users to create a per-build symlink.
+            const std::string shared = ParentDirectoryWithSlash(ggufFileNames[0]) +
+                "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf";
+            if (FileExists(shared)) {
+                json11::Json last;
+                ReadGGUFMetaData(shared, last);
+                AssertInFastLLM(last["params"]["split.no"].int_value() == (int)ggufFileNames.size() - 1 &&
+                    last["params"]["split.count"].int_value() == (int)ggufFileNames.size() &&
+                    last["params"]["split.tensors.count"] == params["split.tensors.count"],
+                    "DeepSeek V4.1 upstream GGUF: shared Engram is not the matching final shard.");
+                ggufFileNames.back() = shared;
+            }
+        }
+        printf("Load model from files:\n");
+        for (const auto &s : ggufFileNames) {
+            printf("%s\n", s.c_str());
+        }
 
         std::unique_ptr<basellm> modelOwner;
         basellm *model = nullptr;
@@ -4882,6 +4906,11 @@ namespace fastllm {
             model = CreateModelWithType(modelType);
             modelOwner.reset(model);
             AddDictRecursion(model, "", config);
+            if (model->model_struct == "deepseek_v41") {
+                // --ori supplies HF configuration and tokenizer files, but
+                // Engram layout and constants still come from the GGUF.
+                LoadGGUFModelConfig(params, params["general.architecture"].string_value(), model);
+            }
             // 设置eos_token_id
             if (config["eos_token_id"].is_null()) {
                 auto tokenizer = json11::Json::parse(ReadAllFile(path + "tokenizer.json"), error);
@@ -5039,7 +5068,10 @@ namespace fastllm {
         json11::Json externalMtpTextConfig;
         const bool externalMtpGGUF = !externalMtpPath.empty() &&
             StringEndWith(externalMtpPath, ".gguf");
-        if (externalMtpGGUF) {
+        const bool externalDsparkGGUF = externalMtpGGUF && model->model_struct == "deepseek_v41";
+        if (externalDsparkGGUF) {
+            AppendDeepSeekV41GGUFAux(model, params, externalMtpPath, false, readGGUFTasks);
+        } else if (externalMtpGGUF) {
             AssertInFastLLM(model->model_struct == "qwen4_exp",
                 "External MTP GGUF requires a Qwen4-Exp target.");
             json11::Json mtpMetadata;
@@ -5187,7 +5219,7 @@ namespace fastllm {
         }
 
         if (!mmprojPath.empty() && arch == "deepseek_v41") {
-            AppendDeepSeekV41GGUFVision(model, params, mmprojPath, readGGUFTasks);
+            AppendDeepSeekV41GGUFAux(model, params, mmprojPath, true, readGGUFTasks);
         }
         // 3.0 更新模型信息
         model->InitParams();
@@ -5225,6 +5257,8 @@ namespace fastllm {
                 if (task.name.find(".engram.embed.") != std::string::npos)
                     model->ngramWeights.insert(task.name);
         }
+        if (arch == "deepseek_v41")
+            PrepareDeepSeekV41UpstreamGGUFTasks(model, params, readGGUFTasks);
         if (!mmprojPath.empty() && arch != "deepseek_v41") {
             AssertInFastLLM(
                 model->model_struct == "qwen3_5",
@@ -5571,7 +5605,7 @@ namespace fastllm {
                             auto *task = readGGUFTaskDict[weightName];
                             tensorBytes = ggml_nbytes(&task->tensor);
                             const WeightType diskType = GetDiskLazyWeightType(model, weightName, tensorBytes, mergeIndex);
-                            if (diskType != WeightType::NONE &&
+                            if (diskType != WeightType::NONE && task->tensor.type != GGML_TYPE_MXFP4 &&
                                 task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                                 SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
                                 task->weight->weightType = diskType;
@@ -5926,7 +5960,7 @@ namespace fastllm {
                    std::chrono::steady_clock::now() - ggufLoadBegin).count(),
                GGUFHostMappedBytes() / 1e9, GGUFHostReadBytes() / 1e9);
         fflush(stdout);
-        if (externalMtpGGUF) {
+        if (externalMtpGGUF && !externalDsparkGGUF) {
             // qwen4exp-mtp stores raw HF norm weights, unlike target GGUF's
             // effective gamma. Let Qwen4 PrepareWeights apply the HF +1 once.
             for (auto &item : model->weight.weight) {
@@ -6762,8 +6796,10 @@ namespace fastllm {
             }
         }
 
+        // MiMo's native tool grammar needs token text even when the frontend
+        // uses Hugging Face for encoding and chat templates.
         // 3. 读取分词
-        if (!skipTokenizer) {
+        if (!skipTokenizer || model->model_type == "naive_n05_flash") {
             ReportModelLoadProgress("tokenizer", 0, 1);
             LoadLLMTokenizerFromHFToModel(path, model);
             ReportModelLoadProgress("tokenizer", 1, 1);

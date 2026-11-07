@@ -875,6 +875,31 @@ static __device__ __forceinline__ uint8_t iq_r4_signs(uint8_t packed) {
     return ksigns_iq2xs[original];
 }
 
+// The caller guarantees a 16-byte aligned destination for eight values.
+template<typename dst_t>
+static __device__ __forceinline__ void StoreDequantizedOctet(dst_t *output, const dst_t (&values)[8]) {
+    if constexpr (std::is_same<dst_t, float>::value) {
+        auto *y = reinterpret_cast<float4 *>(output);
+        y[0] = make_float4(values[0], values[1], values[2], values[3]);
+        y[1] = make_float4(values[4], values[5], values[6], values[7]);
+    } else {
+        uint32_t pairs[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint16_t a, b;
+            if constexpr (std::is_same<dst_t, __nv_bfloat16>::value) {
+                a = __bfloat16_as_ushort(values[2 * j]);
+                b = __bfloat16_as_ushort(values[2 * j + 1]);
+            } else {
+                a = __half_as_ushort(values[2 * j]);
+                b = __half_as_ushort(values[2 * j + 1]);
+            }
+            pairs[j] = uint32_t(a) | (uint32_t(b) << 16);
+        }
+        *reinterpret_cast<uint4 *>(output) = make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
+    }
+}
+
 template<typename dst_t, bool iq3>
 static __global__ void dequantize_block_iq_r4(const void * __restrict__ vx,
                                               dst_t * __restrict__ output,
@@ -918,10 +943,57 @@ static __global__ void dequantize_block_iq_r4(const void * __restrict__ vx,
     }
 }
 
+// Map each lane to the next eight output elements while preserving the R4
+// source layout and scalar rounding. Adjacent lanes use contiguous vector stores.
+// The two IQ2 formats differ only in their grid, sign and scale encoding.
+template<typename dst_t, bool iq2xs>
+static __global__ void dequantize_iq2_r4_contiguous(const void *__restrict__ vx,
+        dst_t *__restrict__ output, int64_t columns) {
+    const int64_t index = (int64_t(blockIdx.x) * 128 + threadIdx.x) * 8;
+    const int64_t outputRow = index / columns;
+    const int64_t column = index % columns;
+    const int row = outputRow % 4;
+    const int ib = (column % QK_K) / 32, il = (column % 32) / 8;
+    const int64_t block = outputRow / 4 * (columns / QK_K) + column / QK_K;
+    uint64_t grid;
+    uint8_t signs;
+    float d;
+    if constexpr (iq2xs) {
+        const auto &x = static_cast<const block_iq2_xs_r4 *>(vx)[block];
+        const uint16_t q2 = x.qs[16 * ib + 4 * row + il];
+        grid = iq2xs_grid[q2 & 511];
+        signs = iq_r4_signs(q2 >> 9);
+        const int scale = (x.scales[4 * ib + row] >> (4 * (il / 2))) & 15;
+        d = __half2float(x.d[row]) * (0.5f + scale) * 0.25f;
+    } else {
+        const auto &x = static_cast<const block_iq2_xxs_r4 *>(vx)[block];
+        const uint8_t *sas = x.sas + 16 * ib + 4 * row;
+        const int scale = (sas[0] & 1) | ((sas[1] & 1) << 1) |
+                          ((sas[2] & 1) << 2) | ((sas[3] & 1) << 3);
+        grid = iq2xxs_grid[x.qs[16 * ib + 4 * row + il]];
+        signs = iq_r4_signs(sas[il] >> 1);
+        d = __half2float(x.d[row]) * (0.5f + scale) * 0.25f;
+    }
+    dst_t values[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int q = (grid >> (8 * j)) & 255;
+        values[j] = DequantizeCast<dst_t>::cast(d * q * ((signs & (1 << j)) ? -1.0f : 1.0f));
+    }
+    StoreDequantizedOctet(output + index, values);
+}
+
 template<typename dst_t, bool iq3>
 static void dequantize_row_iq_r4_cuda(const void *vx, dst_t *y, const int64_t nrows,
                                      const int64_t n_per_row, cudaStream_t stream) {
     const int64_t blocks = nrows * n_per_row / (4 * QK_K);
+    if (!blocks) return;
+    if constexpr (!iq3) {
+        if ((reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            dequantize_iq2_r4_contiguous<dst_t, true><<<blocks, 128, 0, stream>>>(vx, y, n_per_row);
+            return;
+        }
+    }
     dequantize_block_iq_r4<dst_t, iq3><<<blocks, 128, 0, stream>>>(vx, y, n_per_row);
 }
 
@@ -965,7 +1037,14 @@ template<typename dst_t, bool iq2s>
 static void dequantize_row_iq2_other_r4_cuda(const void *vx, dst_t *y,
         int64_t rows, int64_t columns, cudaStream_t stream) {
     const int64_t blocks = rows * columns / (4 * QK_K);
-    if (blocks) dequantize_block_iq2_other_r4<dst_t, iq2s><<<blocks, 128, 0, stream>>>(vx, y, columns);
+    if (!blocks) return;
+    if constexpr (!iq2s) {
+        if ((reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            dequantize_iq2_r4_contiguous<dst_t, false><<<blocks, 128, 0, stream>>>(vx, y, columns);
+            return;
+        }
+    }
+    dequantize_block_iq2_other_r4<dst_t, iq2s><<<blocks, 128, 0, stream>>>(vx, y, columns);
 }
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
@@ -1222,4 +1301,83 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return nullptr;
         }
     }
+}
+
+// Lookup directly in the checkpoint's packed table. Each warp decodes one
+// 256-element group using the same block arithmetic as dense dequantization.
+// No whole-table expansion or host token round trip is needed during replay.
+template<ggml_type Type, bool Repeat>
+__global__ void FastllmGGUFEmbeddingKernel(const float *ids, const uint8_t *weight,
+        float *output, int vocab, int width, size_t rowBytes, int repeats) {
+    const float raw = ids[Repeat ? blockIdx.y / repeats : blockIdx.y];
+    const int token = isfinite(raw) && raw >= 0 && raw < vocab ? int(raw) : -1;
+    const int group = blockIdx.x * 4 + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (group * 256 >= width) return;
+    float *row = output + size_t(blockIdx.y) * width;
+    if (token < 0) {
+        for (int i = lane; i < 256 && group*256+i < width; i += 32)
+            row[group*256+i] = nanf("");
+        return;
+    }
+    const void *source = weight + size_t(token) * rowBytes;
+    if constexpr (Type == GGML_TYPE_IQ4_XS)
+        dequantize_block_iq4_xs_impl<float>(source, row, width, group, lane);
+    else if constexpr (Type == GGML_TYPE_IQ4_NL)
+        dequantize_block_iq4_nl_impl<float>(source, row, width, group, lane);
+    else if constexpr (Type == GGML_TYPE_IQ3_XXS)
+        dequantize_block_iq3_xxs_impl<float>(source, row, group, lane);
+    else if constexpr (Type == GGML_TYPE_IQ3_S)
+        dequantize_block_iq3_s_impl<float>(source, row, group, lane);
+    else if constexpr (Type == GGML_TYPE_Q3_K) {
+        dequantize_block_q3_K_impl<float>(source, row, group, lane);
+        dequantize_block_q3_K_impl<float>(source, row, group, lane+32);
+    }
+}
+
+template<bool Repeat>
+static bool LaunchGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight,
+                                fastllm::Data &output, int repeats) {
+    if (input.dataType != fastllm::FLOAT32 || output.dataType != fastllm::FLOAT32 ||
+        weight.dataType != fastllm::DATA_GGUF_FORMAT || weight.IsRepacked ||
+        weight.dims.size() != 2 || !fastllm::GGUFSupportsCudaEmbedding((ggml_type)weight.ggmlType)) return false;
+    const auto type = (ggml_type)weight.ggmlType;
+    const int width = weight.dims[1];
+    if (width <= 0 || width % ggml_blck_size(type) || !input.cudaData || !weight.cudaData || !output.cudaData) return false;
+    if constexpr (Repeat) {
+        if (repeats <= 0 || input.Count(0) == 0 || input.Count(0) > 65535 / repeats ||
+            output.GetBytes() < size_t(input.Count(0)) * width * repeats * sizeof(float)) return false;
+        const int device = FastllmCudaGetDevice();
+        for (const auto *data : {&input, &weight, static_cast<const fastllm::Data *>(&output)}) {
+            if (data->dataDevice != fastllm::CUDA || data->multiDeviceData ||
+                data->dataDeviceIds.size() != 1 || data->dataDeviceIds[0] != device) return false;
+        }
+    }
+    const dim3 grid((width+1023)/1024, input.Count(0) * (Repeat ? repeats : 1));
+    switch (type) {
+#define EMBEDDING_CASE(name) case GGML_TYPE_##name: \
+        FastllmGGUFEmbeddingKernel<GGML_TYPE_##name, Repeat><<<grid, 128, 0, cudaStreamPerThread>>>( \
+            (const float *)input.cudaData, (const uint8_t *)weight.cudaData, \
+            (float *)output.cudaData, weight.dims[0], width, ggml_row_size(type, width), repeats); break;
+        EMBEDDING_CASE(IQ4_XS)
+        EMBEDDING_CASE(IQ4_NL)
+        EMBEDDING_CASE(IQ3_XXS)
+        EMBEDDING_CASE(IQ3_S)
+        EMBEDDING_CASE(Q3_K)
+#undef EMBEDDING_CASE
+        default: return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight,
+                             fastllm::Data &output) {
+    return LaunchGGUFEmbedding<false>(input, weight, output, 1);
+}
+
+bool FastllmCudaGGUFEmbeddingRepeat(const fastllm::Data &input, const fastllm::Data &weight,
+                                   fastllm::Data &output, int repeats) {
+    // Repeated rows use the identical packed-block decoder. Writing their
+    // final layout directly avoids a temporary embedding and a Repeat kernel.
+    return LaunchGGUFEmbedding<true>(input, weight, output, repeats);
 }

@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -137,6 +138,7 @@ namespace fastllm {
         // 使另一调用方的 Wait() 永久自旋（加载阶段 16 线程并发注册权重时会触发）。
         // 用每 loop 一把锁保证 "等空闲 -> 写 op -> 发布 id" 原子。
         std::mutex pushMutex;
+        std::atomic<bool> stopRequested{false};
 
         AliveThreadLoop(int id)  {
             this->id = id;
@@ -154,6 +156,8 @@ namespace fastllm {
                     task->op->Run();
                     task->doneId.store(currentId, std::memory_order_release);
                     lastRunTime = std::chrono::system_clock::now();
+                } else if (stopRequested.load(std::memory_order_acquire)) {
+                    return;
                 }
                 CPUPause();
 
@@ -203,12 +207,14 @@ namespace fastllm {
         std::vector <std::thread*> threads;
         
         AliveThreadPool (int threadNum) {
-            threadNum = ClampAliveThreads(threadNum);
-            for (int i = 0; i < threadNum; i++) {
-                this->loops.push_back(new AliveThreadLoop(i));
-                this->threads.push_back(new std::thread([loop = this->loops[i]]() { (*loop)(); }));
-            }
-            curActivateThreadInterval = std::make_pair(0, threadNum);
+            ResizeThreads(threadNum);
+        }
+
+        AliveThreadPool(const AliveThreadPool&) = delete;
+        AliveThreadPool& operator=(const AliveThreadPool&) = delete;
+
+        ~AliveThreadPool() {
+            Shutdown();
         }
 
         void PushOp(int tid, MultiThreadBaseOp *op) {
@@ -224,11 +230,31 @@ namespace fastllm {
         }
 
         void Shutdown() {
-            /// TODO: shutdown
+            ResizeThreads(0);
         }
 
+        // Resize between submissions, from the owner/controller thread.
+        // Finish queued work before retiring workers; join before freeing
+        // their task storage. The allocated and active counts stay equal.
         void ResizeThreads(int threadNum) {
-            threadNum = ClampAliveThreads(threadNum);
+            if (threadNum > 0) {
+                threadNum = ClampAliveThreads(threadNum);
+            }
+            threadNum = std::max(0, threadNum);
+            const int oldSize = (int)this->threads.size();
+            for (int i = threadNum; i < oldSize; i++) {
+                this->loops[i]->Wait();
+                this->loops[i]->stopRequested.store(true, std::memory_order_release);
+            }
+            for (int i = threadNum; i < oldSize; i++) {
+                this->threads[i]->join();
+                delete this->threads[i];
+                delete this->loops[i];
+            }
+            if (threadNum < oldSize) {
+                this->threads.resize(threadNum);
+                this->loops.resize(threadNum);
+            }
             for (int i = this->threads.size(); i < threadNum; i++) {
                 this->loops.push_back(new AliveThreadLoop(i));
                 this->threads.push_back(new std::thread([loop = this->loops[i]]() { (*loop)(); }));

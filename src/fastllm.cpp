@@ -7,12 +7,14 @@
 #include "utils.h"
 
 #include "fastllm.h"
+#include "utils/inference_trace.h"
 #include "kvmem.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #endif
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
+#include "devices/cuda/cudaworkspace.h"
 #endif
 #include "contextconfig.h"
 #include "moe_cache_config.h"
@@ -129,6 +131,13 @@ namespace fastllm {
 
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
+            if (data.cudaWorkspace) {
+                AssertInFastLLM(!data.isModelWeight && !data.isKVCache &&
+                    !data.isFake && !FastllmCudaGraphIsCapturingFast() &&
+                    data.cudaWorkspace->Device() == FastllmCudaGetDevice(),
+                    "CUDA scratch workspace cannot own persistent/captured tensors");
+                return AllocateCudaWorkspace(data.cudaWorkspace, bytes);
+            }
             if (data.isModelWeight && !data.directMemory) {
                 // TP NVFP4 sources are retired after each layer is repacked.
                 bool transientExpert = data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
@@ -323,7 +332,9 @@ namespace fastllm {
     static int maxTokens = -1;
     static int defaultPageLen = 128;
     static float gpuMemRatio = 0.9f;
-    static Data emptyData;
+    // Executors update even empty tensors' placement metadata. Rank workers
+    // must not concurrently mutate one process-wide optional-bias sentinel.
+    static thread_local Data emptyData;
 
     void SetModelLoadProgressCallback(const ModelLoadProgressCallback &callback) {
         std::lock_guard<std::mutex> guard(modelLoadProgressLocker);
@@ -916,17 +927,15 @@ namespace fastllm {
 #ifdef PY_API
         py::gil_scoped_release release;
 #endif
-        globalLocker.lock();
+        std::lock_guard<std::mutex> lock(globalLocker);
+        t = std::max(1, t);
         if (fastllmAliveThreadPool != nullptr) {
             fastllmAliveThreadPool->ResizeThreads(t);
-        } else {
-            fastllmAliveThreadPool = new AliveThreadPool(t);
         }
-        threads = fastllmAliveThreadPool->threads.size();
-        globalLocker.unlock();
-#ifdef PY_API
-        py::gil_scoped_acquire acquire;
-#endif
+        // NUMA discovery also sets a default during library initialization.
+        // Record it without creating workers, so explicit/auto configuration
+        // can replace it before the first CPU operation needs the pool.
+        threads = t;
     }
     void SetThreads(int t) {
         SetAliveThreads(t);
@@ -994,8 +1003,9 @@ namespace fastllm {
     }
 
     AliveThreadPool *GetAlivePool() {
+        std::lock_guard<std::mutex> lock(globalLocker);
         if (fastllmAliveThreadPool == nullptr) {
-            SetAliveThreads(threads);
+            fastllmAliveThreadPool = new AliveThreadPool(threads);
         }
         return fastllmAliveThreadPool;
     }
@@ -1774,6 +1784,9 @@ namespace fastllm {
     void Data::CopyFrom(const Data &ori) {
         if (this == &ori) return;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+        FastllmCudaReleaseMxfp8CutlassCache(this);
+#endif
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif
@@ -2929,12 +2942,15 @@ namespace fastllm {
         if (isFake)
             return;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+        FastllmCudaReleaseMxfp8CutlassCache(this);
+#endif
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT || this->dataType == DataType::NVFP4) {
             FastllmCudaReleaseMoeGGUFResident(this);
         }
 #endif
@@ -3122,7 +3138,7 @@ namespace fastllm {
         }
 #ifdef USE_CUDA
 #ifndef USE_ROCM
-        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT || this->dataType == DataType::NVFP4) {
             FastllmCudaReleaseMoeGGUFResident(this);
         }
 #endif
@@ -3154,6 +3170,9 @@ namespace fastllm {
             return;
         }
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+        FastllmCudaReleaseMxfp8CutlassCache(this);
+#endif
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif
@@ -3524,12 +3543,15 @@ namespace fastllm {
             return;
         }
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+        FastllmCudaReleaseMxfp8CutlassCache(this);
+#endif
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT || this->dataType == DataType::NVFP4) {
             FastllmCudaReleaseMoeGGUFResident(this);
         }
 #endif
@@ -4096,12 +4118,24 @@ namespace fastllm {
 
     Random fastllmRandom;
 
-    static bool ToolCallConstraintAllowsToken(const GenerationConfig &config, int tokenId) {
-        const auto &allowed = config.tool_call_allowed_token_ids;
-        if (allowed.empty()) {
-            return true;
+    void ApplyToolTokenMask(Data &logits, int row, const GenerationConfig &config) {
+        if (!config.tool_call_token_mask) return;
+        const int vocab = logits.dims.back();
+        AssertInFastLLM(logits.dataType == FLOAT32 && row >= 0 &&
+            (uint64_t)(row + 1) * vocab <= logits.Count(0) &&
+            config.tool_call_token_mask->size() >= (size_t)(vocab + 31) / 32,
+            "Invalid tool grammar logits mask.");
+#ifdef USE_CUDA
+        if (logits.dataDevice == DataDevice::CUDA) {
+            FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
+            FastllmCudaApplyTokenMask((float *)logits.cudaData + (size_t)row * vocab,
+                config.tool_call_token_mask->data(), vocab);
+            return;
         }
-        return std::binary_search(allowed.begin(), allowed.end(), tokenId);
+#endif
+        float *values = (float *)logits.cpuData + (size_t)row * vocab;
+        for (int token = 0; token < vocab; ++token)
+            if (!config.AllowsToolToken(token)) values[token] = -INFINITY;
     }
 
     int LLMSampling(Data &logits, int outerOffset,
@@ -4129,7 +4163,7 @@ namespace fastllm {
             topk = 1;
         }
         std::vector <std::pair <float, int> > v;
-        bool hasToolNameMask = !config.tool_call_allowed_token_ids.empty();
+        bool hasToolMask = config.tool_call_token_mask || !config.tool_call_allowed_token_ids.empty();
         if (topk <= 64) {
             v.reserve(topk);
             auto betterThan = [](const std::pair<float, int> &a,
@@ -4141,7 +4175,7 @@ namespace fastllm {
                 std::vector<std::pair<float, int> >,
                 decltype(betterThan)> heap(betterThan);
             for (int i = 0; i < vocabSize; i++) {
-                if (hasToolNameMask && !ToolCallConstraintAllowsToken(config, i)) {
+                if (hasToolMask && !config.AllowsToolToken(i)) {
                     continue;
                 }
                 std::pair<float, int> cur = std::make_pair(base[i] * invTemp, i);
@@ -4162,7 +4196,7 @@ namespace fastllm {
         } else {
             v.reserve(vocabSize);
             for (int i = 0; i < vocabSize; i++) {
-                if (hasToolNameMask && !ToolCallConstraintAllowsToken(config, i)) {
+                if (hasToolMask && !config.AllowsToolToken(i)) {
                     continue;
                 }
                 v.push_back(std::make_pair(-base[i] * invTemp, i));
@@ -4175,7 +4209,8 @@ namespace fastllm {
                 v[i].first = -v[i].first;
             }
         }
-        if (v.empty() && hasToolNameMask) {
+        AssertInFastLLM(!config.tool_call_token_mask || !v.empty(), "Empty tool grammar sampling support.");
+        if (v.empty() && hasToolMask) {
             GenerationConfig fallbackConfig = config;
             fallbackConfig.tool_call_allowed_token_ids.clear();
             return LLMSampling(logits, outerOffset, fallbackConfig, tokens);
@@ -4217,10 +4252,12 @@ namespace fastllm {
         candidateOffsets.reserve(topk);
         for (int i = 0; i < topk; i++) {
             int tokenId = (int)base[i * 2];
-            if (ToolCallConstraintAllowsToken(config, tokenId)) {
+            if (config.AllowsToolToken(tokenId)) {
                 candidateOffsets.push_back(i);
             }
         }
+        AssertInFastLLM(!config.tool_call_token_mask || !candidateOffsets.empty(),
+                       "Empty compact tool grammar sampling support.");
         if (candidateOffsets.empty() && !config.tool_call_allowed_token_ids.empty()) {
             GenerationConfig fallbackConfig = config;
             fallbackConfig.tool_call_allowed_token_ids.clear();
@@ -6660,13 +6697,12 @@ namespace fastllm {
         if (trieRoot) EvictTrieSubtree(trieRoot);
         this->maxPages = maxPages;
         freePages.clear(); triePages.clear();
-        freePagesSet.clear(); triePagesSet.clear();
-        evictableLeaves.clear(); pageToTrieNode.clear();
+        evictableLeaves.clear();
+        pageToTrieNode.assign(maxPages, nullptr);
+        freePageFlags.assign(maxPages, 1);
         freePages.reserve(maxPages);
-        freePagesSet.reserve(maxPages);
         for (int i = 0; i < maxPages; ++i) {
             freePages.push_back(i);
-            freePagesSet.insert(i);
         }
         pageTimestamp.assign(maxPages, 0);
         pageRefCount.assign(maxPages, 0);
@@ -6677,39 +6713,48 @@ namespace fastllm {
     void PagedCacheManager::UpdateEvictableLeaf(CacheTrieNode *node) {
         if (!node || node->pageId < 0) return;
         if (node->evictable) evictableLeaves.erase({node->lastAccess, node->pageId});
-        node->evictable = node->children.empty() && pageRefCount[node->pageId] == 0;
+        node->evictable = pageRefCount[node->pageId] == 0 && !node->HasChildren();
         if (node->evictable)
             evictableLeaves.insert({node->lastAccess, node->pageId});
     }
 
-    void PagedCacheManager::RemoveTriePage(int pageIndex) {
-        if (!triePagesSet.erase(pageIndex)) return;
-        auto it = pageToTrieNode.find(pageIndex);
-        int index = it == pageToTrieNode.end() ? -1 : it->second->unusedIndex;
-        if (index < 0 || index >= (int)triePages.size() || triePages[index] != pageIndex) {
-            auto pos = std::find(triePages.begin(), triePages.end(), pageIndex);
-            if (pos == triePages.end()) return;
-            index = (int)(pos - triePages.begin());
+    void PagedCacheManager::TouchTrieNode(CacheTrieNode *node, long long access) {
+        // Matching changes recency, not references or trie topology. Internal
+        // nodes need no leaf-set work; retain the allocation for an actual leaf.
+        if (node->evictable) {
+            auto entry = evictableLeaves.extract({node->lastAccess, node->pageId});
+            entry.value().first = access;
+            evictableLeaves.insert(std::move(entry));
         }
+        node->lastAccess = access;
+    }
+
+    void PagedCacheManager::RemoveTriePage(int pageIndex) {
+        auto *node = pageToTrieNode[pageIndex];
+        if (!node || node->unusedIndex < 0) return;
+        const int index = node->unusedIndex;
         int moved = triePages.back();
         triePages[index] = moved;
         triePages.pop_back();
-        auto movedIt = pageToTrieNode.find(moved);
-        if (movedIt != pageToTrieNode.end()) movedIt->second->unusedIndex = index;
-        if (it != pageToTrieNode.end()) it->second->unusedIndex = -1;
+        pageToTrieNode[moved]->unusedIndex = index;
+        node->unusedIndex = -1;
     }
 
     // The caller owns pageIndexLocker (or is destroying an idle pool).
     void PagedCacheManager::EvictTrieSubtree(CacheTrieNode *node) {
-        for (auto &child : node->children) EvictTrieSubtree(child.second);
+        if (node->branches) {
+            for (auto &child : *node->branches) EvictTrieSubtree(child.second);
+        } else if (node->singleChild) EvictTrieSubtree(node->singleChild);
         const int pid = node->pageId;
         if (pid >= 0) {
             if (node->evictable) evictableLeaves.erase({node->lastAccess, pid});
             RemoveTriePage(pid);
-            pageToTrieNode.erase(pid);
+            pageToTrieNode[pid] = nullptr;
             pageTimestamp[pid] = ++currentTimestamp;
-            if (pageRefCount[pid] == 0 && freePagesSet.insert(pid).second)
+            if (pageRefCount[pid] == 0 && !freePageFlags[pid]) {
+                freePageFlags[pid] = 1;
                 freePages.push_back(pid);
+            }
         }
         delete node;
     }
@@ -6725,20 +6770,13 @@ namespace fastllm {
                 // Defensive fallback for callers retaining only a suffix of a
                 // chain. Detach its metadata without freeing referenced pages.
                 for (int pid : triePages) {
-                    auto it = pageToTrieNode.find(pid);
-                    if (it == pageToTrieNode.end()) {
-                        RemoveTriePage(pid);
-                        if (freePagesSet.insert(pid).second) freePages.push_back(pid);
-                        break;
-                    }
-                    if (!node || it->second->lastAccess < node->lastAccess)
-                        node = it->second;
+                    auto *candidate = pageToTrieNode[pid];
+                    if (!node || candidate->lastAccess < node->lastAccess)
+                        node = candidate;
                 }
-                if ((int)freePages.size() >= count) break;
-                if (!node) continue;
             }
             CacheTrieNode *parent = node->parent;
-            if (parent) parent->children.erase(node->edgeHash);
+            if (parent) parent->EraseChild(node->edgeHash);
             EvictTrieSubtree(node);
             UpdateEvictableLeaf(parent);
         }
@@ -6750,7 +6788,7 @@ namespace fastllm {
         int pageIndex = freePages.back();
         if (pick) {
             freePages.pop_back();
-            freePagesSet.erase(pageIndex);
+            freePageFlags[pageIndex] = 0;
             pageRefCount[pageIndex] = 1;
             pageTimestamp[pageIndex] = ++currentTimestamp;
         }
@@ -6766,22 +6804,22 @@ namespace fastllm {
 
     bool PagedCacheManager::IsCachedPage(int pageIndex, long long generation) {
         std::lock_guard<std::mutex> guard(pageIndexLocker);
-        auto it = pageToTrieNode.find(pageIndex);
-        return it != pageToTrieNode.end() && pageTimestamp[pageIndex] == generation &&
-               it->second->timestamp == generation;
+        auto *node = pageIndex >= 0 && pageIndex < maxPages ? pageToTrieNode[pageIndex] : nullptr;
+        return node && pageTimestamp[pageIndex] == generation && node->timestamp == generation;
     }
 
     void PagedCacheManager::ReleasePageIndexLocked(int pageIndex) {
         if (--pageRefCount[pageIndex] > 0) return;
         pageRefCount[pageIndex] = 0;
-        auto it = pageToTrieNode.find(pageIndex);
-        if (it != pageToTrieNode.end()) {
-            if (triePagesSet.insert(pageIndex).second) {
-                it->second->unusedIndex = (int)triePages.size();
+        auto *node = pageToTrieNode[pageIndex];
+        if (node) {
+            if (node->unusedIndex < 0) {
+                node->unusedIndex = (int)triePages.size();
                 triePages.push_back(pageIndex);
             }
-            UpdateEvictableLeaf(it->second);
-        } else if (freePagesSet.insert(pageIndex).second) {
+            UpdateEvictableLeaf(node);
+        } else if (!freePageFlags[pageIndex]) {
+            freePageFlags[pageIndex] = 1;
             freePages.push_back(pageIndex);
         }
     }
@@ -6792,7 +6830,10 @@ namespace fastllm {
     }
 
     void PagedCacheManager::ReleasePageIndices(const std::vector<int> &pageIndices) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan pageTrace("pages.release.lock", detail);
         std::lock_guard<std::mutex> guard(pageIndexLocker);
+        pageTrace.Next("pages.release.work");
         for (int pageIndex : pageIndices) ReleasePageIndexLocked(pageIndex);
     }
 
@@ -6800,69 +6841,96 @@ namespace fastllm {
         std::lock_guard<std::mutex> guard(pageIndexLocker);
         bool rebuildFree = false;
         for (int pid : pageIds) {
-            ++pageRefCount[pid];
-            if (freePagesSet.erase(pid)) rebuildFree = true;
+            // Already referenced pages cannot be in either unused-page pool.
+            if (++pageRefCount[pid] > 1) continue;
+            if (freePageFlags[pid]) {
+                freePageFlags[pid] = 0;
+                rebuildFree = true;
+            }
             RemoveTriePage(pid);
-            auto it = pageToTrieNode.find(pid);
-            if (it != pageToTrieNode.end()) UpdateEvictableLeaf(it->second);
+            UpdateEvictableLeaf(pageToTrieNode[pid]);
         }
         if (rebuildFree) {
             freePages.erase(std::remove_if(freePages.begin(), freePages.end(),
-                [&](int pid) { return !freePagesSet.count(pid); }), freePages.end());
+                [&](int pid) { return !freePageFlags[pid]; }), freePages.end());
         }
     }
 
     uint64_t PagedCacheManager::HashTokenPage(const int *tokens, int len) {
         uint64_t hash = 0;
-        const uint64_t P = 1000000007ULL;
         for (int i = 0; i < len; i++) {
-            hash = hash * P + (uint64_t)tokens[i];
+            hash = hash * TokenHashMultiplier + (uint64_t)tokens[i];
         }
         return hash;
     }
 
     void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        const long long access = ++currentTimestamp;
         const int count = std::min((int)tokens.size() / pageLen, (int)pages.size());
+        std::vector<uint64_t> hashes(count);
+        for (int i = 0; i < count; ++i)
+            hashes[i] = HashTokenPage(tokens.data() + i * pageLen, pageLen);
+        RecordPrefix(hashes, pages);
+    }
+
+    void PagedCacheManager::RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan pageTrace("pages.publish.lock", detail);
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        pageTrace.Next("pages.publish.work");
+        const long long access = ++currentTimestamp;
+        const int count = std::min(hashes.size(), pages.size());
         CacheTrieNode *cur = trieRoot;
         for (int i = 0; i < count; ++i) {
-            uint64_t hash = HashTokenPage(tokens.data() + i * pageLen, pageLen);
+            uint64_t hash = hashes[i];
             int pid = pages[i];
-            auto it = cur->children.find(hash);
-            auto previous = pageToTrieNode.find(pid);
-            if (previous != pageToTrieNode.end() &&
-                (it == cur->children.end() || previous->second != it->second)) {
+            auto *previous = pageToTrieNode[pid];
+            if (previous && previous->parent == cur && previous->edgeHash == hash &&
+                previous->timestamp == pageTimestamp[pid]) {
+                // Republish an unchanged prefix without rewriting the
+                // physical-page maps and unused pools. Refresh the same
+                // recency as the general publication path.
+                TouchTrieNode(previous, access);
+                cur = previous;
+                continue;
+            }
+            CacheTrieNode *child = cur->FindChild(hash);
+            if (previous && previous != child) {
                 // Publishing different contents in a physical page must also
                 // invalidate its old prefix and every dependent suffix.
-                CacheTrieNode *old = previous->second;
                 for (auto ancestor = cur; ancestor; ancestor = ancestor->parent)
-                    AssertInFastLLM(ancestor != old, "Repeated page in cache prefix.\n");
-                CacheTrieNode *parent = old->parent;
-                parent->children.erase(old->edgeHash);
-                EvictTrieSubtree(old);
+                    AssertInFastLLM(ancestor != previous, "Repeated page in cache prefix.\n");
+                CacheTrieNode *parent = previous->parent;
+                parent->EraseChild(previous->edgeHash);
+                EvictTrieSubtree(previous);
                 UpdateEvictableLeaf(parent);
             }
-            CacheTrieNode *child;
-            if (it == cur->children.end()) {
+            if (!child) {
                 child = new CacheTrieNode();
+                child->nodeId = ++nextTrieNodeId;
                 child->parent = cur; child->edgeHash = hash;
-                cur->children[hash] = child;
+                cur->AddChild(child);
                 UpdateEvictableLeaf(cur);
             } else {
-                child = it->second;
                 if (child->evictable) evictableLeaves.erase({child->lastAccess, child->pageId});
                 child->evictable = false;
                 if (child->pageId >= 0 && child->pageId != pid) {
+                    // Identical prefix contents can move to another physical
+                    // page without removing descendant trie nodes. Invalidate
+                    // cached ancestor page lists even if their endpoint lives.
+                    ++prefixBindingVersion;
                     int old = child->pageId;
                     RemoveTriePage(old);
-                    pageToTrieNode.erase(old);
-                    if (pageRefCount[old] == 0 && freePagesSet.insert(old).second)
+                    pageToTrieNode[old] = nullptr;
+                    if (pageRefCount[old] == 0 && !freePageFlags[old]) {
+                        freePageFlags[old] = 1;
                         freePages.push_back(old);
+                    }
                 }
             }
-            if (freePagesSet.erase(pid))
+            if (freePageFlags[pid]) {
+                freePageFlags[pid] = 0;
                 freePages.erase(std::find(freePages.begin(), freePages.end(), pid));
+            }
             // A generation identifies the physical contents, not how often an
             // unchanged page is published or matched by concurrent requests.
             if (!pageTimestamp[pid]) pageTimestamp[pid] = ++currentTimestamp;
@@ -6870,13 +6938,123 @@ namespace fastllm {
             child->timestamp = pageTimestamp[pid];
             child->lastAccess = access;
             pageToTrieNode[pid] = child;
-            if (pageRefCount[pid] == 0 && triePagesSet.insert(pid).second) {
+            if (pageRefCount[pid] == 0 && child->unusedIndex < 0) {
                 child->unusedIndex = (int)triePages.size();
                 triePages.push_back(pid);
             }
             UpdateEvictableLeaf(child);
             cur = child;
         }
+    }
+
+    CacheTrieNode *PagedCacheManager::FindPrefixLocked(const std::vector<uint64_t> &hashes,
+                                                     PagedPrefixMatch &match) {
+        CacheTrieNode *cur = trieRoot;
+        int count = 0;
+        auto *cached = match.pageId >= 0 && match.pageId < maxPages ? pageToTrieNode[match.pageId] : nullptr;
+        if (match.pages > 0 && match.pages <= (int)hashes.size() && cached &&
+            cached->nodeId == match.nodeId && cached->timestamp == match.generation &&
+            pageTimestamp[match.pageId] == match.generation) {
+            // Trie nodes never change their prefix path. Removing/reparenting
+            // an ancestor evicts the entire subtree, including this anchor.
+            cur = cached;
+            count = match.pages;
+        }
+        const int reused = count;
+        for (; count < (int)hashes.size(); ++count) {
+            auto *child = cur->FindChild(hashes[count]);
+            if (!child) break;
+            if (child->pageId < 0 || pageTimestamp[child->pageId] != child->timestamp) break;
+            cur = child;
+        }
+        if (auto *detail = inference_trace::CurrentDetail()) {
+            detail->Count("pages.reused_prefix_pages", reused);
+            detail->Count("pages.walked_prefix_pages", count - reused);
+        }
+        match = {};
+        if (count) {
+            match.nodeId = cur->nodeId;
+            match.pageId = cur->pageId;
+            match.generation = cur->timestamp;
+            match.pages = count;
+        }
+        return cur;
+    }
+
+    int PagedCacheManager::PreviewPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan pageTrace("pages.preview.lock", detail);
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        pageTrace.Next("pages.preview.work");
+        auto *cur = FindPrefixLocked(hashes, match);
+        if (match.pages) {
+            // Only a leaf can be evicted. Refresh its recency without walking
+            // and rewriting every ancestor on each decode-time preview.
+            TouchTrieNode(cur, ++currentTimestamp);
+        }
+        return match.pages;
+    }
+
+    void PagedCacheManager::QueryPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match,
+                                       std::vector<int> &cachedPageIds) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        auto *cur = FindPrefixLocked(hashes, match);
+        const long long access = ++currentTimestamp;
+        cachedPageIds.resize(match.pages);
+        // An endpoint identifies an immutable trie path. Ancestor eviction
+        // removes its entire subtree, so validating the endpoint also guards
+        // this walk. Keep Query's recency update for every restored page.
+        for (int i = match.pages - 1; i >= 0; --i, cur = cur->parent) {
+            cachedPageIds[i] = cur->pageId;
+            TouchTrieNode(cur, access);
+        }
+    }
+
+    bool PagedCacheManager::PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
+                                                          std::vector<int> &unreferenced) {
+        PagedPrefixPath path;
+        return PreviewUnreferencedPrefixPages(match, pages, unreferenced, path);
+    }
+
+    bool PagedCacheManager::PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
+                                                          std::vector<int> &unreferenced, PagedPrefixPath &path) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan pageTrace("pages.reclaimable.lock", detail);
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        pageTrace.Next("pages.reclaimable.work");
+        unreferenced.clear();
+        if (pages == 0) return true;
+        auto *node = match.pageId >= 0 && match.pageId < maxPages ? pageToTrieNode[match.pageId] : nullptr;
+        if (pages < 0 || pages > match.pages || !node ||
+            node->nodeId != match.nodeId || node->timestamp != match.generation ||
+            pageTimestamp[match.pageId] != match.generation) return false;
+        if (path.manager != this || path.anchor.nodeId != match.nodeId || path.anchor.generation != match.generation ||
+            path.anchor.pageId != match.pageId || path.bindingVersion != prefixBindingVersion ||
+            path.pageIds.size() != (size_t)match.pages) {
+            if (detail) detail->Count("pages.ancestor_rebuild_pages", match.pages);
+            path.manager = nullptr;
+            path.anchor = {};
+            path.pageIds.resize(match.pages);
+            for (int depth = match.pages; depth > 0; --depth, node = node->parent) {
+                if (node == nullptr || node == trieRoot || node->pageId < 0 ||
+                    pageTimestamp[node->pageId] != node->timestamp) {
+                    path.pageIds.clear();
+                    return false;
+                }
+                path.pageIds[depth - 1] = node->pageId;
+            }
+            path.manager = this;
+            path.anchor = match;
+            path.bindingVersion = prefixBindingVersion;
+        }
+        // Manager identity scopes node/page IDs to their pool. The endpoint
+        // guards trie lifetime; bindingVersion additionally guards
+        // same-content physical-page replacement along its ancestor path.
+        // Reference counts remain live: never memoize whether a page is pinned.
+        if (detail) detail->Count("pages.reference_checks", pages);
+        for (int i = pages - 1; i >= 0; --i)
+            if (pageRefCount[path.pageIds[i]] == 0) unreferenced.push_back(path.pageIds[i]);
+        return true;
     }
 
     void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {
@@ -6886,14 +7064,10 @@ namespace fastllm {
         CacheTrieNode *cur = trieRoot;
         for (int i = 0; i < (int)tokens.size() / pageLen; ++i) {
             uint64_t hash = HashTokenPage(tokens.data() + i * pageLen, pageLen);
-            auto it = cur->children.find(hash);
-            if (it == cur->children.end()) break;
-            CacheTrieNode *child = it->second;
+            CacheTrieNode *child = cur->FindChild(hash);
+            if (!child) break;
             if (child->pageId < 0 || pageTimestamp[child->pageId] != child->timestamp) break;
-            if (child->evictable) evictableLeaves.erase({child->lastAccess, child->pageId});
-            child->evictable = false;
-            child->lastAccess = access;
-            UpdateEvictableLeaf(child);
+            TouchTrieNode(child, access);
             cachedPageIds.push_back(child->pageId);
             cur = child;
         }

@@ -65,8 +65,125 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         prefixHistory.clear();
     }
 
+    static void BudgetPreviewOwnership() {
+        NaiveN05PrefixCacheTestAccess model(4);
+        auto c = model.Request(0);
+        model.Checkpoint(*c, 0, 8192); model.Checkpoint(*c, 8192, 200);
+        model.Checkpoint(*c, 8447, 1); model.Publish(*c); model.Drain(*c);
+        auto *pool = model.GetPagedKVCacheManager(0, true);
+        auto refs = pool->pageRefCount;
+        PrefillPrefixPreview preview; preview.Reset(c->currentTokens);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8192, preview) == 8192,
+                "short preview did not honor its limit");
+        for (int i = 0; i < 20; ++i)
+            Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == model.WindowHit(*c),
+                    "SWA preview differs from actual query");
+        Require(pool->pageRefCount == refs, "SWA preview pinned full KV");
+        // Publication changes the candidate set even if the request itself is
+        // unchanged. Keep another owner of the replaced checkpoint to ensure
+        // invalidation does not depend on weak-pointer expiry alone.
+        auto held = model.prefixHistory.back();
+        auto replacement = model.Request(0);
+        model.Checkpoint(*replacement, 0, 8192);
+        model.Checkpoint(*replacement, 8192, 200);
+        model.Checkpoint(*replacement, 8447, 1);
+        model.Publish(*replacement); model.Drain(*replacement);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == model.WindowHit(*c),
+                "publication reused a retired candidate");
+        held.reset();
+        // Weak metadata must not keep the four checkpoint slots alive.
+        model.prefixHistory.clear();
+        Require(model.prefixPool->freeSlots.size() == 4, "preview pinned an SWA checkpoint");
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == 0,
+                "preview resurrected removed SWA checkpoint");
+        auto other = model.Request(1); model.Checkpoint(*other, 0, 8192);
+        model.Publish(*other); model.Drain(*other);
+        c->currentTokens = other->currentTokens; preview.Reset(c->currentTokens);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == model.WindowHit(*c),
+                "query mutation reused stale token equality");
+        pool->SetMaxPages(390625);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == 0,
+                "preview trusted token equality after full KV eviction");
+    }
+
+    static void PublicationHashCollision() {
+        NaiveN05PrefixCacheTestAccess model(8);
+        auto first = model.Request(0), second = model.Request(1);
+        model.Checkpoint(*first, 0, 8192); model.Publish(*first);
+        model.Checkpoint(*second, 0, 8192); model.Publish(*second);
+        const size_t count = model.prefixHistory.size();
+        auto distinct = model.prefixHistory.front();
+        auto published = model.prefixHistory.back();
+        const uint64_t original = distinct->tokenHash;
+        // Fingerprints are only a filter: a collision must not retire a
+        // different conversation or alter the most-recent publication order.
+        distinct->tokenHash = published->tokenHash;
+        model.Publish(*second);
+        Require(model.prefixHistory.size() == count, "hash collision retired a different prefix");
+        Require(model.prefixHistory.back() == published, "publication LRU changed");
+        distinct->tokenHash = original;
+        model.Drain(*first); model.Drain(*second);
+    }
+
+    static void PreviewHashCollision() {
+        NaiveN05PrefixCacheTestAccess model(8);
+        auto first = model.Request(0), second = model.Request(1);
+        model.Checkpoint(*first, 0, 8192); model.Publish(*first);
+        model.Checkpoint(*second, 0, 8192); model.Publish(*second);
+        // Keep only unrelated history, but forge all fingerprints to match
+        // the first request. Residency remains valid; full token checks must
+        // still reject both first-time and memoized collisions.
+        for (auto it = model.prefixHistory.begin(); it != model.prefixHistory.end();) {
+            if ((*it)->tokens.front() == first->currentTokens.front()) it = model.prefixHistory.erase(it);
+            else {
+                (*it)->tokenHash = PagedCacheManager::HashTokenPage(first->currentTokens.data(), (*it)->length);
+                ++it;
+            }
+        }
+        ++model.prefixPool->historyVersion;
+        PrefillPrefixPreview preview; preview.Reset(first->currentTokens);
+        for (int pass = 0; pass < 3; ++pass) {
+            Require(model.PreviewPagedPrefixCacheExtra(first.get(), 8448, preview) == 0,
+                    "preview accepted a fingerprint collision");
+            ++model.prefixPool->historyVersion;
+        }
+        model.Drain(*first); model.Drain(*second);
+    }
+
+    static void PrefixFingerprints() {
+        std::vector<int> input(200017);
+        for (size_t i = 0; i < input.size(); ++i) input[i] = int((i * 731 + 17) % 151000);
+        PrefillPrefixPreview preview;
+        for (int pass = 0; pass < 2; ++pass) {
+            preview.Reset(input);
+            for (int length : {0, 1, 127, 128, 129, 200017, 81920, 98304, 65537, 130})
+                Require(preview.TokenHash(length) == PagedCacheManager::HashTokenPage(input.data(), length),
+                        "incremental fingerprint differs from full token hash");
+            input[32]++;
+        }
+    }
+
     static void Capacity() {
         PrefixPool pool;
+        pool.draftSlotBytes = 1023 * 4096 * 2;
+        for (int ranks : {1, 2, 3, 4, 6, 8}) for (int slots : {1, 4, 17, 1536}) {
+            pool.draftStorage.resize(ranks);
+            int total = 0;
+            for (int rank = 0; rank < ranks; ++rank) {
+                const int count = pool.DraftShardSlots(slots, rank, ranks);
+                total += count;
+                Require(count <= (slots + ranks - 1) / ranks, "draft shard exceeds balanced budget");
+            }
+            Require(total == slots, "draft sharding changed checkpoint capacity");
+            for (int slot = 0; slot < slots; ++slot) {
+                const int rank = slot % ranks;
+                Require(&pool.DraftShard(slot) == &pool.draftStorage[rank] &&
+                        pool.DraftOffset(slot) + pool.draftSlotBytes <=
+                            size_t(pool.DraftShardSlots(slots, rank, ranks)) * pool.draftSlotBytes,
+                        "draft checkpoint falls outside its shard");
+            }
+        }
+        pool.draftSlotBytes = 0;
         pool.slotBytes = 3194880;
         for (int batch : {1, 2, 3, 4, 8, 16, 32, 64, 128, 220, 224, 400, 512}) {
             Require(pool.SlotCount(batch, 0) == batch * 4, "missing minimum checkpoint reservation");
@@ -222,6 +339,10 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
 
 int main() {
     try {
+        fastllm::NaiveN05PrefixCacheTestAccess::BudgetPreviewOwnership();
+        fastllm::NaiveN05PrefixCacheTestAccess::PublicationHashCollision();
+        fastllm::NaiveN05PrefixCacheTestAccess::PreviewHashCollision();
+        fastllm::NaiveN05PrefixCacheTestAccess::PrefixFingerprints();
         fastllm::NaiveN05PrefixCacheTestAccess::Capacity();
         fastllm::NaiveN05PrefixCacheTestAccess::PinnedPressure();
         fastllm::NaiveN05PrefixCacheTestAccess::FourPerRequest();

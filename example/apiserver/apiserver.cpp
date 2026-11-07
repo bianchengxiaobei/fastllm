@@ -320,6 +320,9 @@ std::map <std::string, fastllm::DataType> dataTypeDict = {
     {"float32", fastllm::DataType::FLOAT32},
     {"half", fastllm::DataType::FLOAT16},
     {"float16", fastllm::DataType::FLOAT16},
+    {"bfloat16", fastllm::DataType::BFLOAT16},
+    {"bf16", fastllm::DataType::BFLOAT16},
+    {"fp8_e4m3", fastllm::DataType::FP8_E4M3},
     {"int8", fastllm::DataType::INT8},
     {"int4", fastllm::DataType::INT4_NOZERO},
     {"int4z", fastllm::DataType::INT4},
@@ -2041,6 +2044,16 @@ struct WorkQueue {
             SocketWrite(node->client, message.c_str(), message.length());
             SocketClose(node->client);
             return;
+        } else if ((req->route == "/health" || req->route == "/health/") && req->method == "GET") {
+            std::string body = "{\"status\":\"ok\",\"model\":\"" + ::config.modelName + "\"}\n";
+            std::string message = "HTTP/1.1 200 OK\r\n";
+            message += "Content-Type: application/json\r\n";
+            message += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+            message += "Connection: close\r\n\r\n";
+            message += body;
+            SocketWrite(node->client, message.c_str(), message.length());
+            SocketClose(node->client);
+            return;
         } else if ((req->route == "/generate" || req->route == "/generate/") && req->method == "POST") {
             std::string message = "";
             message += "HTTP/1.1 200 OK\r\n";
@@ -3472,6 +3485,9 @@ int main(int argc, char** argv) {
     printf("[fastllm] default generation config: temperature=%g, top_p=%g, top_k=%d, repeat_penalty=%g\n",
            config.temperature, config.topP, config.topK, config.repeatPenalty);
     fflush(stdout);
+    if (fastllm::GetFastllmEnv().cudaGraph) {
+        workQueue.model->AutoWarmup();
+    }
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.Start();
 

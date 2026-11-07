@@ -3,9 +3,13 @@
 //
 
 #include "basellm.h"
+#include "models/mimo_tool_grammar.h"
 #include "utils.h"
 #include "utils/cuda_cache_budget.h"
 #include "utils/fastllm_int128.h"
+#include "utils/inference_trace.h"
+#include "utils/dense_id_set.h"
+#include "utils/paged_prefix_preview.h"
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
@@ -38,9 +42,16 @@ namespace fastllm {
             }
         }
 
-        static bool NeedRepeatPenalty(const GenerationConfig &config) {
-            float diff = config.repeat_penalty - 1.0f;
-            return diff > 1e-6f || diff < -1e-6f;
+        static void SetSamplingHistory(LastTokensManager &manager, size_t row,
+                                       const GenerationConfig &config, const LastTokensUnit &history) {
+            if (manager.units.size() <= row) manager.units.resize(row + 1);
+            if (config.NeedsTokenHistory()) {
+                manager.units[row] = history;
+            } else {
+                // Preserve row alignment and last_n for fallback samplers,
+                // without copying unused tree nodes or replacing the queue.
+                manager.units[row].Init(config.last_n);
+            }
         }
 
         static std::vector<float>* CreatePendingResultLogits(const GenerationConfig &config) {
@@ -65,42 +76,65 @@ namespace fastllm {
         }
 
         static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
-            std::set<std::pair<PagedCacheManager*, int> > releasedPages;
-            auto releaseUnique = [&](Data &pagedCache) {
-                if (ReleaseKvMemCache(pagedCache)) {
-                    return;
+            auto *detail = inference_trace::CurrentDetail();
+            inference_trace::DetailSpan releaseTrace("release.descriptors", detail);
+            // A TP root can mirror a local shard, and views may partially
+            // overlap. Deduplicate by physical pool/page, preserving first-use
+            // release order without allocating a tree node for every page.
+            struct PageMarks {
+                std::vector<uint64_t> words;
+                std::vector<size_t> touched;
+                std::vector<int> pages;
+                void Begin(int count) {
+                    for (size_t word : touched) words[word] = 0;
+                    touched.clear(); pages.clear();
+                    if (words.size() < ((size_t)count + 63) / 64) words.resize(((size_t)count + 63) / 64);
                 }
-                if (!pagedCache.isPagedKVCache || pagedCache.pagedKVCacheData == nullptr ||
-                    pagedCache.pageIndex.empty()) {
-                    return;
+                void Add(int page) {
+                    const size_t word = (size_t)page / 64;
+                    const uint64_t bit = uint64_t(1) << (page % 64);
+                    if (words[word] & bit) return;
+                    if (!words[word]) touched.push_back(word);
+                    words[word] |= bit;
+                    pages.push_back(page);
                 }
-                std::vector<int> uniquePages;
-                for (int page : pagedCache.pageIndex) {
-                    std::pair<PagedCacheManager*, int> key = {pagedCache.pagedKVCacheData, page};
-                    if (releasedPages.insert(key).second) {
-                        uniquePages.push_back(page);
-                    }
-                }
-                if (!uniquePages.empty()) {
-                    pagedCache.pagedKVCacheData->ReleasePageIndices(uniquePages);
-                }
-                pagedCache.pageIndex.clear();
-                pagedCache.lastPageLen = 0;
             };
-            releaseUnique(cache);
-            if (cache.multiDeviceData) {
-                for (auto &it : cache.multiDeviceDatas) {
-                    if (it.second != nullptr) {
-                        releaseUnique(*it.second);
-                        if (clearDims) {
-                            it.second->dims.clear();
-                        }
-                    }
+            static thread_local PageMarks marks;
+            std::vector<Data *> descriptors;
+            descriptors.reserve(1 + cache.multiDeviceDatas.size());
+            descriptors.push_back(&cache);
+            if (cache.multiDeviceData)
+                for (auto &entry : cache.multiDeviceDatas)
+                    if (entry.second) descriptors.push_back(entry.second);
+            std::vector<PagedCacheManager *> pools;
+            pools.reserve(descriptors.size());
+            for (auto *view : descriptors) {
+                if (!ReleaseKvMemCache(*view) && view->isPagedKVCache &&
+                    view->pagedKVCacheData && !view->pageIndex.empty() &&
+                    std::find(pools.begin(), pools.end(), view->pagedKVCacheData) == pools.end())
+                    pools.push_back(view->pagedKVCacheData);
+            }
+            if (detail) {
+                detail->Count("release.descriptor_count", descriptors.size());
+                detail->Count("release.pool_count", pools.size());
+            }
+            for (auto *pool : pools) {
+                releaseTrace.Next("release.deduplicate");
+                marks.Begin(pool->maxPages);
+                for (auto *view : descriptors) {
+                    if (!view->isPagedKVCache || view->pagedKVCacheData != pool) continue;
+                    for (int page : view->pageIndex) marks.Add(page);
                 }
+                if (detail) detail->Count("release.page_count", marks.pages.size());
+                releaseTrace.Next("release.manager");
+                pool->ReleasePageIndices(marks.pages);
+                releaseTrace.Next("release.clear_views");
+                for (auto *view : descriptors)
+                    if (view->isPagedKVCache && view->pagedKVCacheData == pool) {
+                        view->pageIndex.clear(); view->lastPageLen = 0;
+                    }
             }
-            if (clearDims) {
-                cache.dims.clear();
-            }
+            if (clearDims) for (auto *view : descriptors) view->dims.clear();
         }
 
         static bool ToolCallConstraintStartsWith(const std::string &text, const std::string &prefix) {
@@ -451,13 +485,16 @@ namespace fastllm {
     }
 
     int ResponseContextDict::CreateHandle() {
-        locker.lock();
-        int newId = 0;
-        while (dicts.find(newId) != dicts.end()) {
-            newId++;
-        }
+        std::lock_guard<std::mutex> lock(locker);
+        // Cancelled async fetches may outlive removal. Do not immediately
+        // recycle their handle for the next request (the ABA problem).
+        int newId;
+        do {
+            newId = nextHandle;
+            nextHandle = nextHandle == INT_MAX ? 0 : nextHandle + 1;
+        } while (dicts.find(newId) != dicts.end());
         dicts[newId] = new ResponseContext();
-        locker.unlock();
+        dicts[newId]->generation = ++nextGeneration;
         return newId;
     }
 
@@ -546,13 +583,49 @@ namespace fastllm {
         }
     }
 
+    struct basellm::ToolCallConstraintCache {
+        using Key = std::tuple<std::string, std::string, std::vector<std::string>>;
+        uint64_t vocabularyRevision = 0;
+        bool byteAsChar = false;
+        std::string preTokenizer;
+        std::vector<std::pair<int, std::string>> decodedTokens;
+        std::map<Key, std::vector<int>> states;
+        size_t stateBytes = 0;
+    };
+
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
+        if (context) generationConfig.tool_call_grammar_state = context->generationConfig.tool_call_grammar_state;
         generationConfig.tool_call_generated_text = context ? context->toolCallConstraintGeneratedText : "";
         PrepareToolCallConstraint(generationConfig);
     }
 
     void basellm::PrepareToolCallConstraint(GenerationConfig &generationConfig) {
         generationConfig.tool_call_allowed_token_ids.clear();
+        if (generationConfig.tool_call_grammar) {
+            std::call_once(toolConstraintVocabularyOnce, [&] {
+                AssertInFastLLM(!weight.tokenizer.tokenToStringDict.empty(),
+                    "MiMo tool grammar requires a native tokenizer vocabulary.");
+                auto tokens = std::make_shared<std::vector<std::string>>();
+                for (const auto &entry : weight.tokenizer.tokenToStringDict) {
+                    if (entry.first < 0) continue;
+                    if ((int)tokens->size() <= entry.first) tokens->resize(entry.first + 1);
+                    (*tokens)[entry.first] = weight.tokenizer.DecodeTokens({entry.first});
+                }
+                // The output head can be padded beyond the tokenizer vocabulary.
+                // Empty entries stay forbidden, but the bitset must cover all logits.
+                auto head = weight.weight.find("lm_head.weight");
+                if (head != weight.weight.end() && !head->second.dims.empty())
+                    tokens->resize(std::max(tokens->size(), (size_t)head->second.dims[0]));
+                toolConstraintVocabulary = std::make_shared<MimoToolVocabulary>(std::move(tokens));
+            });
+            std::set<int> stops(eos_token_ids.begin(), eos_token_ids.end());
+            stops.insert(eos_token_id);
+            stops.insert(generationConfig.stop_token_ids.begin(), generationConfig.stop_token_ids.end());
+            generationConfig.tool_call_grammar->Bind(toolConstraintVocabulary, stops);
+            generationConfig.tool_call_token_mask = generationConfig.tool_call_grammar->Mask(
+                generationConfig.tool_call_grammar_state);
+            return;
+        }
         if (!generationConfig.tool_call_name_constraint_enabled &&
             !generationConfig.tool_call_parameter_name_constraint_enabled) {
             return;
@@ -576,25 +649,80 @@ namespace fastllm {
             return;
         }
 
-        std::vector<int> allowedIds;
-        allowedIds.reserve(allowedValues.size() * 4);
         const std::string terminator =
                 generationConfig.tool_call_name_terminator.empty()
                 ? "\"" : generationConfig.tool_call_name_terminator;
-        for (const auto &item : this->weight.tokenizer.tokenToStringDict) {
-            int tokenId = item.first;
-            std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
-            if (IsToolCallEnumTokenAllowed(partial, tokenText,
-                                           allowedValues, terminator)) {
-                allowedIds.push_back(tokenId);
+        std::unique_lock<std::mutex> lock(toolCallConstraintCacheMutex, std::defer_lock);
+        ToolCallConstraintCache *cache = nullptr;
+        ToolCallConstraintCache::Key key;
+        if (UseGpuToolCallConstraints()) {
+            lock.lock();
+            auto &tokenizer = weight.tokenizer;
+            if (!toolCallConstraintCache || toolCallConstraintCache->decodedTokens.size() !=
+                    tokenizer.tokenToStringDict.size() ||
+                toolCallConstraintCache->vocabularyRevision != tokenizer.GetVocabularyRevision() ||
+                toolCallConstraintCache->byteAsChar != tokenizer.byteAsChar ||
+                toolCallConstraintCache->preTokenizer != tokenizer.preTokenizer) {
+                toolCallConstraintCache = std::make_shared<ToolCallConstraintCache>();
+                toolCallConstraintCache->vocabularyRevision = tokenizer.GetVocabularyRevision();
+                toolCallConstraintCache->byteAsChar = tokenizer.byteAsChar;
+                toolCallConstraintCache->preTokenizer = tokenizer.preTokenizer;
+                toolCallConstraintCache->decodedTokens.reserve(tokenizer.tokenToStringDict.size());
+                for (const auto &item : tokenizer.tokenToStringDict)
+                    toolCallConstraintCache->decodedTokens.emplace_back(item.first,
+                        tokenizer.DecodeTokens(std::vector<int>{item.first}));
             }
+            cache = toolCallConstraintCache.get();
+            key = std::make_tuple(partial, terminator, allowedValues);
+            auto found = cache->states.find(key);
+            if (found != cache->states.end()) {
+                generationConfig.tool_call_allowed_token_ids = found->second;
+                return;
+            }
+        }
+        std::vector<int> allowedIds;
+        allowedIds.reserve(allowedValues.size() * 4);
+        auto consider = [&](int tokenId, const std::string &tokenText) {
+            if (IsToolCallEnumTokenAllowed(partial, tokenText, allowedValues, terminator))
+                allowedIds.push_back(tokenId);
+        };
+        if (cache) {
+            for (const auto &item : cache->decodedTokens) consider(item.first, item.second);
+        } else {
+            for (const auto &item : weight.tokenizer.tokenToStringDict)
+                consider(item.first, weight.tokenizer.DecodeTokens(std::vector<int>{item.first}));
         }
         std::sort(allowedIds.begin(), allowedIds.end());
         allowedIds.erase(std::unique(allowedIds.begin(), allowedIds.end()), allowedIds.end());
+        if (cache) {
+            size_t bytes = partial.size() + terminator.size() + allowedIds.size() * sizeof(int);
+            for (const auto &name : allowedValues) bytes += name.size() + sizeof(std::string);
+            // Bound request-defined schemas/states; a miss always uses the original matcher.
+            constexpr size_t maxBytes = 8 * 1024 * 1024;
+            if (cache->states.size() >= 512 || cache->stateBytes + bytes > maxBytes) {
+                cache->states.clear();
+                cache->stateBytes = 0;
+            }
+            if (bytes <= maxBytes) {
+                cache->states.emplace(std::move(key), allowedIds);
+                cache->stateBytes += bytes;
+            }
+        }
         generationConfig.tool_call_allowed_token_ids = std::move(allowedIds);
     }
 
+    void basellm::AdvanceToolCallGrammar(GenerationConfig &config, int tokenId) {
+        config.tool_call_grammar_state = config.tool_call_grammar->AdvanceToken(
+            config.tool_call_grammar_state, tokenId);
+        AssertInFastLLM(config.tool_call_grammar_state >= 0, "Invalid MiMo tool grammar transition.");
+        config.tool_call_token_mask.reset();
+    }
+
     void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {
+        if (context && context->generationConfig.tool_call_grammar && tokenId >= 0) {
+            AdvanceToolCallGrammar(context->generationConfig, tokenId);
+            return;
+        }
         if (context == nullptr ||
             (!context->generationConfig.tool_call_name_constraint_enabled &&
              !context->generationConfig.tool_call_parameter_name_constraint_enabled) ||
@@ -620,11 +748,14 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan recordTrace("record.model_history", detail);
         if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return;
         if (model->DeferHistoryCacheRestore()) model->TryRecordResponseContext(this);
         if (!this->multimodalInput.empty()) {
             return;
         }
+        recordTrace.Next("record.descriptor_scan");
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -696,6 +827,9 @@ namespace fastllm {
             reusablePrefixLen = 0;
         }
 
+        recordTrace.Next("record.paged_publish");
+        std::map<int, std::vector<uint64_t>> recordHashes;
+        std::vector<PagedCacheBatchExecutor::Publication> publications;
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                 bool recordedLocal = false;
@@ -711,9 +845,16 @@ namespace fastllm {
             }
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                inference_trace::DetailSpan descriptorTrace("record.page_copy_hash", detail);
                 auto pages = cache.pageIndex;
                 if (cache.lastPageLen < cache.pageLen) pages.pop_back();
-                cache.pagedKVCacheData->Record(this->allTokens, pages);
+                const int pageLen = cache.pagedKVCacheData->pageLen;
+                auto &hashes = recordHashes[pageLen];
+                const int count = std::min(this->allTokens.size() / pageLen, pages.size());
+                for (int i = hashes.size(); i < count; ++i)
+                    hashes.push_back(PagedCacheManager::HashTokenPage(this->allTokens.data() + i * pageLen, pageLen));
+                if (detail) detail->Count("record.page_count", pages.size());
+                publications.push_back({cache.pagedKVCacheData, &hashes, std::move(pages)});
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -728,6 +869,9 @@ namespace fastllm {
             recordPagedCache(kvFirst);
             recordPagedCache(kvSecond);
         }
+        // Hashes are complete and stable before workers access them. Each
+        // manager retains its lock, page-generation checks and publication LRU.
+        model->pagedCacheExecutor.Publish(publications, GetThreads());
     }
 
     PagedCacheManager* basellm::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
@@ -900,6 +1044,7 @@ namespace fastllm {
     }
 
     void basellm::ShutdownRuntime() {
+        StopPD();
         {
             std::lock_guard<std::mutex> guard(dictLocker);
             this->isFree = true;
@@ -1327,6 +1472,80 @@ namespace fastllm {
         exit(0);
     }
 
+    // Manager topology is stable while one scheduling pass holds dictLocker.
+    // Enumerate/deduplicate it once for all waiting prompts in that pass.
+    struct ResidentPrefixManagers {
+        bool initialized = false;
+        PagedCacheManager *probe = nullptr;
+        std::vector<PagedCacheManager *> managers;
+        void Init(basellm *model) {
+            if (initialized) return;
+            initialized = true;
+            for (int li = 0; li < model->block_cnt && !probe; ++li) {
+                if (model->GetKVCacheRetainedTokens(li) >= 0) continue;
+                for (auto &ref : model->GetPagedKVCacheManagers(li, true))
+                    if (ref.second) { probe = ref.second; break; }
+            }
+            const bool unboundedOnly = probe != nullptr;
+            if (!probe) for (auto &ref : model->GetPagedKVCacheManagers(model->kvCacheId, true))
+                if (ref.second) { probe = ref.second; break; }
+            if (!probe || probe->pageLen <= 0) return;
+            std::unordered_set<PagedCacheManager *> queried{probe};
+            managers.push_back(probe);
+            for (int li = 0; li < model->block_cnt; ++li) {
+                if (unboundedOnly && model->GetKVCacheRetainedTokens(li) >= 0) continue;
+                for (int part = 0; part < 2; ++part)
+                    for (auto &ref : model->GetPagedKVCacheManagers(li, part == 0))
+                        if (ref.second && ref.second->pageLen == probe->pageLen && queried.insert(ref.second).second)
+                            managers.push_back(ref.second);
+            }
+        }
+    };
+
+    // Preview without restoring KV or companion state. References and endpoint
+    // generations are checked afresh; only topology and immutable paths are reused.
+    static int PreviewResidentPrefix(basellm *model, ResponseContext *ctx,
+                                     PagedCacheManager *budgetManager, std::vector<int> &unreferenced,
+                                     ResidentPrefixManagers &plan, PagedPrefixPreviewExecutor &executor) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan previewTrace("preview.reset", detail);
+        if (detail) detail->Count("preview.query_tokens", ctx->currentTokens.size());
+        unreferenced.clear();
+        if (!model->DeferHistoryCacheRestore() || ctx->cacheLen || !ctx->multimodalInput.empty() ||
+            (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) ||
+            ctx->intParams.count("paged_prefix_restore_disabled")) return 0;
+        if (!ctx->prefillPreview) ctx->prefillPreview.reset(new PrefillPrefixPreview());
+        auto &preview = *ctx->prefillPreview;
+        preview.Reset(ctx->currentTokens);
+        previewTrace.Next("preview.managers");
+        plan.Init(model);
+        auto *probe = plan.probe;
+        int length = 0;
+        if (probe && probe->pageLen > 0) {
+            previewTrace.Next("preview.page_hashes");
+            const auto &hashes = preview.Hashes(probe->pageLen);
+            if (detail) detail->Count("preview.manager_count", plan.managers.size());
+            previewTrace.Next("preview.trie_queries");
+            int pages = probe->PreviewPrefix(hashes, preview.matches[probe]);
+            // A full prompt match must leave at least one token for logits.
+            if ((size_t)pages * probe->pageLen >= ctx->currentTokens.size()) --pages;
+            pages = executor.Query(plan.managers, hashes, preview.matches, pages, GetThreads());
+            if (pages > 0) {
+                previewTrace.Next("preview.model_history");
+                length = model->PreviewPagedPrefixCacheExtra(ctx, pages * probe->pageLen, preview);
+                previewTrace.Next("preview.reclaimable_pages");
+                length = std::max(0, std::min(length, pages * probe->pageLen)) / probe->pageLen * probe->pageLen;
+                if (length && budgetManager) {
+                    if (budgetManager->pageLen != probe->pageLen ||
+                        std::find(plan.managers.begin(), plan.managers.end(), budgetManager) == plan.managers.end() ||
+                        !budgetManager->PreviewUnreferencedPrefixPages(preview.matches[budgetManager],
+                            length / probe->pageLen, unreferenced, preview.budgetPath)) length = 0;
+                }
+            }
+        }
+        return std::max(0, std::min(length, (int)ctx->currentTokens.size() - 1));
+    }
+
     // Both schedulers restore the same page references and model-specific
     // companion state. Called while scheduling is locked, between forwards.
     static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx) {
@@ -1358,12 +1577,15 @@ namespace fastllm {
             }
         }
         if (probeManager != nullptr) {
+            if (!ctx->prefillPreview) ctx->prefillPreview = std::make_unique<PrefillPrefixPreview>();
+            auto &preview = *ctx->prefillPreview;
+            preview.Reset(ctx->currentTokens);
             std::map<PagedCacheManager*, std::vector<int> > queriedPages;
             auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
                 auto it = queriedPages.find(manager);
                 if (it == queriedPages.end()) {
                     std::vector<int> pages;
-                    manager->Query(ctx->currentTokens, pages);
+                    manager->QueryPrefix(preview.Hashes(manager->pageLen), preview.matches[manager], pages);
                     it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
                 }
                 return it->second;
@@ -2031,6 +2253,8 @@ namespace fastllm {
                    "(full idle burst, decode interleave enabled).\n",
                    activePrefillTokenLimit);
         }
+        LastTokensManager tokensManager;
+        tokensManager.units.reserve(std::max(1, maxBatch));
         while (true) {
             std::vector <Data*> attentionMasks;
             std::vector <Data*> positionIds;
@@ -2041,7 +2265,6 @@ namespace fastllm {
             std::vector <int> seqLens;
             std::vector <int> handles;
             std::vector <GenerationConfig> generationConfigs;
-            LastTokensManager tokensManager;
             std::vector <ResponseContext*> tokenContexts;
             std::vector <std::vector <float>* > logits;
             std::vector <float> decodePositionValues;
@@ -2075,6 +2298,7 @@ namespace fastllm {
             std::vector <int> abortHandles;
             int busyPages = 0, currentActivate = 0;
             bool hasPrefill = false;
+            bool pendingPD = false;
             struct DecodeOrder {
                 int sortKey;
                 int handle;
@@ -2091,6 +2315,7 @@ namespace fastllm {
                     continue;
                 }
                 if (it.second->isEnding) {
+                    it.second->pdPending.reset();
                     model->OnResponseContextFinished(it.second);
                     for (int i = 0; i < model->block_cnt; i++) {
                         auto &kvFirst = it.second->pastKeyValues[i].first;
@@ -2098,6 +2323,10 @@ namespace fastllm {
                         ReleasePagedCachePages(kvFirst);
                         ReleasePagedCachePages(kvSecond);
                     }
+                    continue;
+                }
+                if (!model->PollPD(it.second)) {
+                    pendingPD |= bool(it.second->pdPending);
                     continue;
                 }
                 if (it.second->preTokens > 0) {
@@ -2692,7 +2921,7 @@ namespace fastllm {
 
                     generationConfigs.push_back(ctx->generationConfig);
                     model->PrepareToolCallConstraint(ctx, generationConfigs.back());
-                    bool ctxNeedRepeatPenalty = NeedRepeatPenalty(generationConfigs.back());
+                    bool ctxNeedRepeatPenalty = generationConfigs.back().NeedsTokenHistory();
                     selectedNeedLastTokens |= ctxNeedRepeatPenalty ||
                                               (generationConfigs.back().output_logits &&
                                                !generationConfigs.back().IsSimpleGreedy()) ||
@@ -2788,10 +3017,13 @@ namespace fastllm {
             }
 
             if (selectedNeedLastTokens) {
-                tokensManager.units.reserve(tokenContexts.size());
-                for (auto *ctx : tokenContexts) {
-                    tokensManager.units.push_back(ctx->tokens);
+                tokensManager.units.resize(tokenContexts.size());
+                for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                    SetSamplingHistory(tokensManager, row, generationConfigs[row], tokenContexts[row]->tokens);
                 }
+            } else {
+                // Keep the existing empty-history fast path for GPU sampling.
+                tokensManager.units.clear();
             }
 
             // Decode阶段：检查空闲分页是否足够，不够时释放资源
@@ -3104,45 +3336,45 @@ namespace fastllm {
                 for (int i = 0; i < handles.size(); i++) {
                     ResponseContext *ctx = tokenContexts[i];
                     int curRet = ret[i];
-                    if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
-                        ctx->isEnding = true;
-                        ctx->TryRecordPagedCache(model);
-                        // printf("[Handle %d] Finished. Reason: eos token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
-                    } else {
-                        auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
-                        if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                    do {
+                        if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
-                            // printf("[Handle %d] Finished. Reason: stop token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
-                        }
-                    }
-                    if (ctx->isEnding == false) {
-                        model->UpdateToolCallConstraintState(ctx, curRet);
-                        if (ctx->currentTokens.size() == 1) {
-                            ctx->currentTokens[0] = curRet;
                         } else {
-                            ctx->currentTokens.assign(1, curRet);
+                            auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
+                            if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                                ctx->isEnding = true;
+                                ctx->TryRecordPagedCache(model);
+                            }
                         }
-                        ctx->resultTokenQueue.push(curRet);
-                        QueueGeneratedResultLogits(ctx, logits, i);
-                        ctx->allTokens.push_back(curRet);
-                        if (NeedRepeatPenalty(ctx->generationConfig)) {
-                            ctx->tokens.Push(curRet);
+                        if (ctx->isEnding == false) {
+                            model->UpdateToolCallConstraintState(ctx, curRet);
+                            if (ctx->currentTokens.size() == 1) {
+                                ctx->currentTokens[0] = curRet;
+                            } else {
+                                ctx->currentTokens.assign(1, curRet);
+                            }
+                            ctx->resultTokenQueue.push(curRet);
+                            QueueGeneratedResultLogits(ctx, logits, i);
+                            ctx->allTokens.push_back(curRet);
+                            if (ctx->generationConfig.NeedsTokenHistory()) {
+                                ctx->tokens.Push(curRet);
+                            }
+                            ctx->curTokens++;
+                            if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
+                                ctx->isEnding = true;
+                                ctx->TryRecordPagedCache(model);
+                            } else if ((maxTotalLens > 0 && (int)ctx->allTokens.size() >= maxTotalLens) ||
+                                       ctx->allTokens.size() >= model->max_positions) {
+                                ctx->isEnding = true;
+                                ctx->TryRecordPagedCache(model);
+                            }
                         }
-                        ctx->curTokens++;
-                        if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
-                            ctx->isEnding = true;
-                            ctx->TryRecordPagedCache(model);
-                            // printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
-                                   // handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
-                        } else if ((maxTotalLens > 0 && (int)ctx->allTokens.size() >= maxTotalLens) ||
-                                   ctx->allTokens.size() >= model->max_positions) {
-                            ctx->isEnding = true;
-                            ctx->TryRecordPagedCache(model);
-                            // printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
-                                   //handles[i], (int)it.second->allTokens.size(), model->max_positions);
-                        }
-                    }
+                        if (ctx->isEnding || !model->PopPendingResponseToken(ctx, curRet, curRet)) break;
+                        ++ctx->intParams["index"];
+                        ++ctx->preTokens;
+                        if (model->verbose) ++genTokens;
+                    } while (true);
                 }
                 model->dictCV.notify_all();
                 ReleasePendingResultLogits(logits);
@@ -3158,7 +3390,7 @@ namespace fastllm {
             }
 
             if (seqLens.size() == 0) {
-                if (!orders.empty()) {
+                if (!orders.empty() || pendingPD) {
                     model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                 } else {
                     model->dictCV.wait(dictLocker);
@@ -3268,6 +3500,7 @@ namespace fastllm {
                     auto lastRecordTime = std::chrono::system_clock::now();
                     long long genTokens = 0;
                     const bool printProfile = GetFastllmEnv().printProfile;
+                    const bool traceInference = inference_trace::Enabled();
                     // Naive uses the base one-token position convention. Keep
                     // scalar views alive across steps; prefill and other models
                     // still go through their virtual input builder.
@@ -3278,11 +3511,19 @@ namespace fastllm {
                     const bool batchPrefill = maxBatch > 1 && model->SupportsPrefillBatching() &&
                                               model->prefillBatchPolicy.targetTokens > 0;
                     const bool fixedKvSlots = model->kvMemConfig.enabled && model->SupportsKvMemBatch();
-                    const bool sharedKvPool = fixedKvSlots && model->SupportsKvMemPrefixCache();
+                    const bool sharedKvPool = model->SupportsSharedPagedKVPool();
                     const int maxPromptTokens = model->max_positions - (sharedKvPool ? 1 : 0);
                     const int prefillChunk = model->GetChunkedPrefillSize();
                     const int prefillBatchLimit = model->GetBatchedPrefillTokenLimit();
+                    // Keep empty per-request history slots for sampling fallbacks,
+                    // without allocating and destroying their queues every token.
+                    LastTokensManager tokensManager;
+                    tokensManager.units.reserve(maxBatch);
+                    DenseIdSet<> protectedPages;
+                    PagedPrefixPreviewExecutor prefixPreviewExecutor;
                     while (true) {
+                        std::unique_ptr<inference_trace::Step> trace;
+                        if (traceInference) trace.reset(new inference_trace::Step());
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
                         std::vector <Data*> ownedPositionIds;
@@ -3292,8 +3533,6 @@ namespace fastllm {
                         int prefillTokens = 0;
                         std::vector <int> handles;
                         std::vector <GenerationConfig> generationConfigs;
-                        LastTokensManager tokensManager;
-                        tokensManager.units.reserve(maxBatch);
                         std::vector <std::vector <float>* > logits;
                         attentionMasks.reserve(maxBatch);
                         positionIds.reserve(maxBatch);
@@ -3304,10 +3543,15 @@ namespace fastllm {
                         generationConfigs.reserve(maxBatch);
                         logits.reserve(maxBatch);
 
+                        if (trace) trace->Mark("allocation_ms");
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+                        if (trace) trace->Mark("dict_lock_ms");
                         if (model->isFree) break;
                         auto &forwardLocker = model->forwardLocker;
 
+                        inference_trace::DetailRegion retireRegion("retire_requests");
+                        auto *detail = inference_trace::CurrentDetail();
+                        if (detail) detail->Count("requests_scanned", model->responseContextDict.dicts.size());
                         // 首先把已经abort的请求删除掉
                         std::set <int> abortHandles;
                         for (auto &it: model->responseContextDict.dicts) {
@@ -3316,15 +3560,28 @@ namespace fastllm {
                                 abortHandles.insert(it.first);
                             }
                         }
+                        if (detail) detail->Count("aborted", abortHandles.size());
                         for (auto &it : abortHandles) {
+                            inference_trace::DetailSpan removeTrace("remove_context", detail);
                             model->RemoveResponseContext(it);
                         }
 
+                        std::set<int> waitingPD;
+                        for (auto &entry : model->responseContextDict.dicts) {
+                            if (!entry.second->isEnding && !model->PollPD(entry.second) && entry.second->pdPending)
+                                waitingPD.insert(entry.first);
+                        }
                         for (auto &entry : model->responseContextDict.dicts)
-                            if (entry.second->isEnding) model->OnResponseContextFinished(entry.second);
+                            if (entry.second->isEnding) {
+                                if (detail) detail->Count("finished");
+                                inference_trace::DetailSpan finishedTrace("finish_context", detail);
+                                entry.second->pdPending.reset();
+                                model->OnResponseContextFinished(entry.second);
+                            }
+                        retireRegion.Stop();
+                        if (trace) trace->Mark("retire_requests_ms");
 
                         int limit = maxTotalLens;
-                        int promptLimit = model->promptLimit;
 
                         // A TP root may expose only a non-owning cache view.
                         // Ask the model for its pool instead of interpreting
@@ -3357,7 +3614,7 @@ namespace fastllm {
                             }
                         }
                         auto reservePagedAppend = [&](const Data &cache, int append) {
-                            // Shared KVMem reserves growth through the requested
+                            // Shared KV pools reserve growth through the requested
                             // output limit at admission, using physical pages.
                             if (sharedKvPool) return true;
                             const long long length = cache.dims.size() > 1 ? cache.dims[1] : 0;
@@ -3395,10 +3652,10 @@ namespace fastllm {
                         };
                         long long reservedPages = 0;
                         int activeDecode = 0;
-                        if (sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
+                        if (batchPrefill || sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
                             auto *ctx = entry.second;
                             if (!ctx->isEnding && ctx->curTokens > 0) {
-                                reservedPages += remainingPages(ctx);
+                                if (sharedKvPool) reservedPages += remainingPages(ctx);
                                 ++activeDecode;
                             }
                         }
@@ -3425,17 +3682,33 @@ namespace fastllm {
                             reservedPages += needed;
                             return true;
                         };
-                        std::vector <std::pair <int, int> > orders;
+                        struct ScheduleOrder {
+                            int first, second;
+                            ResponseContext *context;
+                            bool operator<(const ScheduleOrder &other) const {
+                                return first != other.first ? first < other.first : second < other.second;
+                            }
+                        };
+                        std::vector<ScheduleOrder> orders;
+                        orders.reserve(model->responseContextDict.dicts.size());
+                        bool hasPrefillRequests = false;
                         for (auto &it : model->responseContextDict.dicts) {
-                            orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
+                            if (waitingPD.count(it.first)) continue;
+                            hasPrefillRequests |= it.second->curTokens == 0;
+                            orders.push_back({-(int)it.second->currentTokens.size(), it.first, it.second});
                         }
-                        if (batchPrefill) {
+                        // Without prefill requests the admission comparator reduces
+                        // to pair ordering; avoid a map lookup on every comparison.
+                        if (batchPrefill && hasPrefillRequests) {
                             // Preserve admission order while gathering. Restoring a
                             // prefix shortens currentTokens; sorting by that length
                             // would otherwise keep pinning new requests' KV pages.
                             std::sort(orders.begin(), orders.end(), [&](const auto &a, const auto &b) {
-                                auto *left = model->responseContextDict.dicts.at(a.second);
-                                auto *right = model->responseContextDict.dicts.at(b.second);
+                                // dictLocker pins request lifetimes throughout scheduling.
+                                // Sort the captured pointers without O(log N) map lookups
+                                // for both sides of every comparator invocation.
+                                auto *left = a.context;
+                                auto *right = b.context;
                                 const bool lp = left->curTokens == 0, rp = right->curTokens == 0;
                                 if (lp != rp) return lp;
                                 if (lp && left->queuedAt != right->queuedAt) return left->queuedAt < right->queuedAt;
@@ -3443,70 +3716,118 @@ namespace fastllm {
                             });
                         } else sort(orders.begin(), orders.end());
 
+                        if (trace) trace->Mark("schedule_scan_ms");
                         std::set<int> plannedPrefills;
                         bool deferPrefill = false;
                         if (batchPrefill) {
-                            activeDecode = 0;
-                            auto oldest = PrefillBatchPolicy::Clock::time_point::max();
-                            for (auto &entry : model->responseContextDict.dicts) {
-                                if (entry.second->isEnding) continue;
-                                // A resident-prefix restore can set preTokens before
-                                // the first forward. It is still a pending prefill.
-                                if (entry.second->curTokens > 0) ++activeDecode;
-                                else oldest = std::min(oldest, entry.second->queuedAt);
-                            }
+                            inference_trace::DetailRegion previewRegion("prefill_preview");
+                            const auto &policy = model->prefillBatchPolicy;
                             currentActivate = activeDecode;
-                            const int slots = std::max(0, maxBatch - activeDecode);
+                            int slots = std::max(0, maxBatch - activeDecode);
+                            if (policy.maxRequests > 0) slots = std::min(slots, policy.maxRequests);
                             long long pendingTokens = 0;
-                            bool singlePrefill = false;
-                            for (auto &order : orders) {
-                                if ((int)plannedPrefills.size() >= slots) break;
-                                auto *ctx = model->responseContextDict.dicts.at(order.second);
-                                if (ctx->isEnding || ctx->curTokens != 0) continue;
-                                if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
-                                    ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
-                                // Count only cache misses. Restore each candidate once in
-                                // this pass; the selection below reuses the same KV owners.
-                                if (model->DeferHistoryCacheRestore()) {
-                                    const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
-                                    const long long before = allocatedTokens(cache);
-                                    RestoreResidentPrefix(model, ctx);
-                                    if (ctx->isEnding) continue;
-                                    RestoreDeferredHistory(model, ctx);
-                                    lenSum += allocatedTokens(cache) - before;
+                            int candidates = 0;
+                            bool capacityLimited = false;
+                            auto oldest = PrefillBatchPolicy::Clock::time_point::max();
+                            // Idle/low-load/zero-wait paths go straight to actual
+                            // admission. Preview never owns KV or request slots.
+                            if (policy.maxWaitMs > 0 && activeDecode >= std::max(1, policy.minDecodeRequests)) {
+                                long long previewReserved = reservedPages;
+                                const long long available = sharedKvPool ? freePagedPages() : 0;
+                                protectedPages.Reset(sharedKvPool ? pagedManager->maxPages : 0);
+                                ResidentPrefixManagers previewManagers;
+                                for (auto &order : orders) {
+                                    auto *ctx = model->responseContextDict.dicts.at(order.second);
+                                    if (ctx->isEnding || ctx->curTokens != 0) continue;
+                                    if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
+                                        ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
+                                    if (candidates >= slots) { capacityLimited = true; break; }
+                                    std::vector<int> unreferenced;
+                                    const int prefix = PreviewResidentPrefix(model, ctx,
+                                        sharedKvPool ? pagedManager : nullptr, unreferenced, previewManagers,
+                                        prefixPreviewExecutor);
+                                    const int count = (int)ctx->currentTokens.size() - prefix;
+                                    const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
+                                    if (candidates && (single || pendingTokens + count > prefillBatchLimit)) {
+                                        capacityLimited = true;
+                                        break;
+                                    }
+                                    if (sharedKvPool) {
+                                        inference_trace::DetailSpan capacityTrace("capacity_and_dedup", detail);
+                                        if (detail) detail->Count("unreferenced_pages", unreferenced.size());
+                                        long long pins = 0;
+                                        for (int page : unreferenced) pins += !protectedPages.Contains(page);
+                                        const long long growth = std::max(0LL, remainingPages(ctx) - prefix / pageLen);
+                                        if (previewReserved + growth + pins > available) {
+                                            capacityLimited = true;
+                                            break;
+                                        }
+                                        previewReserved += growth + pins;
+                                        for (int page : unreferenced) protectedPages.Insert(page);
+                                    }
+                                    ++candidates;
+                                    pendingTokens += std::min(count, prefillChunk);
+                                    oldest = std::min(oldest, ctx->queuedAt);
+                                    // A long request occupies the entire chunked forward path.
+                                    capacityLimited |= single;
+                                    if (single || pendingTokens >= policy.targetTokens ||
+                                        (policy.targetRequests > 0 && candidates >= policy.targetRequests)) break;
                                 }
-                                const int count = ctx->currentTokens.size();
-                                const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
-                                if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) {
-                                    if (sharedKvPool) releasePendingPrefix(ctx);
-                                    break;
-                                }
-                                if (sharedKvPool && !reserveSharedRequest(ctx)) continue;
-                                plannedPrefills.insert(order.second);
-                                pendingTokens += count;
-                                singlePrefill = single;
-                                if (single || pendingTokens >= prefillBatchLimit) break;
+                                capacityLimited |= candidates >= slots;
                             }
-                            deferPrefill = !singlePrefill && model->prefillBatchPolicy.ShouldWait(
-                                pendingTokens, plannedPrefills.size(), slots, oldest, PrefillBatchPolicy::Clock::now());
-                            if (deferPrefill && activeDecode == 0) {
-                                model->dictCV.wait_until(dictLocker, model->prefillBatchPolicy.Deadline(oldest));
-                                continue;
+                            const char *reason = policy.Decide(pendingTokens, candidates, activeDecode,
+                                capacityLimited, oldest, PrefillBatchPolicy::Clock::now());
+                            deferPrefill = std::strcmp(reason, "wait") == 0;
+                            previewRegion.Stop();
+                            if (trace) {
+                                trace->prefillDecision = reason;
+                                trace->prefillCandidates = candidates;
+                                trace->prefillCandidateTokens = pendingTokens;
+                                trace->activeDecode = activeDecode;
+                                trace->Mark("prefill_preview_ms");
+                            }
+                            // Real admission always rematches. If an earlier
+                            // admission changes the budget, the candidate is
+                            // rejected and its references are released here.
+                            // No restoration occurs on a decode-only wait pass.
+                            if (!deferPrefill && !(capacityLimited && candidates == 0)) {
+                                pendingTokens = 0;
+                                for (auto &order : orders) {
+                                    if ((int)plannedPrefills.size() >= slots) break;
+                                    auto *ctx = model->responseContextDict.dicts.at(order.second);
+                                    if (ctx->isEnding || ctx->curTokens != 0) continue;
+                                    if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
+                                        ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
+                                    if (model->DeferHistoryCacheRestore()) {
+                                        const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
+                                        const long long before = allocatedTokens(cache);
+                                        RestoreResidentPrefix(model, ctx);
+                                        if (ctx->isEnding) continue;
+                                        RestoreDeferredHistory(model, ctx);
+                                        lenSum += allocatedTokens(cache) - before;
+                                    }
+                                    ctx->prefillPreview.reset();
+                                    const int count = ctx->currentTokens.size();
+                                    const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
+                                    if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) {
+                                        releasePendingPrefix(ctx);
+                                        break;
+                                    }
+                                    if (sharedKvPool && !reserveSharedRequest(ctx)) break;
+                                    plannedPrefills.insert(order.second);
+                                    pendingTokens += count;
+                                    if (single || pendingTokens >= policy.targetTokens) break;
+                                }
                             }
                         }
 
+                        if (trace) trace->Mark("prefix_restore_plan_ms");
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;
                             if (isPrompt && deferPrefill) continue; // Keep decoding while collecting prompts.
                             if (isPrompt == 0 && seqLens.size() > 0) {
                                 continue;
                             }
-/*
-                            if (lenSum >= promptLimit && isPrompt) {
-                                continue;
-                            }
-*/
-
                             int currentMaxLen = 0;
 
                             // for (auto &it: model->responseContextDict.dicts) {
@@ -3562,20 +3883,13 @@ namespace fastllm {
                                     continue;
                                 }
 
-                                int outputLimit = it.second->generationConfig.output_token_limit;
-                                outputLimit = (outputLimit < 0 ? 128 : outputLimit);
-/*
-                                if (isPrompt && lenSum + it.second->currentTokens.size() > promptLimit) {
-                                    continue;
-                                }
-*/
                                 // The reserve is an admission-control heuristic.  It must not
                                 // reject the only pending request forever when the configured
                                 // token budget is smaller than the fixed 256-token reserve.
                                 // A lone request can still make progress and the decode path
                                 // below will stop it when no more KV space is available.
                                 if (isPrompt && currentActivate > 0 &&
-                                    !fixedKvSlots &&
+                                    !fixedKvSlots && !sharedKvPool &&
                                     lenSum + it.second->currentTokens.size() +
                                         (currentActivate + 1) * 256 > maxTotalLens) {
                                     continue;
@@ -3642,14 +3956,8 @@ namespace fastllm {
                                 model->PrepareToolCallConstraint(it.second, generationConfigs.back());
                                 logits.push_back(CreatePendingResultLogits(it.second->generationConfig));
 
-                                // Keep one slot per request, but plain greedy decoding
-                                // does not consume repetition history. Avoid copying
-                                // its multiset/queue (including vector-growth copies).
-                                const auto &sampling = generationConfigs.back();
-                                if (sampling.IsSimpleGreedy() && !sampling.output_logits)
-                                    tokensManager.units.emplace_back(sampling.last_n);
-                                else
-                                    tokensManager.units.push_back(it.second->tokens);
+                                SetSamplingHistory(tokensManager, handles.size(),
+                                                   generationConfigs.back(), it.second->tokens);
                                 handles.push_back(it.first);
 
                                 if (it.second->preTokens == 0) {
@@ -3717,16 +4025,31 @@ namespace fastllm {
                                     // break;
                                 }
 
-                                // Fixed-slot KV already reserves every request's full
-                                // context. Charging another decode reserve here would
-                                // serialize a completely occupied batch.
+                                // Fixed slots and shared physical pools already reserve
+                                // decode growth. A logical-length sum would double-count
+                                // shared prefixes and serialize a fully admitted batch.
                                 if (seqLens.size() >= maxBatch ||
-                                    (!fixedKvSlots && lenSum + seqLens.size() * 128 > limit)) {
+                                    (!fixedKvSlots && !sharedKvPool && lenSum + seqLens.size() * 128 > limit)) {
                                     break;
                                 }
                             }
                         }
+                        tokensManager.units.resize(handles.size());
+                        if (trace) trace->Mark("batch_input_build_ms");
                         if (seqLens.size() > 0) {
+                            if (trace) {
+                                trace->submitted = true;
+                                trace->phase = prefillTokens > 0 ? "prefill" : "decode";
+                                trace->handles = handles;
+                                trace->lengths = seqLens;
+                                for (size_t row = 0; row < handles.size(); ++row) {
+                                    const Data *position = positionIds[row];
+                                    trace->contextBefore.push_back(position && position->dataDevice == DataDevice::CPU &&
+                                        position->dataType == FLOAT32 && position->cpuData && position->Count(0) > 0
+                                        ? (int)((const float *)position->cpuData)[0] : -1);
+                                    trace->cachedPrefix.push_back(model->responseContextDict.dicts.at(handles[row])->cacheLen);
+                                }
+                            }
                             std::vector <std::pair <Data, Data> > *pastKeyValue1;
                             ResponseContext *singleContext = nullptr;
                             bool isSingleText = false;
@@ -3738,8 +4061,10 @@ namespace fastllm {
                                 pastKeyValue1 = &singleContext->pastKeyValues;
                                 isSingleText = singleContext->multimodalInput.empty();
                             }
+                            if (trace) trace->Mark("batch_finalize_ms");
                             dictLocker.unlock();
                             forwardLocker.lock();
+                            if (trace) trace->Mark("forward_lock_ms");
 #ifdef USE_CUDA
                             if (model->RetainCudaWorkspace()) {
                                 FastllmCudaTrimBigBuffer();
@@ -3749,12 +4074,14 @@ namespace fastllm {
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret;
+                            if (trace) trace->Mark("workspace_input_ms");
                             std::chrono::system_clock::time_point profileStartTime;
                             if (printProfile) {
                                 profileStartTime = std::chrono::system_clock::now();
                                 ClearProfiler();
                             }
                             auto prefillStartTime = std::chrono::steady_clock::now();
+                            if (trace) trace->Mark("pre_forward_ms");
 #ifdef USE_CUDA
                             try {
 #endif
@@ -3822,6 +4149,7 @@ namespace fastllm {
                                     }
                                 }
                             }
+                            if (trace) trace->Mark("forward_dispatch_ms");
                             if (model->verbose && prefillTokens > 0) {
                                 double spend = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() - prefillStartTime).count();
@@ -3832,8 +4160,10 @@ namespace fastllm {
                             if (printProfile) {
                                 PrintLoopProfile("old", seqLens, (int)ret.size(), profileStartTime);
                             }
+                            if (trace) trace->Mark("legacy_forward_log_ms");
 #ifdef USE_CUDA
                             } catch (const CudaWorkspaceExhausted &error) {
+                                if (trace) trace->failed = true;
                                 forwardLocker.unlock();
                                 if (!dictLocker.owns_lock()) dictLocker.lock();
                                 fprintf(stderr, "[Fastllm] %s\n", error.what());
@@ -3853,6 +4183,7 @@ namespace fastllm {
 #endif
                             forwardLocker.unlock();
                             dictLocker.lock();
+                            if (trace) trace->Mark("result_lock_ms");
 
                             if (model->verbose) {
                                 auto nowTime = std::chrono::system_clock::now();
@@ -3882,37 +4213,63 @@ namespace fastllm {
                                 }
                             }
 
+                            if (trace) trace->Mark("legacy_decode_log_ms");
+                            inference_trace::DetailRegion postRegion("postprocess");
+                            if (detail) detail->Count("requests", handles.size());
                             for (int i = 0; i < handles.size(); i++) {
+                                inference_trace::DetailSpan tokenTrace("lookup", detail);
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
+                                tokenTrace.Next("stop_check_and_record");
                                 int curRet = ret[i];
-                                if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
-                                    it.second->isEnding = true;
-                                    it.second->TryRecord(model);
-                                } else {
-                                    auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
-                                    if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
+                                do {
+                                    if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                                         it.second->isEnding = true;
                                         it.second->TryRecord(model);
+                                    } else {
+                                        auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
+                                        if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
+                                            it.second->isEnding = true;
+                                            it.second->TryRecord(model);
+                                        }
                                     }
-                                }
-                                if (it.second->isEnding == false) {
-                                    model->UpdateToolCallConstraintState(it.second, curRet);
-                                    it.second->currentTokens = std::vector<int>{curRet};
-                                    it.second->resultTokenQueue.push(curRet);
-                                    QueueGeneratedResultLogits(it.second, logits, i);
-                                    it.second->allTokens.push_back(curRet);
-                                    it.second->tokens.Push(curRet);
-                                    it.second->curTokens++;
-                                    if (it.second->curTokens == it.second->generationConfig.output_token_limit
-                                        || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
-                                        || it.second->allTokens.size() >= model->max_positions) {
-                                        it.second->isEnding = true;
-                                        it.second->TryRecord(model);
+                                    if (it.second->isEnding == false) {
+                                        tokenTrace.Next("token_state_and_queue");
+                                        model->UpdateToolCallConstraintState(it.second, curRet);
+                                        if (it.second->curTokens > 0 && it.second->currentTokens.size() == 1)
+                                            it.second->currentTokens[0] = curRet;
+                                        else
+                                            // Release a potentially large prompt buffer once.
+                                            it.second->currentTokens = std::vector<int>{curRet};
+                                        it.second->resultTokenQueue.push(curRet);
+                                        QueueGeneratedResultLogits(it.second, logits, i);
+                                        it.second->allTokens.push_back(curRet);
+                                        if (it.second->generationConfig.NeedsTokenHistory())
+                                            it.second->tokens.Push(curRet);
+                                        it.second->curTokens++;
+                                        tokenTrace.Next("limit_check_and_record");
+                                        if (it.second->curTokens == it.second->generationConfig.output_token_limit
+                                            || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
+                                            || it.second->allTokens.size() >= model->max_positions) {
+                                            it.second->isEnding = true;
+                                            it.second->TryRecord(model);
+                                        }
                                     }
-                                }
+                                    if (it.second->isEnding || !model->PopPendingResponseToken(it.second, curRet, curRet)) break;
+                                    ++it.second->intParams["index"];
+                                    ++it.second->preTokens;
+                                    if (model->verbose) ++genTokens;
+                                } while (true);
                             }
-                            model->dictCV.notify_all();
-                            ReleasePendingResultLogits(logits);
+                            {
+                                inference_trace::DetailSpan notifyTrace("notify_consumers", detail);
+                                model->dictCV.notify_all();
+                            }
+                            {
+                                inference_trace::DetailSpan logitsTrace("release_logits", detail);
+                                ReleasePendingResultLogits(logits);
+                            }
+                            postRegion.Stop();
+                            if (trace) trace->Mark("postprocess_ms");
                         } else {
                             // Finished requests keep their pages until the
                             // caller drains their output and removes them.
@@ -3925,7 +4282,8 @@ namespace fastllm {
                                         return entry.second->isEnding && allocatedTokens(
                                             entry.second->pastKeyValues[model->kvCacheId].first) > 0;
                                     })) {
-                                model->dictCV.wait(dictLocker);
+                                if (!waitingPD.empty()) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                                else model->dictCV.wait(dictLocker);
                                 continue;
                             }
                             int maxLen = -1, select = -1;
@@ -3951,9 +4309,11 @@ namespace fastllm {
                             delete attentionMasks[i];
                         }
                         for (Data *position : ownedPositionIds) delete position;
+                        if (trace) trace->Mark("cleanup_ms");
 
                         if (seqLens.size() == 0) {
-                            model->dictCV.wait(dictLocker);
+                            if (!waitingPD.empty()) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                            else model->dictCV.wait(dictLocker);
                         }
                     }
                 }, this);
@@ -3978,8 +4338,8 @@ namespace fastllm {
         // a restored media prefix may belong to different images with the same
         // placeholder tokens. Keep request-local KV reuse, but do not restore
         // cross-request token-only caches for multimodal prompts.
-        bool allowHistoryCache = context->multimodalInput.empty();
-        bool restoredNativeHistory = !this->DeferHistoryCacheRestore() &&
+        bool allowHistoryCache = context->multimodalInput.empty() && !IsPDDecode();
+        bool restoredNativeHistory = !IsPDDecode() && !this->DeferHistoryCacheRestore() &&
             (allowHistoryCache ? this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen) :
                                  this->TryRestoreMultimodalHistoryCache(context));
 
@@ -4013,8 +4373,17 @@ namespace fastllm {
 
         this->OnResponseContextCreated(context);
 
+        try { BeginPD(context); }
+        catch (const std::exception &error) {
+            std::cerr << "[FastKV PD] request rejected: " << error.what() << std::endl;
+            context->error = ResponseContextErrorRuntime;
+            context->isEnding = true;
+        }
+
         dictLocker.unlock();
-        dictCV.notify_one();
+        // Scheduler and token consumers share this condition variable. A
+        // single notification can wake only a consumer and strand new work.
+        dictCV.notify_all();
         return handleId;
     }
 
@@ -4072,7 +4441,10 @@ namespace fastllm {
         if (context == nullptr) {
             return -1;
         } else {
+            const uint64_t generation = context->generation;
             while (true) {
+                context = responseContextDict.GetHandle(handleId);
+                if (context == nullptr || context->isAbort) return -1;
                 if (context->resultTokenQueue.size() > 0) {
                     int ret = context->resultTokenQueue.front();
                     context->resultTokenQueue.pop();
@@ -4082,16 +4454,17 @@ namespace fastllm {
                         ResponseContextError err = context->error;
                         RemoveResponseContext(handleId);
                         dictLocker.unlock();
-                        dictCV.notify_one();
+                        dictCV.notify_all();
                         if (err == ResponseContextErrorPromptTooLong) {
                             return -2;
                         }
+                        if (err == ResponseContextErrorRuntime) return -3;
                         return -1;
                     }
                 }
-                dictLocker.unlock();
-                MySleep(0);
-                dictLocker.lock();
+                dictCV.wait_for(dictLocker, std::chrono::seconds(1));
+                context = responseContextDict.GetHandle(handleId);
+                if (!context || context->generation != generation) return -1;
             }
         }
     }
@@ -4114,7 +4487,9 @@ namespace fastllm {
         if (context == nullptr) {
             return -1;
         }
+        const uint64_t generation = context->generation;
         while (true) {
+            if (context->isAbort) return -1;
             if (statistics != nullptr) {
                 CopyResponseStatistics(*context, statistics);
             }
@@ -4131,8 +4506,9 @@ namespace fastllm {
                 ResponseContextError err = context->error;
                 RemoveResponseContext(handleId);
                 dictLocker.unlock();
-                dictCV.notify_one();
-                return err == ResponseContextErrorPromptTooLong ? -2 : -1;
+                dictCV.notify_all();
+                return err == ResponseContextErrorPromptTooLong ? -2 :
+                       err == ResponseContextErrorRuntime ? -3 : -1;
             }
             // The async Python server used to pair CanFetchResponse() with a
             // zero-sleep polling loop here.  During a long CUDA graph replay
@@ -4141,14 +4517,12 @@ namespace fastllm {
             // speculative block.  Wait for the scheduler notification instead.
             // The bounded timeout preserves the server's periodic prefill
             // keepalive even if a legacy scheduler misses a notification.
-            if (dictCV.wait_for(dictLocker, std::chrono::seconds(1)) ==
-                std::cv_status::timeout) {
-                return 0;
-            }
+            const auto status = dictCV.wait_for(dictLocker, std::chrono::seconds(1));
             context = responseContextDict.GetHandle(handleId);
-            if (context == nullptr) {
+            if (context == nullptr || context->generation != generation) {
                 return -1;
             }
+            if (status == std::cv_status::timeout) return 0;
         }
     }
 
@@ -4158,7 +4532,10 @@ namespace fastllm {
         if (context == nullptr) {
             return -1;
         } else {
+            const uint64_t generation = context->generation;
             while (true) {
+                context = responseContextDict.GetHandle(handleId);
+                if (context == nullptr || context->isAbort) return -1;
                 if (context->resultTokenQueue.size() > 0) {
                     int ret = context->resultTokenQueue.front();
                     context->resultTokenQueue.pop();
@@ -4172,13 +4549,13 @@ namespace fastllm {
                     if (context->isEnding) {
                         RemoveResponseContext(handleId);
                         dictLocker.unlock();
-                        dictCV.notify_one();
+                        dictCV.notify_all();
                         return -1;
                     }
                 }
-                dictLocker.unlock();
-                MySleep(0);
-                dictLocker.lock();
+                dictCV.wait_for(dictLocker, std::chrono::seconds(1));
+                context = responseContextDict.GetHandle(handleId);
+                if (!context || context->generation != generation) return -1;
             }
         }
     }
@@ -4366,16 +4743,22 @@ namespace fastllm {
 
     int basellm::GetBatchedPrefillTokenLimit() {
         if (SupportsPrefillBatching() && prefillBatchPolicy.targetTokens > 0)
-            return std::max(GetChunkedPrefillSize(), prefillBatchPolicy.targetTokens);
+            // KVMem can use smaller per-request chunks than the explicitly
+            // configured aggregate prefill budget. Keep the release target
+            // independent of that hard budget, as in ordinary chunked prefill.
+            return std::max({GetChunkedPrefillSize(), chunkedPrefillSize, prefillBatchPolicy.targetTokens});
         return this->GetChunkedPrefillSize();
     }
 
-    bool basellm::SetPrefillBatching(int targetTokens, int maxWaitMs) {
+    bool basellm::SetPrefillBatching(int targetTokens, int maxWaitMs, int targetRequests,
+                                    int maxRequests, int minDecodeRequests) {
         std::lock_guard<std::mutex> lock(mainLoopLocker);
-        if (mainLoop != nullptr || targetTokens < 0 || maxWaitMs < 0 ||
-            (maxWaitMs > 0 && targetTokens == 0) ||
+        if (mainLoop != nullptr || targetTokens < 0 || maxWaitMs < 0 || targetRequests < 0 ||
+            maxRequests < 0 || minDecodeRequests < 0 ||
+            ((maxWaitMs > 0 || targetRequests > 0 || maxRequests > 0 || minDecodeRequests > 0) && targetTokens == 0) ||
+            (maxRequests > 0 && targetRequests > maxRequests) ||
             (targetTokens > 0 && !SupportsPrefillBatching())) return false;
-        prefillBatchPolicy = {targetTokens, maxWaitMs};
+        prefillBatchPolicy = {targetTokens, maxWaitMs, targetRequests, maxRequests, minDecodeRequests};
         return true;
     }
 

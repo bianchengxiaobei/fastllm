@@ -56,6 +56,7 @@ using CustomArFlag = uint32_t;
 
 enum class CustomArEnableMode {
     Disabled,
+    Preferred,
     Auto,
     Forced,
 };
@@ -64,7 +65,7 @@ CustomArEnableMode CustomArModeFromEnv() {
     static const CustomArEnableMode mode = []() {
         const char *env = std::getenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE");
         if (env == nullptr || env[0] == '\0') {
-            return CustomArEnableMode::Auto;
+            return CustomArEnableMode::Preferred;
         }
         std::string value(env);
         std::transform(value.begin(), value.end(), value.begin(),
@@ -75,6 +76,9 @@ CustomArEnableMode CustomArModeFromEnv() {
         }
         if (value == "auto") {
             return CustomArEnableMode::Auto;
+        }
+        if (value == "prefer") {
+            return CustomArEnableMode::Preferred;
         }
         return CustomArEnableMode::Disabled;
     }();
@@ -145,9 +149,9 @@ void LogCustomArDisabledOnce() {
     std::call_once(once, []() {
         std::fprintf(stderr,
                      "[Fastllm] graph-safe custom all-reduce is disabled; "
-                     "unset FASTLLM_CUDA_CUSTOM_ALLREDUCE or set it to auto "
-                     "to benchmark the current 2/4/6/8-GPU path, or set it "
-                     "to 1 to force-enable.\n");
+                     "unset FASTLLM_CUDA_CUSTOM_ALLREDUCE or set it to prefer "
+                     "to use validated custom paths, set it to auto to "
+                     "benchmark against NCCL, or to 1 to force-enable.\n");
         std::fflush(stderr);
     });
 }
@@ -367,6 +371,24 @@ void FastllmCustomAllReduceAndGatherKernel(CustomArRankData *routedData,
         routedOutput[index] = sum;
         sharedOutput[index] = value;
     }
+}
+
+// Scalar uint64 maximum: exact integer ordering, including encoded argmax keys.
+template <int Ranks>
+__global__ void FastllmCustomScalarMaxUint64Kernel(CustomArRankData *data,
+        CustomArRankSignals signals, CustomArSignal *self, unsigned long long *output, int rank) {
+    const CustomArRankData pointers = *data;
+    CustomArBarrierStart<Ranks>(signals, self, rank);
+    unsigned long long value = threadIdx.x < Ranks ?
+        *(const unsigned long long*)pointers.ptrs[threadIdx.x] : 0;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        const unsigned long long other = __shfl_down_sync(0xffffffffu, value, offset);
+        value = value > other ? value : other;
+    }
+    CustomArBarrierFinal<Ranks>(signals, self, rank);
+    __syncthreads();
+    if (threadIdx.x == 0) *output = value;
 }
 
 template <typename T, int Ranks>
@@ -1855,50 +1877,18 @@ bool LaunchCustomArPairAdd(CustomArState &state,
     return true;
 }
 
-bool RunCustomArCandidate(void *data, void *dest, int count,
-                          int dataType, int deviceId,
-                          bool requireEnabledPath = false, int rowElements = 0,
-                          int hostSpinMicroseconds = 0) {
-    if (count <= 0 || rowElements < 0 || (rowElements && count % rowElements)) {
-        return false;
-    }
-    // The kernels access data/dest as 16-byte aligned packets; a misaligned or
-    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
-    // 13).  Whether *this* rank's pointers are usable is local information and
-    // must not be decided here: a rank that returned early would leave its
-    // peers waiting in the rendezvous (or in the device barrier) forever.
-    // Record the flag and let the collective rendezvous below drop every rank
-    // to NCCL together.
-    const bool localEligible = data != nullptr && dest != nullptr &&
-        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
-    size_t typeBytes = CustomArTypeBytes(dataType);
-    size_t bytes = (size_t)count * typeBytes;
-    if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
-        bytes % 16 != 0) {
-        return false;
-    }
-
-    CustomArState &state = GetCustomArState();
-    int rank = -1;
-    CustomArCallLease lease;
-    // Both custom kernels sum ranks 0..N-1 in FP32 and round once.
-    // Keep that arithmetic when a verification block crosses the automatic
-    // message-size threshold; otherwise switching to NCCL changes logits.
-    const size_t policyBytes = rowElements ? (size_t)rowElements * typeBytes : bytes;
-    if (policyBytes % 16 != 0) return false;
-    if (!lease.Acquire(state, policyBytes, dataType, deviceId,
-                       requireEnabledPath, rank)) {
-        return false;
-    }
-
-    CustomArRankData *rankData = nullptr;
-    if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, localEligible, rankData, hostSpinMicroseconds)) {
-        return false;
-    }
-    if (dataType == fastllm::DataType::BFLOAT16 && state.taggedPeer &&
-        state.taggedPeer->CanUse(count)) {
-        const bool launched = state.taggedPeer->Launch(data, dest, count, rank);
+// Registration/eligibility is complete before this function enqueues work.
+// Keep one-row and batched reductions on the same rank-ordered arithmetic.
+bool LaunchRegisteredCustomAr(CustomArState &state, CustomArRankData *rankData,
+                              void *data, void *dest, int count, int dataType,
+                              int deviceId, int rank, int rowElements) {
+    const size_t bytes = (size_t)count * CustomArTypeBytes(dataType);
+    const size_t policyBytes = rowElements
+        ? (size_t)rowElements * CustomArTypeBytes(dataType) : bytes;
+    if ((dataType == fastllm::DataType::BFLOAT16 || dataType == fastllm::DataType::FLOAT32) &&
+        state.taggedPeer && state.taggedPeer->CanUse(count)) {
+        const bool launched = state.taggedPeer->Launch(
+            data, dest, count, rank, dataType == fastllm::DataType::FLOAT32);
         if (cudaGetLastError() != cudaSuccess) {
             FastllmCudaSetThreadError();
             return false;
@@ -1958,6 +1948,51 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
         }
     }
     return true;
+}
+
+bool RunCustomArCandidate(void *data, void *dest, int count,
+                          int dataType, int deviceId,
+                          bool requireEnabledPath = false, int rowElements = 0,
+                          int hostSpinMicroseconds = 0) {
+    if (count <= 0 || rowElements < 0 || (rowElements && count % rowElements)) {
+        return false;
+    }
+    // The kernels access data/dest as 16-byte aligned packets; a misaligned or
+    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
+    // 13).  Whether *this* rank's pointers are usable is local information and
+    // must not be decided here: a rank that returned early would leave its
+    // peers waiting in the rendezvous (or in the device barrier) forever.
+    // Record the flag and let the collective rendezvous below drop every rank
+    // to NCCL together.
+    const bool localEligible = data != nullptr && dest != nullptr &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
+    size_t typeBytes = CustomArTypeBytes(dataType);
+    size_t bytes = (size_t)count * typeBytes;
+    if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
+        bytes % 16 != 0) {
+        return false;
+    }
+
+    CustomArState &state = GetCustomArState();
+    int rank = -1;
+    CustomArCallLease lease;
+    // Both custom kernels sum ranks 0..N-1 in FP32 and round once.
+    // Keep that arithmetic when a verification block crosses the automatic
+    // message-size threshold; otherwise switching to NCCL changes logits.
+    const size_t policyBytes = rowElements ? (size_t)rowElements * typeBytes : bytes;
+    if (policyBytes % 16 != 0) return false;
+    if (!lease.Acquire(state, policyBytes, dataType, deviceId,
+                       requireEnabledPath, rank)) {
+        return false;
+    }
+
+    CustomArRankData *rankData = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, data, count,
+                                        dataType, localEligible, rankData, hostSpinMicroseconds)) {
+        return false;
+    }
+    return LaunchRegisteredCustomAr(state, rankData, data, dest, count,
+                                    dataType, deviceId, rank, rowElements);
 }
 
 bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
@@ -2388,9 +2423,9 @@ bool CheckCustomArCorrectnessTyped(const CustomArState &state,
             float expectedRounded = CustomArHostToFloat<T>(
                 CustomArHostFromFloat<T>(expected[index]));
             float actual = CustomArHostToFloat<T>(host[index]);
-            if (std::fabs(actual - expectedRounded) > 0.001f) {
+            if (!std::isfinite(actual) || std::fabs(actual - expectedRounded) > 0.001f) {
                 std::fprintf(stderr,
-                             "[Fastllm] custom all-reduce auto-test "
+                             "[Fastllm] custom all-reduce self-test "
                              "mismatch on GPU %d at element %d: expected "
                              "%.6f, got %.6f.\n",
                              state.devices[rank], index,
@@ -2548,7 +2583,7 @@ bool BenchmarkCustomArPath(const CustomArState &state,
         customUs > 0.0f && ncclUs > 0.0f;
 }
 
-uint32_t AutoTuneCustomAr(CustomArState &state) {
+uint32_t SelectCustomArPaths(CustomArState &state, bool benchmarkPerformance) {
     struct ScopedNcclForceSync {
         bool previous = FastllmCudaGetNcclForceSync();
         ScopedNcclForceSync() {
@@ -2587,7 +2622,7 @@ uint32_t AutoTuneCustomAr(CustomArState &state) {
         CustomArBenchBuffers buffers;
         if (!AllocateCustomArBenchBuffers(state.devices, path.bytes, buffers)) {
             std::fprintf(stderr,
-                         "[Fastllm] custom all-reduce auto-test could not "
+                         "[Fastllm] custom all-reduce self-test could not "
                          "allocate the %s %s-message buffers; keeping NCCL "
                          "for that path.\n",
                          path.typeName, path.sizeName);
@@ -2597,17 +2632,26 @@ uint32_t AutoTuneCustomAr(CustomArState &state) {
             state, buffers, path.bytes, path.dataType);
         float customUs = 0.0f;
         float ncclUs = 0.0f;
-        bool benchmarkOk = correctnessOk && BenchmarkCustomArPath(
-            state, buffers, path.bytes, path.dataType,
-            useCudaGraph, customUs, ncclUs);
+        bool benchmarkOk = correctnessOk && (!benchmarkPerformance ||
+            BenchmarkCustomArPath(state, buffers, path.bytes, path.dataType,
+                                  useCudaGraph, customUs, ncclUs));
         FreeCustomArBenchBuffers(state.devices, buffers);
 
         if (!correctnessOk) {
             std::fprintf(stderr,
-                         "[Fastllm] custom all-reduce auto-test failed "
+                         "[Fastllm] custom all-reduce self-test failed "
                          "correctness for the %s %s-message path; using "
                          "NCCL.\n",
                          path.typeName, path.sizeName);
+            continue;
+        }
+        if (!benchmarkPerformance) {
+            enabledPaths |= path.bit;
+            std::fprintf(stderr,
+                         "[Fastllm] custom all-reduce self-test: %zu GPUs, "
+                         "%s %s %zu KiB: correctness passed -> custom preferred.\n",
+                         state.devices.size(), path.typeName, path.sizeName,
+                         (size_t)(path.bytes / 1024ULL));
             continue;
         }
         if (!benchmarkOk) {
@@ -2911,7 +2955,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
     }
     state.initialized = true;
     state.enabledPaths.store(kCustomArAllPaths, std::memory_order_release);
-    // Keep the public path disabled while auto mode exercises the private
+    // Keep the public path disabled while selection exercises the private
     // candidate. Concurrent callers safely retain NCCL until selection ends.
     state.runtimeEnabled.store(false, std::memory_order_release);
     const bool pushAvailable = state.pushAvailable;
@@ -2938,7 +2982,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         return valid && enabledPaths != 0;
     };
 
-    if (!autoMode) {
+    if (mode == CustomArEnableMode::Forced) {
         bool enabled = publishPolicy(kCustomArAllPaths);
         if (!enabled) {
             return false;
@@ -2953,23 +2997,24 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         return true;
     }
 
-    uint32_t enabledPaths = AutoTuneCustomAr(state);
+    uint32_t enabledPaths = SelectCustomArPaths(state, autoMode);
     bool enabled = publishPolicy(enabledPaths);
     if (!policyPublished) {
         return false;
     }
     if (enabledPaths == 0) {
         std::fprintf(stderr,
-                     "[Fastllm] custom all-reduce auto mode retained NCCL "
-                     "for every tested path.\n");
+                     "[Fastllm] custom all-reduce %s mode retained NCCL "
+                     "for every tested path.\n", autoMode ? "auto" : "prefer");
     } else {
         int selectedPathCount = 0;
         for (uint32_t bit = 1; bit <= kCustomArFloatLargePath; bit <<= 1) {
             selectedPathCount += (enabledPaths & bit) != 0 ? 1 : 0;
         }
         std::fprintf(stderr,
-                     "[Fastllm] custom all-reduce auto-enabled for %zu GPUs "
+                     "[Fastllm] custom all-reduce %s for %zu GPUs "
                      "(%d of 6 dtype/message paths).\n",
+                     autoMode ? "auto-selected" : "preferred",
                      devices.size(), selectedPathCount);
     }
     std::fflush(stderr);
@@ -2989,8 +3034,47 @@ bool FastllmCudaCustomAllReduceWithSpin(void *data, void *dest, int count,
 
 bool FastllmCudaCustomAllReduceRows(void *data, void *dest, int count,
                                     int rowElements, int dataType, int deviceId) {
-    if (rowElements <= 0) return false;
-    return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, rowElements);
+    if (count <= 0 || rowElements <= 0 || count % rowElements) return false;
+    const size_t typeBytes = CustomArTypeBytes(dataType);
+    const size_t bytes = (size_t)count * typeBytes;
+    if (bytes <= CustomArMaxBytes())
+        return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, rowElements);
+    const size_t rowBytes = (size_t)rowElements * typeBytes;
+    if (!typeBytes || rowBytes > CustomArMaxBytes() || rowBytes % 16) return false;
+    const int chunkElements = (CustomArMaxBytes() / rowBytes) * rowElements;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, rowBytes, dataType, deviceId, true, rank)) return false;
+    const bool eligible = data && dest &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
+    auto at = [typeBytes](void *pointer, int offset) -> void * {
+        return pointer ? (uint8_t *)pointer + (size_t)offset * typeBytes : nullptr;
+    };
+    // Register every chunk before launching any of them. A cold Graph tuple or
+    // one misaligned rank must reject the whole operation without modifying an
+    // in-place input that the caller may subsequently reduce through fallback.
+    std::vector<CustomArRankData *> pointers;
+    for (int offset = 0; offset < count;) {
+        const int size = std::min(chunkElements, count - offset);
+        CustomArRankData *registered = nullptr;
+        if (!FindOrRegisterCustomArPointers(state, rank, at(data, offset), size,
+                                            dataType, eligible, registered)) return false;
+        pointers.push_back(registered);
+        offset += size;
+    }
+    size_t chunk = 0;
+    for (int offset = 0; offset < count;) {
+        const int size = std::min(chunkElements, count - offset);
+        if (!LaunchRegisteredCustomAr(state, pointers[chunk++], at(data, offset),
+                at(dest, offset), size, dataType, deviceId, rank, rowElements)) {
+            // A CUDA launch error is not a recoverable eligibility miss: earlier
+            // chunks may already have written their reductions back in place.
+            throw std::runtime_error("chunked custom all-reduce launch failed");
+        }
+        offset += size;
+    }
+    return true;
 }
 
 bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
@@ -3111,7 +3195,7 @@ bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
             fastllm::FLOAT32, eligible, routedData) ||
         !FindOrRegisterCustomArPointers(state, rank, shared, count,
             fastllm::BFLOAT16, eligible, sharedData)) return false;
-    if (state.taggedPeer && state.taggedPeer->CanUse(count)) {
+    if (state.taggedPeer && state.taggedPeer->CanUseJoint(count)) {
         const bool launched = state.taggedPeer->LaunchJoint(routed, dest, shared, count, rank);
         if (cudaGetLastError() != cudaSuccess) {
             FastllmCudaSetThreadError();
@@ -3204,8 +3288,11 @@ bool FastllmCudaCustomAllGatherAddRMSNorm(void *data, void *residual,
         const float *weight, void *output, int count, int channels,
         float eps, int dataType, int deviceId) {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    // This path reads the owner shards directly and writes the residual;
+    // unlike AllReduce it does not use the bounded in-place scratch buffer.
+    // Its collective grid is capped below and loops over larger row batches.
     if (dataType != fastllm::BFLOAT16 || channels != 4096 || count <= 0 ||
-        count % channels || (size_t)count * 2 > CustomArMaxBytes() ||
+        count % channels ||
         !std::isfinite(eps) || eps <= 0) return false;
     CustomArState &state = GetCustomArState();
     CustomArCallLease lease;
@@ -3301,4 +3388,33 @@ bool FastllmCudaCustomAllReduceAdd(void *data, void *dest, int count,
                                    int dataType, int deviceId) {
     return RunCustomArAddCandidate(data, dest, count, dataType, deviceId,
                                    true);
+}
+
+bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId) {
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    // Reuse the small-message P2P eligibility; the integer kernel uses exactly
+    // the same system-scope barriers as the calibrated float path.
+    if (!lease.Acquire(state, sizeof(unsigned long long), fastllm::FLOAT32,
+                       deviceId, true, rank)) return false;
+    CustomArRankData *pointers = nullptr;
+    // A distinct rendezvous tag prevents pairing a mismatched SUM/MAX round.
+    constexpr int scalarMaxRegistration = -2;
+    const bool eligible = value && (((uintptr_t)value & 7u) == 0);
+    if (!FindOrRegisterCustomArPointers(state, rank, value, 1,
+            scalarMaxRegistration, eligible, pointers)) return false;
+#define CUSTOM_MAX_CASE(N) case N: FastllmCustomScalarMaxUint64Kernel<N> \
+        <<<1, 32, 0, cudaStreamPerThread>>>(pointers, state.allSignals, \
+            state.allSignals.signals[rank], (unsigned long long*)value, rank); break
+    switch (state.devices.size()) {
+        CUSTOM_MAX_CASE(2);
+        CUSTOM_MAX_CASE(4);
+        CUSTOM_MAX_CASE(6);
+        CUSTOM_MAX_CASE(8);
+        default: return false;
+    }
+#undef CUSTOM_MAX_CASE
+    if (cudaGetLastError() != cudaSuccess) { FastllmCudaSetThreadError(); return false; }
+    return true;
 }

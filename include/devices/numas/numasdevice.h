@@ -144,6 +144,11 @@ namespace fastllm {
     bool HostMoeCanonicalV41Decode(const float *input, float *output,
         Data **weights, int weightsBatch, const int32_t *indices,
         const float *scores, int topk, float swigluLimit);
+    // One routed expert per input row. Group repeated experts without copying
+    // their canonical weights or changing the disk backend's arithmetic.
+    bool HostMoeCanonicalV41Batch(const float *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const float *scores, float swigluLimit);
 
     // FP32 verifier subset, returning unweighted [row, route, hidden] values.
     // An expert must have the same CPU/GPU ownership in every input row.
@@ -161,6 +166,14 @@ namespace fastllm {
         Data **weights, int weightsBatch, const int32_t *indices,
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         const std::function<void()> &submitGpu, double *cpuElapsedUs);
+
+    // Native BF16 grouped experts: BF16 gate/up and activation, FP32 down
+    // accumulation, then score and BF16 rounding. Whole experts are assigned
+    // to one device for all rows; returns weighted per-route FP32 values.
+    void NumasMoeBF16Experts(const uint16_t *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        const std::function<void()> &submitGpu = {});
 
     // V4.1 verifier: keep all rows for a CPU expert in one grouped GEMM.
     // perRoute returns BF16-rounded FP32 expert outputs at [row, route, hidden];

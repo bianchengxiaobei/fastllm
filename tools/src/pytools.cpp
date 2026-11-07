@@ -3,10 +3,14 @@
 //
 
 #include "model.h"
+#include "models/mimo_tool_grammar.h"
 #include "models/naive_n05_flash.h"
+#include "models/clover.h"
+#include "parallel/model.h"
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
 #include "utils/autotune.h"
+#include "cpu_thread_bench.h"
 
 #include <cstring>
 #include <csignal>
@@ -58,6 +62,7 @@ struct FASTLLM_PYTOOLS_INIT {
 
 static thread_local std::string fastllmPytoolsWarmupError;
 static thread_local std::string fastllmPytoolsContextResult;
+static thread_local std::string fastllmPytoolsCloverError;
 
 extern "C" {
     DLL_EXPORT bool start_autotune_recording(const char *path) {
@@ -103,6 +108,53 @@ extern "C" {
 
     DLL_EXPORT int get_cpu_threads() {
         return fastllm::GetThreads();
+    }
+
+    DLL_EXPORT const char *benchmark_cpu_linear_threads(int hidden, int intermediate, int kind,
+            const int *counts, int count, int budgetMs) {
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 1 || intermediate < 1 ||
+                    budgetMs < 1 || budgetMs > 1000) return nullptr;
+            result = BenchmarkCpuLinearThreads(hidden, intermediate, kind, counts, count, budgetMs);
+            return result.c_str();
+        } catch (...) { return nullptr; }
+    }
+
+    DLL_EXPORT const char *benchmark_cpu_moe_threads(int hidden, int intermediate, int kind,
+            int rows, int topk, const int *counts, int count, int budgetMs) {
+#ifdef USE_NUMAS
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 256 || hidden > 8192 ||
+                    intermediate < 256 || intermediate > 4096 || rows < 1 || rows > 32 ||
+                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000) return nullptr;
+            for (int i = 0; i < count; ++i)
+                if (counts[i] < 1 || counts[i] > 128) return nullptr;
+            result = BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs);
+            return result.c_str();
+        } catch (...) { return nullptr; }
+#else
+        return nullptr;
+#endif
+    }
+
+    DLL_EXPORT const char *benchmark_cpu_standard_moe_threads(int hidden, int intermediate, int kind, int downKind,
+            int rows, int topk, const int *counts, int count, int budgetMs) {
+#ifdef USE_NUMAS
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 256 || hidden > 8192 ||
+                    intermediate < 256 || intermediate > 4096 || rows < 1 || rows > 32 ||
+                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000) return nullptr;
+            for (int i = 0; i < count; ++i)
+                if (counts[i] < 1 || counts[i] > 128) return nullptr;
+            result = BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs, true, downKind);
+            return result.c_str();
+        } catch (...) { return nullptr; }
+#else
+        return nullptr;
+#endif
     }
 
     DLL_EXPORT void set_cpu_low_mem(bool low) {
@@ -189,7 +241,13 @@ extern "C" {
             s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions,
             s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes,
             s.cpuWorkspaceBytes, s.cpuBufferReuses, s.cpuBufferAllocations,
-            s.cpuReclaims, s.asyncMaintenance};
+            s.cpuReclaims, s.asyncMaintenance,
+            s.cpuBufferMmaps, s.cpuBufferMunmaps, s.cpuBufferSplits, s.cpuBufferCoalesces,
+            s.canonicalPromotionChecks, s.canonicalPromotionRejects, s.canonicalResidenceRejects,
+            s.canonicalUploadBytes, s.canonicalUploadUs, s.canonicalDownloadUs,
+            s.decodeHandoffD2HCopies, s.decodeHandoffD2HBytes, s.decodeHandoffWaitUs,
+            s.decodeOutputH2DCopies, s.decodeOutputH2DBytes,
+            s.residentReadbackCopies, s.residentReadbackBytes, s.residentReadbackWaitUs};
         const int count = sizeof(result) / sizeof(result[0]);
         if (values && capacity > 0) std::copy_n(result, std::min(capacity, count), values);
         return count;
@@ -418,6 +476,20 @@ extern "C" {
         auto root = json11::Json::parse(payload, error);
         if (!error.empty() || root.is_null()) {
             return false;
+        }
+        const auto &structure = root["structural_tag"];
+        if (structure["format"].string_value() == "mimo_xml") {
+            auto names = read_string_array(structure["allowed_names"]);
+            auto parameters = read_string_array_map(structure["parameter_names_by_tool"]);
+            std::map<std::string, std::vector<std::string>> tools;
+            for (const auto &name : names) tools[name] = parameters[name];
+            try {
+                config.tool_call_grammar = std::make_shared<fastllm::MimoToolGrammar>(tools,
+                    structure["requires_tool_call"].bool_value(), structure["max_tool_calls"].int_value() == 1);
+            } catch (const std::exception &) { return false; }
+            config.tool_call_grammar_state = 0;
+            config.tool_call_token_mask.reset();
+            return true;
         }
         json11::Json contentSampling = root["content_sampling"];
         if (contentSampling.is_object() &&
@@ -834,6 +906,17 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT const char *configure_attention_parallel_llm_model(int modelId, int size) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            auto *adapter = dynamic_cast<fastllm::parallel::AttentionParallelModel*>(models.GetModel(modelId));
+            if (size < 1 || (!adapter && size != 1))
+                throw std::invalid_argument("model does not support the requested attention DP layout");
+            if (adapter) adapter->ConfigureAttentionParallel(size);
+        } catch (const std::exception &error) { fastllmPytoolsContextResult = error.what(); }
+        return fastllmPytoolsContextResult.c_str();
+    }
+
     DLL_EXPORT void set_model_indexer_dtype(int modelId, const char *dtype) {
         std::string value = dtype;
         fastllm::AssertInFastLLM(value == "auto" || value == "fp8" || value == "fp8_e4m3",
@@ -844,12 +927,12 @@ extern "C" {
 
     DLL_EXPORT void set_model_indexer_tp_storage(int modelId, const char *storage) {
         const std::string value = storage;
-        fastllm::AssertInFastLLM(value == "replicated" || value == "layer_shard",
-                                "indexer_tp_storage should be replicated or layer_shard.");
+        fastllm::AssertInFastLLM(value == "replicated" || value == "layer_shard" || value == "context_shard",
+                                "indexer_tp_storage should be replicated, layer_shard or context_shard.");
         auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
         fastllm::AssertInFastLLM(model || value == "replicated",
-                                "Indexer layer_shard storage currently supports Naive DSA models only.");
-        if (model) model->SetIndexerTPStorage(value == "layer_shard");
+                                "Sharded Indexer storage currently supports Naive DSA models only.");
+        if (model) model->SetIndexerTPStorage(value == "layer_shard", value == "context_shard");
     }
 
     DLL_EXPORT void set_model_kv_cache_dtype(int modelId, char *kv_cache_dtype) {
@@ -1035,6 +1118,51 @@ extern "C" {
         int ret = model->FetchResponseTokens(handleId);
         std::string s = (ret == -1 ? "<flmeos>" : model->weight.tokenizer.DecodeTokens(std::vector <int> {ret}));
         return string_to_chars(s);
+    }
+
+    DLL_EXPORT const char *get_clover_error() {
+        return fastllmPytoolsCloverError.c_str();
+    }
+
+    static thread_local std::string fastkvPDError;
+    DLL_EXPORT const char *get_pd_error() { return fastkvPDError.c_str(); }
+    DLL_EXPORT bool configure_pd_llm_model(int modelId, const char *options) {
+        try {
+            if (!options) throw std::invalid_argument("PD options required");
+            std::string error;
+            auto config = json11::Json::parse(options, error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            models.GetModel(modelId)->ConfigurePD(config);
+            fastkvPDError.clear();
+            return true;
+        } catch (const std::exception &e) { fastkvPDError = e.what(); return false; }
+    }
+
+    DLL_EXPORT bool configure_clover_llm_model(int modelId, const char *options) {
+        try {
+            auto *model = dynamic_cast<fastllm::CloverModel *>(models.GetModel(modelId));
+            if (!model || !options) throw std::invalid_argument("Clover model/options required");
+            std::string error;
+            auto config = json11::Json::parse(options, error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            model->ConfigureClover(config);
+            fastllmPytoolsCloverError.clear();
+            return true;
+        } catch (const std::exception &e) { fastllmPytoolsCloverError = e.what(); return false; }
+    }
+
+    DLL_EXPORT int launch_response_clover_llm_model(int modelId, int len, const int *values, const char *options) {
+        try {
+            auto *model = dynamic_cast<fastllm::CloverModel *>(models.GetModel(modelId));
+            if (!model || !options || !values || len <= 0)
+                throw std::invalid_argument("Clover model, nonempty prompt and options required");
+            std::string error;
+            auto config = json11::Json::parse(options, error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            int handle = model->LaunchClover(std::vector<int>(values, values + len), config);
+            fastllmPytoolsCloverError.clear();
+            return handle;
+        } catch (const std::exception &e) { fastllmPytoolsCloverError = e.what(); return -1; }
     }
 
     DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,
@@ -1368,6 +1496,12 @@ extern "C" {
     DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {
         auto model = models.GetModel(modelId);
         model->SetChunkedPrefillSize(size);
+    }
+
+    DLL_EXPORT bool set_prefill_coalescing_llm_model(int modelId, int tokens, int maxWaitMs,
+                                                   int targetRequests, int maxRequests, int minDecodeRequests) {
+        return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs, targetRequests,
+                                                          maxRequests, minDecodeRequests);
     }
 
     DLL_EXPORT bool set_prefill_batching_llm_model(int modelId, int tokens, int maxWaitMs) {

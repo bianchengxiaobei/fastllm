@@ -1790,6 +1790,7 @@ enum ggml_type {
         // GGML_TYPE_Q4_0_4_4 = 31, support has been removed from gguf files
         // GGML_TYPE_Q4_0_4_8 = 32,
         // GGML_TYPE_Q4_0_8_8 = 33,
+        GGML_TYPE_MXFP4   = 39,
         GGML_TYPE_TQ1_0   = 34,
         GGML_TYPE_TQ2_0   = 35,
         // GGML_TYPE_IQ4_NL_4_4 = 36,
@@ -2127,6 +2128,13 @@ template <int nrc_y>
 static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
 
 namespace fastllm {
+    // Ordinary row layouts with exact FP32 CUDA lookup decoders. Keep this
+    // predicate shared by import and dispatch so unsupported tables stay dense.
+    inline bool GGUFSupportsCudaEmbedding(ggml_type type) {
+        return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL ||
+               type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q3_K;
+    }
+
     const std::string GGUF_KEY_GENERAL_ALIGNMENT = "general.alignment";
     const int GGUF_DEFAULT_ALIGNMENT = 32;
 
@@ -2198,9 +2206,14 @@ namespace fastllm {
         }
     };
 
-    // Append validated vision weights and install parameters before InitParams.
-    void AppendDeepSeekV41GGUFVision(basellm *model, const json11::Json &target,
-                                    const std::string &path, std::vector<ReadGGUFTask> &tasks);
+    void LoadDeepSeekV41UpstreamGGUFConfig(basellm *model, const json11::Json &params);
+    void PrepareDeepSeekV41UpstreamGGUFTasks(basellm *model, const json11::Json &params,
+                                            std::vector<ReadGGUFTask> &tasks);
+
+    // Append validated auxiliary weights and install parameters before InitParams.
+    void AppendDeepSeekV41GGUFAux(basellm *model, const json11::Json &target,
+                                 const std::string &path, bool vision,
+                                 std::vector<ReadGGUFTask> &tasks);
 
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType = GGUFWeightReplaceRule::GGUFWeightReplaceType::GGUFWeightReplaceDirect);

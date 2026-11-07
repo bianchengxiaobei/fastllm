@@ -4,6 +4,7 @@
 #include "qwen4_exp_tp.h"
 #include "models/qwen4_paged_cache.h"
 #include "executor.h"
+#include "devices/disk/diskdevice.h"
 #include "utils.h"
 #ifdef USE_CUDA
 #ifndef USE_ROCM
@@ -276,6 +277,24 @@ namespace fastllm {
             }
         }
 #endif
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (runRoutedExperts && moeDevice == "disk" && batch * sequence == 1) {
+            selectExperts();
+            if (DiskMoeAsyncScope::TryRun(deviceLayer, flattened, expertIndex, expertScore, output,
+                    [&] { runSharedExpert(sharedOutput); })) {
+                finishHybrid();
+                return;
+            }
+            if (!FastllmCudaGraphIsCapturingFast()) {
+                DiskMergeMOE disk;
+                if (disk.RunGpuGGUFDecode(flattened, expertIndex, expertScore, output, moeWeights,
+                        [&] { runSharedExpert(sharedOutput); })) {
+                    finishHybrid();
+                    return;
+                }
+            }
+        }
+#endif
         runSharedExpert(runRoutedExperts ? sharedOutput : output);
 
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
@@ -351,7 +370,16 @@ namespace fastllm {
         Data &routedOutput = writeRoutedDirectly ? output : routed;
         Data w1, w2, w3, temporaryInput, temporaryOutput;
         if (!hybridMoe) {
-            MergeMOE(flattened, expertIndex, expertScore, moeWeights, moeBiass, w1, w2, w3,
+            // Disk dispatch changes routing tensors to CPU placement. Keep
+            // captured routing buffers resident and owned by the dense graph.
+            Data diskIndex, diskScore;
+            Data *routedIndex = &expertIndex, *routedScore = &expertScore;
+            if (prepared && moeDevice == "disk") {
+                diskIndex.CopyFrom(expertIndex);
+                diskScore.CopyFrom(expertScore);
+                routedIndex = &diskIndex; routedScore = &diskScore;
+            }
+            MergeMOE(flattened, *routedIndex, *routedScore, moeWeights, moeBiass, w1, w2, w3,
                      temporaryInput, temporaryOutput, 1.0f, routedOutput, deviceLayer);
         }
 #ifdef USE_CUDA
@@ -403,16 +431,33 @@ namespace fastllm {
     }
 
     void Qwen4ExpModel::PrepareHybridExperts(bool hasMtpWeights) {
-        if (MoeCudaCacheRequested()) {
-            HybridMoeCachePlan cache;
+        // DiskMergeMOE owns the GPU tier for whole disk layers, including
+        // models with CUDA-resident layers. Other placements keep their planner.
+        const bool diskCache = !DiskMoeLayerIndices(weights).empty();
+        if (MoeCudaCacheRequested() && !diskCache) {
+            HybridMoeCachePlan cache(HybridMoeMath::Qwen38FlashNext);
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            std::vector<CudaPrefillStage> stages;
+            const char *owned = std::getenv("FASTLLM_QWEN38_OWNED_PP");
+            hybridOwnedPp = owned && std::string(owned) == "1" &&
+                GetFastllmEnv().cudaGraph && !threadTpState && threadTpRank < 0 &&
+                BuildCudaPrefillStages(deviceMap, block_cnt, stages);
+            auto cacheOwner = [&](int layer) {
+                if (hybridOwnedPp) for (const auto &stage : stages)
+                    if (layer >= stage.firstLayer && layer < stage.endLayer) return stage.device;
+                return -1;
+            };
+#else
+            auto cacheOwner = [](int) { return -1; };
+#endif
             const bool includeDraft = hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
                 weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData;
             const int targetLayers = includeDraft ? block_cnt : static_cast<int>(weights.size());
             for (int layer = 0; layer < targetLayers; ++layer)
-                cache.Add(weights[layer], SelectMoeDeviceForLayer(layer));
+                cache.Add(weights[layer], SelectMoeDeviceForLayer(layer), cacheOwner(layer));
             if (includeDraft) {
                 cache.Add(mtpMoeWeights, SelectSpecialWeightDevice(
-                    "mtp.layers.0.mlp.experts.0.gateup_proj.weight", block_cnt - 1));
+                    "mtp.layers.0.mlp.experts.0.gateup_proj.weight", block_cnt - 1), cacheOwner(block_cnt - 1));
             }
             std::function<void()> registerNumaWeights;
 #ifdef USE_NUMAS
@@ -420,6 +465,9 @@ namespace fastllm {
 #endif
             const bool cachePrepared = cache.Prepare(registerNumaWeights);
             if (!cachePrepared) {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+                hybridOwnedPp = false;
+#endif
                 std::fprintf(stderr, "[Fastllm] Qwen4 CUDA expert cache unavailable; using the "
                                      "configured MoE device.\n");
             }
@@ -553,6 +601,31 @@ namespace fastllm {
             const std::vector<int> *hostInputTokens,
             bool materializeCausalMaskOnGraphFallback,
             const Data *precomputedEmbedding, PrefillStageContext *prefill) {
+        int asyncDevice = 0;
+        bool asyncDisk = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (batch == 1 && inputIds.dims == std::vector<int>({1, 1}) &&
+            !DiskMoeLayerIndices(weights).empty() &&
+            !prefill && !threadTpState && threadTpRank < 0 && Qwen4MtpDraftsPerStep() == 0 &&
+            std::getenv("FASTLLM_QWEN4_DUMP_DIR") == nullptr && Qwen4CudaOnlyDeviceMap(deviceMap)) {
+            std::map<int, int> ratios;
+            const auto devices = ParseDeviceIds(SelectDeviceFromMap(deviceMap, 1, block_cnt), "cuda", ratios);
+            asyncDisk = devices.size() == 1;
+            if (asyncDisk) asyncDevice = devices[0];
+            for (int l = 1; l < block_cnt && asyncDisk; ++l)
+                asyncDisk = SelectDeviceFromMap(deviceMap, l + 1, block_cnt) == SelectDeviceFromMap(deviceMap, 1, block_cnt);
+        }
+#endif
+        // Embedding may migrate inputIds to CUDA. Keep the original host token
+        // for PLE so ordinary decode does not copy it back from the device.
+        std::vector<int> inputTokens;
+        if (!hostInputTokens && UseFullHybridGraph() && allowDecodeCudaGraph &&
+            inputIds.dims.size() == 2 && inputIds.dims[0] == 1 && inputIds.dims[1] == 1 &&
+            inputIds.dataDevice == DataDevice::CPU && inputIds.dataType == FLOAT32 && inputIds.cpuData) {
+            inputTokens.push_back((int)(reinterpret_cast<const float *>(inputIds.cpuData)[0] + 0.01f));
+            hostInputTokens = &inputTokens;
+        }
+        DiskMoeAsyncScope diskAsync(weights, asyncDevice, asyncDisk, autoWarmupRunning.load());
         ForwardState frame(*this, ExecutionMode::Hybrid, batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig,
             lastTokens, retLogits, targetMultiHidden, allVerificationTokens, verificationAccepted,
             verificationCapture, recordPrefixSnapshot, allowDecodeCudaGraph, decodeEquivalentGdn,
@@ -568,6 +641,8 @@ namespace fastllm {
             frame.PrefetchExperts(layer + 1);
             frame.EndLayer(layer);
         }
-        return frame.Finish();
+        auto result = frame.Finish();
+        diskAsync.Finish();
+        return result;
     }
 } // namespace fastllm

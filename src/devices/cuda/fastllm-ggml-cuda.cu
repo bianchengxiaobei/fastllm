@@ -1,3 +1,4 @@
+#include "utils/qwen38_hybrid.h"
 #include "fastllm-cuda-gguf-projections.h"
 #include "fastllm-cuda-gguf-planar.h"
 #include "fastllm-cuda-gguf-linear-add.h"
@@ -14,6 +15,9 @@
 #include <set>
 #include <cstdlib>
 #include <string>
+#include <map>
+#include <memory>
+#include <mutex>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
@@ -28,8 +32,8 @@
 
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
 
-template <typename T, bool Permuted = false>
-static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded, int keyHeads = 0, int groups = 0, int headDim = 0) {
+template <typename T, bool Permuted = false, bool Grouped = false>
+static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded, int keyHeads = 0, int groups = 0, int headDim = 0, int groupRows = 1) {
     const int64_t ix0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (ix0 >= kx0_padded) {
@@ -50,7 +54,10 @@ static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict
         const int head = ix0 / headDim;
         source = ((head % keyHeads) * groups + head / keyHeads) * headDim + ix0 % headDim;
     }
-    const float xi = ix0 < kx ? (float)x[ix1*kx + source] : 0.0f;
+    // Grouped WoA reads token-major input and writes group-major Q8 rows.
+    // This removes the separate activation transpose before batched GEMV.
+    const int64_t sourceRow = Grouped ? (ix1 % groupRows)*groups + ix1/groupRows : ix1;
+    const float xi = ix0 < kx ? (float)x[sourceRow*kx + source] : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -87,7 +94,7 @@ bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weigh
         int groups, int rows, fastllm::Data &output) {
     using namespace fastllm;
     if (input.dims.size() != 4 || input.dims[0] <= 0 || input.dims[1] <= 0 ||
-        int64_t(input.dims[0]) * input.dims[1] > MMVQ_MAX_BATCH_SIZE ||
+        int64_t(input.dims[0])*input.dims[1] > MMVQ_MAX_BATCH_SIZE ||
         groups <= 0 || rows <= 0 || input.dims[2] % groups ||
         weight.dataType != DATA_GGUF_FORMAT || weight.ggmlType != GGML_TYPE_Q5_K ||
         !input.cudaData || !weight.cudaData ||
@@ -100,18 +107,19 @@ bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weigh
     if (columns == 2560 && rows >= 2048) return false;
     const int padded = (columns + 511) / 512 * 512;
     auto *q8 = static_cast<block_q8_1 *>(FastllmCudaMalloc(
-        size_t(tokens) * groups * padded / QK8_1 * sizeof(block_q8_1)));
+        size_t(groups) * tokens * padded / QK8_1 * sizeof(block_q8_1)));
     output.dataType = input.dataType; output.UpdateUnitSize();
     output.Resize({input.dims[0], input.dims[1], groups * rows});
     output.dataDevice = CUDA; output.dataDeviceIds = input.dataDeviceIds;
     output.Allocate(false);
     const auto stream = cudaStreamPerThread;
-    if (input.dataType == FLOAT32)
-        quantize_row_q8_1_cuda(static_cast<const float *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
-    else if (input.dataType == FLOAT16)
-        quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
-    else
-        quantize_row_q8_1_cuda(static_cast<const __nv_bfloat16 *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
+    const dim3 blocks((padded+CUDA_QUANTIZE_BLOCK_SIZE-1)/CUDA_QUANTIZE_BLOCK_SIZE, groups*tokens);
+#define GROUP_QUANT(T) quantize_q8_1<T, false, true><<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>( \
+    static_cast<const T *>(input.cudaData), q8, columns, padded, 0, groups, 0, tokens)
+    if (input.dataType == FLOAT32) { GROUP_QUANT(float); }
+    else if (input.dataType == FLOAT16) { GROUP_QUANT(half); }
+    else { GROUP_QUANT(__nv_bfloat16); }
+#undef GROUP_QUANT
     FastllmGgufQ5KGroupedGemv(weight.cudaData, q8, output.cudaData, input.dataType,
         groups, columns, rows, padded, tokens, stream);
     checkCudaErrors("GGUF grouped WoA", cudaGetLastError());
@@ -233,23 +241,106 @@ void ggml_cuda_op_mul_mat_vec_q(
 }
 */
 
+namespace {
+// Eager dequantization and its GEMM consume the same buffer in stream order.
+// Returning each shape to the event-aware general pool can leave many pending
+// buffers behind a long prefill. Keep one bounded arena per device instead.
+// Captures retain their existing private allocations: replay bypasses this
+// host lease, so sharing an arena with a captured node would be unsafe.
+struct GgufPrefillArena {
+    std::mutex mutex;
+    int device = -1;
+    void *data = nullptr;
+    cudaEvent_t ready = nullptr;
+    bool recorded = false;
+    ~GgufPrefillArena() {
+        if (!data) return;
+        int previous = -1;
+        cudaGetDevice(&previous);
+        cudaSetDevice(device);
+        if (recorded) cudaEventSynchronize(ready);
+        cudaFree(data);
+        if (ready) cudaEventDestroy(ready);
+        if (previous >= 0) cudaSetDevice(previous);
+    }
+};
+
+struct GgufPrefillArenaLease {
+    GgufPrefillArena &arena;
+    std::unique_lock<std::mutex> lock;
+    bool active = false;
+    explicit GgufPrefillArenaLease(GgufPrefillArena &arena)
+        : arena(arena), lock(arena.mutex) {}
+    ~GgufPrefillArenaLease() {
+        if (!active) return;
+        checkCudaErrors("GGUF prefill arena completion",
+            cudaEventRecord(arena.ready, cudaStreamPerThread));
+        arena.recorded = true;
+    }
+};
+
+static std::unique_ptr<GgufPrefillArenaLease> AcquireGgufPrefillArena(size_t bytes) {
+    const char *enabled = std::getenv("FASTLLM_QWEN38_PREFILL_ARENA");
+    if (!enabled || std::strcmp(enabled, "1") || bytes != size_t(64) * 1024 * 1024)
+        return nullptr;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return nullptr;
+    int device = -1;
+    checkCudaErrors("GGUF prefill arena device", cudaGetDevice(&device));
+    static std::mutex registryMutex;
+    static std::map<int, std::unique_ptr<GgufPrefillArena>> registry;
+    GgufPrefillArena *arena;
+    {
+        std::lock_guard<std::mutex> guard(registryMutex);
+        auto &entry = registry[device];
+        if (!entry) entry = std::make_unique<GgufPrefillArena>();
+        arena = entry.get();
+    }
+    auto lease = std::make_unique<GgufPrefillArenaLease>(*arena);
+    if (!arena->data) {
+        const auto status = cudaMalloc(&arena->data, bytes);
+        if (status == cudaErrorMemoryAllocation) {
+            cudaGetLastError();
+            return nullptr;  // The existing pool may still have reusable space.
+        }
+        checkCudaErrors("GGUF prefill arena allocation", status);
+        arena->device = device;
+        checkCudaErrors("GGUF prefill arena event",
+            cudaEventCreateWithFlags(&arena->ready, cudaEventDisableTiming));
+    }
+    if (arena->recorded) checkCudaErrors("GGUF prefill arena handoff",
+        cudaStreamWaitEvent(cudaStreamPerThread, arena->ready, 0));
+    lease->active = true;
+    return lease;
+}
+} // namespace
+
 // Reuse an existing arena or borrow the required bytes from the pool,
 // preserving the original 256 MiB chunk policy and workspace override.
 struct FastllmGGUFDequantWorkspace {
     void *data = nullptr;
     size_t bytes = 0;
     bool owned = false;
+    std::unique_ptr<GgufPrefillArenaLease> prefillLease;
 
     FastllmGGUFDequantWorkspace(const fastllm::Data &weight,
             const char *context, int m, int k,
-            size_t elementBytes, size_t extraElementBytes = 0) {
-        data = FastllmCudaTryGetFlashInferFloatWorkspace(&bytes);
+            size_t elementBytes, size_t extraElementBytes = 0,
+            size_t limitBytes = 0) {
+        prefillLease = AcquireGgufPrefillArena(limitBytes);
+        if (prefillLease) {
+            data = prefillLease->arena.data;
+            bytes = limitBytes;
+        } else {
+            data = FastllmCudaTryGetFlashInferFloatWorkspace(&bytes);
+        }
         if (data == nullptr && std::getenv("FT_FLOAT_WORKSPACE_SIZE") != nullptr) {
             data = FastllmCudaGetFlashInferFloatWorkspace(&bytes);
         }
         if (data == nullptr) {
             const int rows = FastllmGGUFCalcChunkRows(
-                size_t(256) * 1024 * 1024, m, k,
+                limitBytes ? limitBytes : size_t(256) * 1024 * 1024, m, k,
                 elementBytes, extraElementBytes,
                 FastllmGGUFDequantRowGroup(static_cast<ggml_type>(weight.ggmlType)),
                 weight, context);
@@ -258,6 +349,7 @@ struct FastllmGGUFDequantWorkspace {
             data = FastllmCudaMalloc(bytes);
             owned = true;
         }
+        if (limitBytes) bytes = std::min(bytes, limitBytes);
         if (data == nullptr || bytes == 0) {
             fastllm::ErrorInFastLLM(
                 "Fastllm GGUF CUDA " + std::string(context) +
@@ -618,6 +710,15 @@ bool FastllmCudaGGUFLinearAddPermuted(const fastllm::Data &input,
     return FastllmGGUFLinearAddImpl(input, weight, bias, output, keyHeads, valueHeads, headDim);
 }
 
+static bool FastllmGGUFPrefillDequant(int rows) {
+    const char *flag = std::getenv("FASTLLM_QWEN38_PREFILL_DEQUANT");
+#ifdef USE_ROCM
+    return false;
+#else
+    return fastllm::qwen38ForwardActive && rows >= 128 && flag && std::strcmp(flag, "1") == 0;
+#endif
+}
+
 bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if ((ggml_type)weight.ggmlType == GGML_TYPE_BF16) {
         return FastllmCudaHalfMatMulBFloat16(
@@ -651,9 +752,10 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     ggml_backend_cuda_context ctx;
 
     const ggml_type ggufType = (ggml_type)weight.ggmlType;
+    const bool prefillDequant = FastllmGGUFPrefillDequant(n) && ggml_get_to_fp16_cuda(ggufType);
     const bool allowSmallMmvq = weight.forceGGUFFp32Dequant &&
         FastllmGGUFSmallMmvqShape(ggufType, n, m, k);
-    const bool forceDequant = n != 1 && weight.forceGGUFFp32Dequant &&
+    const bool forceDequant = n != 1 && (weight.forceGGUFFp32Dequant || prefillDequant) &&
         !(allowSmallMmvq && get_has_vec_dot_q_cuda(ggufType));
     auto dequant = ggml_get_to_fp16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda(ggufType);
@@ -677,11 +779,13 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     if (!usedDirectGemv && !usedMmq && !usedPlanar && !usedExtendedMmvq &&
         (forceDequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
         dequant != nullptr) {
-        auto handle = getFastllmCublasHandle();
-        FastllmGGUFDequantWorkspace scratch(weight, "FP16 GEMM", m, k, sizeof(half));
+        auto handle = prefillDequant ? getFastllmCublasFp32ReductionHandle() : getFastllmCublasHandle();
+        if (!handle) throw std::runtime_error("GGUF prefill requires a warmed FP32-reduction cuBLAS handle");
+        FastllmGGUFDequantWorkspace scratch(weight, "FP16 GEMM", m, k, sizeof(half), 0,
+            prefillDequant ? size_t(64) * 1024 * 1024 : 0);
         FastllmGGUFDequantGemm(
                 cudaInput, weight, cudaOutput, n, m, k,
-                scratch.data, scratch.bytes, dequant, handle, stream);
+                scratch.data, scratch.bytes, dequant, handle, stream, prefillDequant);
     } else if (!usedDirectGemv && !usedMmq && !usedPlanar && !usedExtendedMmvq) {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (

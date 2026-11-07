@@ -5,6 +5,27 @@ import {
 } from "../../assets/app.js";
 
 let profileRenderSignature = "";
+let gpuInventoryPromise;
+function renderGpuChoices() {
+  gpuInventoryPromise ||= request("/api/hardware").catch(() => ({gpus: []}));
+  gpuInventoryPromise.then(report => {
+    const root = document.getElementById("gpu-choices");
+    const input = elements.launchForm.querySelector('[data-field="visible_gpus"]');
+    const selected = input.value.split(",").map(value => value.trim());
+    root.replaceChildren(...(report.gpus || []).map(gpu => {
+      const label = document.createElement("label"), checkbox = document.createElement("input");
+      checkbox.type = "checkbox"; checkbox.value = String(gpu.index);
+      checkbox.checked = selected.includes(checkbox.value) || selected.includes(gpu.uuid);
+      checkbox.onchange = () => {
+        input.value = [...root.querySelectorAll("input:checked")].map(node => node.value).join(",");
+        input.dispatchEvent(new Event("change", {bubbles: true}));
+      };
+      const text = document.createElement("span");
+      text.textContent = `GPU ${gpu.index} · ${gpu.name}`;
+      label.append(checkbox, text); return label;
+    }));
+  });
+}
 let folderPickerTarget = null, folderPickerDirectoriesOnly = false, folderPickerFileExtension = "";
 const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   device: "auto",
@@ -36,7 +57,8 @@ const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   mtp: "auto",
   draft_tokens: "auto"
 });
-const AUTOMATIC_CONFIGURATION_FIELDS = new Set(Object.keys(AUTOMATIC_CONFIGURATION_DEFAULTS));
+const EXTERNAL_DRAFT_FIELDS = new Set(["use_external_draft", "speculative_algorithm", "speculative_draft_model_path", "mtp", "draft_tokens", "draft_threshold"]);
+const AUTOMATIC_CONFIGURATION_FIELDS = new Set([...Object.keys(AUTOMATIC_CONFIGURATION_DEFAULTS), ...EXTERNAL_DRAFT_FIELDS]);
 function resetProfileSearch() {
   state.profileQuery = "";
   elements.profileSearch.value = "";
@@ -58,7 +80,14 @@ function fillForm(config) {
       .map((field) => `--${field} ${JSON.stringify(config[field])}`);
     config = { ...config, extra_args: [...limits, config.extra_args].filter(Boolean).join(" ") };
   }
+  config = {...config, use_external_draft: config?.use_external_draft ??
+    (config?.config_mode !== "auto" && Boolean(config?.speculative_draft_model_path))};
+  if (config.use_external_draft) {
+    config = {...config, mtp: "auto", draft_tokens:
+      Number(config.draft_tokens) > 0 ? config.draft_tokens : Number(config.mtp) > 0 ? config.mtp : "auto"};
+  }
   state.speculativeCountField = initialSpeculativeTokenField(config || {});
+  if (config.use_external_draft) document.getElementById("editor-speculative").open = true;
   for (const input of elements.launchForm.querySelectorAll("[data-field]")) {
     const value = config?.[input.dataset.field];
     if (input.type === "checkbox") {
@@ -73,6 +102,7 @@ function fillForm(config) {
   state.dirty = false;
   renderSaveState();
   updateConditionalFields();
+  renderGpuChoices();
 }
 
 function collectForm() {
@@ -87,7 +117,7 @@ function collectForm() {
 }
 
 function isSimpleNewProfile() {
-  return state.currentIndex === null && collectForm().config_mode !== "custom";
+  return (collectForm().backend || "llm") === "llm" && state.currentIndex === null && collectForm().config_mode !== "custom";
 }
 
 function renderProfilePresentation() {
@@ -113,6 +143,10 @@ function renderProfilePresentation() {
     ? t("Choose a model and configuration mode, then save or start your service.")
     : t("Edit all settings, or click Automatic configuration to choose a mode.");
   elements.configurationModeDescription.textContent = configurationModeDescription(mode);
+  const video = config.backend === "minimax_h3";
+  elements.launchForm.classList.toggle("video-profile", video);
+  document.getElementById("video-backend-fields").classList.toggle("hidden", !video);
+  if (video) elements.profileEditorDescription.textContent = t("Start a video API alongside your chat models. Pika is detected automatically.");
 }
 
 function configurationModeDescription(mode) {
@@ -181,15 +215,37 @@ function handleConfigurationModeChange() {
 function handleFormChange(event) {
   if (!event.target.matches("[data-field]")) return;
   const changedField = event.target.dataset.field;
+  if (changedField === "visible_gpus") renderGpuChoices();
+  if (changedField === "backend") {
+    cancelPendingAutomaticConfiguration();
+    state.automaticConfigStatus = {phase: "idle"};
+    elements.launchForm.querySelector('[data-field="command"]').value = "server";
+  }
+  if (changedField === "use_external_draft") {
+    const enabled = event.target.checked;
+    const algorithm = elements.launchForm.querySelector('[data-field="speculative_algorithm"]');
+    if (!enabled || algorithm.value === "off") algorithm.value = "auto";
+    elements.launchForm.querySelector('[data-field="mtp"]').value = "auto";
+    if (!enabled) {
+      elements.launchForm.querySelector('[data-field="speculative_draft_model_path"]').value = "";
+      elements.launchForm.querySelector('[data-field="draft_tokens"]').value = "auto";
+      elements.launchForm.querySelector('[data-field="draft_threshold"]').value = "";
+    }
+    state.speculativeCountField = "draft_tokens";
+  }
   if (changedField === "speculative_algorithm" && event.target.value === "off") {
     for (const [field, value] of Object.entries({ mtp: "0", draft_tokens: "auto", speculative_draft_model_path: "" })) {
       elements.launchForm.querySelector(`[data-field="${field}"]`).value = value;
     }
     elements.launchForm.querySelector('[data-field="enable_speculative_decoding"]').checked = false;
+    elements.launchForm.querySelector('[data-field="use_external_draft"]').checked = false;
+    elements.launchForm.querySelector('[data-field="draft_threshold"]').value = "";
   } else if (changedField === "speculative_algorithm" && event.target.value !== state.editingConfig?.speculative_algorithm) {
     const mtp = elements.launchForm.querySelector('[data-field="mtp"]');
     const draft = elements.launchForm.querySelector('[data-field="draft_tokens"]');
-    if (event.target.value === "mtp") {
+    if (collectForm().use_external_draft) {
+      mtp.value = "auto";
+    } else if (event.target.value === "mtp") {
       const count = Number(draft.value) > 0 ? draft.value : mtp.value;
       mtp.value = Number(count) >= 1 && Number(count) <= 8 ? count
         : collectForm().speculative_draft_model_path ? "auto" : "3";
@@ -206,7 +262,7 @@ function handleFormChange(event) {
   if (changedField === "speculative_algorithm") {
     state.speculativeCountField = initialSpeculativeTokenField(collectForm());
   }
-  if (changedField === "speculative_draft_model_path" && !event.target.value.trim()
+  if (changedField === "speculative_draft_model_path" && !collectForm().use_external_draft && !event.target.value.trim()
       && collectForm().speculative_algorithm === "mtp" && state.speculativeCountField === "draft_tokens") {
     elements.launchForm.querySelector('[data-field="mtp"]').value = collectForm().draft_tokens;
     elements.launchForm.querySelector('[data-field="draft_tokens"]').value = "auto";
@@ -256,15 +312,23 @@ function updateConditionalFields() {
     document.getElementById(id).classList.toggle("hidden", isWebui);
   }
   const speculativeOff = config.speculative_algorithm === "off";
+  const externalDraft = Boolean(config.use_external_draft);
+  const automaticDraftOff = config.config_mode === "auto" && !externalDraft;
+  document.getElementById("editor-speculative").classList.toggle("hidden", isWebui || config.backend !== "llm");
+  document.getElementById("speculative-options").classList.toggle("hidden", automaticDraftOff);
+  const thresholdEnabled = !speculativeOff && !automaticDraftOff && ["", "auto", "dspark"].includes(config.speculative_algorithm);
+  document.getElementById("speculative-threshold-field").classList.toggle("hidden", !thresholdEnabled);
+  elements.launchForm.querySelector('[data-field="draft_threshold"]').disabled = !thresholdEnabled;
   const mtpCount = speculativeTokenField() === "mtp";
   elements.speculativeMtpField.classList.toggle("hidden", speculativeOff || !mtpCount);
   elements.speculativeDraftTokensField.classList.toggle("hidden", speculativeOff || mtpCount);
-  elements.speculativePathField.classList.toggle("hidden", speculativeOff);
+  elements.speculativePathField.classList.toggle("hidden", speculativeOff || !externalDraft);
   for (const field of ["mtp", "draft_tokens", "speculative_draft_model_path"]) {
     elements.launchForm.querySelector(`[data-field="${field}"]`).disabled = speculativeOff
+      || (field === "speculative_draft_model_path" && !externalDraft)
       || (field === "mtp" && !mtpCount) || (field === "draft_tokens" && mtpCount);
   }
-  elements.chooseDraftModelFolder.disabled = speculativeOff;
+  elements.chooseDraftModelFolder.disabled = speculativeOff || !externalDraft;
   const speculativeHints = {
     off: t("Speculative decoding is off. No draft model will be loaded."),
     mtp: t("Built-in MTP needs 1–8 draft tokens. For external MTP, choose a checkpoint file or folder; auto uses its default."),
@@ -272,7 +336,9 @@ function updateConditionalFields() {
     dspark: t("Choose a DSpark model folder, or set the token count for built-in DSpark. MTP is disabled."),
     auto: t("Detect the algorithm from the draft model or existing MTP settings. Without either, speculative decoding stays off.")
   };
-  elements.speculativeModeHint.textContent = speculativeHints[config.speculative_algorithm] || speculativeHints.auto;
+  elements.speculativeModeHint.textContent = automaticDraftOff
+    ? t("Enable an external draft to configure its file, token count and threshold.")
+    : speculativeHints[config.speculative_algorithm] || speculativeHints.auto;
   elements.cudaDeviceField.classList.toggle("hidden", config.device !== "cuda");
   elements.tpDeviceField.classList.toggle("hidden", config.device !== "tp");
   elements.cudappDeviceField.classList.toggle("hidden", config.device !== "cudapp");
@@ -297,6 +363,7 @@ function updateConditionalFields() {
 }
 
 function initialSpeculativeTokenField(config) {
+  if (config.use_external_draft) return "draft_tokens";
   if (config.speculative_algorithm === "mtp") {
     const externalCount = config.speculative_draft_model_path && !(Number(config.mtp) > 0) && Number(config.draft_tokens) > 0;
     return externalCount ? "draft_tokens" : "mtp";
@@ -335,6 +402,7 @@ function prepareAutomaticConfigurationForNewProfile() {
 }
 
 function scheduleAutomaticConfiguration(delay = 650) {
+  if (collectForm().backend !== "llm") return;
   if (collectForm().config_mode === "auto") return;
   window.clearTimeout(state.automaticConfigTimer);
   state.automaticConfigRequestId += 1;
@@ -388,6 +456,7 @@ async function configureProfileAutomatically({ automatic = false, selection = nu
     const recommendation = await request("/api/recommend", {
       method: "POST",
       body: JSON.stringify({
+        visible_gpus: current.visible_gpus,
         model, name: current.name || current.model_name || "", config_mode: requested.config_mode,
         enable_speculative_decoding: requested.enable_speculative_decoding
       })
@@ -407,7 +476,8 @@ async function configureProfileAutomatically({ automatic = false, selection = nu
     }
     const recommendedFields = {};
     for (const [field, value] of Object.entries(recommendation.config)) {
-      if (AUTOMATIC_CONFIGURATION_FIELDS.has(field)) recommendedFields[field] = value;
+      if (AUTOMATIC_CONFIGURATION_FIELDS.has(field)
+          && !(current.use_external_draft && EXTERNAL_DRAFT_FIELDS.has(field))) recommendedFields[field] = value;
     }
     state.editingConfig = {
       ...collectForm(), ...selection, ...recommendedFields,
@@ -664,7 +734,8 @@ function renderProfiles() {
     ]),
     active,
     runningIndex,
-    state.runtime?.phase || "stopped"
+    state.runtime?.phase || "stopped",
+    state.runtime?.services?.map(service => [service.sessionId, service.phase])
   ]);
   if (signature === profileRenderSignature) {
     updateProfileRuntime();
@@ -706,7 +777,10 @@ function renderProfiles() {
   profiles.forEach(({ profile, index }) => {
     const item = document.createElement("article");
     item.className = "profile-item";
-    const running = index === runningIndex;
+    const service = (state.runtime?.services || [state.runtime]).find(service => runtimeIsActive(service)
+      && service.model === profile.model && service.endpoint?.endsWith(`:${profile.port}`)
+      && (service.backend || "llm") === (profile.backend || "llm"));
+    const running = Boolean(service);
     item.classList.toggle("running", running);
 
     const avatar = document.createElement("span");
@@ -735,7 +809,7 @@ function renderProfiles() {
     const actions = document.createElement("div");
     actions.className = "project-actions";
     const start = profileActionButton("start", index, t("Start"), "start");
-    start.disabled = active;
+    start.disabled = running;
     if (running) {
       const phaseLabels = {
         starting: t("Starting"),
@@ -743,12 +817,24 @@ function renderProfiles() {
         stopping: t("Stopping")
       };
       const status = document.createElement("span");
-      status.className = `profile-live-status ${state.runtime?.phase || "running"}`;
-      status.textContent = phaseLabels[state.runtime?.phase] || t("Running");
+      status.className = `profile-live-status ${service.phase || "running"}`;
+      status.textContent = phaseLabels[service.phase] || t("Running");
       titleRow.append(status);
-      start.textContent = phaseLabels[state.runtime?.phase] || t("Running");
+      start.textContent = phaseLabels[service.phase] || t("Running");
     }
-    if (active && !running) start.title = t("Stop the running service before starting another item.");
+    if (running) {
+      for (const [action, label] of [["select", t("Manage")], ["stop", t("Stop")]]) {
+        const button = document.createElement("button");
+        button.type = "button"; button.className = "project-action"; button.textContent = label;
+        button.addEventListener("click", async () => {
+          try {
+            state.runtime = await request(`/api/services/${service.sessionId}/${action}`, {method: "POST"});
+            renderRuntime();
+          } catch (error) { showToast(friendlyError(error), "error"); }
+        });
+        actions.append(button);
+      }
+    }
     actions.append(
       start,
       profileActionButton("edit", index, t("Edit"), "edit"),
@@ -756,7 +842,7 @@ function renderProfiles() {
     );
     item.append(avatar, copy, actions);
 
-    if (running) item.append(renderProfileRuntime());
+    if (running && service.sessionId === state.runtime?.sessionId) item.append(renderProfileRuntime());
     elements.profileList.append(item);
   });
 }
@@ -772,6 +858,8 @@ function profileActionButton(action, index, label, variant = "") {
 }
 
 function profileDeviceLabel(profile) {
+  if (profile.visible_gpus) return `GPU ${profile.visible_gpus}`;
+  if (profile.backend === "minimax_h3") return t("Video generation");
   if (profile.config_mode === "auto") return t("Automatic configuration");
   const devices = {
     auto: t("Auto device"),
@@ -902,6 +990,9 @@ function showProfileEditor() {
   document.body.classList.add("modal-open");
   elements.launchForm.scrollTop = 0;
   elements.automaticResourceLimits.open = false;
+  const config = collectForm();
+  document.getElementById("editor-speculative").open = Boolean(config.use_external_draft)
+    || (config.config_mode !== "auto" && (Number(config.mtp) > 0 || ["mtp", "dspark", "dflash"].includes(config.speculative_algorithm)));
   elements.automaticTuning.open = false;
   document.getElementById("vision-module").open = false;
   elements.launchForm.querySelector("#editor-advanced").open = !isSimpleNewProfile();

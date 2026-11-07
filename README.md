@@ -32,6 +32,22 @@ AMD GPU 见 [ROCm 安装](docs/rocm.md)；CPU-only 和其他平台见[源码安�
 
 ### 浏览器启动
 
+单机多副本可使用独立的 `ftllm deploy` 组件，复用原生服务参数，提供后台进程管理和
+流式请求路由；现有 `ftllm serve/server` 用法不变。配置与命令见 [多副本部署](docs/deploy.md)。
+
+~~~bash
+# API Server，默认监听 0.0.0.0:8080
+ftllm server Qwen/Qwen3-0.6B
+
+# 命令行对话
+ftllm run Qwen/Qwen3-0.6B
+
+# WebUI，连接上面的 API Server，默认监听 127.0.0.1:1616
+ftllm webui --api_base http://127.0.0.1:8080/v1
+~~~
+
+浏览器部署启动器可直接运行：
+
 ```sh
 ftllm
 ```
@@ -81,9 +97,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 指南](docs/qwen3.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) |
 | DeepSeek-V4.1-Flash 1017 | [DeepSeek-V4.1 指南](docs/deepseek_v41.md) |
+| Clover-35B-A3B-Preview | [Clover 单卡指南](docs/clover.md) |
 | Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) |
 | GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) |
 | Dots3-Note / Laguna | [Dots3-Note](docs/dots3_note.md) · [Laguna](docs/laguna.md) |
+| HY-Nomas | [世界模型与 HTTP Demo 部署](docs/hy_nomas.md) |
+| LingBot World 2.0 1.3B | [原生推理、世界会话与 HTTP Demo](docs/lingbot_world.md) |
+| MiniMax-H3（T2VA） | [原生音视频生成与 HTTP Demo](tools/minimax_h3/README.md) |
 
 其他模型见[支持列表](docs/models.md)。让 Agent 帮忙部署时，可先提供[模型与参数速查](docs/model-deployment-agent.md)。实测速度与硬件、请求和量化格式有关，见 [Benchmark](docs/benchmark.md)。
 

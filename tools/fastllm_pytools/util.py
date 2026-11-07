@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import subprocess
 import glob
@@ -162,11 +163,11 @@ def _is_nvidia_cuda_platform() -> bool:
             if device_class.startswith("0x03") and vendor == "0x10de":
                 has_nvidia_display_controller = True
         if accelerator_vendors:
-            # Server boards commonly expose an ASPEED or Matrox BMC as a VGA
-            # controller alongside the compute GPUs.  They are display-only
-            # management devices and must not make an NVIDIA host look mixed.
-            bmc_display_vendors = {"0x1a03", "0x102b"}
-            compute_vendors = accelerator_vendors - bmc_display_vendors
+            # Server boards and VMs may expose ASPEED, Matrox or Cirrus VGA
+            # alongside the compute GPUs. These display-only adapters must
+            # not make an NVIDIA host look mixed.
+            display_only_vendors = {"0x1a03", "0x102b", "0x1013"}
+            compute_vendors = accelerator_vendors - display_only_vendors
             return (has_nvidia_display_controller and
                     compute_vendors == {"0x10de"})
     except Exception:
@@ -573,6 +574,8 @@ def apply_image_embedding_cache_env(args):
 
 def apply_vision_device_env(args):
     device = getattr(args, "vision_device", None)
+    if device is not None:
+        os.environ["FASTLLM_QWEN4_VISION_DEVICE"] = _vision_device(device)
     if device is None:
         device = os.environ.get("FASTLLM_QWEN35_VISION_DEVICE", "auto")
     os.environ["FASTLLM_QWEN35_VISION_DEVICE"] = _vision_device(device)
@@ -857,6 +860,54 @@ def _configure_sm89_fp8_linear_triton(args) -> str:
     )
     return detected
 
+def _configure_sm120_mxfp4_grouped_triton(args, config) -> str:
+    """Select the measured single-GPU DSpark backend without enabling other ops."""
+    auto_env_name = "FASTLLM_CUDA_TRITON_MXFP4_GROUPED_AUTO"
+    # This flag belongs to model selection, not to the user's environment.
+    # Re-evaluate it when a process loads a subsequent model.
+    os.environ.pop(auto_env_name, None)
+    if (not getattr(args, "auto", False) or
+            not 1 <= getattr(args, "dspark", 0) <= 7 or
+            getattr(args, "max_batch", 0) != 1 or
+            _uses_thread_tp(getattr(args, "tp", "")) or
+            getattr(args, "moe_cuda_cache", 0) <= 0 or
+            str(getattr(args, "moe_device", "")).lower() not in ("cpu", "numa") or
+            str(getattr(args, "path", "")).lower().endswith(".gguf")):
+        return ""
+    if ("FASTLLM_CUDA_TRITON" in os.environ or
+            "FASTLLM_CUDA_TRITON_MXFP4_GROUPED" in os.environ):
+        return ""
+    text = config.get("text_config", config)
+    quant = config.get("quantization_config", {})
+    if not isinstance(text, dict) or not isinstance(quant, dict):
+        return ""
+    if (config.get("model_type") != "deepseek_v41" or
+            text.get("hidden_size") != 5120 or
+            text.get("moe_intermediate_size") != 2304 or
+            text.get("num_experts_per_tok") != 6 or
+            text.get("dspark_num_experts_per_tok") != 3 or
+            text.get("swiglu_limit") != 10.0 or
+            quant.get("expert_dtype") != "fp4" or
+            quant.get("scale_fmt") != "ue8m0" or
+            quant.get("weight_block_size") != [32, 32]):
+        return ""
+    device = str(getattr(args, "device", "")).strip().lower()
+    if not re.fullmatch(r"cuda:\d+", device) or not _is_nvidia_cuda_platform():
+        return ""
+    device_id = int(device.split(":", 1)[1])
+    if _nvidia_cuda_compute_capabilities([device_id]).get(device_id) != 120:
+        return ""
+    detected = _find_triton_python()
+    if not detected:
+        print("[Fastllm] SM120 MXFP4 grouped MoE: Triton is unavailable; "
+              "built-in CUDA will be used.", flush=True)
+        return ""
+    os.environ["FASTLLM_CUDA_TRITON_PYTHON"] = detected
+    os.environ[auto_env_name] = "1"
+    print("[Fastllm] SM120 MXFP4 grouped MoE enabled automatically for DSpark "
+          "with the current Python environment: %s" % detected, flush=True)
+    return detected
+
 def _is_naive_n05_family(config) -> bool:
     if config.get("model_type") == "naive_n05_flash":
         return True
@@ -962,9 +1013,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
-    parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard'], default='replicated',
-                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；默认各卡复制')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
+    parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
+                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 按上下文分片并合并全局 TopK，支持纯显存 KV 和 KVMem；默认各卡复制')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA、DeepSeek-V4.1，或 Naive TP KVMem 的 DSA KV；Naive SWA/Indexer 保持 FP8）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
                         help='启用稀疏/主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"prefix_tokens":4096,"retrieval_norm_power":1.0}。prefix_tokens 常驻保留序列开头的 token（chat template 的 system 段），默认 0 表示按 chat template 逐请求自动推导。retrieval_norm_power 取值 [0,1]，0 为原始点积、1 为余弦相似度，默认 0。默认关闭（--auto 可按预算启用 Qwen4 精确换页）；单请求，Qwen3/3.5 单卡稀疏检索或按 KV head 切分的张量并行，Qwen4/QSA 混合推理按 resident_tokens 限制每层显存 KV，保留原生注意力选择；MiMo/Naive CUDA TP 支持多请求精确 DSA KV 缓存与共享分页前缀，需先设置 --max_batch')
@@ -982,9 +1033,15 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = 'prefill阶段把主机上的路由专家搬上卡用GPU算：1开/0关；默认-1按配置自动'
                                '（专家在cpu内存里就开）')
     parser.add_argument('--prefill_batch_tokens', type=int, default=0,
-                        help='prefill 攒批的未缓存 token 目标，0关闭；当前仅支持 Naive 普通 TP GPU 推理；批量总预算至少为 chunked_prefill_size')
+                        help='prefill 攒批的未缓存 token 目标，0关闭；支持 Naive TP GPU 推理及 DSpark；批量总预算至少为 chunked_prefill_size')
     parser.add_argument('--prefill_max_wait_ms', type=int, default=0,
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
+    parser.add_argument('--prefill_batch_requests', type=int, default=0,
+                        help='prefill 攒批请求数目标；与 token 目标任一达到即放行，0不设请求数目标')
+    parser.add_argument('--prefill_max_requests', type=int, default=0,
+                        help='单批 prefill 请求数上限，0仅受模型剩余请求槽位限制')
+    parser.add_argument('--prefill_min_decode_requests', type=int, default=0,
+                        help='只有活跃 decode 请求数达到此值才等待攒批；空闲时始终立即放行')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
                              help='开启DeepSeek-V4.1快速 prefill；该模型的--auto默认开启，可用--no_fast_prefill关闭')
@@ -993,10 +1050,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
-                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N；默认auto，CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
+                        help = 'Qwen3.5/Qwen4 视觉编码器设备: auto/cpu/cuda/cuda:N；Qwen3.5 CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
+    parser.add_argument('--attn-dp-size', type=int, default=1,
+                        help='Attention DP组数；组内TP宽度为--tp总卡数/此值，当前支持DeepSeek V4.1纯GPU路径')
     parser.add_argument('--ep', type = int, choices = (1, 4, 8), default = None,
                         help = '专家并行数；1为原MoE TP路径（默认），4/8为MiMo FP8/H20的专家并行，使用内置MegaMoE W8A8；需配合相同大小的--tp')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
@@ -1007,7 +1066,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = 'moe_cuda_cache', type = _memory_size_or_auto,
                         default = 0,
                         help = '混合推理时每卡MoE专家缓存上限，如3g；auto预留上下文和工作区后分配；0关闭')
-    cache_policy = parser.add_argument_group('GGUF/NVFP4/FP8混合decode缓存更新（加载模型前设置）')
+    cache_policy = parser.add_argument_group('GGUF/NVFP4/FP8/BF16混合decode缓存更新（加载模型前设置）')
     for name, kind, default, help_text in (
         ('half_life', _moe_cache_float, 128., 'decode热度半衰期，单位解码步（可验证多个推测token）；0不衰减，默认128'),
         ('update_interval', _moe_cache_interval, 1, '每多少个decode步更新一次，默认1'),
@@ -1068,25 +1127,27 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         type = int, choices = [0, 1], default = None,
                         help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
     parser.add_argument("--dspark", type = int, default = 0,
-                        help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
+                        help = "启用 DSpark 并指定每轮候选数；外置草稿配合 --draft 使用，保留 checkpoint 的训练 block size")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
-                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash")
+                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、clover")
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
                         "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
                         help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可指定 mtp.safetensors 或 Qwen4 MTP GGUF")
     parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
-                        help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
+                        help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置；外置 DSpark 仍计算完整训练 block，只截取候选前缀")
+    parser.add_argument("--draft_gpu_resident", "--draft-gpu-resident", type=int, choices=(0, 1), default=None,
+                        help="DeepSeek-V4.1 DSpark 草稿专家显存策略：1 要求全驻留，0 关闭全驻留优先；未指定保持现有策略。支持单卡/PP/TP，需 MXFP4 草稿；--auto 会检查预算，显存不足时报错")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
                         dest = "speculative_num_draft_tokens", type = int, default = -1,
-                        help = "DFlash 每轮 block token 数（含 anchor），默认读取 draft config")
+                        help = "DFlash/Clover 每轮 block token 数（含 anchor）")
     parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
                         dest = "speculative_dspark_block_size", type = int, default = -1,
-                        help = "DSpark block size；默认读取 draft config")
+                        help = "外置 DSpark 的训练 block size 校验值；必须与 draft config 一致，候选数使用 --draft_tokens")
     parser.add_argument("--speculative_dspark_confidence_threshold", "--speculative-dspark-confidence-threshold",
                         dest = "speculative_dspark_confidence_threshold", type = float, default = 0.5,
-                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示固定验证完整 block")
+                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示不按置信度提前截短候选")
     parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
@@ -1102,6 +1163,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     return parser
 
 def add_server_args(parser):
+    parser.add_argument("--pd", default="", help="Fast KV Manager PD configuration as a JSON object")
     parser.add_argument("--model_name", type = str, default = '', help = "部署的模型名称, 调用api时会进行名称核验")
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
@@ -1173,6 +1235,14 @@ def make_normal_llm_model(args, startup_progress = None):
     if getattr(args, "autotune", False):
         args.auto = True
 
+    draft_gpu_resident = getattr(args, "draft_gpu_resident", None)
+    if draft_gpu_resident not in (None, 0, 1):
+        raise ValueError("--draft-gpu-resident must be 0 or 1")
+    # This is model configuration, not a sticky process-wide opt-in.
+    os.environ.pop("FASTLLM_DSPARK_GPU_RESIDENT", None)
+    if draft_gpu_resident is not None:
+        os.environ["FASTLLM_DSPARK_GPU_RESIDENT"] = str(int(draft_gpu_resident))
+
     if getattr(args, "auto", False):
         args._auto_explicit = [name for name in getattr(args, "_auto_explicit", ())
                                if name not in ("device", "moe_device") or getattr(args, name, None)]
@@ -1180,9 +1250,15 @@ def make_normal_llm_model(args, startup_progress = None):
     user_set_device = bool(args.device and args.device != "")
     prefill_batch_tokens = getattr(args, 'prefill_batch_tokens', 0)
     prefill_max_wait_ms = getattr(args, 'prefill_max_wait_ms', 0)
-    if not all(isinstance(value, int) and 0 <= value <= 2147483647
-               for value in (prefill_batch_tokens, prefill_max_wait_ms)) or (prefill_max_wait_ms > 0 and prefill_batch_tokens == 0):
-        raise ValueError("--prefill_batch_tokens and --prefill_max_wait_ms require non-negative int32 values; waiting requires a positive token target")
+    prefill_batch_requests = getattr(args, 'prefill_batch_requests', 0)
+    prefill_max_requests = getattr(args, 'prefill_max_requests', 0)
+    prefill_min_decode_requests = getattr(args, 'prefill_min_decode_requests', 0)
+    prefill_values = (prefill_batch_tokens, prefill_max_wait_ms, prefill_batch_requests,
+                      prefill_max_requests, prefill_min_decode_requests)
+    if (not all(isinstance(value, int) and 0 <= value <= 2147483647 for value in prefill_values)
+            or (prefill_batch_tokens == 0 and any(prefill_values[1:]))
+            or (prefill_max_requests > 0 and prefill_batch_requests > prefill_max_requests)):
+        raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and batch_requests <= max_requests when capped")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
     # Resolve this after loading a saved JSON configuration. An explicit zero
     # must remain an opt-out, including when another model previously used slabs.
@@ -1215,6 +1291,7 @@ def make_normal_llm_model(args, startup_progress = None):
     draft_text_config = {}
     draft_has_mtp_weights = False
     draft_is_mtp_gguf = False
+    draft_is_dspark_gguf = False
     if speculative_draft_path:
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
@@ -1222,6 +1299,15 @@ def make_normal_llm_model(args, startup_progress = None):
         draft_is_mtp_gguf = draft_is_file and speculative_draft_path.lower().endswith(".gguf")
         if draft_is_mtp_gguf:
             metadata = read_gguf_metadata(speculative_draft_path, {"general.architecture"})
+            draft_is_dspark_gguf = metadata.get("general.architecture") == "dflash"
+            if draft_is_dspark_gguf:
+                from .deepseek_v41_gguf import dspark_config
+                draft_config = dspark_config(speculative_draft_path)
+                if speculative_algorithm and speculative_algorithm != "dspark":
+                    raise ValueError("DeepSeek DSpark GGUF requires the dspark algorithm")
+                speculative_algorithm = "dspark"
+                draft_is_mtp_gguf = False
+        if draft_is_mtp_gguf:
             if metadata.get("general.architecture") != "qwen4exp-mtp":
                 raise ValueError("external MTP GGUF must have qwen4exp-mtp architecture")
             names = read_gguf_tensor_names(speculative_draft_path)
@@ -1231,7 +1317,7 @@ def make_normal_llm_model(args, startup_progress = None):
             draft_text_config = {"model_type": "qwen4_exp", "mtp_num_hidden_layers": 1}
             if speculative_algorithm and speculative_algorithm != "mtp":
                 raise ValueError("Qwen4 MTP GGUF requires the mtp speculative algorithm")
-        else:
+        elif not draft_is_dspark_gguf:
             draft_config_dir = (os.path.dirname(speculative_draft_path)
                                 if draft_is_file else speculative_draft_path)
             draft_config_path = os.path.join(draft_config_dir, "config.json")
@@ -1281,9 +1367,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 "--draft_tokens and --dspark specify different token counts")
         dspark_tokens = draft_tokens
         args.dspark = dspark_tokens
-    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash"):
+    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash", "clover"):
         raise ValueError(
-            "--speculative_algorithm currently supports off, mtp, dspark or dflash")
+            "--speculative_algorithm currently supports off, mtp, dspark, dflash or clover")
+    if speculative_algorithm == "clover" and (mtp or dspark_tokens or speculative_draft_path or draft_tokens > 0):
+        raise ValueError("Clover shares the target model; use --speculative_num_draft_tokens for its block width")
     if speculative_algorithm == "dspark" and mtp > 0:
         raise ValueError("MTP and DSpark cannot be enabled together")
     if (speculative_algorithm == "dspark" and not speculative_draft_path and
@@ -1370,6 +1458,13 @@ def make_normal_llm_model(args, startup_progress = None):
         args.mtp = mtp
         args.speculative_draft_model_path = speculative_draft_path
         args.speculative_algorithm = "mtp"
+    elif draft_is_dspark_gguf:
+        if draft_tokens > 0 and dspark_tokens > 0 and draft_tokens != dspark_tokens:
+            raise ValueError("--draft_tokens and --dspark specify different token counts")
+        dspark_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or draft_config["dspark_block_size"]
+        args.dspark = dspark_tokens
+        args.speculative_draft_model_path = speculative_draft_path
+        _configure_embedded_dspark(args)
     elif speculative_draft_path:
         if not os.path.isdir(speculative_draft_path):
             raise ValueError(
@@ -1382,22 +1477,26 @@ def make_normal_llm_model(args, startup_progress = None):
         configured_block = int(draft_config.get("block_size", 0))
         requested_block = int(
             getattr(args, "speculative_dspark_block_size", -1))
-        if dspark_tokens > 0:
-            requested_block = dspark_tokens
         if requested_block > 0 and requested_block != configured_block:
             raise ValueError(
                 "FastLLM currently requires the DSpark runtime block size "
                 "to match the checkpoint (requested=%d, checkpoint=%d)" %
                 (requested_block, configured_block))
+        if draft_tokens > 0 and dspark_tokens > 0 and draft_tokens != dspark_tokens:
+            raise ValueError("--draft_tokens and --dspark specify different token counts")
+        # Candidate count is independent of the noncausal draft backbone block.
+        # Preserve the checkpoint block even when verifying only its prefix.
+        draft_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or -1
         if (draft_tokens > 0 and
                 not 1 <= draft_tokens <= configured_block):
             raise ValueError(
-                "DSpark --draft_tokens must be in [1, checkpoint block_size] "
+                "DSpark --draft_tokens/--dspark must be in [1, checkpoint block_size] "
                 "(requested=%d, checkpoint block_size=%d)" %
                 (draft_tokens, configured_block))
         os.environ["FASTLLM_DSPARK_MODEL_PATH"] = speculative_draft_path
         if draft_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
+            args.draft_tokens = draft_tokens
         confidence_threshold = float(getattr(
             args, "speculative_dspark_confidence_threshold", 0.5))
         if not 0.0 <= confidence_threshold <= 1.0:
@@ -1447,9 +1546,12 @@ def make_normal_llm_model(args, startup_progress = None):
     if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
         config_path = os.path.join(args.ori, "config.json")
     gguf_config = None
-    if (not os.path.exists(config_path) and os.path.isfile(args.path) and
-            args.path.lower().endswith(".gguf")):
-        gguf_config = get_gguf_model_config(args.path)
+    if os.path.isfile(args.path) and args.path.lower().endswith(".gguf"):
+        # --ori may describe HF DSpark weights that are absent from the GGUF.
+        # V4.1 startup defaults must follow the actual backbone metadata.
+        if (not os.path.exists(config_path) or
+                read_gguf_metadata(args.path, {"general.architecture"}).get("general.architecture") == "deepseek41"):
+            gguf_config = get_gguf_model_config(args.path)
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
@@ -1462,6 +1564,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_glm5_next_model = False
     is_deepseek_v4_model = False
     is_dots3_note_model = False
+    is_clover_model = False
     if (os.path.exists(config_path) or gguf_config is not None):
         try:
             if gguf_config is None:
@@ -1469,12 +1572,15 @@ def make_normal_llm_model(args, startup_progress = None):
                     config = json.load(file)
             else:
                 config = gguf_config
+            if draft_is_dspark_gguf:
+                config.update(dspark_config(speculative_draft_path, config))
             if getattr(args, "mmproj", "") and config.get("gguf_architecture") == "deepseek41":
                 from .deepseek_v41_gguf import vision_config
                 config.update(vision_config(args.mmproj, config))
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
+            is_clover_model = model_type == "clover_moe"
             is_naive_n05_model = _is_naive_n05_family(config)
             if is_naive_n05_model:
                 is_thread_tp_moe_model = True
@@ -1536,7 +1642,7 @@ def make_normal_llm_model(args, startup_progress = None):
                     speculative_algorithm = args.speculative_algorithm
                     _configure_embedded_dspark(args)
             if speculative_algorithm == "dspark":
-                if speculative_draft_path:
+                if speculative_draft_path and not draft_is_dspark_gguf:
                     if (architecture != "KimiK3ForConditionalGeneration" and
                             model_type != "kimi_k3" and not is_naive_n05_model):
                         raise ValueError(
@@ -1726,6 +1832,13 @@ def make_normal_llm_model(args, startup_progress = None):
             if speculative_algorithm:
                 raise
             pass
+    if is_clover_model:
+        from .clover_config import prepare as prepare_clover
+        prepare_clover(args, config)
+    elif speculative_algorithm == "clover":
+        raise ValueError("--speculative_algorithm clover requires a Clover checkpoint")
+    if draft_gpu_resident == 1 and (not is_deepseek_v41_model or args.dspark <= 0):
+        raise ValueError("--draft-gpu-resident 1 requires DeepSeek-V4.1 with DSpark enabled")
     automatic_plan = None
     if getattr(args, "autotune", False):
         from ftllm import llm
@@ -1763,6 +1876,10 @@ def make_normal_llm_model(args, startup_progress = None):
             args.device = target_spec
             if (not user_set_moe_device):
                 args.moe_device = target_spec
+        elif is_clover_model:
+            args.device = cuda_spec
+            if not user_set_moe_device:
+                args.moe_device = cuda_spec
         elif is_laguna_hybrid_tp_model:
             multicuda_spec = "multicuda:" + cuda_spec.split(":", 1)[1]
             if (not user_set_device):
@@ -1812,12 +1929,12 @@ def make_normal_llm_model(args, startup_progress = None):
         # expert tensors.
         args.cuda_slab = 225
     elif (is_qwen38_flash_next_model and cuda_slab_auto and
-            gguf_config is not None and _uses_cuda_device(args.device) and
+            _uses_cuda_device(args.device) and
             args.moe_device_layers < 0 and
             str(args.moe_device).strip().lower() in ("cpu", "numa", "disk")):
         # Host-offloaded experts have their own cache arena. Pack the persistent
-        # dense GPU weights instead: their many 6.25 MiB and smaller allocations
-        # otherwise waste hundreds of MiB at the CUDA allocation granularity.
+        # dense GPU weights and native BF16 draft experts instead: their many
+        # small allocations otherwise waste CUDA allocation pages.
         # A 64 MiB slab retains 256-byte alignment and the existing compute paths.
         args.cuda_slab = 64
     if (is_glm5_next_model and gguf_config is not None and cuda_slab_auto and
@@ -1827,6 +1944,8 @@ def make_normal_llm_model(args, startup_progress = None):
         # Pack them into the existing weight slabs instead of paying CUDA's
         # allocation granularity for each shard. Explicit --cuda_slab wins.
         args.cuda_slab = 64
+    if is_qwen38_flash_next_model and hybrid_auto_plan is not None:
+        hybrid_auto_plan["cuda_slab"] = args.cuda_slab
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
@@ -1893,13 +2012,13 @@ def make_normal_llm_model(args, startup_progress = None):
 
     tp_arg = getattr(args, "tp", "")
     indexer_storage = getattr(args, "indexer_tp_storage", "replicated")
-    if indexer_storage not in ("replicated", "layer_shard"):
-        raise ValueError("indexer_tp_storage must be replicated or layer_shard")
-    if indexer_storage == "layer_shard":
+    if indexer_storage not in ("replicated", "layer_shard", "context_shard"):
+        raise ValueError("indexer_tp_storage must be replicated, layer_shard or context_shard")
+    if indexer_storage in ("layer_shard", "context_shard"):
         if not is_naive_n05_model:
-            raise ValueError("Indexer layer_shard storage currently supports Naive DSA models only")
+            raise ValueError(f"Indexer {indexer_storage} storage currently supports Naive DSA models only")
         if _thread_tp_cuda_device_count(tp_arg or os.environ.get("FASTLLM_TP", "")) < 2:
-            raise ValueError("Indexer layer_shard storage requires --tp with at least two CUDA devices")
+            raise ValueError(f"Indexer {indexer_storage} storage requires --tp with at least two CUDA devices")
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
@@ -1930,6 +2049,19 @@ def make_normal_llm_model(args, startup_progress = None):
         # placements, after TP fallback. Keep auto intact for subsequent models.
         os.environ.setdefault("FASTLLM_EXECUTION_MODE", "auto")
     _configure_sm89_fp8_linear_triton(args)
+    _configure_sm120_mxfp4_grouped_triton(
+        args, config if is_deepseek_v41_model else {})
+    attention_dp = getattr(args, "attn_dp_size", 1)
+    if attention_dp < 1:
+        raise ValueError("--attn-dp-size must be positive")
+    if attention_dp > 1:
+        if not is_deepseek_v41_model:
+            raise ValueError("Attention DP currently requires the DeepSeek V4.1 adapter")
+        world = _thread_tp_cuda_device_count(getattr(args, "tp", ""))
+        if world < attention_dp or world % attention_dp:
+            raise ValueError("--attn-dp-size must divide the total --tp device count")
+        if speculative_algorithm not in ("", "none", "dspark"):
+            raise ValueError("Attention DP currently supports DSpark or ordinary decoding")
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
@@ -1940,6 +2072,14 @@ def make_normal_llm_model(args, startup_progress = None):
         llm.set_cuda_graph(graph_enabled)
     llm.set_moe_device_layers(-1)
     cache_bytes = _memory_size_bytes(getattr(args, "moe_cuda_cache", 0))
+    if draft_gpu_resident == 1:
+        from .hybrid_auto import devices as draft_devices, draft_cache_device
+        draft_cache_device(*draft_devices(args))  # Validate topology before loading weights.
+        if "disk" in str(args.moe_device):
+            raise ValueError("--draft-gpu-resident 1 requires CPU/NUMA or GPU-resident experts; disk expert caches are not supported")
+        if (args.moe_device_layers != 0 and cache_bytes <= 0 and
+                any(kind in str(args.moe_device) for kind in ("cpu", "numa", "disk"))):
+            raise ValueError("--draft-gpu-resident 1 requires a GPU expert cache; use --auto or --moe_cuda_cache")
     if hybrid_auto_plan and "moe_cuda_cache_per_device" in hybrid_auto_plan:
         llm.set_moe_cuda_cache(cache_bytes, hybrid_auto_plan["moe_cuda_cache_per_device"])
     else:
@@ -2079,7 +2219,7 @@ def make_normal_llm_model(args, startup_progress = None):
                             chat_template = args.chat_template,
                             tool_call_parser = args.tool_call_parser,
                             external_mtp_path = (speculative_draft_path
-                                if speculative_algorithm == "mtp" else ""),
+                                if speculative_algorithm == "mtp" or draft_is_dspark_gguf else ""),
                             mmproj_path = args.mmproj,
                             max_context_length = -1 if legacy_context_limit else max_context_length,
                             rope_scaling = rope_scaling,
@@ -2087,10 +2227,16 @@ def make_normal_llm_model(args, startup_progress = None):
                             indexer_tp_storage = indexer_storage)
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
+        if is_clover_model:
+            model.configure_clover(
+                mode="self_speculative" if args.speculative_algorithm == "clover" else "low_confidence",
+                block_size=(args.speculative_num_draft_tokens if args.speculative_num_draft_tokens > 0 else 32))
         llm.report_model_load_progress("weights_finalize", 0, 1)
         if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
             model.enable_thinking = False
         model.set_atype(args.atype)
+        if attention_dp > 1:
+            model.configure_attention_parallel(attention_dp)
         if (args.moe_atype != ""):
             model.set_moe_atype(args.moe_atype)
         if (args.cache_history.lower() not in ["", "false", "0", "off"]):
@@ -2136,7 +2282,13 @@ def make_normal_llm_model(args, startup_progress = None):
             if hasattr(llm, "set_prefill_moe_gpu"):
                 llm.set_prefill_moe_gpu(args.prefill_moe_gpu)
         if prefill_batch_tokens > 0:
-            model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
+            if any(prefill_values[2:]):
+                model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms,
+                                          target_requests=prefill_batch_requests,
+                                          max_requests=prefill_max_requests,
+                                          min_decode_requests=prefill_min_decode_requests)
+            else:
+                model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()
@@ -2151,6 +2303,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 "to %d or less, reduce --mtp, or use GPUs with more memory."
                 % (args.max_batch, effective_max_batch, effective_max_batch)
             )
+        if getattr(args, "pd", ""):
+            model.configure_pd(**json.loads(args.pd))
         return model
     except Exception:
         if model is not None:

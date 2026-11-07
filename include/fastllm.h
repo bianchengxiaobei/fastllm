@@ -32,6 +32,7 @@
 namespace fastllm {
     struct RopeConfig;
     class Data;
+    class CudaWorkspace;
 
     class FastllmEnv {
     public:
@@ -184,6 +185,8 @@ namespace fastllm {
         bool operator!=(const alignedAllocator<U, Alignment>&) const { return false; }
     };
 
+    class MimoToolGrammar;
+
     struct GenerationConfig {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
         int output_token_least = 0; // 最低输出的多少
@@ -201,6 +204,16 @@ namespace fastllm {
         bool enable_hash_id = false; // 给会话添加hash id
         bool add_special_tokens = true; // prompt添加special tokens（chatglm模型生效）
         std::multiset <int> stop_token_ids;
+        std::shared_ptr<MimoToolGrammar> tool_call_grammar;
+        int tool_call_grammar_state = 0;
+        std::shared_ptr<const std::vector<uint32_t>> tool_call_token_mask;
+        bool AllowsToolToken(int token) const {
+            if (token < 0) return false;
+            if (tool_call_token_mask && ((size_t)(token / 32) >= tool_call_token_mask->size() ||
+                !((*tool_call_token_mask)[token / 32] & (uint32_t(1) << (token % 32))))) return false;
+            return tool_call_allowed_token_ids.empty() || std::binary_search(
+                tool_call_allowed_token_ids.begin(), tool_call_allowed_token_ids.end(), token);
+        }
         bool tool_call_name_constraint_enabled = false;
         std::vector <std::string> tool_call_allowed_names;
         std::vector <std::string> tool_call_invoke_name_prefixes;
@@ -220,8 +233,14 @@ namespace fastllm {
         float tool_call_content_top_p = 1.0f;
         float tool_call_content_temperature = 1.0f;
 
+        // History is consumed only by repetition penalties. Keep every
+        // non-unit value: CPU and model-specific samplers use different epsilons.
+        bool NeedsTokenHistory() const {
+            return repeat_penalty != 1.0f;
+        }
+
         bool IsSimpleGreedy() const {
-            if (!tool_call_allowed_token_ids.empty()) {
+            if (tool_call_token_mask || !tool_call_allowed_token_ids.empty()) {
                 return false;
             }
             if (fabs(repeat_penalty - 1) > 1e-8) {
@@ -233,6 +252,8 @@ namespace fastllm {
             return true;
         }
     };
+
+    void ApplyToolTokenMask(Data &logits, int row, const GenerationConfig &config);
 
     struct LastTokensUnit {
         int tot = 0;
@@ -571,6 +592,9 @@ namespace fastllm {
         uint8_t *cpuData = nullptr; // 数据指针
 
 	    void *cudaData = nullptr;
+        // Optional eager scratch owner; model weights, KV and graph buffers
+        // must never opt in. Allocation slices retain this owner independently.
+        std::shared_ptr<CudaWorkspace> cudaWorkspace;
         bool cudaDataBorrowed = false; // cudaData points into another owner and should not be freed directly
         // Set only when this object owns entries in the DeepSeek-V4 CUDA
         // route-table registry, so ordinary temporary tensors can skip the
@@ -754,15 +778,62 @@ namespace fastllm {
         void ResetMultiDeviceState();
     };
 
+    // Non-owning match anchor. A node ID plus physical generation prevents
+    // stale anchors from being revived after eviction or allocator reuse.
+    struct PagedPrefixMatch {
+        uint64_t nodeId = 0;
+        int pageId = -1, pages = 0;
+        long long generation = 0;
+    };
+
+    struct PagedPrefixPath {
+        const PagedCacheManager *manager = nullptr;
+        PagedPrefixMatch anchor;
+        uint64_t bindingVersion = 0;
+        std::vector<int> pageIds; // Metadata only; does not acquire references.
+    };
+
     struct CacheTrieNode {
-        int pageId = -1;
+        uint64_t nodeId = 0;
         long long timestamp = 0;
         long long lastAccess = 0;
-        int unusedIndex = -1;
-        bool evictable = false;
-        std::unordered_map<uint64_t, CacheTrieNode*> children;
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
+        int pageId = -1;
+        int unusedIndex = -1;
+        bool evictable = false;
+        // Most cached token pages have exactly one successor. Allocate a hash
+        // table only at a fork, rather than two heap allocations per page.
+        CacheTrieNode *singleChild = nullptr;
+        std::unique_ptr<std::unordered_map<uint64_t, CacheTrieNode*>> branches;
+        bool HasChildren() const { return singleChild || (branches && !branches->empty()); }
+        CacheTrieNode *FindChild(uint64_t hash) const {
+            if (singleChild) return singleChild->edgeHash == hash ? singleChild : nullptr;
+            if (!branches) return nullptr;
+            auto it = branches->find(hash);
+            return it == branches->end() ? nullptr : it->second;
+        }
+        void AddChild(CacheTrieNode *child) {
+            if (branches) {
+                branches->emplace(child->edgeHash, child);
+                singleChild = branches->size() == 1 ? child : nullptr;
+            } else if (singleChild) {
+                branches = std::make_unique<std::unordered_map<uint64_t, CacheTrieNode*>>();
+                branches->emplace(singleChild->edgeHash, singleChild);
+                branches->emplace(child->edgeHash, child);
+                singleChild = nullptr;
+            } else {
+                singleChild = child;
+            }
+        }
+        void EraseChild(uint64_t hash) {
+            if (branches) {
+                branches->erase(hash);
+                singleChild = branches->size() == 1 ? branches->begin()->second : nullptr;
+                // Keep an existing fork's bucket order so subtree eviction
+                // returns physical pages in the same order after it shrinks.
+            } else if (singleChild && singleChild->edgeHash == hash) singleChild = nullptr;
+        }
     };
 
     // 一个带PageCache功能的Data，可以管理多个PageCache
@@ -785,8 +856,9 @@ namespace fastllm {
             // 空闲页双池：freePages 不在 Trie 中，triePages 在 Trie 中但未被引用
             std::vector<int> freePages;
             std::vector<int> triePages;
-            std::unordered_set<int> freePagesSet;
-            std::unordered_set<int> triePagesSet;
+            // Page IDs are dense. Avoid allocating hash-set nodes whenever
+            // a cached prefix enters or leaves the unused-page pools.
+            std::vector<uint8_t> freePageFlags;
             std::mutex pageIndexLocker;
 
             int FreePageCount() const { return (int)freePages.size() + (int)triePages.size(); }
@@ -800,7 +872,7 @@ namespace fastllm {
 
             // Trie树缓存管理
             CacheTrieNode *trieRoot = nullptr;
-            std::unordered_map<int, CacheTrieNode*> pageToTrieNode;
+            std::vector<CacheTrieNode*> pageToTrieNode;
 
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
@@ -809,9 +881,23 @@ namespace fastllm {
             void ReleasePageIndices(const std::vector<int> &pageIndices);
             void Pick(std::vector<int> &pageIds);
 
+            static constexpr uint64_t TokenHashMultiplier = 1000000007ULL;
             static uint64_t HashTokenPage(const int *tokens, int len);
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
             void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
+            // Hashes belong to an immutable, caller-validated query. These
+            // methods neither allocate KV nor acquire request page references.
+            int PreviewPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match);
+            // Reuse hashes across layers/ranks. A match belongs to this exact
+            // immutable query; a stale cache generation falls back to the trie.
+            void QueryPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match,
+                             std::vector<int> &cachedPageIds);
+            void RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages);
+            bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
+                                               std::vector<int> &unreferenced);
+            bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
+                                               std::vector<int> &unreferenced, PagedPrefixPath &path);
+
 
             // Materialize free pages in the same order used by allocation.
             // This may evict unreferenced cache entries, but never reserves pages.
@@ -819,8 +905,12 @@ namespace fastllm {
             bool IsCachedPage(int pageIndex, long long generation);
 
         private:
+            uint64_t nextTrieNodeId = 0;
+            uint64_t prefixBindingVersion = 0;
+            CacheTrieNode *FindPrefixLocked(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match);
             std::set<std::pair<long long, int>> evictableLeaves;
             void UpdateEvictableLeaf(CacheTrieNode *node);
+            void TouchTrieNode(CacheTrieNode *node, long long access);
             void RemoveTriePage(int pageIndex);
             void ReleasePageIndexLocked(int pageIndex);
             void PrepareFreePages(int count);
@@ -938,6 +1028,9 @@ namespace fastllm {
 
         void SetSpecialTokens(const std::map <std::string, int> &specialTokens); // 设置需要优先处理的特殊token
 
+        // Derived caches must also account for decoder options such as byteAsChar.
+        uint64_t GetVocabularyRevision() const { return vocabularyRevision; }
+
         void SetTokenizerConfig(const json11::Json &config);
 
         std::string Normalize(const std::string &ori, const bool addDummyPrefix=true); // 字符规范化
@@ -952,6 +1045,7 @@ namespace fastllm {
 
         std::string GetToken(int id); // 获取id对应的token
     private:
+        uint64_t vocabularyRevision = 0;
         std::vector<float> BytePairEncode(const std::string &s);
 
         std::vector<float> UnigramEncode(const std::string &s);

@@ -220,7 +220,10 @@ struct MailboxMoe {
             view.q8InputPrepared = true;
             view.preserveMissing = true;
             const auto &source = group.ggufSources[table];
-            if (source.weights[0].type == l.gateGgmlType && source.weights[1].type == l.downGgmlType) {
+            // Match the upload layout, including IQ2 R4 records consumed
+            // directly by the projection kernels instead of being restored.
+            if (FastllmCudaV41GGUFNumaSupported(l.gateGgmlType, l.downGgmlType,
+                    source.weights[0].type, source.weights[1].type)) {
                 view.numaGateType = source.weights[0].type;
                 view.numaDownType = source.weights[1].type;
             }
@@ -589,7 +592,7 @@ bool TryMailboxMoe(OffloadGroup &group, DeviceCache &origin, int table, const fa
     }
     if (std::count(s.host->owners, s.host->owners + s.topk, -1))
         CooperativeMoeWaitCpu<<<1, 32, 0, cudaStreamPerThread>>>(&s.mapped->computed, seq);
-    cuda::dsv41_cache::Reduce<<<(l.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+    fastllm::cuda::dsv41_cache::Reduce<<<(l.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
         s.mappedOutput, static_cast<const float *>(r.partial.cudaData), local->owners, local->ids,
         static_cast<__nv_bfloat16 *>(output.cudaData), l.hidden, s.topk);
     checkCudaErrors("Mailbox reduction", cudaGetLastError());

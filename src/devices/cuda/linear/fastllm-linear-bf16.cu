@@ -18,6 +18,9 @@ FastllmCudaLinearGraphScope::FastllmCudaLinearGraphScope(std::shared_ptr<void> &
     auto &current = fastllm_bf16_lt::SerialGraphWorkspace();
     previous = std::move(current);
     current = std::static_pointer_cast<fastllm_bf16_lt::Workspace>(workspace);
+    // Warmup can use eager Lt even if the graph lease pool is full. Capturing
+    // a different GEMV/GEMM fallback would then change its reduction order.
+    if (!current && FastllmCudaGraphIsCapturingFast()) FastllmCudaSetThreadError();
 }
 
 FastllmCudaLinearGraphScope::~FastllmCudaLinearGraphScope() {
@@ -155,36 +158,43 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     __syncthreads();
 }
 
-// At K=256 the vectorized GEMV has only one active warp per output. Pack
-// eight outputs into a CTA while preserving its per-lane products and
-// compensated reduction tree. No vocabulary size or GPU model is assumed.
+// At K=256, one warp computes each dot with the original compensated
+// reduction. Tiling output rows reuses its input vector without changing
+// the per-lane products or BF16 rounding.
+template <int RowsPerWarp = 1>
 __global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
         const __nv_bfloat16 *weight, __nv_bfloat16 *output,
         const __nv_bfloat16 *bias, int outputs) {
     const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 8 + threadIdx.x / 32;
-    if (row >= outputs) return;
-    union_bf16_8 a, b;
+    const int first = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * RowsPerWarp;
+    if (first >= outputs) return;
+    union_bf16_8 a, b[RowsPerWarp];
     a.in = *reinterpret_cast<const uint4 *>(input + lane * 8);
-    b.in = *reinterpret_cast<const uint4 *>(weight + (size_t)row * 256 + lane * 8);
-    float value = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-        value += __bfloat162float(a.out[i]) * __bfloat162float(b.out[i]);
-    float correction = 0.0f;
-#pragma unroll
-    for (int step = 16; step; step >>= 1) {
-        float peer = __shfl_down_sync(0xffffffffu, value, step);
-        if (lane < step) {
-            float other = peer - correction;
-            float sum = value + other;
-            correction = (sum - value) - other;
-            value = sum;
+    #pragma unroll
+    for (int r = 0; r < RowsPerWarp; ++r)
+        if (first + r < outputs)
+            b[r].in = *reinterpret_cast<const uint4 *>(weight + (size_t)(first + r) * 256 + lane * 8);
+    #pragma unroll
+    for (int r = 0; r < RowsPerWarp; ++r) if (first + r < outputs) {
+        float value = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            value += __bfloat162float(a.out[i]) * __bfloat162float(b[r].out[i]);
+        float correction = 0.0f;
+        #pragma unroll
+        for (int step = 16; step; step >>= 1) {
+            float peer = __shfl_down_sync(0xffffffffu, value, step);
+            if (lane < step) {
+                float other = peer - correction;
+                float sum = value + other;
+                correction = (sum - value) - other;
+                value = sum;
+            }
         }
-    }
-    if (lane == 0) {
-        if (bias) value += __bfloat162float(bias[row]);
-        output[row] = __float2bfloat16_rn(value);
+        if (lane == 0) {
+            if (bias) value += __bfloat162float(bias[first + r]);
+            output[first + r] = __float2bfloat16_rn(value);
+        }
     }
 }
 
@@ -693,7 +703,10 @@ template <int THREADS>
 static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
     // PART=2..8 reuses the weights without changing the per-row reduction.
     if (n == 1 && m == 256) {
-        FastllmGemvBf16SmallK<<<(k + 7) / 8, 256>>>(input, weight, output, bias, k);
+        if (k >= 16384 && FastllmCudaRuntimeArch() == 90)
+            FastllmGemvBf16SmallK<4><<<(k + 15) / 16, 128>>>(input, weight, output, bias, k);
+        else
+            FastllmGemvBf16SmallK<><<<(k + 7) / 8, 256>>>(input, weight, output, bias, k);
     } else if (n == 1) {
         FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 1> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
@@ -1132,6 +1145,31 @@ bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &we
 }
 
 // BF16 input × BF16 weight -> BF16 output
+bool FastllmCudaBFloat16LinearFixedRows(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    auto dense = [](const fastllm::Data &x) {
+        return x.dataType == fastllm::BFLOAT16 && x.dataDevice == fastllm::CUDA &&
+            x.cudaData && x.dims.size() == 2 && x.strides.size() == 2 &&
+            x.dims[0] > 0 && x.dims[1] > 0 && x.strides[1] == 1 &&
+            x.strides[0] == (uint64_t)x.dims[1] && !x.multiDeviceData;
+    };
+    if (!dense(input) || !dense(weight) || !dense(output) ||
+        input.dataDeviceIds != weight.dataDeviceIds || input.dataDeviceIds != output.dataDeviceIds ||
+        input.dims[1] != weight.dims[1] || output.dims[0] != input.dims[0] ||
+        output.dims[1] != weight.dims[0] || input.dims[0] <= 32 || input.dims[0] % 32 ||
+        input.dims[1] < 1024 || weight.dims[0] < 1024 || input.dims[1] % 4 || weight.dims[0] % 4 ||
+        output.cudaData == input.cudaData || output.cudaData == weight.cudaData ||
+        FastllmCudaRuntimeArch() != 90) return false;
+    const int rows = input.dims[0], in = input.dims[1], out = weight.dims[0];
+    // The shared Lt workspace is bounded at 8 MiB. Larger inputs are covered
+    // in 256-row groups, without retaining another per-layer allocation.
+    for (int row = 0; row < rows; row += 256)
+        if (!fastllm_bf16_lt::Matmul((const uint16_t *)input.cudaData + size_t(row) * in,
+                weight.cudaData, (uint16_t *)output.cudaData + size_t(row) * out,
+                std::min(256, rows - row), in, out, CUDA_R_16BF, 32)) return false;
+    return true;
+}
+
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaBF16EnsureBiasOnDevice(weight, bias, k);
     FastllmCudaBF16EnsureBiasBf16OnDevice(weight, bias, k);
@@ -1283,5 +1321,80 @@ bool FastllmCudaBFloat16LinearFloat32(const fastllm::Data &input, const fastllm:
         &alpha, weight.cudaData, CUDA_R_16BF, m, input.cudaData, CUDA_R_16BF, m,
         &beta, output.cudaData, CUDA_R_32F, k, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("BF16 linear with FP32 output failed");
+    return true;
+}
+
+bool FastllmCudaTryPackBFloat16Weights(const fastllm::Data &first,
+        const fastllm::Data *second, fastllm::Data &packed) {
+    using namespace fastllm;
+    if (FastllmCudaGraphIsCapturing() || FastllmCudaRuntimeArch() < 80 ||
+        &packed == &first || &packed == second || packed.isFake || packed.multiDeviceData)
+        return false;
+    const int device = FastllmCudaGetDevice();
+    for (const Data *w : {&first, second}) {
+        if (!w) continue;
+        if (w->dataType != FLOAT32 || w->dataDevice != CUDA || !w->cudaData ||
+            w->multiDeviceData || w->dims.size() != 2 || w->dims[0] <= 0 || w->dims[1] <= 0 ||
+            w->dataDeviceIds != std::vector<int>{device} || w->IsRepacked ||
+            (packed.cudaData && packed.cudaData == w->cudaData) ||
+            (second && w->dims[1] != first.dims[1])) return false;
+    }
+    const int64_t rows = (int64_t)first.dims[0] + (second ? second->dims[0] : 0);
+    if (rows > std::numeric_limits<int>::max()) return false;
+    packed.dataType = BFLOAT16; packed.UpdateUnitSize();
+    packed.Resize({(int)rows, first.dims[1]});
+    packed.ToDevice(CUDA, std::vector<int>{device}, false); packed.Allocate(false);
+    int *flag = (int*)FastllmCudaMalloc(sizeof(int));
+    FastllmCudaMemset0(flag, sizeof(int));
+    uint64_t offset = 0;
+    for (const Data *w : {&first, second}) {
+        if (!w) continue;
+        FastllmCompactBFloat16ExactKernel<<<(w->Count(0) + 255) / 256, 256>>>(
+            (const float*)w->cudaData, (uint16_t*)packed.cudaData + offset, w->Count(0), flag);
+        offset += w->Count(0);
+    }
+    int inexact = 1;
+    FastllmCudaCopyFromDeviceToHost(&inexact, flag, sizeof(int));
+    FastllmCudaFree(flag);
+    return inexact == 0;
+}
+
+namespace {
+__global__ void FastllmSplitLinearFloat32Kernel(const float *input, float *first,
+        float *second, uint64_t count, int firstWidth, int width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int col = i % width;
+    const uint64_t row = i / width;
+    if (col < firstWidth) first[row * firstWidth + col] = input[i];
+    else second[row * (width - firstWidth) + col - firstWidth] = input[i];
+}
+}
+
+bool FastllmCudaBFloat16LinearPairFloat32(const fastllm::Data &input,
+        const fastllm::Data &packed, int firstWidth, fastllm::Data &first,
+        fastllm::Data &second, fastllm::Data &scratch) {
+    using namespace fastllm;
+    if (packed.dims.size() != 2 || firstWidth <= 0 || firstWidth >= packed.dims[0] ||
+        input.dims.empty() || input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        &first == &second || &first == &scratch || &second == &scratch)
+        return false;
+    for (const Data *out : {&first, &second, &scratch})
+        if (out == &input || out == &packed || out->multiDeviceData || out->isFake ||
+            (out->cudaData && (out->cudaData == input.cudaData || out->cudaData == packed.cudaData)))
+            return false;
+    if ((first.cudaData && (first.cudaData == second.cudaData || first.cudaData == scratch.cudaData)) ||
+        (second.cudaData && second.cudaData == scratch.cudaData)) return false;
+    // Validate and submit the GEMM before the split. No intermediate BF16 rounding.
+    if (!FastllmCudaBFloat16LinearFloat32(input, packed, scratch)) return false;
+    const int width = packed.dims[0];
+    for (Data *out : {&first, &second}) {
+        auto dims = input.dims; dims.back() = out == &first ? firstWidth : width - firstWidth;
+        out->dataType = FLOAT32; out->UpdateUnitSize(); out->Resize(dims);
+        out->ToDevice(CUDA, input.dataDeviceIds, false); out->Allocate(false);
+    }
+    FastllmSplitLinearFloat32Kernel<<<(scratch.Count(0) + 255) / 256, 256>>>(
+        (const float*)scratch.cudaData, (float*)first.cudaData, (float*)second.cudaData,
+        scratch.Count(0), firstWidth, width);
     return true;
 }

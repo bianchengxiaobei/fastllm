@@ -40,9 +40,10 @@ struct Probe : DeepSeekV41Model {
         v41DsparkEnabled = true;
         deviceMap = {{"cuda:0", 1}};
     }
-    void HeadSetup() {
+    void HeadSetup(bool quantized = false) {
         deviceMap = {{"multicuda:0,1", 1}};
         v41DsparkTpDevices = {0, 1};
+        if (quantized) quantizedLinearNames.insert("head.weight");
     }
     void EmbeddingSetup(int mode) {
         block_cnt = 2;
@@ -96,8 +97,8 @@ static std::array<double, 4> Target(int prev) {
 static int Draw(const std::array<double, 4> &p, std::mt19937 &rng) {
     return std::discrete_distribution<int>(p.begin(), p.end())(rng);
 }
-static void Sampling(Probe &model, int drafts, int mode) {
-    constexpr int vocab = 128, samples = 6000;
+static void Sampling(Probe &model, int drafts, int mode, int vocab = 128) {
+    constexpr int samples = 6000;
     std::mt19937 rng(12731 + drafts * 37 + mode);
     std::vector<int> counts(64), acceptance(drafts + 1);
     std::vector<float> logits((drafts + 1) * vocab, -1000);
@@ -171,6 +172,47 @@ static void Sampling(Probe &model, int drafts, int mode) {
     for (int n : acceptance)
         std::cout << n << ',';
     std::cout << " PASS\n" << std::flush;
+}
+// Exercise the packed token/prefix readback with unequal batch and row counts.
+// Later positions deliberately match q after the first rejection, so using the
+// total accepted count instead of the contiguous prefix cannot pass this test.
+static void BatchedRejectionReadback() {
+    constexpr int sentinel = -739;
+    for (int vocab : {129, 16385}) for (int drafts : {1, 5, 8}) for (int batch : {1, 3, 8, 9}) {
+        const int rows = batch * (drafts + 1);
+        std::vector<float> logits(rows * vocab, -INFINITY), q(batch * drafts * vocab);
+        std::vector<int> ids(batch * drafts, 0), ks(rows, vocab);
+        std::vector<float> ts(rows, 1.0f), ps(rows, 1.0f);
+        for (int b = 0; b < batch; ++b) {
+            const int prefix = (b + drafts) % (drafts + 1);
+            for (int s = 0; s <= drafts; ++s) {
+                const int token = s == drafts ? 2 : s == prefix ? 1 : 0;
+                logits[(b * (drafts + 1) + s) * vocab + token] = 0;
+                if (s < drafts) q[(b * drafts + s) * vocab] = 1;
+            }
+        }
+        Data gpu(FLOAT32, {rows, vocab}, logits), proposal(FLOAT32, {batch * drafts, vocab}, q);
+        gpu.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        proposal.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        for (int filter = 0; filter < 4; ++filter) {
+            std::fill(ks.begin(), ks.end(), filter & 1 ? 4 : vocab);
+            std::fill(ps.begin(), ps.end(), filter & 2 ? .9f : 1.0f);
+            std::vector<int> output(rows + 2, sentinel), accepted(batch + 2, sentinel);
+            Check(FastllmCudaMtpRejectionSampling((float*)gpu.cudaData, (float*)proposal.cudaData,
+                ts.data(), ks.data(), ps.data(), ids.data(), output.data() + 1,
+                accepted.data() + 1, batch, drafts, vocab), "batched rejection failed");
+            Check(output.front() == sentinel && output.back() == sentinel &&
+                accepted.front() == sentinel && accepted.back() == sentinel, "readback overrun");
+            for (int b = 0; b < batch; ++b) {
+                const int prefix = (b + drafts) % (drafts + 1);
+                Check(accepted[b + 1] == prefix, "wrong contiguous accepted prefix");
+                for (int s = 0; s <= prefix; ++s)
+                    Check(output[1 + b * (drafts + 1) + s] ==
+                        (s < prefix ? 0 : prefix == drafts ? 2 : 1), "wrong batched result token");
+            }
+        }
+    }
+    std::cout << "batched rejection readback PASS\n";
 }
 static std::vector<float> Read(Data &data) {
     if (data.multiDeviceData) {
@@ -301,36 +343,69 @@ static void MainFeatures() {
 // A sparse head has an exact oracle independent of GEMM and gather code.
 static void DraftHead() {
     constexpr int vocab = 256, width = 128;
-    for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32}) {
+    for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32}) for (bool quantized : {false, true}) {
         Probe model;
-        model.HeadSetup();
+        model.HeadSetup(quantized);
         std::vector<float> weights(vocab * width);
         for (int row = 0; row < vocab; ++row)
             weights[row * width + row % width] = (row + 1) / 256.0f;
         auto &head = model.weight["head.weight"];
         head.CopyFrom(Data(type, {vocab, width}, weights));
         head.tpLinearType = TP_LINEAR_ROW;
-        for (bool async : {false, true}) for (bool replicated : {false, true}) {
+        for (bool async : {false, true}) for (bool replicated : {false, true}) for (bool sharded : {false, true}) {
             const bool previousAsync = MultiCudaSetPersistentAsyncDispatch(async);
             Data output;
-            for (int tokens : {1, 5, 6, 1}) {
+            for (int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 1}) {
                 std::vector<float> values(tokens * width);
                 for (int i = 0; i < tokens * width; ++i) values[i] = (i % 4) - 2;
                 Data input(DataType::BFLOAT16, {1, tokens, width}, values);
                 input.ToDevice(DataDevice::CUDA, std::vector<int>{0});
                 if (replicated) PrepareMultiCudaReplicatedData(input, {0, 1}, true);
                 Check(cudaSetDevice(1) == cudaSuccess, "head starts on remote rank");
-                model.DsparkProjectHead(input, output);
-                Check(output.dims == std::vector<int>({1, tokens, vocab}) && !output.multiDeviceData,
-                      "draft head gather layout");
-                auto actual = Read(output);
+                model.DsparkProjectHead(input, output, false, sharded);
+                Check(output.dims == std::vector<int>({1, tokens, vocab}), "head shape");
+                Check(output.dataType == (type == DataType::FLOAT32 && !quantized ? DataType::FLOAT32 : DataType::BFLOAT16),
+                      "head changed logits rounding precision");
+                std::vector<float> actual;
+                if (sharded) {
+                    Check(output.IsTensorParallelSharded() && output.tpAxis == 2,
+                          "verifier head lost vocabulary shards");
+                    Data converted;
+                    ToDataType(output, converted, DataType::FLOAT32);
+                    Check(converted.IsTensorParallelSharded() && converted.tpRanges == output.tpRanges,
+                          "verifier head conversion lost shard metadata");
+                    actual.resize(tokens * vocab);
+                    std::vector<int> covered(vocab);
+                    for (auto &entry : converted.multiDeviceDatas) {
+                        auto local = Read(*entry.second);
+                        const int shardWidth = entry.second->dims.back();
+                        Check(local.size() == size_t(tokens * shardWidth), "head shard size");
+                        int offset = 0;
+                        for (auto range : converted.tpRanges.at(entry.first)) {
+                            Check(range.first >= 0 && range.first <= range.second && range.second <= vocab &&
+                                  offset + range.second - range.first <= shardWidth, "head shard bounds");
+                            for (int col = range.first; col < range.second; ++col) {
+                                Check(++covered[col] == 1, "head shards overlap");
+                                for (int t = 0; t < tokens; ++t)
+                                    actual[t * vocab + col] = local[t * shardWidth + offset + col - range.first];
+                            }
+                            offset += range.second - range.first;
+                        }
+                        Check(offset == shardWidth, "head shard width");
+                    }
+                    Check(std::all_of(covered.begin(), covered.end(), [](int n) { return n == 1; }),
+                          "head vocabulary has holes");
+                } else {
+                    Check(!output.multiDeviceData, "draft head gather layout");
+                    actual = Read(output);
+                }
                 std::vector<float> expected(tokens * vocab);
                 for (int t = 0; t < tokens; ++t)
                     for (int row = 0; row < vocab; ++row)
                         expected[t * vocab + row] = values[t * width + row % width] * weights[row * width + row % width];
                 Data rounded(DataType::BFLOAT16, {1, tokens, vocab}, expected);
                 auto reference = Read(rounded);
-                Check(actual == reference, "draft head gathered wrong logits");
+                Check(actual == reference, "head projection produced wrong logits");
                 Check(head.multiDeviceData && head.multiDeviceDatas.size() == 2,
                       "draft head discarded vocabulary shards");
             }
@@ -338,7 +413,7 @@ static void DraftHead() {
                   "draft head changed async dispatch setting");
         }
     }
-    std::cout << "draft TP head PASS\n";
+    std::cout << "draft gathered / verifier sharded TP head, M=1..8 PASS\n";
 }
 static void DeviceSelection(Probe &model, int devices) {
     constexpr int drafts = 7, vocab = 128, token = 17;
@@ -657,9 +732,11 @@ int main() {
     DeviceSelection(model, devices);
     ToolConstraints(model);
     StopPrefix(model);
+    BatchedRejectionReadback();
     for (int drafts : {3, 4, 5, 7})
         for (int mode = 0; mode < 3; ++mode)
             Sampling(model, drafts, mode);
+    for (int mode : {0, 1, 2}) Sampling(model, 5, mode, 16385);
     Rollback(model);
     if (devices >= 2) {
         MainFeatures();

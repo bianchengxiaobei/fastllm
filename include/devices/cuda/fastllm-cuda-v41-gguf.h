@@ -40,6 +40,10 @@ bool FastllmCudaRunV41GGUFHostStream(
 // Native CUDA activation semantics (Q8_1), distinct from NUMA's Q8_K path.
 size_t FastllmCudaV41GGUFGroupedWorkspaceBytes(
     int gateType, int downType, int rows, int hidden, int inter, int experts, int topk);
+// Streamed projections bound padded routes independently of the outer prefill.
+// Keep the resident workspace/launch limits above unchanged.
+bool FastllmCudaV41GGUFStreamedSupported(
+    int gateType, int downType, int rows, int hidden, int inter, int experts, int topk);
 bool FastllmCudaV41GGUFGroupedProjection(
     bool gate, int type, const void *inputQ8, void *outputBF16,
     const void *weightPointers, const int32_t *indices, void *workspace,
@@ -53,6 +57,7 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
     int topk, float swigluLimit, float *perExpert);
 size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter);
 bool FastllmCudaV41GGUFSupported(int gateType, int downType);
+bool FastllmCudaV41GGUFNumaSupported(int gateType, int downType, int numaGateType, int numaDownType);
 
 // Resident CUDA pointers remain live until return. Read jobs fill bounded,
 // page-aligned pinned slots and return the canonical payload within each slot.
@@ -74,3 +79,14 @@ bool FastllmCudaMergeMOEV41GGUFDisk(const fastllm::Data &input,
     fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
     int experts, const int32_t *indices, const float *scores, int topk,
     float swigluLimit, const FastllmCudaV41DiskExperts &source);
+// Ordinary canonical GGUF, FP32 activation/accumulation, same bounded disk
+// transport. Unsupported types leave the caller on its existing expert path.
+bool FastllmCudaMergeMOEGGUFDisk(const fastllm::Data &input,
+    fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
+    int experts, const int32_t *indices, const float *scores, int topk,
+    const FastllmCudaV41DiskExperts &source);
+
+// SM75 fallback for canonical block-32 native FP4 resident experts.
+bool FastllmCudaMergeMOEV41NativeResident(
+    const fastllm::Data &input, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    const fastllm::Data &indices, const fastllm::Data &scores, float swigluLimit);

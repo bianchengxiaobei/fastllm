@@ -1,21 +1,30 @@
 // Full verification graphs must preserve the eager chunk's causal attention,
 // compressor stream and deferred ring writes, including changing cache pointers.
-static void RunVerifyRegression() {
+static void RunVerifyRegression(int packedMode = 0) {
     int checked = 0;
     for (int heads : {8, 17, 64})
     for (int tokens : {2, 3, 4, 5, 6, 7, 8})
         for (int ratio : {0, 1, 2})
             for (int mask : {0, 1, 2}) {
-                if (!ratio && mask)
+                if ((!ratio && mask) || (longContext && heads != 8) ||
+                    (sharedCandidates && (heads != 8 || mask != 2)))
                     continue;
                 FastllmV41FullDecodeConfig c;
                 c.batch = tokens;
                 c.heads = heads;
+                c.indexHeads = indexHeads;
                 c.verifying = true;
+                if (packedMode) {
+                    const bool fp4 = packedMode == 3;
+                    c.ringMode = 1; c.ringRowBytes = 528;
+                    c.cmpMode = fp4 ? 3 : 1; c.cmpRowBytes = fp4 ? 288 : 528;
+                    c.indexMode = fp4 ? 2 : 1; c.indexRowBytes = fp4 ? 68 : 132;
+                }
                 c.ratio = ratio;
                 c.kvSource = c.indexSource = ratio != 0;
-                c.maxKeys = 32768;
+                c.maxKeys = longContext ? 1048576 : 32768;
                 c.candidateTopK = 16;
+                if (sharedCandidates || mask == 1) c.blockSize = 8;
                 c.writeCandidates = mask == 1;
                 c.useCandidates = mask == 2;
                 c.softmaxScale = 1 / std::sqrt(512.f);
@@ -25,8 +34,8 @@ static void RunVerifyRegression() {
                 Fill(q, {1, tokens, heads, 512}, 1);
                 Fill(kv, {1, tokens, 512}, 2);
                 Fill(out, q.dims, 3);
-                Fill(iq, {1, tokens, 32, 128}, 4);
-                Fill(iw, {1, tokens, 32}, 5, FLOAT32);
+                Fill(iq, {1, tokens, indexHeads, 128}, 4);
+                Fill(iw, {1, tokens, indexHeads}, 5, FLOAT32);
                 Fill(sink, {heads}, 6, FLOAT32);
                 Fill(top, {1, tokens, 512}, 7, INT32);
                 Fill(cand, {1, tokens, maxBlocks}, 8, INT8);
@@ -37,7 +46,8 @@ static void RunVerifyRegression() {
                 Fill(latent, {1, tokens, 512}, 13);
                 Fill(newKeys, {1, tokens, 128}, 14);
                 Fill(norm, {512}, 15, FLOAT32);
-                Fill(saved, kv.dims, 16);
+                Fill(saved, packedMode ? std::vector<int>{1, tokens, c.ringRowBytes} : kv.dims,
+                    16, packedMode ? INT8 : BFLOAT16);
                 Fill(savedRaw, {1, tokens + 1, 512}, 17, FLOAT32);
                 Fill(savedScore, savedRaw.dims, 18, FLOAT32);
                 Data q0(q), k0(kv), iq0(iq), nk0(newKeys), qr(q), kr(kv), iqr(iq), ring, relocated,
@@ -46,6 +56,15 @@ static void RunVerifyRegression() {
                 Fill(relocated, ring.dims, 21);
                 Fill(cmp, {1, c.maxKeys, 512}, 22);
                 Fill(keys, {1, c.maxKeys, 128}, 23);
+                auto pack = [&](Data &data, int mode) {
+                    if (!mode) return;
+                    Data encoded;
+                    Check(FastllmCudaDeepSeekV41QuantizeKV(data, encoded, mode, mode == 3 ? 16 : 32),
+                        "verify packed KV");
+                    data.CopyFrom(encoded);
+                };
+                pack(ring, c.ringMode); pack(relocated, c.ringMode);
+                pack(cmp, c.cmpMode); pack(keys, c.indexMode);
                 Fill(tail, {1, 1, 512}, 24, FLOAT32);
                 Fill(tailScore, tail.dims, 25, FLOAT32);
                 tail0.CopyFrom(tail);
@@ -72,6 +91,8 @@ static void RunVerifyRegression() {
                 b.savedKV = saved.cudaData;
                 b.savedRawKV = savedRaw.cudaData;
                 b.savedRawScore = savedScore.cudaData;
+                CandidateReuseProducer producer;
+                producer.Setup(c, b);
                 void *plan = FastllmCudaV41CreateFullDecode(c, b);
                 Check(plan, "verify plan");
                 std::vector<FastllmV41FullDecodeRequest> requests(tokens);
@@ -79,22 +100,27 @@ static void RunVerifyRegression() {
                     for (int i = 0; i < tokens; ++i)
                         requests[i] = {r.cudaData,    cmp.cudaData,       keys.cudaData,
                                        tail.cudaData, tailScore.cudaData, pos + i};
+                    Check(producer.Upload(requests.data(), tokens), "candidate producer upload");
                     Check(FastllmCudaV41UploadFullDecode(plan, requests.data(), tokens),
                           "verify upload");
                 };
                 upload(1, ring);
+                producer.Launch();
                 Check(FastllmCudaV41PrepareFullDecode(plan) && FastllmCudaV41FinishFullDecode(plan),
                       "verify warmup");
                 Cuda(cudaDeviceSynchronize());
                 cudaGraph_t graph;
                 cudaGraphExec_t exec;
                 Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                producer.Launch();
                 Check(FastllmCudaV41PrepareFullDecode(plan) && FastllmCudaV41FinishFullDecode(plan),
                       "verify capture");
                 Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
                 Cuda(cudaGraphInstantiate(&exec, graph, 0));
-                for (int pos : {1, 2, 125, 126, 127, 128, 509, 510, 511, 1021, 1022, 1023, 4095,
-                                8192, 16383}) {
+                for (int pos : (longContext
+                                ? std::vector<int>{131071, 131072, 262143, 262144, 1048560}
+                                : std::vector<int>{1, 2, 125, 126, 127, 128, 509, 510, 511, 1021, 1022, 1023, 4095,
+                                8192, 16383})) {
                     Data &r = pos >= 509 ? relocated : ring;
                     CopyDevice(q, q0);
                     CopyDevice(kv, k0);
@@ -106,7 +132,19 @@ static void RunVerifyRegression() {
                     CopyDevice(cmp, rc);
                     CopyDevice(keys, rk);
                     ring0.CopyFrom(r);
-                    Cuda(cudaMemsetAsync(cand.cudaData, 1, cand.GetBytes(), cudaStreamPerThread));
+                    std::vector<uint8_t> hostMask(size_t(tokens) * maxBlocks, 1);
+                    if (mask == 2) {
+                        for (int row = 0; row < tokens; ++row)
+                            for (int block = 0; block < maxBlocks; ++block)
+                                hostMask[size_t(row) * maxBlocks + block] = pos % 5 == 0 ? 0 :
+                                    pos % 3 == 0 ? 1 : (block + row * 3 + pos) % 11 < 2;
+                    }
+                    // Compaction must interpret every nonzero byte as selected.
+                    if (sharedCandidates)
+                        for (size_t i = 0; i < hostMask.size(); ++i)
+                            if (hostMask[i]) hostMask[i] = i % 3 == 0 ? 255 : i % 3 == 1 ? 7 : 1;
+                    Cuda(cudaMemcpyAsync(cand.cudaData, hostMask.data(), hostMask.size(),
+                                         cudaMemcpyHostToDevice, cudaStreamPerThread));
                     auto rotary = [&](Data &x, int start, int step, int mode,
                                       bool inverse = false) {
                         Check(FastllmCudaDeepSeekV41RotaryQuant(
@@ -155,14 +193,15 @@ static void RunVerifyRegression() {
                         }
                         rotary(refLatent, old * ratio, ratio, 3);
                         rotary(refNewKeys, old * ratio, ratio, 2);
-                        Cuda(cudaMemcpyAsync((char *)cmpReference.cudaData + size_t(old) * 512 * 2,
+                        pack(refLatent, c.cmpMode); pack(refNewKeys, c.indexMode);
+                        Cuda(cudaMemcpyAsync((char *)cmpReference.cudaData + size_t(old) * c.cmpRowBytes,
                                              refLatent.cudaData, refLatent.GetBytes(),
                                              cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-                        Cuda(cudaMemcpyAsync((char *)keyReference.cudaData + size_t(old) * 128 * 2,
+                        Cuda(cudaMemcpyAsync((char *)keyReference.cudaData + size_t(old) * c.indexRowBytes,
                                              refNewKeys.cudaData, refNewKeys.GetBytes(),
                                              cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-                        View(refCmp, cmpReference, 0, {1, count, 512});
-                        View(refKeys, keyReference, 0, {1, count, 128});
+                        View(refCmp, cmpReference, 0, {1, count, packedMode ? c.cmpRowBytes : 512});
+                        View(refKeys, keyReference, 0, {1, count, packedMode ? c.indexRowBytes : 128});
                         rotary(iqr, pos, 1, 2);
                         Check(FastllmCudaDeepSeekV41IndexerScore(iqr, iw, refKeys, ratio, pos,
                                                                  refScores),
@@ -174,8 +213,11 @@ static void RunVerifyRegression() {
                         if (mask == 2) {
                             Fill(refCand, {1, tokens, (count + c.blockSize - 1) / c.blockSize}, 0,
                                  INT8);
-                            Cuda(cudaMemsetAsync(refCand.cudaData, 1, refCand.GetBytes(),
-                                                 cudaStreamPerThread));
+                            const int blocks = (count + c.blockSize - 1) / c.blockSize;
+                            for (int row = 0; row < tokens; ++row)
+                                Cuda(cudaMemcpyAsync((uint8_t*)refCand.cudaData + size_t(row) * blocks,
+                                    hostMask.data() + size_t(row) * maxBlocks, blocks,
+                                    cudaMemcpyHostToDevice, cudaStreamPerThread));
                         }
                         Check(FastllmCudaDeepSeekV41IndexerTopK(
                                   refScores, mask == 2 ? &refCand : nullptr, c.topK, ratio, pos,
@@ -191,10 +233,12 @@ static void RunVerifyRegression() {
                     upload(pos, r);
                     Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
                     Cuda(cudaDeviceSynchronize());
+                    producer.Validate(c, hostMask, pos);
                     Equal(q, qr, "verify q");
                     Equal(kv, kr, "verify kv");
                     Equal(out, refOut, "verify output");
-                    Equal(saved, kr, "deferred ring rows");
+                    Data expectedSaved(kr); pack(expectedSaved, c.ringMode);
+                    Equal(saved, expectedSaved, "deferred ring rows");
                     Equal(r, ring0, "committed ring untouched");
                     Equal(tail, tail0, "committed tail untouched");
                     Equal(tailScore, tailScore0, "tail score untouched");

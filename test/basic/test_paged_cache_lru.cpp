@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include <numeric>
 #include <stdexcept>
+#include <random>
 
 using namespace fastllm;
 
@@ -18,6 +19,57 @@ static std::vector<int> Allocate(PagedCacheManager &pool, int count) {
     std::vector<int> pages;
     for (int i = 0; i < count; ++i) pages.push_back(pool.GetUnusedPageIndex(true));
     return pages;
+}
+
+static void CheckPoolPartition(PagedCacheManager &pool) {
+    std::vector<int> unused(pool.maxPages);
+    for (int page : pool.freePages) {
+        Require(page >= 0 && page < pool.maxPages, "free page out of range");
+        Require(++unused[page] == 1 && pool.pageRefCount[page] == 0,
+                "free page duplicated or still referenced");
+        Require(pool.freePageFlags[page] && !pool.pageToTrieNode[page], "free page still cached");
+    }
+    for (int page : pool.triePages) {
+        Require(page >= 0 && page < pool.maxPages, "cached page out of range");
+        Require(++unused[page] == 1 && pool.pageRefCount[page] == 0,
+                "cached page duplicated or still referenced");
+        auto *node = pool.pageToTrieNode[page];
+        Require(node && !pool.freePageFlags[page] && node->unusedIndex >= 0 &&
+                pool.triePages[node->unusedIndex] == page, "cached page membership invalid");
+    }
+    for (int page = 0; page < pool.maxPages; ++page)
+        Require((unused[page] == 1) == (pool.pageRefCount[page] == 0), "lost page or dangling reference");
+}
+
+static void CheckSparsePagePicksAndReplacement() {
+    PagedCacheManager pool; pool.pageLen = 128; pool.SetMaxPages(32);
+    auto picked = std::vector<int>{0, 17, 31};
+    pool.Pick(picked); pool.Pick(picked);
+    CheckPoolPartition(pool);
+    std::vector<int> expected;
+    for (int page = 30; page > 0; --page) if (page != 17) expected.push_back(page);
+    auto allocated = Allocate(pool, 29);
+    Require(allocated == expected, "picking free pages changed allocation order");
+    pool.ReleasePageIndices(picked);
+    CheckPoolPartition(pool);
+    pool.ReleasePageIndices(allocated); pool.ReleasePageIndices(picked);
+    CheckPoolPartition(pool);
+    auto tokens = Tokens(1);
+    auto a = Allocate(pool, 8); pool.Record(tokens, a);
+    auto b = Allocate(pool, 8); pool.Record(tokens, b);
+    // The old physical pages stay live even when their logical prefix now
+    // points to a different request's pages.
+    CheckPoolPartition(pool);
+    pool.ReleasePageIndices(a); pool.ReleasePageIndices(b);
+    CheckPoolPartition(pool);
+    auto suffix = std::vector<int>(b.begin() + 4, b.end()); pool.Pick(suffix);
+    // Retaining only a suffix exercises metadata subtree eviction while some
+    // physical pages remain referenced.
+    auto pressure = Allocate(pool, 28);
+    CheckPoolPartition(pool);
+    pool.ReleasePageIndices(pressure); pool.ReleasePageIndices(suffix);
+    CheckPoolPartition(pool);
+    pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
 }
 
 static int Match(PagedCacheManager &pool, const std::vector<int> &tokens) {
@@ -115,11 +167,194 @@ static void CheckRepurposedPages() {
     pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
 }
 
+static std::vector<uint64_t> Hashes(PagedCacheManager &pool, const std::vector<int> &tokens) {
+    std::vector<uint64_t> hashes;
+    for (size_t i = 0; i + pool.pageLen <= tokens.size(); i += pool.pageLen)
+        hashes.push_back(PagedCacheManager::HashTokenPage(tokens.data() + i, pool.pageLen));
+    return hashes;
+}
+
+static void CheckPrefixPathAcrossPools() {
+    for (int pageLen : {64, 128, 256}) {
+        PagedCacheManager first, second;
+        first.pageLen = second.pageLen = pageLen;
+        first.SetMaxPages(16); second.SetMaxPages(16);
+        auto tokens = Tokens(1, 8 * pageLen);
+        auto a = Allocate(first, 8), b = Allocate(second, 8);
+        // Pools can assign the same endpoint identity but different ancestors.
+        std::swap(b[0], b[1]);
+        first.Record(tokens, a); second.Record(tokens, b);
+        first.ReleasePageIndices(a); second.ReleasePageIndices(b);
+        PagedPrefixMatch ma, mb;
+        Require(first.PreviewPrefix(Hashes(first, tokens), ma) == 8 &&
+                second.PreviewPrefix(Hashes(second, tokens), mb) == 8, "cross-pool prefix missing");
+        Require(ma.nodeId == mb.nodeId && ma.pageId == mb.pageId && ma.generation == mb.generation,
+                "fixture does not exercise colliding pool-local identities");
+        PagedPrefixPath path;
+        std::vector<int> unused;
+        const std::vector<int> expectedA(a.rend() - 6, a.rend());
+        const std::vector<int> expectedB(b.rend() - 6, b.rend());
+        Require(first.PreviewUnreferencedPrefixPages(ma, 6, unused, path) && unused == expectedA,
+                "first pool path mismatch");
+        Require(second.PreviewUnreferencedPrefixPages(mb, 6, unused, path) && unused == expectedB,
+                "path reused physical pages from another pool");
+        Require(first.PreviewUnreferencedPrefixPages(ma, 6, unused, path) && unused == expectedA,
+                "returning to the first pool reused stale physical pages");
+        first.EvictTrieSubtree(first.trieRoot); first.trieRoot = nullptr;
+        second.EvictTrieSubtree(second.trieRoot); second.trieRoot = nullptr;
+    }
+}
+
+static void CheckReadOnlyPrefixPreview() {
+    PagedCacheManager pool; pool.pageLen = 128; pool.SetMaxPages(16);
+    auto tokens = Tokens(1), pages = Publish(pool, tokens);
+    auto hashes = Hashes(pool, tokens);
+    PagedPrefixMatch memo;
+    const auto refs = pool.pageRefCount;
+    PagedPrefixPath path;
+    std::vector<int> unreferenced;
+    for (int i = 0; i < 20; ++i) {
+        Require(pool.PreviewPrefix(hashes, memo) == 8, "preview match changed");
+        Require(pool.PreviewUnreferencedPrefixPages(memo, 6, unreferenced, path), "preview page budget failed");
+        Require(unreferenced.size() == 6 && pool.pageRefCount == refs && pool.FreePageCount() == 16,
+                "preview retained references or allocated pages");
+    }
+    auto held = std::vector<int>(pages.begin(), pages.begin() + 2); pool.Pick(held);
+    Require(pool.PreviewUnreferencedPrefixPages(memo, 6, unreferenced, path) && unreferenced.size() == 4,
+            "preview double-counted already protected prefix pages");
+    pool.ReleasePageIndices(held);
+    // A longer prefix published after a previous preview must be discovered.
+    auto longer = Tokens(1, 1280); auto all = pages; pool.Pick(all);
+    auto tail = Allocate(pool, 2); all.insert(all.end(), tail.begin(), tail.end());
+    pool.Record(longer, all); pool.ReleasePageIndices(all);
+    // Keep the same query across publication, as queued requests do.
+    PagedPrefixMatch growing; auto query = Hashes(pool, Tokens(1, 1536));
+    Require(pool.PreviewPrefix(query, growing) == 10, "long prefix missing");
+    auto complete = Tokens(1, 1536); pool.Pick(all); tail = Allocate(pool, 2);
+    all.insert(all.end(), tail.begin(), tail.end()); pool.Record(complete, all); pool.ReleasePageIndices(all);
+    Require(pool.PreviewPrefix(query, growing) == 12, "cached miss hid a newly published suffix");
+    const auto oldMatch = memo;
+    auto pressure = Allocate(pool, 16);
+    Require(!pool.PreviewUnreferencedPrefixPages(oldMatch, 6, unreferenced, path),
+            "cached ancestor path survived endpoint eviction");
+    Require(pool.PreviewPrefix(hashes, memo) == 0, "evicted endpoint reused by preview");
+    Require(pool.PreviewPrefix(query, growing) == 0, "evicted growing endpoint reused");
+    pool.ReleasePageIndices(pressure);
+    auto replacement = Publish(pool, Tokens(20000));
+    Require(pool.PreviewPrefix(hashes, memo) == 0, "physical page reuse revived old prefix");
+    memo = {}; auto replacementHashes = Hashes(pool, Tokens(20000));
+    Require(pool.PreviewPrefix(replacementHashes, memo) == 8, "replacement preview missing");
+    pool.SetMaxPages(16); Publish(pool, Tokens(30000));
+    Require(pool.PreviewPrefix(replacementHashes, memo) == 0, "pool reset revived node identity");
+    pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
+}
+
+static void CheckPlannedPrefixQueries() {
+    PagedCacheManager pool; pool.pageLen = 128; pool.SetMaxPages(16);
+    auto tokens = Tokens(1), pages = Publish(pool, tokens);
+    auto hashes = Hashes(pool, tokens);
+    PagedPrefixMatch memo;
+    Require(pool.PreviewPrefix(hashes, memo) == 8, "restore preview missing");
+    std::vector<int> restored;
+    pool.QueryPrefix(hashes, memo, restored);
+    Require(restored == pages, "planned query changed page order");
+    // Publish a longer path while the immutable request is queued.
+    auto query = Hashes(pool, Tokens(1, 1536)); memo = {};
+    pool.PreviewPrefix(query, memo);
+    auto all = pages; pool.Pick(all); auto tail = Allocate(pool, 4);
+    all.insert(all.end(), tail.begin(), tail.end());
+    pool.RecordPrefix(query, all); pool.ReleasePageIndices(all);
+    pool.QueryPrefix(query, memo, restored);
+    Require(restored == all, "planned query hid newly published suffix");
+    auto pressure = Allocate(pool, 16);
+    pool.QueryPrefix(query, memo, restored);
+    Require(restored.empty(), "planned query restored evicted pages");
+    pool.ReleasePageIndices(pressure);
+    Publish(pool, Tokens(9000));
+    pool.QueryPrefix(hashes, memo, restored);
+    Require(restored.empty(), "planned query revived reused page");
+    auto replacement = Hashes(pool, Tokens(9000)); memo = {};
+    pool.PreviewPrefix(replacement, memo);
+    pool.SetMaxPages(16); Publish(pool, Tokens(10000));
+    pool.QueryPrefix(replacement, memo, restored);
+    Require(restored.empty(), "planned query revived reset pool");
+    pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
+}
+
+static void CheckReboundPrefixPath() {
+    PagedCacheManager pool; pool.pageLen = 128; pool.SetMaxPages(16);
+    auto tokens = Tokens(1), pages = Publish(pool, tokens);
+    auto hashes = Hashes(pool, tokens);
+    PagedPrefixMatch match; PagedPrefixPath path;
+    pool.PreviewPrefix(hashes, match);
+    std::vector<int> unused;
+    Require(pool.PreviewUnreferencedPrefixPages(match, 6, unused, path), "initial ancestor path missing");
+    const auto endpoint = match;
+    auto replacement = Allocate(pool, 4);
+    pool.Record(std::vector<int>(tokens.begin(), tokens.begin() + 512), replacement);
+    pool.ReleasePageIndices(replacement);
+    pool.PreviewPrefix(hashes, match);
+    Require(match.nodeId == endpoint.nodeId && match.generation == endpoint.generation,
+            "fixture did not retain the old endpoint");
+    std::vector<int> actual;
+    pool.Query(tokens, actual);
+    std::vector<int> expected(actual.begin(), actual.begin() + 6);
+    std::reverse(expected.begin(), expected.end());
+    Require(pool.PreviewUnreferencedPrefixPages(match, 6, unused, path) && unused == expected,
+            "unchanged endpoint revived old ancestor page bindings");
+    pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
+}
+
+static void CheckPlannedQueryAgainstTokenQuery() {
+    // Compare the original token-query path and the planned path under the
+    // same publications, shared prefixes, eviction pressure and pool resets.
+    PagedCacheManager original, planned;
+    original.pageLen = planned.pageLen = 128;
+    original.SetMaxPages(64); planned.SetMaxPages(64);
+    std::vector<std::vector<int>> queries;
+    for (int i = 0; i < 12; ++i) {
+        auto tokens = Tokens(1, (i + 2) * 128 + 17);
+        for (int j = 256; j < (int)tokens.size(); ++j) tokens[j] += i * 3000;
+        queries.push_back(std::move(tokens));
+    }
+    std::vector<PagedPrefixMatch> memo(queries.size());
+    std::vector<PagedPrefixPath> paths(queries.size());
+    std::mt19937 random(731);
+    for (int step = 0; step < 1200; ++step) {
+        int which = random() % queries.size();
+        auto &tokens = queries[which]; auto hashes = Hashes(original, tokens);
+        if (step % 3 == 0) {
+            auto a = Allocate(original, hashes.size()), b = Allocate(planned, hashes.size());
+            Require(a == b, "planned query changed LRU allocation order");
+            original.Record(tokens, a); planned.RecordPrefix(hashes, b);
+            original.ReleasePageIndices(a); planned.ReleasePageIndices(b);
+        }
+        std::vector<int> a, b;
+        original.Query(tokens, a); planned.QueryPrefix(hashes, memo[which], b);
+        Require(a == b, "planned query differs under eviction pressure");
+        std::vector<int> expected, unreferenced;
+        for (auto it = b.rbegin(); it != b.rend(); ++it)
+            if (planned.pageRefCount[*it] == 0) expected.push_back(*it);
+        Require(planned.PreviewUnreferencedPrefixPages(memo[which], b.size(), unreferenced, paths[which]) &&
+                unreferenced == expected, "cached path differs from live page-reference budget");
+        Require(original.pageRefCount == planned.pageRefCount, "query retained pages");
+        Require(original.FreePageCount() == planned.FreePageCount(), "page pool mismatch");
+        CheckPoolPartition(original); CheckPoolPartition(planned);
+        if (step % 101 == 100) { original.SetMaxPages(64); planned.SetMaxPages(64); }
+    }
+    original.EvictTrieSubtree(original.trieRoot); original.trieRoot = nullptr;
+    planned.EvictTrieSubtree(planned.trieRoot); planned.trieRoot = nullptr;
+}
+
 int main() {
     try {
         CheckPressure(false); CheckPressure(true);
         CheckPreviewAndReferences(); CheckAnchorAndFork();
-        CheckRepurposedPages();
+        CheckRepurposedPages(); CheckReadOnlyPrefixPreview();
+        CheckPlannedPrefixQueries(); CheckPlannedQueryAgainstTokenQuery();
+        CheckReboundPrefixPath();
+        CheckPrefixPathAcrossPools();
+        CheckSparsePagePicksAndReplacement();
         std::cout << "PAGED CACHE LRU PASS" << std::endl;
     } catch (const std::exception &error) {
         std::cerr << error.what() << std::endl;

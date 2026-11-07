@@ -13,7 +13,7 @@ video_require = ['imageio', 'imageio-ffmpeg']
 all_require = server_require + download_require + tokenizer_require + video_require + pptx_require + document_require + data_require
 
 PACKAGE_INFO = {
-    "release": {"name": "ftllm", "version": "1.9.0"},
+    "release": {"name": "ftllm", "version": "1.9.1"},
     "nightly": {"name": "ftllm-nightly", "version": "0.0.0.3"},
 }
 
@@ -65,12 +65,12 @@ setup (
             'ftllm=ftllm.cli:main'
         ]
     },
-    packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
+    packages = ['ftllm', 'ftllm/deploy', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
     package_data = {
         '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.mjs', '*.svg', 'build_info.json',
              'fastllm_triton_server.py', 'launcher_assets/*',
              'launcher_assets/locales/*.json', 'webui_assets/*',
-             'ui_plugins/*/*', 'plugin_assets/*']
+             'ui_plugins/*/*', 'plugin_assets/*', 'minimax_h3_server', 'minimax_h3_generate', 'h3_assets/*']
     },
     install_requires=[
         'pyreadline3',
@@ -82,8 +82,9 @@ setup (
         'nvidia-nccl-cu12'
     ] + all_require,
     extras_require={
-        'all': all_require,
+        'all': all_require + ['aiohttp'],
         'server': server_require,
+        'deploy': server_require + ['aiohttp'],
         'webui': webui_require,
         'pptx': pptx_require,
         'document': document_require,

@@ -271,6 +271,12 @@ else:
     for libname in ["libfastllm_tools.so", "libfastllm_tools-cu11.so", "libfastllm_tools-cpu.so"]:
         try:
             fastllm_lib = _load_library(os.path.join(os.path.split(os.path.realpath(__file__))[0], libname))
+            if libname == "libfastllm_tools-cpu.so" and load_errors and any(
+                os.path.isfile(os.path.join(os.path.dirname(os.path.realpath(__file__)), name))
+                for name in ("libfastllm_tools.so", "libfastllm_tools-cu11.so")
+            ):
+                print("Warning: CUDA library loading failed; running with CPU fallback. "
+                      + "; ".join(load_errors), file=sys.stderr)
             print("Load", libname)
             succ = True
             break
@@ -446,6 +452,15 @@ fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ct
                                                   ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "launch_response_clover_llm_model"):
+    fastllm_lib.launch_response_clover_llm_model.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p]
+    fastllm_lib.launch_response_clover_llm_model.restype = ctypes.c_int
+    fastllm_lib.configure_clover_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.configure_clover_llm_model.restype = ctypes.c_bool
+    fastllm_lib.get_clover_error.argtypes = []
+    fastllm_lib.get_clover_error.restype = ctypes.c_char_p
+
 fastllm_lib.launch_response_llm_model_multimodal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                                             ctypes.c_char_p, ctypes.c_void_p, 
                                                             ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
@@ -560,6 +575,9 @@ fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_prefill_batching_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
+if hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
+    fastllm_lib.set_prefill_coalescing_llm_model.argtypes = [ctypes.c_int] * 6
+    fastllm_lib.set_prefill_coalescing_llm_model.restype = ctypes.c_bool
 
 fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_model_indexer_dtype.restype = None
@@ -572,6 +590,9 @@ fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 
 fastllm_lib.warmup_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.warmup_llm_model.restype = ctypes.c_char_p
+if hasattr(fastllm_lib, "configure_attention_parallel_llm_model"):
+    fastllm_lib.configure_attention_parallel_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+    fastllm_lib.configure_attention_parallel_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.get_max_input_len_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
@@ -872,7 +893,13 @@ def get_disk_moe_cache_stats():
              "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
              "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes",
              "cpu_workspace_bytes", "cpu_buffer_reuses", "cpu_buffer_allocations",
-             "cpu_reclaims", "async_maintenance")
+             "cpu_reclaims", "async_maintenance",
+             "cpu_buffer_mmaps", "cpu_buffer_munmaps", "cpu_buffer_splits", "cpu_buffer_coalesces",
+             "canonical_promotion_checks", "canonical_promotion_rejects", "canonical_residence_rejects",
+             "canonical_upload_bytes", "canonical_upload_us", "canonical_download_us",
+             "decode_handoff_d2h_copies", "decode_handoff_d2h_bytes", "decode_handoff_wait_us",
+             "decode_output_h2d_copies", "decode_output_h2d_bytes",
+             "resident_readback_copies", "resident_readback_bytes", "resident_readback_wait_us")
     if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
         values = (ctypes.c_uint64 * len(names))()
         count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
@@ -1225,10 +1252,13 @@ class TokenizerCache:
     def __init__ (self):
         from collections import deque
         self.caches = deque(maxlen = 100)
+        self.lock = threading.Lock()
     
     def add(self, prompt, tokens):
-        # print("add cache", prompt[:100], tokens[:100])
-        self.caches.append([prompt, tokens])
+        # A cancelled stream may still hold its mutable history lists.
+        entry = (tuple(prompt), tuple(tuple(part) for part in tokens))
+        with self.lock:
+            self.caches.append(entry)
     
     def prompt_can_match(self, prompt, cur_len, s):
         if (cur_len + len(s) > len(prompt)):
@@ -1242,7 +1272,11 @@ class TokenizerCache:
         max_len = 0
         use_cahce_prompt = ""
         use_cache_tokens = []
-        for it in self.caches:
+        # Input preparation and completed streams run on different threads.
+        # Keep matching/tokenization outside the short publication lock.
+        with self.lock:
+            entries = tuple(self.caches)
+        for it in entries:
             cur_tokens = []
             cur_prompt = ""
             cur_len = 0
@@ -1526,8 +1560,8 @@ class model:
                   indexer_tp_storage: str = "replicated"):
         if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
             raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
-        if indexer_tp_storage not in ("replicated", "layer_shard"):
-            raise ValueError("indexer_tp_storage must be replicated or layer_shard")
+        if indexer_tp_storage not in ("replicated", "layer_shard", "context_shard"):
+            raise ValueError("indexer_tp_storage must be replicated, layer_shard or context_shard")
         if indexer_tp_storage != "replicated" and not hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
             raise RuntimeError("The loaded FastLLM library does not support Indexer TP storage; rebuild FastLLM.")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
@@ -1635,13 +1669,17 @@ class model:
                             self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
-                if external_mtp_path and mmproj_path:
-                    raise ValueError(
-                        "external MTP and mmproj cannot be used together")
-                if mmproj_path and self.config.get("gguf_architecture") == "deepseek41":
-                    from .deepseek_v41_gguf import vision_config
-                    self.config.update(vision_config(mmproj_path, self.config))
-                if context_requested:
+                if external_mtp_path and mmproj_path and self.config.get("gguf_architecture") != "deepseek41":
+                    raise ValueError("external MTP and mmproj cannot be used together")
+                if self.config.get("gguf_architecture") == "deepseek41":
+                    from .deepseek_v41_gguf import dspark_config, vision_config
+                    if external_mtp_path:
+                        self.config.update(dspark_config(external_mtp_path, self.config))
+                    if mmproj_path:
+                        self.config.update(vision_config(mmproj_path, self.config))
+                if context_requested or (external_mtp_path and mmproj_path):
+                    if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_context"):
+                        raise RuntimeError("the loaded FastLLM library does not support combined GGUF add-ons")
                     self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
                         path.encode(), ori_model_path.encode(),
                         external_mtp_path.encode(), mmproj_path.encode(),
@@ -1797,13 +1835,23 @@ class model:
             if key in self.default_generation_config
         })
 
+        if model_type == "clover_moe":
+            self.default_generation_config.update(
+                do_sample=False, top_p=1.0, top_k=0,
+                repetition_penalty=1.05, presence_penalty=0.9, frequency_penalty=0.0)
+
         # 统一尝试加载 generation_config.json
         if config_base_path:
             generation_config_path = os.path.join(config_base_path, "generation_config.json")
             if os.path.isfile(generation_config_path):
                 with open(generation_config_path, "r", encoding="utf-8") as f:
                     gen_cfg = json.load(f)
-                    if gen_cfg.get('do_sample', False):
+                    if model_type == "clover_moe":
+                        self._clover_generation_config = gen_cfg
+                        for key in self.default_generation_config:
+                            if key in gen_cfg and gen_cfg[key] is not None:
+                                self.default_generation_config[key] = gen_cfg[key]
+                    elif gen_cfg.get('do_sample', False):
                         for key in ["repetition_penalty", "top_p", "top_k", "temperature"]:
                             if key in gen_cfg:
                                 self.default_generation_config[key] = gen_cfg[key]
@@ -2862,16 +2910,70 @@ class model:
             print("add_cache failed: need hf_tokenizer.")
             exit(0)
     
+    def _is_clover(self):
+        return (getattr(self, "config", None) or {}).get("model_type") == "clover_moe"
+
+    def configure_pd(self, **options):
+        if not hasattr(fastllm_lib, "configure_pd_llm_model"):
+            raise RuntimeError("Rebuild FastLLM with Fast KV Manager support")
+        fastllm_lib.configure_pd_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p]
+        fastllm_lib.configure_pd_llm_model.restype = ctypes.c_bool
+        fastllm_lib.get_pd_error.restype = ctypes.c_char_p
+        if not fastllm_lib.configure_pd_llm_model(self.model, json.dumps(options, allow_nan=False).encode()):
+            raise ValueError(fastllm_lib.get_pd_error().decode())
+
+    def configure_clover(self, **options):
+        if not self._is_clover():
+            raise ValueError("Clover generation options require a Clover model")
+        if not hasattr(fastllm_lib, "configure_clover_llm_model"):
+            raise RuntimeError("Rebuild FastLLM with native Clover support")
+        if not fastllm_lib.configure_clover_llm_model(
+                self.model, json.dumps(options, allow_nan=False).encode()):
+            raise ValueError(fastllm_lib.get_clover_error().decode())
+
+    def _launch_clover(self, tokens, max_length, min_length, do_sample, top_p,
+                       top_k, temperature, repeat_penalty, stop_token_ids, options):
+        if not hasattr(fastllm_lib, "launch_response_clover_llm_model"):
+            raise RuntimeError("Rebuild FastLLM with native Clover support")
+        config = dict(getattr(self, "_clover_generation_config", {}))
+        config.update(options or {})
+        config.update(max_new_tokens=max_length, min_new_tokens=min_length,
+                      do_sample=do_sample, top_p=top_p, top_k=top_k,
+                      temperature=temperature, repetition_penalty=repeat_penalty,
+                      stop_token_ids=list(stop_token_ids or []))
+        handle = fastllm_lib.launch_response_clover_llm_model(
+            self.model, len(tokens), (ctypes.c_int * len(tokens))(*tokens),
+            json.dumps(config, allow_nan=False).encode())
+        if handle < 0:
+            raise ValueError(fastllm_lib.get_clover_error().decode())
+        return handle
+
     def launch_stream_response(self,
                         query: Union[str, List[Dict[str, str]]],
                         history: List[Tuple[str, str]] = None,
-                        max_length: int = 8192, min_length: int = 0, do_sample = True, 
-                        top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
+                        max_length: int = 8192, min_length: int = 0, do_sample = None,
+                        top_p = None, top_k = None, temperature = None, repeat_penalty = None,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
                         images: List = None, videos: List = None, tools: List = None, enable_thinking = None,
                         thinking_effort = None, tool_choice = None,
                         chat_template_kwargs = None,
-                        tool_call_constraint: Optional[Dict[str, Any]] = None):
+                        tool_call_constraint: Optional[Dict[str, Any]] = None,
+                        clover_options: Optional[Dict[str, Any]] = None):
+        is_clover = self._is_clover()
+        sampling_defaults = (self.default_generation_config if is_clover else
+                             dict(do_sample=True, top_p=0.8, top_k=1, temperature=1.0, repetition_penalty=1.0))
+        if do_sample is None:
+            do_sample = sampling_defaults.get("do_sample", False)
+        if top_p is None:
+            top_p = sampling_defaults["top_p"]
+        if top_k is None:
+            top_k = sampling_defaults["top_k"]
+        if temperature is None:
+            temperature = sampling_defaults["temperature"]
+        if repeat_penalty is None:
+            repeat_penalty = sampling_defaults["repetition_penalty"]
+        if is_clover and (images or videos or tool_call_constraint):
+            raise ValueError("Clover currently supports text generation without constrained sampling")
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         pending_text_input_token_cache = getattr(
@@ -3171,10 +3273,14 @@ class model:
                         lambda: len(input),
                         transform = self.trans_conversation)
 
-                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
-            handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                        max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
-                                                        False, stop_token_len, stop_token_list)
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+            if is_clover:
+                handle = self._launch_clover(input, max_length, min_length, do_sample, top_p,
+                    top_k, temperature, repeat_penalty, stop_token_ids, clover_options)
+            else:
+                handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                                                            max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                            False, stop_token_len, stop_token_list)
             if (self.save_history):
                 if can_reuse_token_count:
                     # Native KV history is independent of this Python text
@@ -3208,6 +3314,10 @@ class model:
                 lambda text: self.tokenizer_cache.tokenize_with_cache(self, text),
                 lambda: len(self.tokenizer_cache.tokenize_with_cache(self, prompt)))
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+            if is_clover:
+                input = self.tokenizer_encode_string(prompt)
+                return self._launch_clover(input, max_length, min_length, do_sample, top_p,
+                    top_k, temperature, repeat_penalty, stop_token_ids, clover_options)
             if (self.save_history):
                 input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
                 handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
@@ -3266,6 +3376,8 @@ class model:
                 if (cur <= -1):
                     if (cur == -2):
                         self._raise_prompt_too_long(handle)
+                    if cur == -3:
+                        raise RuntimeError("Native model generation failed; see server log for details")
                     break
                 tokens.append(cur)
                 ret = tokenizer.decode(tokens)
@@ -3287,6 +3399,8 @@ class model:
                 token = fastllm_lib.fetch_response_llm_model(self.model, handle)
                 if token == -2:
                     self._raise_prompt_too_long(handle)
+                if token == -3:
+                    raise RuntimeError("Native model generation failed; see server log for details")
                 if (self.save_history and handle in self.current_tokenizer_cache):
                     if (token <= -1):
                         try:
@@ -3376,6 +3490,8 @@ class model:
                 if count <= -1:
                     if count == -2:
                         self._raise_prompt_too_long(handle)
+                    if count == -3:
+                        raise RuntimeError("Native model generation failed; see server log for details")
                     if (self.save_history):
                         try:
                             cur = self.current_tokenizer_cache.pop(handle)
@@ -3422,6 +3538,8 @@ class model:
                 if count <= -1:
                     if count == -2:
                         self._raise_prompt_too_long(handle)
+                    if count == -3:
+                        raise RuntimeError("Native model generation failed; see server log for details")
                     if (self.save_history and
                             handle in self.current_tokenizer_cache):
                         try:
@@ -3578,6 +3696,8 @@ class model:
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
+        if self._is_clover() and atype not in ("bf16", "bfloat16", "fp16", "float16"):
+            raise ValueError("Clover activations must be BF16 or FP16")
         if getattr(self, "kvmem_enabled", False):
             raise ValueError("Set compute dtype before configuring KVMem")
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
@@ -3586,9 +3706,21 @@ class model:
         fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
 
     def set_kv_cache_dtype(self, kv_cache_dtype: str):
+        if self._is_clover() and kv_cache_dtype not in ("bf16", "bfloat16", "fp16", "float16"):
+            raise ValueError("Clover attention KV must be BF16 or FP16")
         if getattr(self, "kvmem_enabled", False):
             raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
+
+    def configure_attention_parallel(self, size: int):
+        setter = getattr(fastllm_lib, "configure_attention_parallel_llm_model", None)
+        if setter is None:
+            if size != 1:
+                raise RuntimeError("Native library does not support attention DP; rebuild it first")
+            return
+        error = setter(self.model, size)
+        if error:
+            raise ValueError(error.decode("utf-8", errors="replace"))
 
     def warmup(self):
         error = fastllm_lib.warmup_llm_model(self.model)
@@ -3624,17 +3756,20 @@ class model:
         on each device, reusing that workspace between layers. This also supports
         PP/TP and CUDA Graph; sink/recent/retrieval policy parameters do not apply
         to native QSA. Pure GPU and CPU execution modes do not enable Qwen4 KVMem.
-        Qwen4 resident_tokens must be divisible by 4. host_mib covers all target
-        and possible draft KV layers. Prefix reuse and concurrent requests are
-        disabled in the Qwen4 adapters; the full max_tokens context remains
-        available. MiMo/Naive N0.5 supports CUDA TP with an explicit max_batch
-        set before KVMem, BF16/FP8 KV and CUDA Graph. Its Indexer stays on GPU
-        and preserves exact TopK; prefill stages one layer at a time.
-        MiMo KVMem supports shared paged prefixes and GPU SWA checkpoints; draft
-        models remain disabled. Its global physical pool can be set with
-        set_max_tokens / --tokens before configuring KVMem, independently of the
-        per-request max_tokens limit. host_mib covers all requests, ranks and KV
-        layers (including graph padding).
+        Qwen4 resident_tokens must be divisible by 4. Prefix reuse and concurrent
+        requests are disabled in those adapters; the full max_tokens context
+        remains available. MiMo/Naive N0.5 supports CUDA TP with an explicit
+        max_batch set before KVMem, BF16/FP8 KV and CUDA Graph. Its Indexer stays
+        on GPU and preserves exact TopK; prefill stages one layer at a time.
+        MiMo KVMem supports DSpark, shared paged prefixes and GPU SWA/draft checkpoints.
+        Draft KV remains on GPU; target verification unions sparse queries per request,
+        splitting them into bounded batches when resident_tokens is small.
+        Its global physical pool can be set with set_max_tokens / --tokens before
+        configuring KVMem, independently of the per-request max_tokens limit.
+        host_mib covers all requests, ranks and KV layers (including graph padding).
+        For Qwen3/3.5, token budgets except max_tokens must align to the KV page.
+        retrieval_interval controls their speculative score reuse in committed
+        tokens; it need not be page aligned. Use 1 to refresh every verify round.
         """
         values = (max_tokens, resident_tokens, sink_tokens, prefix_tokens, recent_tokens,
                   retrieval_tokens, prefill_tokens)
@@ -3699,14 +3834,32 @@ class model:
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""
         fastllm_lib.set_chunked_prefill_size_llm_model(self.model, size)
 
-    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0):
-        """启动前设置 prefill 攒批目标和最长等待；目前仅支持 Naive 普通 TP GPU 推理。"""
-        if not all(isinstance(value, int) and 0 <= value <= 2147483647
-                   for value in (tokens, max_wait_ms)) or (max_wait_ms > 0 and tokens == 0):
-            raise ValueError("prefill batching requires non-negative int32 values and a positive token target when waiting")
-        if not fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms):
+    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0, *,
+                            target_requests: int = 0, max_requests: int = 0,
+                            min_decode_requests: int = 0):
+        """Configure bounded prefill coalescing before serving; zero tokens disables it.
+
+        Token and request targets independently release a batch. Capacity, idle
+        decode and continuing chunks also release it without waiting. Request
+        limits are per prefill batch, not the model's overall concurrency.
+        """
+        values = (tokens, max_wait_ms, target_requests, max_requests, min_decode_requests)
+        if (not all(isinstance(v, int) and 0 <= v <= 2147483647 for v in values)
+                or (tokens == 0 and any(values[1:]))
+                or (max_requests > 0 and target_requests > max_requests)):
+            raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and target_requests <= max_requests when capped")
+        if any(values[2:]):
+            if not hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
+                raise RuntimeError("This FastLLM library does not support the requested prefill coalescing options")
+            ok = fastllm_lib.set_prefill_coalescing_llm_model(self.model, *values)
+        else:
+            ok = fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms)
+        if not ok:
             raise ValueError("prefill batching must be configured before serving and currently requires ordinary Naive TP GPU inference")
-    
+        self.prefill_batching = dict(tokens=tokens, max_wait_ms=max_wait_ms,
+                                    target_requests=target_requests, max_requests=max_requests,
+                                    min_decode_requests=min_decode_requests)
+
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)
     

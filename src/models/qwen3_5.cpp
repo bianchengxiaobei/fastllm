@@ -2,6 +2,7 @@
 // Created by huangyuyang on 2/19/26.
 //
 
+#include "utils/recurrent_prefix_cache.h"
 #include "utils.h"
 
 #include "qwen3_5.h"
@@ -5342,11 +5343,7 @@ namespace fastllm {
             std::map<int, std::shared_ptr<KvMemPrefixData> > kvMem;
         };
 
-        struct Qwen35LinearPrefixSnapshot {
-            int cachedLen = 0;
-            int requestId = 0;
-            long long timestamp = 0;
-            std::vector<int> tokens;
+        struct Qwen35LinearPrefixSnapshot : RecurrentPrefixKey {
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
             // True when layers hold KVMem full-attention prefixes; such a
             // snapshot is only reusable by another KVMem request.
@@ -5382,22 +5379,8 @@ namespace fastllm {
             return *counter;
         }
 
-        static int Qwen35EnvInt(const char *name, int fallback) {
-            const char *value = std::getenv(name);
-            if (value == nullptr || value[0] == 0) {
-                return fallback;
-            }
-            char *end = nullptr;
-            long parsed = std::strtol(value, &end, 10);
-            if (end == value) {
-                return fallback;
-            }
-            return (int)parsed;
-        }
-
         static bool Qwen35LinearPrefixCacheEnabled() {
-            const char *enabled = std::getenv("FASTLLM_PREFIX_CACHE");
-            return enabled == nullptr || enabled[0] == 0 || Qwen35MoeIsTrueString(enabled);
+            return RecurrentPrefixCacheEnabled();
         }
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
@@ -5417,11 +5400,11 @@ namespace fastllm {
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 4));
+            return RecurrentPrefixMaxPerRequest();
         }
 
         static int Qwen35LinearPrefixSnapshotMaxRecords() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 8));
+            return RecurrentPrefixMaxRecords();
         }
 
         static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {
@@ -8692,11 +8675,7 @@ namespace fastllm {
             std::map<int, std::shared_ptr<KvMemPrefixData> > kvMem;
         };
 
-        struct Qwen35LinearPrefixSnapshot {
-            int cachedLen = 0;
-            int requestId = 0;
-            long long timestamp = 0;
-            std::vector<int> tokens;
+        struct Qwen35LinearPrefixSnapshot : RecurrentPrefixKey {
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
             // True when layers hold KVMem full-attention prefixes; such a
             // snapshot is only reusable by another KVMem request.

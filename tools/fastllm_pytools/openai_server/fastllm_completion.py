@@ -1764,6 +1764,10 @@ class FastLLmCompletion:
       return payload
 
   def _model_supports_tool_call_constraint(self) -> bool:
+      # Clover generates blocks and has no constrained decoder. Its tools are
+      # prompted and validated by FunctionCallParser, without a native mask.
+      if (getattr(self.model, "config", None) or {}).get("model_type") == "clover_moe":
+          return False
       launch_fn = getattr(self.model, "launch_stream_response", None)
       if launch_fn is None:
           return False
@@ -1848,6 +1852,34 @@ class FastLLmCompletion:
           tool_calls = parsed.valid_tool_calls,
           content = parsed.content,
       )
+
+  def _order_tool_results(
+      self, conversation: List[ConversationMessage],
+  ) -> List[ConversationMessage]:
+      # Parallel tools may finish out of order. Templates which omit call IDs
+      # associate a complete result group with the preceding call order.
+      messages: List[ConversationMessage] = []
+      cursor = 0
+      while cursor < len(conversation):
+          message = conversation[cursor]
+          messages.append(message)
+          cursor += 1
+          if message.role != "assistant" or not message.tool_calls:
+              continue
+          end = cursor
+          while end < len(conversation) and conversation[end].role == "tool":
+              end += 1
+          results = conversation[cursor:end]
+          call_ids = [call.get("id") for call in message.tool_calls]
+          result_ids = [result.tool_call_id for result in results]
+          if (all(call_ids) and len(set(call_ids)) == len(call_ids)
+                  and len(result_ids) == len(call_ids)
+                  and set(result_ids) == set(call_ids)):
+              order = {call_id: index for index, call_id in enumerate(call_ids)}
+              results = sorted(results, key=lambda result: order[result.tool_call_id])
+          messages.extend(results)
+          cursor = end
+      return messages
 
   def _normalize_system_messages(
       self, conversation: List[ConversationMessage],
@@ -3047,7 +3079,8 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
-          conversation = self._normalize_system_messages(conversation)
+          conversation = self._order_tool_results(
+              self._normalize_system_messages(conversation))
           if len(conversation) == 0:
               raise Exception("Empty msg")
 
@@ -3242,7 +3275,8 @@ class FastLLmCompletion:
               for message in conversation:
                   if message.role == "developer":
                       message.role = "system"
-              conversation = self._normalize_system_messages(conversation)
+              conversation = self._order_tool_results(
+                  self._normalize_system_messages(conversation))
 
           if len(conversation) == 0:
             raise Exception("Empty msg")
@@ -3291,6 +3325,24 @@ class FastLLmCompletion:
       frequency_penalty = default_gen['repetition_penalty']
       if request.frequency_penalty and request.frequency_penalty != 0.0:
         frequency_penalty = request.frequency_penalty
+
+      clover_options = None
+      if getattr(self.model, "config", {}).get("model_type") == "clover_moe":
+          clover_options = dict(request.clover_options or {})
+          # OpenAI additive penalties are independent of repetition scaling.
+          # An omitted field uses the checkpoint default; explicit zero disables it.
+          for key in ("presence_penalty", "frequency_penalty"):
+              value = getattr(request, key)
+              if key in request.model_fields_set and value is not None:
+                  clover_options[key] = value
+              else:
+                  clover_options.setdefault(key, default_gen[key])
+          frequency_penalty = (request.repetition_penalty if request.repetition_penalty is not None
+                               else default_gen['repetition_penalty'])
+          if request.do_sample is not None:
+              do_sample = request.do_sample and request.temperature != 0
+          elif not any(getattr(request, key) is not None for key in ("temperature", "top_p", "top_k")):
+              do_sample = default_gen.get("do_sample", False)
 
       max_length = request.max_tokens if request.max_tokens else 32768
       min_length = request.min_tokens if request.min_tokens else 0
@@ -3362,6 +3414,8 @@ class FastLLmCompletion:
       }
       if chat_template_kwargs is not None:
           launch_kwargs["chat_template_kwargs"] = chat_template_kwargs
+      if clover_options is not None:
+          launch_kwargs["clover_options"] = clover_options
       if self._is_kimi_k3_model():
           launch_kwargs.update({
               "thinking_effort": thinking_effort,

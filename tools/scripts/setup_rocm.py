@@ -11,7 +11,7 @@ all_require = server_require + download_require + video_require + pptx_require +
 
 setup (
     name = "ftllm_rocm",
-    version = "1.9.0",
+    version = "1.9.1",
     author = "huangyuyang",
     author_email = "ztxz16@foxmail.com",
     description = "High-performance C++ inference engine for dense and MoE language models",
@@ -21,7 +21,7 @@ setup (
             'ftllm=ftllm.cli:main'
         ]
     },
-    packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal'],
+    packages = ['ftllm', 'ftllm/deploy', 'ftllm/openai_server', 'ftllm/openai_server/protocal'],
     package_data = {
         '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.svg',
              'launcher_assets/*', 'launcher_assets/locales/*.json', 'webui_assets/*',
@@ -33,8 +33,9 @@ setup (
         'jinja2>=3.1.0'
     ] + all_require,
     extras_require={
-        'all': all_require,
+        'all': all_require + ['aiohttp'],
         'server': server_require,
+        'deploy': server_require + ['aiohttp'],
         'webui': webui_require,
         'pptx': pptx_require,
         'document': document_require,

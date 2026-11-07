@@ -4208,7 +4208,7 @@ namespace {
         }
     }
 
-#endif
+#endif // USE_CUDA
 
     void RunQwen4HyperPrepareRegressionCase(
             fastllm::DataType type, int rows, int lowRank, int groups,

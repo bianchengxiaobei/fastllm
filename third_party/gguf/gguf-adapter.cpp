@@ -1,22 +1,37 @@
 #include "gguf.h"
 #include "executor.h"
+#include <climits>
 
 namespace fastllm {
-    static std::vector<GGUFWeightReplaceRule> DeepSeekV41GGUFWeightRules() {
+    static std::vector<GGUFWeightReplaceRule> DeepSeekV41GGUFWeightRules(bool draft = false) {
         using Rule = GGUFWeightReplaceRule;
         std::vector<Rule> rules;
         auto add = [&](const std::string &pattern, const std::string &name,
                        Rule::GGUFWeightReplaceType type = Rule::GGUFWeightReplaceDirect) {
             rules.emplace_back(std::regex("^" + pattern + "$"), name, type);
         };
-        const std::string layer = "layers.$1.";
-        add(R"(token_embd\.weight)", "embed.weight", Rule::GGUFWeightReplaceForceFP32);
-        add(R"(output\.weight)", "head.weight");
-        add(R"(output_norm\.weight)", "norm.weight");
-        add(R"(engram_(token_map|primes|offsets|multipliers)\.weight)", "engram_$1.weight");
-        add(R"(blk\.(\d+)\.engram_embd\.weight)", layer + "engram.embed.weight");
-        add(R"(blk\.(\d+)\.engram_(q|k)\.weight)", layer + "engram.$2_weight", Rule::GGUFWeightReplaceForceFP32);
-        add(R"(blk\.(\d+)\.engram_wkv\.weight)", layer + "engram.wkv.weight");
+        const std::string layer = draft ? "mtp.$1." : "layers.$1.";
+        if (draft) {
+            add(R"(fc\.weight)", "mtp.0.main_proj.weight");
+            add(R"(enc\.output_norm\.weight)", "mtp.0.main_norm.weight");
+            add(R"(output_norm\.weight)", "draft_last.norm.weight");
+            add(R"(markov_w1\.weight)", "draft_last.markov_head.embed.weight", Rule::GGUFWeightReplaceForceBF16);
+            add(R"(markov_w2\.weight)", "draft_last.markov_head.head.weight", Rule::GGUFWeightReplaceForceBF16);
+            add(R"(conf_proj\.weight)", "draft_last.confidence_head.proj.weight", Rule::GGUFWeightReplaceForceFP32);
+        } else {
+            add(R"(token_embd\.weight)", "embed.weight", Rule::GGUFWeightReplaceForceFP32);
+            add(R"(output\.weight)", "head.weight");
+            add(R"(output_norm\.weight)", "norm.weight");
+            add(R"(engram_(token_map|primes|offsets|multipliers)\.weight)", "engram_$1.weight");
+            add(R"(blk\.(\d+)\.engram_embd\.weight)", layer + "engram.embed.weight");
+            add(R"(blk\.(\d+)\.engram_(q|k)\.weight)", layer + "engram.$2_weight", Rule::GGUFWeightReplaceForceFP32);
+            add(R"(blk\.(\d+)\.engram_wkv\.weight)", layer + "engram.wkv.weight");
+            add(R"(blk\.(\d+)\.engram_kv\.weight)", layer + "engram.wkv.weight");
+            // The upstream layout stores q*k in FP32. A unit k parameter is
+            // installed after loading, preserving the existing CPU/TP/graph math.
+            add(R"(blk\.(\d+)\.engram_gate\.weight)", layer + "engram.q_weight", Rule::GGUFWeightReplaceForceFP32);
+            add(R"(per_layer_token_embd\.weight)", "engram_combined.weight");
+        }
         add(R"(blk\.(\d+)\.(attn_norm|ffn_norm)\.weight)", layer + "$2.weight");
         add(R"(blk\.(\d+)\.(hc_(?:attn|ffn)_(?:base|fn|scale))\.weight)", layer + "$2");
         add(R"(blk\.(\d+)\.attn_sinks\.weight)", layer + "attn.attn_sink");
@@ -33,7 +48,8 @@ namespace fastllm {
         add(R"(blk\.(\d+)\.indexer\.k_norm\.weight)", layer + "attn.indexer.k_norm.weight");
         add(R"(blk\.(\d+)\.ffn_gate_inp\.weight)", layer + "ffn.gate.weight", Rule::GGUFWeightReplaceForceFP32);
         add(R"(blk\.(\d+)\.exp_probs_b\.bias)", layer + "ffn.gate.bias");
-        add(R"(blk\.(\d+)\.exp_probs_b_vl\.bias)", layer + "ffn.gate.bias_vl", Rule::GGUFWeightReplaceForceFP32);
+        if (!draft)
+            add(R"(blk\.(\d+)\.exp_probs_b_vl\.bias)", layer + "ffn.gate.bias_vl", Rule::GGUFWeightReplaceForceFP32);
         for (const auto &projection : std::vector<std::pair<std::string, std::string>>{
                  {"gate", "w1"}, {"up", "w3"}, {"down", "w2"}}) {
             add(R"(blk\.(\d+)\.ffn_)" + projection.first + R"(_shexp\.weight)",
@@ -43,6 +59,161 @@ namespace fastllm {
                 Rule::GGUFWeightReplacePacked);
         }
         return rules;
+    }
+
+    void LoadDeepSeekV41UpstreamGGUFConfig(basellm *model, const json11::Json &params) {
+        if (params["deepseek41.ple.layers"].is_null()) return;
+        const auto require = [](bool ok, const std::string &message) {
+            AssertInFastLLM(ok, "DeepSeek V4.1 upstream GGUF: " + message);
+        };
+        const auto alias = [&](const std::string &key, const std::string &source) {
+            const auto &value = params["deepseek41." + source];
+            require(!value.is_null(), "missing metadata " + source);
+            const std::string text = value.is_string() ? value.string_value() : value.dump();
+            const auto old = model->weight.dicts.find(key);
+            require(old == model->weight.dicts.end() || old->second == text,
+                    "conflicting metadata for " + key);
+            model->weight.AddDict(key, text);
+        };
+        for (const auto &pair : std::vector<std::pair<std::string, std::string>>{
+                 {"kv_source_layer_ids", "attention.kv_source_layers"},
+                 {"index_source_layer_ids", "attention.indexer.source_layers"},
+                 {"candidate_source_layer_id", "attention.indexer.candidate_source_layer"},
+                 {"candidate_topk_blocks", "attention.indexer.candidate_top_k_blocks"},
+                 {"candidate_block_size", "attention.indexer.candidate_block_size"},
+                 {"engram_layer_ids", "ple.layers"}, {"engram_max_ngram_size", "ple.ngram_size"},
+                 {"engram_n_heads", "ple.heads_per_ngram"},
+                 {"engram_head_dim", "embedding_length_per_layer_input"},
+                 {"engram_pad_token_id", "engram.pad_token_id"}}) alias(pair.first, pair.second);
+        require(params["deepseek41.expert_gating_func"].int_value() == 4,
+                "requires sqrtsoftplus expert gating");
+        model->weight.AddDict("scoring_func", "sqrtsoftplus");
+
+        const auto integers = [&](const std::string &key) {
+            const auto &array = params["deepseek41." + key];
+            require(array.is_array(), "missing integer array " + key);
+            std::vector<int64_t> result;
+            for (const auto &item : array.array_items()) {
+                // GGUF U64/I64 values use JsonLL. Do not round hash constants
+                // through number_value() or through a serialized double.
+                int64_t value = item.ll_value();
+                if (value == 0 && item.number_value() >= 0 && item.number_value() <= INT_MAX)
+                    value = item.int_value();
+                require(item.is_number() && value >= 0 && item.dump() == std::to_string(value),
+                        "invalid integer in " + key);
+                result.push_back(value);
+            }
+            return result;
+        };
+        const auto layers = integers("ple.layers");
+        const int ngram = params["deepseek41.ple.ngram_size"].int_value();
+        const int heads = params["deepseek41.ple.heads_per_ngram"].int_value();
+        require(!layers.empty() && ngram > 1 && heads > 0 && (int64_t)(ngram - 1) * heads <= INT_MAX,
+                "invalid PLE dimensions");
+        const size_t cols = (ngram - 1) * heads;
+        const auto primes = integers("ple.head_vocab_sizes");
+        auto offsets = integers("ple.head_offsets");
+        const auto multipliers = integers("ple.layer_multipliers");
+        const auto tokens = integers("engram.token_map");
+        require(primes.size() == layers.size() * cols && offsets.size() == primes.size() &&
+                multipliers.size() == layers.size() * ngram && !tokens.empty(), "incomplete Engram layout");
+        json11::Json::array rows;
+        int64_t total = 0;
+        for (size_t layer = 0; layer < layers.size(); ++layer) {
+            const int64_t base = total;
+            require(layers[layer] < params["deepseek41.block_count"].int_value() &&
+                    (layer == 0 || layers[layer] > layers[layer - 1]), "invalid PLE layer ids");
+            for (size_t j = layer * cols; j < (layer + 1) * cols; ++j) {
+                require(primes[j] > 0 && primes[j] <= INT_MAX && offsets[j] == total,
+                        "invalid PLE head ranges");
+                offsets[j] -= base; // Runtime lookup tables have layer-local rows.
+                total += primes[j];
+            }
+            require(total - base <= INT_MAX, "Engram layer exceeds supported row count");
+            rows.emplace_back((long long)(total - base));
+        }
+        for (auto value : multipliers) require(value > 0 && value % 2 == 1, "invalid Engram hash multiplier");
+        for (auto value : tokens) require(value < INT_MAX, "invalid Engram token map");
+        const int64_t vocab = *std::max_element(tokens.begin(), tokens.end()) + 1;
+        model->weight.AddDict("engram_num_embeddings", json11::Json(rows).dump());
+        model->weight.AddDict("engram_compressed_vocab_size", std::to_string(vocab));
+
+        const auto install = [&](const std::string &name, const std::vector<int64_t> &values, ggml_type kind) {
+            require(!model->weight.weight.count(name), "duplicate Engram constant " + name);
+            Data &data = model->weight[name];
+            data.dataType = DATA_GGUF_FORMAT;
+            data.isGGUFData = true;
+            data.ggmlType = kind;
+            data.dims = {(int)values.size()};
+            auto *tensor = new ggml_tensor();
+            data.ggmlTensor = tensor;
+            tensor->type = kind;
+            tensor->dims = data.dims;
+            tensor->ne[0] = values.size();
+            tensor->nb[0] = kind == GGML_TYPE_I32 ? sizeof(int32_t) : sizeof(int64_t);
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                tensor->ne[i] = 1;
+                tensor->nb[i] = tensor->nb[0] * values.size();
+            }
+            data.expansionBytes = ggml_nbytes(tensor);
+            data.cpuData = new uint8_t[data.expansionBytes];
+            if (kind == GGML_TYPE_I32) {
+                for (size_t i = 0; i < values.size(); ++i) ((int32_t*)data.cpuData)[i] = (int32_t)values[i];
+            } else memcpy(data.cpuData, values.data(), data.expansionBytes);
+        };
+        install("engram_token_map.weight", tokens, GGML_TYPE_I32);
+        install("engram_primes.weight", primes, GGML_TYPE_I64);
+        install("engram_offsets.weight", offsets, GGML_TYPE_I64);
+        install("engram_multipliers.weight", multipliers, GGML_TYPE_I64);
+    }
+
+    void PrepareDeepSeekV41UpstreamGGUFTasks(basellm *model, const json11::Json &params,
+                                            std::vector<ReadGGUFTask> &tasks) {
+        if (params["deepseek41.ple.layers"].is_null()) return;
+        const auto &layers = params["deepseek41.ple.layers"].array_items();
+        const auto &sizes = params["deepseek41.ple.head_vocab_sizes"].array_items();
+        const size_t cols = sizes.size() / layers.size(); // Validated by config import.
+        for (const auto &layer : layers) {
+            const std::string prefix = "layers." + std::to_string(layer.int_value()) + ".engram.";
+            int gates = 0;
+            for (const auto &task : tasks) {
+                AssertInFastLLM(task.name != prefix + "k_weight",
+                    "DeepSeek V4.1 upstream GGUF: mixed legacy and fused Engram gates.");
+                if (task.name == prefix + "q_weight") {
+                    AssertInFastLLM(task.tensor.name == "blk." + std::to_string(layer.int_value()) + ".engram_gate.weight",
+                        "DeepSeek V4.1 upstream GGUF: missing fused Engram gate.");
+                    ++gates;
+                }
+            }
+            AssertInFastLLM(gates == 1, "DeepSeek V4.1 upstream GGUF: missing or duplicate fused Engram gate.");
+        }
+        std::vector<ReadGGUFTask> normalized;
+        bool found = false;
+        for (const auto &task : tasks) {
+            if (task.name != "engram_combined.weight") { normalized.push_back(task); continue; }
+            AssertInFastLLM(!found && task.tensor.type == GGML_TYPE_IQ4_NL && task.tensor.dims.size() == 2 &&
+                task.tensor.ne[0] == params["deepseek41.embedding_length_per_layer_input"].int_value(),
+                "DeepSeek V4.1 upstream GGUF: invalid combined Engram table.");
+            found = true;
+            int64_t row = 0;
+            for (size_t i = 0; i < layers.size(); ++i) {
+                int64_t count = 0;
+                for (size_t j = i * cols; j < (i + 1) * cols; ++j) count += sizes[j].int_value();
+                auto part = task;
+                part.name = "layers." + std::to_string(layers[i].int_value()) + ".engram.embed.weight";
+                part.tensor.dims[0] = (int)count;
+                part.tensor.ne[1] = count;
+                for (int d = 2; d < GGML_MAX_DIMS; ++d)
+                    part.tensor.nb[d] = part.tensor.nb[1] * count;
+                part.offset += row * task.tensor.nb[1];
+                row += count;
+                normalized.push_back(part);
+                model->ngramWeights.insert(part.name);
+            }
+            AssertInFastLLM(row == task.tensor.ne[1], "DeepSeek V4.1 upstream GGUF: Engram table row mismatch.");
+        }
+        AssertInFastLLM(found, "DeepSeek V4.1 upstream GGUF: missing combined Engram table (last shard).");
+        tasks.swap(normalized);
     }
 
     static std::vector<GGUFWeightReplaceRule> DeepSeekV41VisionGGUFWeightRules() {
@@ -72,8 +243,8 @@ namespace fastllm {
         return rules;
     }
 
-    void AppendDeepSeekV41GGUFVision(basellm *model, const json11::Json &target,
-                                 const std::string &path,
+    void AppendDeepSeekV41GGUFAux(basellm *model, const json11::Json &target,
+                                 const std::string &path, bool vision,
                                  std::vector<ReadGGUFTask> &tasks) {
         json11::Json document;
         ReadGGUFMetaData(path, document);
@@ -88,34 +259,61 @@ namespace fastllm {
         require(target["general.architecture"].string_value() == "deepseek41",
                 "requires a DeepSeek V4.1 GGUF target");
         std::vector<ReadGGUFTask> auxiliary;
-        require(meta["general.architecture"].string_value() == "clip" &&
-                meta["clip.projector_type"].string_value() == "deepseek41v" &&
-                meta["clip.vision.projection_dim"] == target["deepseek41.embedding_length"],
-                "incompatible vision architecture/projection dimension");
-        if (!meta["deepseek41.vision.source"].is_null())
-            require(meta["deepseek41.vision.source"] == target["deepseek41.engram.source"],
-                    "vision routing source does not match the backbone");
-        for (const auto &pair : std::vector<std::pair<std::string, std::string>>{
-                 {"hidden_size", "embedding_length"}, {"num_hidden_layers", "block_count"},
-                 {"intermediate_size", "feed_forward_length"}, {"num_attention_heads", "attention.head_count"},
-                 {"patch_size", "patch_size"}, {"downsample_ratio", "projector.scale_factor"}})
-            add("vision_config." + pair.first, meta["clip.vision." + pair.second]);
-        const auto &tokens = target["tokenizer.ggml.tokens"].array_items();
-        int imageToken = -1;
-        for (int i = 0; i < (int)tokens.size(); ++i)
-            if (tokens[i].string_value() == "<｜deepseek_image｜>") imageToken = i;
-        require(imageToken >= 0, "target tokenizer has no image token");
-        add("image_token_id", imageToken);
-        const int layers = meta["clip.vision.block_count"].int_value();
-        require(layers > 0, "empty vision encoder");
-        AppendGGUFTasks("deepseek_v41_mmproj", path, auxiliary);
-        for (int i = 0; i < layers; ++i) {
-            const std::string p = "vision.blocks." + std::to_string(i) + ".mlp.";
-            model->weightMergeRules.push_back(WeightMergeRule({
-                WeightMergeRuleSingle({p + "gate.weight", p + "up.weight"}, p + "w1.weight", "linearSwiglu")}));
+        int layers = 0;
+        if (vision) {
+            require(meta["general.architecture"].string_value() == "clip" &&
+                    meta["clip.projector_type"].string_value() == "deepseek41v" &&
+                    meta["clip.vision.projection_dim"] == target["deepseek41.embedding_length"],
+                    "incompatible vision architecture/projection dimension");
+            if (!meta["deepseek41.vision.source"].is_null())
+                require(meta["deepseek41.vision.source"] == target["deepseek41.engram.source"],
+                        "vision routing source does not match the backbone");
+            for (const auto &pair : std::vector<std::pair<std::string, std::string>>{
+                     {"hidden_size", "embedding_length"}, {"num_hidden_layers", "block_count"},
+                     {"intermediate_size", "feed_forward_length"}, {"num_attention_heads", "attention.head_count"},
+                     {"patch_size", "patch_size"}, {"downsample_ratio", "projector.scale_factor"}})
+                add("vision_config." + pair.first, meta["clip.vision." + pair.second]);
+            const auto &tokens = target["tokenizer.ggml.tokens"].array_items();
+            int imageToken = -1;
+            for (int i = 0; i < (int)tokens.size(); ++i)
+                if (tokens[i].string_value() == "<｜deepseek_image｜>") imageToken = i;
+            require(imageToken >= 0, "target tokenizer has no image token");
+            add("image_token_id", imageToken);
+            layers = meta["clip.vision.block_count"].int_value();
+            require(layers > 0, "empty vision encoder");
+            AppendGGUFTasks("deepseek_v41_mmproj", path, auxiliary);
+            for (int i = 0; i < layers; ++i) {
+                const std::string p = "vision.blocks." + std::to_string(i) + ".mlp.";
+                model->weightMergeRules.push_back(WeightMergeRule({
+                    WeightMergeRuleSingle({p + "gate.weight", p + "up.weight"}, p + "w1.weight", "linearSwiglu")}));
+            }
+        } else {
+            require(meta["general.architecture"].string_value() == "dflash", "expected DSpark dflash architecture");
+            for (const std::string &key : {"embedding_length", "attention.head_count", "attention.key_length",
+                     "rope.dimension_count", "attention.q_lora_rank", "attention.output_lora_rank",
+                     "attention.output_group_count", "hyper_connection.count", "expert_feed_forward_length"})
+                require(!meta["dflash." + key].is_null() && meta["dflash." + key] == target["deepseek41." + key],
+                        "draft/target mismatch: " + key);
+            layers = meta["dflash.block_count"].int_value();
+            require(layers > 0 && layers <= target["deepseek41.block_count"].int_value(), "invalid draft layer count");
+            for (const auto &pair : std::vector<std::pair<std::string, std::string>>{
+                     {"num_nextn_predict_layers", "block_count"}, {"dspark_block_size", "block_size"},
+                     {"dspark_target_layer_ids", "target_layers"}, {"dspark_n_routed_experts", "expert_count"},
+                     {"dspark_num_experts_per_tok", "expert_used_count"}})
+                add(pair.first, meta["dflash." + pair.second]);
+            add("dspark_noise_token_id", meta["tokenizer.ggml.mask_token_id"]);
+            add("dspark_external_gguf", true);
+            require(meta["dflash.block_size"].int_value() > 0 &&
+                    !meta["dflash.target_layers"].array_items().empty(), "missing DSpark block/target layers");
+            const auto &ratios = meta["dflash.attention.compress_ratios"].array_items();
+            require((int)ratios.size() == layers, "missing draft compression ratios");
+            for (const auto &ratio : ratios) require(ratio.int_value() == 0, "compressed draft attention is unsupported");
+            AppendGGUFTasks("deepseek_v41_dspark", path, auxiliary);
         }
         std::map<std::string, std::vector<int>> shapes;
         for (auto &task : auxiliary) {
+            if (task.name.compare(0, 11, "draft_last.") == 0)
+                task.name = "mtp." + std::to_string(layers - 1) + "." + task.name.substr(11);
             if (task.name == "vision.patch_embed.proj.weight") {
                 auto &t = task.tensor;
                 require(t.dims.size() == 4 && t.dims[1] == 3, "invalid patch convolution");
@@ -130,36 +328,83 @@ namespace fastllm {
             require(found != shapes.end() && found->second == expected, "missing/invalid tensor " + name);
         };
         const int hidden = target["deepseek41.embedding_length"].int_value();
-        const int dim = meta["clip.vision.embedding_length"].int_value();
-        const int inter = meta["clip.vision.feed_forward_length"].int_value();
-        const int patch = meta["clip.vision.patch_size"].int_value();
-        const int scale = meta["clip.vision.projector.scale_factor"].int_value();
-        require(dim > 0 && inter > 0 && patch > 0 && scale > 0, "invalid vision dimensions");
-        shape("vision.patch_embed.proj.weight", {dim, 3 * patch * patch});
-        shape("vision.patch_embed.proj.bias", {dim});
-        shape("vision.norm.weight", {dim});
-        shape("aligner.w1.weight", {hidden, dim * scale * scale});
-        shape("aligner.w2.weight", {hidden, hidden});
-        for (const auto &name : {"aligner.w1.bias", "aligner.w2.bias", "image_start", "image_end", "image_newline"})
-            shape(name, {hidden});
-        for (int i = 0; i < layers; ++i) {
-            const std::string p = "vision.blocks." + std::to_string(i);
-            shape(p + ".attn.wqkv.weight", {3 * dim, dim});
-            shape(p + ".attn.wqkv.bias", {3 * dim});
-            shape(p + ".attn.wo.weight", {dim, dim});
-            shape(p + ".attn.wo.bias", {dim});
-            shape(p + ".norm1.weight", {dim}); shape(p + ".norm2.weight", {dim});
-            shape(p + ".mlp.gate.weight", {inter, dim}); shape(p + ".mlp.up.weight", {inter, dim});
-            shape(p + ".mlp.w2.weight", {dim, inter});
+        if (vision) {
+            const int dim = meta["clip.vision.embedding_length"].int_value();
+            const int inter = meta["clip.vision.feed_forward_length"].int_value();
+            const int patch = meta["clip.vision.patch_size"].int_value();
+            const int scale = meta["clip.vision.projector.scale_factor"].int_value();
+            require(dim > 0 && inter > 0 && patch > 0 && scale > 0, "invalid vision dimensions");
+            shape("vision.patch_embed.proj.weight", {dim, 3 * patch * patch});
+            shape("vision.patch_embed.proj.bias", {dim});
+            shape("vision.norm.weight", {dim});
+            shape("aligner.w1.weight", {hidden, dim * scale * scale});
+            shape("aligner.w2.weight", {hidden, hidden});
+            for (const auto &name : {"aligner.w1.bias", "aligner.w2.bias", "image_start", "image_end", "image_newline"})
+                shape(name, {hidden});
+            for (int i = 0; i < layers; ++i) {
+                const std::string p = "vision.blocks." + std::to_string(i);
+                shape(p + ".attn.wqkv.weight", {3 * dim, dim});
+                shape(p + ".attn.wqkv.bias", {3 * dim});
+                shape(p + ".attn.wo.weight", {dim, dim});
+                shape(p + ".attn.wo.bias", {dim});
+                shape(p + ".norm1.weight", {dim}); shape(p + ".norm2.weight", {dim});
+                shape(p + ".mlp.gate.weight", {inter, dim}); shape(p + ".mlp.up.weight", {inter, dim});
+                shape(p + ".mlp.w2.weight", {dim, inter});
+            }
+            for (const auto &item : shapes)
+                if (item.first.compare(0, 7, "layers.") == 0)
+                    require(item.second == std::vector<int>{target["deepseek41.expert_count"].int_value()},
+                            "invalid image routing bias " + item.first);
+        } else {
+            const std::string last = "mtp." + std::to_string(layers - 1);
+            const auto markov = shapes[last + ".markov_head.embed.weight"];
+            require(markov.size() == 2 && markov[1] > 0 &&
+                    markov == shapes[last + ".markov_head.head.weight"], "invalid Markov head");
+            require(markov[0] == (int)target["tokenizer.ggml.tokens"].array_items().size(), "draft vocabulary mismatch");
+            add("dspark_markov_rank", markov[1]);
+            require(shapes["mtp.0.main_proj.weight"] == std::vector<int>{hidden,
+                hidden * (int)meta["dflash.target_layers"].array_items().size()}, "invalid draft projection");
+            shape("mtp.0.main_norm.weight", {hidden}); shape(last + ".norm.weight", {hidden});
+            shape(last + ".confidence_head.proj.weight", {1, hidden + markov[1]});
+            const int experts = meta["dflash.expert_count"].int_value();
+            const int inter = meta["dflash.expert_feed_forward_length"].int_value();
+            const int hc = meta["dflash.hyper_connection.count"].int_value();
+            const int hcOut = hc * (hc + 2);
+            const int heads = meta["dflash.attention.head_count"].int_value();
+            const int head = meta["dflash.attention.key_length"].int_value();
+            const int qrank = meta["dflash.attention.q_lora_rank"].int_value();
+            const int orank = meta["dflash.attention.output_lora_rank"].int_value();
+            const int groups = meta["dflash.attention.output_group_count"].int_value();
+            require(experts > 0 && inter > 0 && hc > 0 && groups > 0 && heads % groups == 0 &&
+                    meta["dflash.expert_used_count"].int_value() > 0 &&
+                    meta["dflash.expert_used_count"].int_value() <= experts, "invalid draft expert/attention configuration");
+            for (int i = 0; i < layers; ++i) {
+                const std::string p = "mtp." + std::to_string(i);
+                shape(p + ".attn.wkv.weight", {head, hidden});
+                shape(p + ".attn.wq_a.weight", {qrank, hidden});
+                shape(p + ".attn.wq_b.weight", {heads * head, qrank});
+                shape(p + ".attn.wo_a.weight", {groups * orank, heads / groups * head});
+                shape(p + ".attn.wo_b.weight", {hidden, groups * orank});
+                shape(p + ".attn.q_norm.weight", {qrank}); shape(p + ".attn.kv_norm.weight", {head});
+                shape(p + ".attn.attn_sink", {heads});
+                shape(p + ".ffn.gate.weight", {experts, hidden}); shape(p + ".ffn.gate.bias", {experts});
+                for (const std::string &part : {"attn", "ffn"}) {
+                    shape(p + "." + part + "_norm.weight", {hidden});
+                    shape(p + ".hc_" + part + "_base", {hcOut});
+                    shape(p + ".hc_" + part + "_scale", {3});
+                    shape(p + ".hc_" + part + "_fn", {hcOut, hc * hidden});
+                }
+                for (int e = -1; e < experts; ++e) {
+                    const std::string ep = p + ".ffn." + (e < 0 ? "shared_experts" : "experts." + std::to_string(e));
+                    shape(ep + ".w1.weight", {inter, hidden}); shape(ep + ".w3.weight", {inter, hidden});
+                    shape(ep + ".w2.weight", {hidden, inter});
+                }
+            }
         }
-        for (const auto &item : shapes)
-            if (item.first.compare(0, 7, "layers.") == 0)
-                require(item.second == std::vector<int>{target["deepseek41.expert_count"].int_value()},
-                        "invalid image routing bias " + item.first);
         require(!auxiliary.empty(), "no auxiliary tensors");
         tasks.insert(tasks.end(), auxiliary.begin(), auxiliary.end());
-        printf("[Fastllm] DeepSeek V4.1: external vision GGUF %s (%zu mapped tensors)\n",
-               path.c_str(), auxiliary.size());
+        printf("[Fastllm] DeepSeek V4.1: external %s GGUF %s (%zu mapped tensors)\n",
+               vision ? "vision" : "DSpark", path.c_str(), auxiliary.size());
     }
 
     static std::vector<GGUFWeightReplaceRule> Glm5NextGGUFWeightRules() {
@@ -272,6 +517,7 @@ namespace fastllm {
     std::vector <GGUFWeightReplaceRule> GetGGUFWeightReplaceRules(const std::string &arch) {
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > originalArchRulesDict = {
             {"deepseek_v41", DeepSeekV41GGUFWeightRules()},
+            {"deepseek_v41_dspark", DeepSeekV41GGUFWeightRules(true)},
             {"deepseek_v41_mmproj", DeepSeekV41VisionGGUFWeightRules()},
             {"glm5_next", Glm5NextGGUFWeightRules()},
             {"qwen4_exp", Qwen4GGUFWeightRules()},
