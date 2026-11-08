@@ -2746,6 +2746,7 @@ namespace fastllm {
             std::vector<int> reducePos, sampleExpertIdx, samplesExpertCount;
             std::vector<int> expertOffsets, reduceExpertOrder;
             std::vector<float> taskWeights;
+            std::vector<float> reduceTaskWeights;
 #ifdef USE_CUDA
             std::unique_ptr<void, FastllmCudaHostFreeDeleter> pinnedInput {nullptr};
             size_t pinnedInputBytes = 0;
