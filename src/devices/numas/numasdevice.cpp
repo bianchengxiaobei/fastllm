@@ -10992,7 +10992,7 @@ namespace fastllm {
                                             downRowBytes,
                                     downInputDataType, row, end,
                                     routed, routeWeight, swigluLimit,
-                                    quantize, false, false);
+                                    quantize, activationQuantBlock);
                             }
                         }
                         for (int nid = 0;
