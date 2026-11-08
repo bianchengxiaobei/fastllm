@@ -30,11 +30,11 @@
 #include <type_traits>
 #include <vector>
 
-#ifdef _MSC_VER
 // windows.h 里的 "typedef signed int INT32" 会和 DataType::INT32 在非限定名字
 // 查找下冲突, nvcc/MSVC 直接报 ambiguous. 本单元统一按 DataType 使用该名字.
+// 无条件定义: MSVC 解决撞名; Linux 下同样把所有非限定用法(含全局作用域的
+// 模板函数)重写成完整限定名, 两个编译器共用一套拼法.
 #define INT32 ::fastllm::DataType::INT32
-#endif
 
 #if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
 #define FASTLLM_NAIVE_SWA_FLASHINFER
@@ -2492,8 +2492,8 @@ void UploadDescriptorChunks(const std::vector<Row> &rows, Row *out) {
 }
 template<class Row>
 const Row *DeviceDescriptors(const std::vector<Row> &rows, fastllm::Data &storage) {
-    // 本文件 36 行的 #define INT32 会把限定名 fastllm::INT32 撕成非法记号，
-    // 这里沿用文件约定写裸 INT32（宏展开成完整限定名）。
+    // 36 行的 #define INT32 无条件生效，这里按文件约定写裸 INT32
+    //（宏展开成完整限定名，全局作用域也可见）。
     Output(storage, INT32, {int((rows.size() * sizeof(Row) + 3) / 4)});
     auto *out = (Row *)storage.cudaData;
 #if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
@@ -5764,7 +5764,7 @@ void FastllmCudaNaiveVerifyLengths(const fastllm::Data &positions, fastllm::Data
     fastllm::AssertInFastLLM(positions.dataType == fastllm::FLOAT32 &&
         positions.dataDevice == fastllm::DataDevice::CUDA, "Invalid verification positions.");
     const int count = positions.Count(0);
-    // 同上：避免 fastllm::INT32 撞上本文件的 INT32 宏。
+    // 同上：裸 INT32 依赖 36 行的无条件宏展开。
     Output(lengths, INT32, {count});
     VerifyPositionLengths<<<(count + 255) / 256, 256>>>(
         (const float *)positions.cudaData, (int *)lengths.cudaData, count);
