@@ -316,7 +316,7 @@ namespace fastllm {
     }
 
     void* allocate_interleaved(size_t size) {
-        if (!numaDetector.canUseNuma) {
+        if (!GetNumaDetector().canUseNuma) {
             return allocate_aligned(size);
         }
         void* ptr = numa_alloc_interleaved(size);
@@ -331,7 +331,7 @@ namespace fastllm {
         if (!ptr) {
             return;
         }
-        if (!numaDetector.canUseNuma) {
+        if (!GetNumaDetector().canUseNuma) {
             free_aligned(ptr, size);
             return;
         }
