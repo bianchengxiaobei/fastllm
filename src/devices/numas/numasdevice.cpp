@@ -7783,6 +7783,7 @@ namespace fastllm {
         struct BenchmarkProfile {
             int maxN = 0;
             bool initialized = false;
+            int lastPrintedLimit = -1;
             std::map<int, double> cpuTimeUs;
             std::map<int, double> gpuTimeUs;
         };
