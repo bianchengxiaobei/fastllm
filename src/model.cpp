@@ -137,8 +137,49 @@ namespace fastllm {
 
     static inline long long NowNanos() {
         return (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+                std::chrono::steady_clock::now().time_since_epoch()).count();
     }
+
+    // 冷启动时单个张量只有一两百 KB，一次发出去就是一串小请求：既吃不到设备带宽，
+    // 也把预读打散。这里每线程维护一个前向窗口，小请求按 8MB 对齐顺序读，后续
+    // 张量多半已经落在窗口里，直接从缓冲里 memcpy 走。窗口只往前推不回退，所以
+    // 最坏情况也只是多读一个窗口，不会退化成随机读。
+    // 这些定义本身不依赖平台（Windows 的 ReadFile 快路径与加载侧的 fopen 回退
+    // 都要引用），放在 _WIN32 分岔之外；Linux 下 readahead/整块读计数保持为 0。
+    static size_t LoadReadAheadBytes() {
+        static const size_t bytes = []() {
+            const char *env = std::getenv("FASTLLM_LOAD_READAHEAD_MB");
+            long mb = env == nullptr ? 8 : std::atol(env);
+            return mb <= 0 ? (size_t)0 : (size_t)mb * 1048576;
+        }();
+        return bytes;
+    }
+
+    struct LoadReadAheadWindow {
+        std::string fileName;
+        uint64_t start = 0;
+        size_t bytes = 0;
+        // 自适应窗口目标：命中就放大，未命中就减半。张量顺序一旦不是按偏移
+        // 递增的，窗口会自己缩到接近请求大小，不会拿 8MB 去换 224KB。
+        size_t target = 0;
+        std::vector <uint8_t> buffer;
+    };
+
+    static thread_local LoadReadAheadWindow gLoadReadAheadWindow;
+    // 多读进来的字节 / 命中窗口（完全没有磁盘 IO）的请求数 / 填窗口次数
+    static std::atomic<long long> gLoadReadAheadExtraBytes{0};
+    static std::atomic<long long> gLoadReadAheadHits{0};
+    static std::atomic<long long> gLoadReadAheadFills{0};
+
+    // 按偏移整块读。整块指这一次调用要的字节数（通常就是一整个张量），
+    // 不要退化成 CRT 的 4KB 缓冲读，否则又是一串 4K 随机请求。
+    static std::atomic<long long> gLoadReadNanos{0};
+    static std::atomic<long long> gLoadReadCalls{0};
+    static std::atomic<long long> gLoadReadBytes{0};
+    // ReadFileAtOffset 失败后回退到 fopen/memcpy 的次数：回退路径既不进 readIO
+    // 统计，也没有预读，如果数量大就是加载变慢的真正原因。
+    static std::atomic<long long> gLoadReadFallbacks{0};
+    static std::atomic<long long> gLoadFopenCalls{0};
 
 #if defined(_WIN32) || defined(_WIN64)
     // FASTLLM_LOAD_READFILE=0 可以退回映射读，方便对照。
@@ -237,45 +278,6 @@ namespace fastllm {
         cache.push_back(entry);
         return &cache.back();
     }
-
-    // 冷启动时单个张量只有一两百 KB，一次发出去就是一串小请求：既吃不到设备带宽，
-    // 也把 FILE_FLAG_SEQUENTIAL_SCAN 的预读打散。这里每线程维护一个前向窗口，小请求
-    // 按 8MB 对齐顺序读，后续张量多半已经落在窗口里，直接从缓冲里 memcpy 走。
-    // 窗口只往前推不回退，所以最坏情况也只是多读一个窗口，不会退化成随机读。
-    static size_t LoadReadAheadBytes() {
-        static const size_t bytes = []() {
-            const char *env = std::getenv("FASTLLM_LOAD_READAHEAD_MB");
-            long mb = env == nullptr ? 8 : std::atol(env);
-            return mb <= 0 ? (size_t)0 : (size_t)mb * 1048576;
-        }();
-        return bytes;
-    }
-
-    struct LoadReadAheadWindow {
-        std::string fileName;
-        uint64_t start = 0;
-        size_t bytes = 0;
-        // 自适应窗口目标：命中就放大，未命中就减半。张量顺序一旦不是按偏移
-        // 递增的，窗口会自己缩到接近请求大小，不会拿 8MB 去换 224KB。
-        size_t target = 0;
-        std::vector <uint8_t> buffer;
-    };
-
-    static thread_local LoadReadAheadWindow gLoadReadAheadWindow;
-    // 多读进来的字节 / 命中窗口（完全没有磁盘 IO）的请求数 / 填窗口次数
-    static std::atomic<long long> gLoadReadAheadExtraBytes{0};
-    static std::atomic<long long> gLoadReadAheadHits{0};
-    static std::atomic<long long> gLoadReadAheadFills{0};
-
-    // 按偏移整块读。整块指这一次调用要的字节数（通常就是一整个张量），
-    // 不要退化成 CRT 的 4KB 缓冲读，否则又是一串 4K 随机请求。
-    static std::atomic<long long> gLoadReadNanos{0};
-    static std::atomic<long long> gLoadReadCalls{0};
-    static std::atomic<long long> gLoadReadBytes{0};
-    // ReadFileAtOffset 失败后回退到 fopen/memcpy 的次数：回退路径既不进 readIO
-    // 统计，也没有预读，如果数量大就是加载变慢的真正原因。
-    static std::atomic<long long> gLoadReadFallbacks{0};
-    static std::atomic<long long> gLoadFopenCalls{0};
 
     static bool ReadFileExact(HANDLE handle, uint64_t offset, void *dst, size_t len) {
         LARGE_INTEGER position;
