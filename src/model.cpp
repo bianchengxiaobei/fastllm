@@ -181,25 +181,15 @@ namespace fastllm {
     static std::atomic<long long> gLoadReadFallbacks{0};
     static std::atomic<long long> gLoadFopenCalls{0};
 
-#if defined(_WIN32) || defined(_WIN64)
-    // FASTLLM_LOAD_READFILE=0 可以退回映射读，方便对照。
-    static bool UseLoadReadFile() {
-        static const bool enabled = []() {
-            const char *env = std::getenv("FASTLLM_LOAD_READFILE");
-            return env == nullptr || std::atoi(env) != 0;
-        }();
-        return enabled;
-    }
-
-    // 二分加载路径用：分别跳过读盘和建权重缓冲，看剩下的时间落在哪一段。
-    // FASTLLM_LOAD_SKIP_READ=1   张量内容不读盘，直接清零填充
-    // FASTLLM_LOAD_SKIP_WEIGHT=1 不建 model->weight 的缓冲（不转换、不拷贝）
+    // ---- 加载调试开关（定义与平台无关，读取方在共享代码里，放在 _WIN32 分岔外）----
+    // FASTLLM_LOAD_SKIP_READ=1 跳过 safetensors 读取。
     static bool SkipLoadRead() {
         static const bool enabled =
             std::getenv("FASTLLM_LOAD_SKIP_READ") != nullptr;
         return enabled;
     }
 
+    // FASTLLM_LOAD_SKIP_WEIGHT=1 不建 model->weight 的缓冲（不转换、不拷贝）
     static bool SkipWeightBuild() {
         static const bool enabled =
             std::getenv("FASTLLM_LOAD_SKIP_WEIGHT") != nullptr;
@@ -239,15 +229,47 @@ namespace fastllm {
         return interval;
     }
 
+    // HeapValidate 只在 Windows 上有；其它平台没有等价物，恒返回 true
+    //（开关无效但不报错）。
     static bool CheckLoadHeap(const char *tensorName) {
+#if defined(_WIN32) || defined(_WIN64)
         if (HeapValidate(GetProcessHeap(), 0, nullptr)) {
             return true;
         }
         fprintf(stderr, "[load-trace] HEAP CORRUPT after %s\n", tensorName);
         fflush(stderr);
         return false;
+#else
+        (void)tensorName;
+        return true;
+#endif
     }
 
+    // ---- SafeTensor 块池统计（Windows 堆病理专项的池本体留在 _WIN32 块内，
+    // 计数器本身与平台无关，profile 打印在共享代码里）----
+    static std::atomic<long long> gSafeTensorBlockHits{0};
+    static std::atomic<long long> gSafeTensorBlockMisses{0};
+    static std::atomic<long long> gSafeTensorBlockPooledFrees{0};
+    static std::atomic<long long> gSafeTensorBlockDirectFrees{0};
+    // 在真实进程里直接量分配/释放的耗时：同样的动作在纯净进程里是 0.13ms 级，
+    // 这里如果是毫秒级，说明是进程状态（堆布局/映射/CUDA 上下文）把它拖慢的。
+    static std::atomic<long long> gSafeTensorAllocNanos{0};
+    static std::atomic<long long> gSafeTensorAllocCalls{0};
+    static std::atomic<long long> gSafeTensorFreeNanos{0};
+    static std::atomic<long long> gSafeTensorFreeCalls{0};
+
+#if defined(_WIN32) || defined(_WIN64)
+    // FASTLLM_LOAD_READFILE=0 可以退回映射读，方便对照。
+    static bool UseLoadReadFile() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_LOAD_READFILE");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
+    // 二分加载路径用：分别跳过读盘和建权重缓冲，看剩下的时间落在哪一段。
+    // FASTLLM_LOAD_SKIP_READ=1   张量内容不读盘，直接清零填充
     struct LoadFileEntry {
         std::string name;
         HANDLE handle = INVALID_HANDLE_VALUE;
@@ -1575,16 +1597,6 @@ namespace fastllm {
     };
 
     static thread_local SafeTensorBlockPool safeTensorBlockPool;
-    static std::atomic<long long> gSafeTensorBlockHits{0};
-    static std::atomic<long long> gSafeTensorBlockMisses{0};
-    static std::atomic<long long> gSafeTensorBlockPooledFrees{0};
-    static std::atomic<long long> gSafeTensorBlockDirectFrees{0};
-    // 在真实进程里直接量分配/释放的耗时：同样的动作在纯净进程里是 0.13ms 级，
-    // 这里如果是毫秒级，说明是进程状态（堆布局/映射/CUDA 上下文）把它拖慢的。
-    static std::atomic<long long> gSafeTensorAllocNanos{0};
-    static std::atomic<long long> gSafeTensorAllocCalls{0};
-    static std::atomic<long long> gSafeTensorFreeNanos{0};
-    static std::atomic<long long> gSafeTensorFreeCalls{0};
 
     static bool UseSafeTensorBlockPool() {
         static const bool enabled = []() {
