@@ -36,7 +36,9 @@
 // 模板函数)重写成完整限定名, 两个编译器共用一套拼法.
 #define INT32 ::fastllm::DataType::INT32
 
-#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && defined(FASTLLM_CUDA_MIN_ARCH) && \
+    FASTLLM_CUDA_MIN_ARCH >= 800 && \
+    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
 #define FASTLLM_NAIVE_SWA_FLASHINFER
 #include "naive-n05-swa-flashinfer.cuh"
 #endif
@@ -2510,6 +2512,10 @@ bool DescriptorWorkspaceAliases(const fastllm::Data *workspace, const fastllm::D
     return workspace && (workspace->isFake || workspace->multiDeviceData ||
         workspace == &data || (workspace->cudaData && workspace->cudaData == data.cudaData));
 }
+// CUDA 禁止在匿名命名空间里定义 __global__ 函数: 匿名命名空间赋予内部链接,
+// nvcc+GCC 构建会丢弃 host stub 导致最终链接报 undefined reference (MSVC 碰巧
+// 能编过, 掩盖了问题). draft-flash 这族 kernel 放进具名命名空间.
+namespace naive_draft_flash {
 struct DeviceDraftBatch { const DraftBatchRow *rows; };
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
 // Reuse the existing FlashInfer device primitive with independent KV pointers.
@@ -2539,6 +2545,7 @@ __global__ __launch_bounds__(128) void BatchDraftFlash(DeviceDraftBatch batch, D
         threadIdx, blockIdx.x, 0, blockIdx.z, 1, p.num_kv_heads);
 }
 #endif
+}
 
 template<class Batch>
 __global__ void BatchDraftQKV(Batch batch, const float *qNorm, const float *kNorm,
@@ -2733,7 +2740,7 @@ bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
     Output(query, BFLOAT16, {1, raw.dims[1], heads * dim});
     for (int i = 0; i < count; ++i) descriptors[i].query = (BF16 *)query.cudaData + (size_t)i * rows * heads * dim;
     if (descriptorsWorkspace && count > kDraftBatchLimit) {
-        DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace)};
+        naive_draft_flash::DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace)};
         BatchDraftQKV<<<dim3(heads + kvHeads, rows * count), 256, 0, cudaStreamPerThread>>>(batch,
             (const float *)qNorm.cudaData, (const float *)kNorm.cudaData,
             rows, heads, kvHeads, dim, window, eps, theta);
@@ -2780,6 +2787,10 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
     Output(output, BFLOAT16, query.dims);
 
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
+    using naive_draft_flash::BatchDraftFlash;
+    using naive_draft_flash::DeviceDraftBatch;
+    using naive_draft_flash::DraftFlashParams;
+    using naive_draft_flash::DraftFlashTraits;
     if (count >= 8 && dim == 128 && heads / kvHeads <= 32 &&
         window >= rows && BulkKernelSupported(BatchDraftFlash,
             sizeof(DraftFlashTraits::SharedStorageSingle), 80)) {

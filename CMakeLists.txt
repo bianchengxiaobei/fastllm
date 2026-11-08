@@ -361,6 +361,26 @@ if (USE_CUDA)
         set(FASTLLM_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES_NORMALIZED})
     endif()
     message(STATUS "Effective CUDA architectures: ${FASTLLM_CUDA_ARCHITECTURES}")
+    # Minimum SM target across the architecture list. CUDA sources use it to
+    # keep host-pass conditionals consistent with the per-arch device passes:
+    # a kernel family compiled only for sm_80+ must not be referenced by host
+    # code when no device pass in the list contains it (nvcc/GCC then drops
+    # the internal-linkage host stub and the final link fails).
+    set(FASTLLM_CUDA_MIN_ARCH 999)
+    foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        string(REGEX MATCH "^[0-9]+" FASTLLM_CUDA_ARCH_NUMBER "${FASTLLM_CUDA_ARCH}")
+        if (FASTLLM_CUDA_ARCH_NUMBER STREQUAL "" AND
+            DEFINED CMAKE_CUDA_ARCHITECTURES_NATIVE)
+            string(REGEX MATCH "^[0-9]+" FASTLLM_CUDA_ARCH_NUMBER
+                "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+        endif()
+        if (NOT FASTLLM_CUDA_ARCH_NUMBER STREQUAL "" AND
+            FASTLLM_CUDA_ARCH_NUMBER LESS FASTLLM_CUDA_MIN_ARCH)
+            set(FASTLLM_CUDA_MIN_ARCH ${FASTLLM_CUDA_ARCH_NUMBER})
+        endif()
+    endforeach()
+    message(STATUS "Minimum CUDA architecture: ${FASTLLM_CUDA_MIN_ARCH}")
+    add_compile_definitions(FASTLLM_CUDA_MIN_ARCH=${FASTLLM_CUDA_MIN_ARCH})
     add_compile_definitions(USE_CUDA)
     # FlashInfer requires sm_70+.  The CUDA host compilation pass does not set
     # __CUDA_ARCH__, so a pure legacy build needs an explicit project-wide
