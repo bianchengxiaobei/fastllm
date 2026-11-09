@@ -3047,9 +3047,12 @@ namespace fastllm {
     }
 
     // fastllm 量化张量在 safetensors 里 = [version][dataType][ggmlType][量化块]。
+#if defined(USE_MMAP) || defined(_WIN32)
     // 主机权重直接借映射区里那块量化块: 启动不读盘也不复制, 页在真正用到时 fault,
     // 并且留在系统文件缓存里, 下次启动直接命中。映射是 PAGE_WRITECOPY, 万一有人
     // 往权重里写也只会拷到私有页, 不会踩坏映射。
+    // FileMmap 的实现只在 _WIN32 / USE_MMAP 下存在, 非 mmap 构建整个关闭,
+    // 走常规读盘路径。
     static bool UseLoadMmapBorrow() {
         static const bool enabled = []() {
             const char *env = std::getenv("FASTLLM_LOAD_MMAP_ADOPT");
@@ -3132,6 +3135,7 @@ namespace fastllm {
         }
         return true;
     }
+#endif
 
     // INT4_GROUP 的权重读进临时块之后，字节布局已经是最终布局（nibble 交换在
     // CreateBufferWithPacked* 里做完了），所以可以直接把临时块的 ownership 转给
@@ -7460,6 +7464,7 @@ namespace fastllm {
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
                             // 主机 fastllm 量化权重借映射区, 省掉启动时整份读盘。
                             bool borrowedFastllmPayload = false;
+#if defined(USE_MMAP) || defined(_WIN32)
                             if (!diskLazyWeight && UseLoadMmapBorrow() &&
                                 weightName.find(".experts.") != std::string::npos &&
                                 tensorMap[tensorName].size() == 1 &&
@@ -7468,6 +7473,7 @@ namespace fastllm {
                                     *destinationWeight, tensor,
                                     GetLoadFileMmapForBorrow(tensor.fileName));
                             }
+#endif
                             if (diskLazyWeight) {
                                 if (packedInt4Info.isAffine) {
                                     ErrorInFastLLM(

@@ -871,6 +871,8 @@ namespace fastllm {
     // GGUF 主机权重默认走文件映射而不是读进堆: 启动时不用把几十上百 GB 读一遍,
     // 页按需从盘上 fault, 并且留在系统文件缓存里, 下次启动直接命中。
     // 关掉: FASTLLM_GGUF_MMAP_HOST=0。
+    // FileMmap 实现只在 _WIN32 / USE_MMAP 下存在, 非 mmap 构建整个关闭。
+#if defined(USE_MMAP) || defined(_WIN32)
     static bool GGUFHostMmapEnabled() {
         static const bool enabled = []() {
             const char *env = std::getenv("FASTLLM_GGUF_MMAP_HOST");
@@ -906,6 +908,10 @@ namespace fastllm {
         }
         return mapped;
     }
+#else
+    static bool GGUFHostMmapEnabled() { return false; }
+    static std::shared_ptr<FileMmap> GGUFMapHostFile(const std::string &) { return nullptr; }
+#endif
 
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
