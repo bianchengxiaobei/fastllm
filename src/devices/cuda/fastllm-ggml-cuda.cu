@@ -1361,6 +1361,31 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     ggml_backend_cuda_context ctx;
 
     const ggml_type ggufType = (ggml_type)weight.ggmlType;
+    // 临时排查探针：确认主机侧专家权重是否真的搬进了 weight.cudaData。
+    // 命中时打印指针归属；cudaData 为空说明这个专家被静默跳过，直接停住。
+    // 排查完请连同下面的 probe 一起删掉。
+    if (weight.cudaData == nullptr ||
+        std::getenv("FASTLLM_GGUF_PTR_PROBE") != nullptr) {
+        cudaPointerAttributes probeAttr{};
+        const cudaError_t probeState =
+            cudaPointerGetAttributes(&probeAttr, weight.cudaData);
+        (void)cudaGetLastError();
+        static int probePrinted = 0;
+        if (probePrinted++ < 16) {
+            printf("[gguf-ptr-probe] %s ggml=%d ptr=%p state=%d type=%d device=%d "
+                   "pinned=%d model=%d n=%d m=%d k=%d\n",
+                   weight.name.c_str(), (int)ggufType, (void *)weight.cudaData,
+                   (int)probeState, (int)probeAttr.type, (int)probeAttr.device,
+                   (int)weight.isPinned, (int)weight.isModelWeight, n, m, k);
+            fflush(stdout);
+        }
+        if (weight.cudaData == nullptr) {
+            printf("[gguf-ptr-probe] weight.cudaData 为空, 专家权重没有搬到显存: %s\n",
+                   weight.name.c_str());
+            fflush(stdout);
+            std::abort();
+        }
+    }
     const bool allowSmallMmvq = weight.forceGGUFFp32Dequant &&
         FastllmGGUFSmallMmvqShape(ggufType, n, m, k);
     const bool forceDequant = n != 1 && weight.forceGGUFFp32Dequant &&
