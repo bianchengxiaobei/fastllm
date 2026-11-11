@@ -9440,6 +9440,23 @@ namespace fastllm {
                 }
             }
 
+            // 本轮上传被 prefillCache 接管时调用: 准入记录不会再有对应的显存
+            // 副本, 直接丢掉, 免得下次被当成常驻而跳过上传。
+            void DiscardUncommitted() {
+                std::lock_guard<std::mutex> guard(this->mutex);
+                if (!this->requested) {
+                    return;
+                }
+                for (auto it = this->resident.begin(); it != this->resident.end();) {
+                    if (!it->second.committed) {
+                        this->ReleaseBytesLocked(it->second.bytes);
+                        it = this->resident.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
         private:
             void SyncLocked() {
                 const uint64_t wanted = GetMoeCudaCacheBytes();
@@ -9477,11 +9494,18 @@ namespace fastllm {
             }
 
             bool IsLiveLocked(const HostMoeResidentEntry &entry) const {
+                // 记录里的显存副本才是唯一依据: 只有被 Commit 记下、且 Data 上
+                // 的指针仍与之一致时才算常驻。未 Commit 的准入记录可能因为
+                // prefillCache 接管而永远没有上传, 不能当常驻跳过上传。
+                if (entry.gateup == nullptr || entry.down == nullptr ||
+                    entry.gateup->cudaData == nullptr ||
+                    entry.down->cudaData == nullptr) {
+                    return false;
+                }
                 if (!entry.committed) {
                     return true;
                 }
-                return entry.gateup != nullptr && entry.down != nullptr &&
-                       entry.gateup->cudaData == entry.gateupDevice &&
+                return entry.gateup->cudaData == entry.gateupDevice &&
                        entry.down->cudaData == entry.downDevice;
             }
 
@@ -9763,6 +9787,7 @@ namespace fastllm {
             weights = prefillCache.Weights();
             // 别名权重指向共享缓存, 常驻记录不再对应它们, 本次调用不参与.
             hostResidentActive = false;
+            HostMoeResidentCache::Instance().DiscardUncommitted();
         }
 #endif
 
@@ -10060,8 +10085,13 @@ namespace fastllm {
         auto doUploadWeight = [&](int slot, void *stream, double *allocSeconds) {
             if (hostResidentActive && slot / 2 < (int)hostResidentSkipUpload.size() &&
                 hostResidentSkipUpload[slot / 2]) {
-                probeUpload(slot, "skip-resident");
-                return; // 显存里已经有这个专家的副本, 不用重传
+                // 记账说常驻, 但显存副本已经不在了: 走普通上传路径补回来,
+                // 否则 GEMM 会拿空指针去读权重。
+                Data *residentWeight = weights[slot];
+                if (residentWeight != nullptr && residentWeight->cudaData != nullptr) {
+                    probeUpload(slot, "skip-resident");
+                    return; // 显存里已经有这个专家的副本, 不用重传
+                }
             }
             Data *weight = weights[slot];
 #ifndef USE_ROCM
