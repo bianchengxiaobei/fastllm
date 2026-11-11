@@ -10030,9 +10030,37 @@ namespace fastllm {
         };
         // allocSeconds 只在开归因时非空: 延迟释放把 cudaData 清回 nullptr, 每次上传
         // 都要重新向池子要一块显存, 这段开销原本混在 upload 里看不出来.
+        // 临时排查探针: 打印每次上传走的分支和结果, cudaData 仍为空时必报.
+        // 排查完连同 [gguf-ptr-probe] 一起删掉.
+        const bool uploadPtrProbe =
+            std::getenv("FASTLLM_GGUF_PTR_PROBE") != nullptr;
+        auto probeUpload = [&](int slot, const char *branch) {
+            if (!uploadPtrProbe || slot < 0) {
+                return;
+            }
+            Data *probed = weights[slot];
+            if (probed == nullptr) {
+                return;
+            }
+            static int probedOk = 0, probedNull = 0;
+            if (probed->cudaData != nullptr && probedOk++ >= 16) {
+                return;
+            }
+            if (probed->cudaData == nullptr && probedNull++ >= 64) {
+                return;
+            }
+            printf("[gguf-ptr-probe] upload slot=%d branch=%s cudaData=%p "
+                   "pinned=%d cpu=%d numa=%d bytes=%llu ggml=%d name=%s\n",
+                   slot, branch, (void *)probed->cudaData, (int)probed->isPinned,
+                   (int)(probed->cpuData != nullptr), (int)probed->numasData.size(),
+                   (unsigned long long)probed->GetBytes(), probed->ggmlType,
+                   probed->name.c_str());
+            fflush(stdout);
+        };
         auto doUploadWeight = [&](int slot, void *stream, double *allocSeconds) {
             if (hostResidentActive && slot / 2 < (int)hostResidentSkipUpload.size() &&
                 hostResidentSkipUpload[slot / 2]) {
+                probeUpload(slot, "skip-resident");
                 return; // 显存里已经有这个专家的副本, 不用重传
             }
             Data *weight = weights[slot];
@@ -10041,10 +10069,12 @@ namespace fastllm {
             // 布局在设备上还原; 两种情况都由 prefillCache 负责搬运.
             if (cachedPrefill && weight != sourceWeights[slot]) {
                 prefillCache.Upload(slot, stream);
+                probeUpload(slot, "prefill-cache");
                 return;
             }
 #endif
             if (!(weight->cpuData || !weight->numasData.empty())) {
+                probeUpload(slot, "no-host-copy");
                 return;
             }
             if (weight->cpuData != nullptr) {
@@ -10062,9 +10092,11 @@ namespace fastllm {
                 if (stream != nullptr) {
                     FastllmCudaCopyFromPinnedHostToDeviceAsync(
                         weight->cudaData, weight->cpuData, weight->GetBytes(), stream);
+                    probeUpload(slot, "pinned-async");
                 } else {
                     FastllmCudaCopyFromPinnedHostToDevice(
                         weight->cudaData, weight->cpuData, weight->GetBytes());
+                    probeUpload(slot, "pinned-sync");
                 }
                 return;
             }
@@ -10079,10 +10111,12 @@ namespace fastllm {
                 if (FastllmCudaUploadHostToDevicePinnedStaged(
                         weight->cudaData, weight->cpuData,
                         weight->GetBytes(), stream)) {
+                    probeUpload(slot, "pinned-staged");
                     return;
                 }
             }
             weight->ToCudaTemporary({}, true, stream);
+            probeUpload(slot, "temporary");
         };
         auto uploadWeight = [&](int slot, void *stream = nullptr) {
             if (!profileMoeStream) {
@@ -10115,6 +10149,7 @@ namespace fastllm {
                 weight->dataDevice = DataDevice::CPU;
                 weight->cudaData = nullptr;
                 weight->cudaDataBorrowed = false;
+                probeUpload(slot, "release-cleared");
                 return;
             }
             weight->FreeCudaTemporary({}, false);
