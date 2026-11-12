@@ -118,7 +118,7 @@ namespace fastllm {
         bool captureMain = false;     // 采集 dspark_target_layer_ids 各层的 main hidden
         bool deferWindow = false;     // 滑窗写入延后到接受长度确定之后
         bool wantAllTokens = false;   // head 对本片段的每个位置计算目标 logits
-        int mainHiddenStartPos = -1;  // bounded prefill 只采集末尾窗口，记录其绝对起点
+        int mainHiddenStartPos = -1;  // 草稿只推进末尾窗口时的绝对起点；Data 可能仍是完整片段
         std::vector<Data> mainHidden;         // [目标层数]，每个 [1, seqlen, dim]
         std::vector<Data> windowKV;           // [block_cnt]，本次前向的滑窗 KV（延后写入）
         std::vector<Data> rawKV, rawScore;    // kv source 层：压缩器的原始输入流（含旧 rawTail）
@@ -166,6 +166,12 @@ namespace fastllm {
         int totalLen = 0;
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;
+        // DSpark 草稿滑窗只按精确前缀保存；截断命中（T-1）缺少 ring 中最老的一行，
+        // 不参与恢复，保持 filled=0 的旧行为。
+        bool dsparkValid = false;
+        int dsparkCommitted = 0;
+        int dsparkFilled = 0;
+        std::vector<Data> dsparkWindowKV;
         long long flushTime = 0;
         int recordTimes = 0;
     };

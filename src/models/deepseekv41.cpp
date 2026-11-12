@@ -4356,6 +4356,38 @@ namespace fastllm {
                 }
             }
         }
+        // DSpark 草稿滑窗必须和目标快照处于同一精确前缀。pending / 投机回滚会让
+        // committed 与 totalLen 脱节，这种状态不发布，恢复侧继续从 filled=0 开始。
+        if (v41DsparkEnabled && state.dspark) {
+            const DeepSeekV41DsparkState &dspark = *state.dspark;
+            bool valid = !dspark.disabled && v41DsparkLayers > 0 &&
+                (int)dspark.layers.size() == v41DsparkLayers &&
+                dspark.committed == totalLen && dspark.filled > 0;
+            if (valid) {
+                memory->dsparkWindowKV.resize(v41DsparkLayers);
+                for (int stage = 0; stage < v41DsparkLayers && valid; stage++) {
+                    const Data &src = dspark.layers[stage].windowKV;
+                    if (src.dims.size() != 3 || src.dims[0] != 1 || src.dims[1] <= 0 ||
+                        src.dims[1] > window_size || src.dims[2] != head_dim_full ||
+                        src.Count(0) == 0) {
+                        valid = false;
+                        break;
+                    }
+                    V41SnapshotTensor(memory->dsparkWindowKV[stage], src);
+                    if (memory->dsparkWindowKV[stage].dims != src.dims ||
+                        memory->dsparkWindowKV[stage].Count(0) == 0) {
+                        valid = false;
+                    }
+                }
+            }
+            if (valid) {
+                memory->dsparkValid = true;
+                memory->dsparkCommitted = dspark.committed;
+                memory->dsparkFilled = std::min(dspark.filled, window_size);
+            } else {
+                memory->dsparkWindowKV.clear();
+            }
+        }
         return memory;
     }
 
@@ -4401,6 +4433,31 @@ namespace fastllm {
                 dst.rawTail = 0;
             }
         }
+        // T-1 截断命中缺少环形缓冲中最老的一行，无法精确重建草稿滑窗；
+        // 只恢复与目标快照完全等长的精确前缀，其余情况保留 filled=0 的旧行为。
+        if (memory.dsparkValid && v41DsparkEnabled && v41DsparkLayers > 0 &&
+            exact && memory.dsparkCommitted == len &&
+            (int)memory.dsparkWindowKV.size() == v41DsparkLayers) {
+            auto dspark = std::make_shared<DeepSeekV41DsparkState>();
+            dspark->layers.resize(v41DsparkLayers);
+            bool valid = true;
+            for (int stage = 0; stage < v41DsparkLayers && valid; stage++) {
+                const Data &src = memory.dsparkWindowKV[stage];
+                if (src.dims.size() != 3 || src.dims[0] != 1 || src.dims[1] <= 0 ||
+                    src.dims[1] > window_size || src.dims[2] != head_dim_full ||
+                    src.Count(0) == 0) {
+                    valid = false;
+                    break;
+                }
+                V41RestoreTensor(dspark->layers[stage].windowKV, src);
+            }
+            if (valid) {
+                dspark->committed = len;
+                dspark->filled = std::max(0, std::min(
+                    memory.dsparkFilled, std::min(window_size, len)));
+                state->dspark = std::move(dspark);
+            }
+        }
         return state;
     }
 
@@ -4441,8 +4498,9 @@ namespace fastllm {
         // 追加一份磁盘拷贝，重启后同一前缀免重 prefill（内部走后台线程，不阻塞）
         V41PrefixDiskRecord(memory);
         if (V41PrefixCacheDebug()) {
-            printf("[fastllm-dsv41-prefix-cache] record tokens=%d records=%d\n",
-                   memory->totalLen, (int)v41HistoryCache.memorys.size());
+            printf("[fastllm-dsv41-prefix-cache] record tokens=%d dspark=%d filled=%d records=%d\n",
+                   memory->totalLen, memory->dsparkValid ? 1 : 0, memory->dsparkFilled,
+                   (int)v41HistoryCache.memorys.size());
             fflush(stdout);
         }
     }
@@ -4514,8 +4572,8 @@ namespace fastllm {
         inputTokens.erase(inputTokens.begin(), inputTokens.begin() + len);
         cacheLen = len;
         if (V41PrefixCacheDebug()) {
-            printf("[fastllm-dsv41-prefix-cache] hit len=%d (lcp=%d record=%d) remaining=%d\n",
-                   len, hitLen, memory->totalLen, (int)inputTokens.size());
+            printf("[fastllm-dsv41-prefix-cache] hit len=%d (lcp=%d record=%d dspark=%d) remaining=%d\n",
+                   len, hitLen, memory->totalLen, state->dspark ? 1 : 0, (int)inputTokens.size());
             fflush(stdout);
         }
         return true;

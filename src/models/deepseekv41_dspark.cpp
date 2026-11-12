@@ -1900,6 +1900,16 @@ namespace fastllm {
             // prefill 分块的中间结果不是真正的下一个 token，这时只更新滑窗、不生成候选
             const int anchor = allowSpeculate && !isIntermediateChunkedPrefill && textOnly &&
                 segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
+            // Only the final window_size positions survive in the draft ring.
+            // Keep the full capture for decode/verify, but let a long prefill
+            // chunk advance just its tail instead of projecting every row.
+            if (scratches[i].mainHiddenStartPos < 0 && window_size > 0 &&
+                segments[i].seqlen > window_size && !scratches[i].mainHidden.empty() &&
+                scratches[i].mainHidden[0].dims.size() == 3 &&
+                scratches[i].mainHidden[0].dims[1] == segments[i].seqlen) {
+                scratches[i].mainHiddenStartPos =
+                    segments[i].startPos + segments[i].seqlen - window_size;
+            }
             DsparkDebugDumpState(*segments[i].state, "plain");
             DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
                           segments[i].startPos + segments[i].seqlen, anchor, generationConfigs[i]);
@@ -2106,6 +2116,32 @@ namespace fastllm {
         // hidden states are ready; do not also wait for cache admissions.
         ApplyDsparkDevice(bool(scratch.commitKV));
 
+#ifdef USE_CUDA
+        // Prefix-cache restore leaves the draft ring on CPU. The first advance
+        // moves it onto the draft device before any ring store / attention use.
+        // Resolve PP's last stage explicitly: the caller's current CUDA device
+        // may still be the first stage after a hybrid verify pipeline.
+        int draftDevice = -1;
+        if (!v41DsparkTpDevices.empty()) {
+            draftDevice = v41DsparkTpDevices.front();
+        } else {
+            const std::string spec = SelectDeviceFromMap(this->deviceMap, block_cnt, block_cnt);
+            if (spec == "cuda") draftDevice = 0;
+            else if (spec.size() > 5 && spec.compare(0, 5, "cuda:") == 0)
+                draftDevice = atoi(spec.c_str() + 5);
+        }
+        if (draftDevice >= 0) {
+            FastllmCudaSetDevice(draftDevice);
+            for (auto &layer : dspark.layers) {
+                if (layer.windowKV.dims.size() == 3 &&
+                    layer.windowKV.dataDevice != DataDevice::CUDA) {
+                    layer.windowKV.ToDevice(DataDevice::CUDA,
+                        std::vector<int>{draftDevice}, true);
+                }
+            }
+        }
+#endif
+
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
         Data combined, tmp;
         std::vector<const Data *> inputs;
@@ -2126,18 +2162,34 @@ namespace fastllm {
 #endif
             inputs.push_back(hidden);
         }
+        // The naive concat always reads each input's first `rows` rows. Only
+        // use it when no tail slicing is needed; prefill can retain the full
+        // chunk while advancing only its final window_size rows.
+        bool inputsMatchRows = true;
+        for (const Data *hidden : inputs) {
+            inputsMatchRows &= hidden->dims.size() == 3 && hidden->dims[1] == rows;
+        }
 #ifdef USE_CUDA
-        const bool joinedOnDevice = FastllmCudaNaiveDraftConcat(inputs, rows, combined);
+        const bool joinedOnDevice = inputsMatchRows &&
+            FastllmCudaNaiveDraftConcat(inputs, rows, combined);
 #else
         const bool joinedOnDevice = false;
 #endif
         if (!joinedOnDevice) for (size_t k = 0; k < inputs.size(); ++k) {
             const Data *hidden = inputs[k];
+            AssertInFastLLM(hidden->dims.size() == 3 && rows > 0 &&
+                            rows <= hidden->dims[1],
+                            "DeepSeekV41 DSpark: main hidden is shorter than the committed span.");
             Data part;
             if (rows == hidden->dims[1]) {
                 part.CopyFrom(*hidden);
             } else {
-                Split(*hidden, 1, 0, rows, part);
+                // A bounded / prefill tail starts at mainHiddenStartPos and
+                // keeps the most recent rows; otherwise retain the historical
+                // first-rows behavior.
+                const int begin = scratch.mainHiddenStartPos >= 0 ?
+                    hidden->dims[1] - rows : 0;
+                Split(*hidden, 1, begin, begin + rows, part);
             }
             if (k == 0) {
                 combined.CopyFrom(part);
