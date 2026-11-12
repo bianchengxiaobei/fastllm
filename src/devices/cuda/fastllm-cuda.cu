@@ -6825,11 +6825,28 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     if (size == 0 || dst == src) {
         return;
     }
+    if (dst == nullptr || src == nullptr) {
+        printf("[fastllm] D2D copy with null pointer dst=%p src=%p size=%zu\n", dst, src, size);
+        fflush(stdout);
+        return;
+    }
 
+    // 用真实的捕获状态判断, 不用 "可能正在捕获" 的缓存标志: 捕获失败/流被留在
+    // 捕获态时, 走 async 分支只会拿到 cudaErrorInvalidValue, 把真因盖掉。
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus) != cudaSuccess) {
+        cudaGetLastError();
+        captureStatus = cudaStreamCaptureStatusNone;
+    }
     cudaError_t state = cudaSuccess;
-    if (FastllmCudaGraphIsCapturingFast()) {
+    if (captureStatus == cudaStreamCaptureStatusActive) {
         state = cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice,
                                 cudaStreamPerThread);
+        if (state != cudaSuccess) {
+            printf("[fastllm] D2D capture copy failed dst=%p src=%p size=%zu err=%d(%s)\n",
+                   dst, src, size, (int)state, cudaGetErrorString(state));
+            fflush(stdout);
+        }
         checkCudaErrors("Error: CUDA error when async copy on GPU!", state);
         return;
     }
