@@ -2751,20 +2751,21 @@ namespace fastllm {
             placements.push_back(main);
             placements.push_back(moe);
             v41MoeCudaGraphCompatible &= !V41DeviceSpecUsesType(moe, "disk");
-            // 主机专家搬到 GPU 做 prefill 时, 专家不落户 native device cache,
-            // 原生 MoE 全图必然在前几层之后被拒, 还会把捕获流留在捕获态。
-            // 与其每层白试一次并把它弄坏, 不如直接不建全图。
-            const int hostPrefill = GetFastllmEnv().prefillMoeGpu;
-            const bool hostPrefillToGpu = hostPrefill >= 0 ? hostPrefill != 0
-                                                          : moe.find("cpu") != std::string::npos;
-            if (hostPrefillToGpu && (V41DeviceSpecUsesType(moe, "numa") || moe == "cpu")) {
+            // 专家在主机(numa/cpu)上时, 原生 MoE 全图要求它们先落户 native
+            // device cache; 只要有一层没落户(显存不够/缓存被关掉), 图就必然被拒,
+            // 而拒绝点落在捕获体内, 会把流留在捕获态, 后面全是级联错误。
+            // 默认不建全图, FASTLLM_DSV41_MOE_GRAPH=1 可强行打开。
+            const char *forceMoeGraph = std::getenv("FASTLLM_DSV41_MOE_GRAPH");
+            const bool allowMoeGraph = forceMoeGraph != nullptr && atoi(forceMoeGraph) != 0;
+            if (!allowMoeGraph && (V41DeviceSpecUsesType(moe, "numa") || moe == "cpu")) {
                 v41MoeCudaGraphCompatible = false;
             }
         }
         const char *requested = std::getenv("FASTLLM_EXECUTION_MODE");
         executionMode = ResolveExecutionMode(requested, placements);
-        printf("[Fastllm] FASTLLM_EXECUTION_MODE=%s -> %s (DeepSeek-V4.1)\n",
-               NormalizeExecutionMode(requested ? requested : "auto").c_str(), ExecutionModeName(executionMode));
+        printf("[Fastllm] FASTLLM_EXECUTION_MODE=%s -> %s (DeepSeek-V4.1) moeGraph=%d\n",
+               NormalizeExecutionMode(requested ? requested : "auto").c_str(), ExecutionModeName(executionMode),
+               v41MoeCudaGraphCompatible ? 1 : 0);
         fflush(stdout);
     }
 
