@@ -205,6 +205,7 @@ def generate_checkpoint(args, tiny, engram_mod, model_mod, tokenizer):
 # ---------------- fastllm 生成 ----------------
 
 VOCAB_SIZE = 129280
+LAST_CHILD_TEXT = []
 
 
 def run_fastllm(args, prompt, decode_steps, want_logits=False):
@@ -216,9 +217,13 @@ def run_fastllm(args, prompt, decode_steps, want_logits=False):
     os.environ.setdefault("FASTLLM_DSV41_DISABLE_FAKE_QUANT", "1")
     parser = make_normal_parser("v41 dspark")
     argv = ["--path", args.work_dir, "--dtype", args.dtype, "--device", args.device,
-            "--moe_device", args.moe_device, "-t", str(args.threads)]
+            "--moe_device", args.moe_device, "-t", str(args.threads),
+            "--cache_history", "true"]
     if args.tp:
         argv += ["--tp", args.tp]
+    chunk = os.environ.get("V41_TEST_CHUNKED_PREFILL", "0") or "0"
+    if chunk not in ("", "0"):
+        argv += ["--chunked_prefill_size", chunk]
     # DSpark 走正式的启动参数（ftllm 的 --speculative_algorithm dspark --dspark N），
     # util.py 会清掉直接设置的 FASTLLM_DSPARK_TOKENS，所以不能只靠环境变量
     dspark = int(os.environ.get("V41_TEST_DSPARK_TOKENS", "0") or 0)
@@ -287,7 +292,9 @@ def run_child(args, prompt, decode_steps, env, want_logits=False):
         child_env = dict(os.environ)
         child_env.update({k: str(v) for k, v in env.items()})
         for key in ("V41_TEST_DSPARK_TOKENS", "V41_TEST_DSPARK_THRESHOLD",
-                    "FASTLLM_DSPARK_FORCE_DRAFTS", "FASTLLM_DSPARK_STATS_FILE"):
+                    "V41_TEST_CHUNKED_PREFILL",
+                    "FASTLLM_DSPARK_FORCE_DRAFTS", "FASTLLM_DSPARK_STATS_FILE",
+                    "FASTLLM_DSV41_PREFIX_CACHE_DEBUG"):
             if key not in env:
                 child_env.pop(key, None)
         argv = [sys.executable, os.path.abspath(__file__),
@@ -299,11 +306,14 @@ def run_child(args, prompt, decode_steps, env, want_logits=False):
             argv += ["--tp", args.tp]
         result = subprocess.run(argv, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         text = result.stdout.decode("utf-8", "replace")
+        global LAST_CHILD_TEXT
+        LAST_CHILD_TEXT = text.splitlines()
         if result.returncode != 0 or not os.path.exists(base + ".out"):
             print(text)
             raise RuntimeError("child process failed (rc=%d)" % result.returncode)
-        for line in text.splitlines():
-            if "DSpark" in line or "fastllm:" in line or "Traceback" in line:
+        for line in LAST_CHILD_TEXT:
+            if ("DSpark" in line or "fastllm:" in line or
+                    "prefix-cache" in line or "Traceback" in line):
                 print("    | " + line)
         out = json.load(open(base + ".out"))
         tops = [{int(k): v for k, v in d.items()} for d in out.get("tops", [])]
@@ -546,8 +556,12 @@ def main():
     spec, spec_speed, _ = run_child(args, prompt, decode_steps, {
         "V41_TEST_DSPARK_TOKENS": args.dspark_tokens,
         "FASTLLM_DSPARK_STATS_FILE": stats_path,
+        "FASTLLM_DSV41_PREFIX_CACHE_DEBUG": "1",
     })
     rounds = read_stats(stats_path)
+    if any("record tokens=" in line and "dspark=1" in line
+           for line in LAST_CHILD_TEXT):
+        print("    OK: 前缀缓存记录包含 DSpark 草稿滑窗")
     proposed = sum(r[0] for r in rounds)
     accepted = sum(r[1] for r in rounds)
     print("    dspark tokens:  ", spec)
@@ -572,6 +586,50 @@ def main():
             failures.extend(sub_fail)
             if not sub_fail:
                 print("    OK: 除 BF16 并列翻转外与基准一致")
+
+    # 只解码 1 个 token 的请求没有未排空的 DSpark pending，请求结束时一定处于
+    # 可记录状态；用它验证 history snapshot 真的带上了草稿滑窗。
+    print("\n=== 2a. 前缀缓存快照（1 token 解码）===")
+    run_child(args, prompt, 1, {
+        "V41_TEST_DSPARK_TOKENS": args.dspark_tokens,
+        "FASTLLM_DSV41_PREFIX_CACHE_DEBUG": "1",
+    })
+    if any("record tokens=" in line and "dspark=1" in line
+           for line in LAST_CHILD_TEXT):
+        print("    OK: history record 包含 DSpark 草稿滑窗")
+    else:
+        failures.append("1 token DSpark 请求没有记录草稿滑窗快照")
+
+    # 分块 prefill 会走中间 chunk 的草稿滑窗裁尾路径。它不应改变目标输出，
+    # 但必须仍然产生候选且不触发回滚 / 位置断言。
+    if args.prefill > 16:
+        print("\n=== 2b. DSpark + 分块 prefill（13 token/chunk，末尾短块）===")
+        chunk_stats = os.path.join(tempfile.gettempdir(),
+                                   "v41-dspark-chunk-stats-%d.txt" % os.getpid())
+        if os.path.exists(chunk_stats):
+            os.remove(chunk_stats)
+        chunk_base, _, chunk_base_tops = run_child(
+            args, prompt, decode_steps, {"V41_TEST_CHUNKED_PREFILL": "13"},
+            want_logits=True)
+        chunked, chunk_speed, _ = run_child(args, prompt, decode_steps, {
+            "V41_TEST_DSPARK_TOKENS": args.dspark_tokens,
+            "V41_TEST_CHUNKED_PREFILL": "13",
+            "FASTLLM_DSPARK_STATS_FILE": chunk_stats,
+        })
+        chunk_rounds = read_stats(chunk_stats)
+        print("    dspark tokens:  ", chunked)
+        print("    verify rounds: %d, speed %.2f tok/s" % (len(chunk_rounds), chunk_speed))
+        if not chunk_rounds:
+            failures.append("分块 prefill 下 DSpark 没有进行任何一次校验")
+        cidx, ckind, cgap = compare_sequences(chunk_base, chunk_base_tops, chunked)
+        if cidx < 0:
+            print("    OK: 与分块 prefill 基准逐 token 完全一致")
+        elif ckind == "real":
+            failures.append("分块 prefill + DSpark 输出与基准不一致（位置 %d，非并列）" % cidx)
+        else:
+            # 分块 prefill 的基准和 reanchor 也必须使用相同 chunk，避免把分块
+            # 本身的 GEMM 舍入差异误判成 DSpark 问题；这里只做首个分歧检查。
+            print("    OK: 首个分歧为 BF16 并列（位置 %d，差距 %.4g）" % (cidx, cgap))
 
     if not args.skip_rollback:
         block = args.dspark_tokens
