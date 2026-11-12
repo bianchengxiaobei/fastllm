@@ -5323,9 +5323,25 @@ namespace fastllm {
 
             if (captureOk) {
                 state.capturing = true;
-                body();
+                // 捕获体里的 AssertInFastLLM / ErrorInFastLLM 会抛异常。不接住的话
+                // 后面的 EndCapture 和 state 清理全被跳过, 每张卡的 cudaStreamPerThread
+                // 就一直停在捕获态, 之后所有 CUDA 调用都以 "operation not permitted
+                // when stream is capturing" 失败, 真正的第一条错误被彻底淹没。
+                try {
+                    body();
+                } catch (const std::exception &error) {
+                    printf("[Fastllm] graph capture body failed: %s\n", error.what());
+                    fflush(stdout);
+                    captureOk = false;
+                } catch (...) {
+                    printf("[Fastllm] graph capture body failed: unknown exception\n");
+                    fflush(stdout);
+                    captureOk = false;
+                }
                 state.capturing = false;
-                captureOk = !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
+                if (captureOk) {
+                    captureOk = !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
+                }
             }
 
             if (workersJoined) {
