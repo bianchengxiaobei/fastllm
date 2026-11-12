@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -76,19 +77,29 @@ public:
         std::fill(candidatePositions.begin(), candidatePositions.end(), -1);
         std::fill(residentPositions.begin(), residentPositions.end(), -1);
         for (auto &key : keys) key.slot = -1;
+        int rejected = 0;
         for (int s = 0; s < int(slots.size()); ++s) {
-            const int key = owners[s];
-            if (key < -1 || key >= int(keys.size()) ||
-                (key >= 0 && (keyPartitions[key] != slotPartitions[s] || keys[key].slot >= 0)))
-                throw std::invalid_argument("invalid MoE residency snapshot");
-            if (!slotAvailable[s] && key >= 0)
-                throw std::invalid_argument("resident in a leased MoE slot");
+            int key = owners[s];
+            // 设备侧快照是并发更新的, 可能短暂出现重复或越界的 key。这里直接抛异常
+            // 会从工作线程一路 terminate 掉整个进程; 把不可信的 slot 当成空位,
+            // 让它按普通空位重新分配, 比杀进程安全。
+            const bool trust = key >= -1 && key < int(keys.size()) &&
+                (key < 0 || (keyPartitions[key] == slotPartitions[s] && keys[key].slot < 0)) &&
+                !(!slotAvailable[s] && key >= 0);
+            if (!trust) {
+                ++rejected;
+                key = -1;
+            }
             slots[s] = key;
             if (key >= 0) keys[key].slot = s;
             InsertResident(s);
         }
         for (int key = 0; key < int(keys.size()); ++key)
             if (keys[key].slot < 0) InsertCandidate(key);
+        if (rejected > 0) {
+            fprintf(stderr, "[Fastllm] MoE residency snapshot: %d slot(s) rejected\n", rejected);
+            fflush(stderr);
+        }
     }
 
     // Transport availability is independent of heat and current residency.
