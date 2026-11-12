@@ -9459,7 +9459,18 @@ namespace fastllm {
 
         private:
             void SyncLocked() {
-                const uint64_t wanted = GetMoeCudaCacheBytes();
+                uint64_t wanted = GetMoeCudaCacheBytes();
+                // 原生 GGUF 专家缓存用的也是 --moe_cuda_cache 这个预算。自建常驻缓存
+                // 再按同一个预算吃一份, 显存就是双倍: 22G 卡上 decode 的 dequant
+                // workspace 会被挤到一条都分配不出来。默认让位给原生缓存, 需要自建
+                // 缓存时设 FASTLLM_HOST_MOE_RESIDENT=1。
+                static const bool forceResident = []() {
+                    const char *env = std::getenv("FASTLLM_HOST_MOE_RESIDENT");
+                    return env != nullptr && atoi(env) != 0;
+                }();
+                if (!forceResident) {
+                    wanted = 0;
+                }
                 if (wanted != this->budget) {
                     this->ClearLocked();
                     this->budget = wanted;
