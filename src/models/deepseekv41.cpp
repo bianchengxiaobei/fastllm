@@ -2751,6 +2751,15 @@ namespace fastllm {
             placements.push_back(main);
             placements.push_back(moe);
             v41MoeCudaGraphCompatible &= !V41DeviceSpecUsesType(moe, "disk");
+            // 主机专家搬到 GPU 做 prefill 时, 专家不落户 native device cache,
+            // 原生 MoE 全图必然在前几层之后被拒, 还会把捕获流留在捕获态。
+            // 与其每层白试一次并把它弄坏, 不如直接不建全图。
+            const int hostPrefill = GetFastllmEnv().prefillMoeGpu;
+            const bool hostPrefillToGpu = hostPrefill >= 0 ? hostPrefill != 0
+                                                          : moe.find("cpu") != std::string::npos;
+            if (hostPrefillToGpu && (V41DeviceSpecUsesType(moe, "numa") || moe == "cpu")) {
+                v41MoeCudaGraphCompatible = false;
+            }
         }
         const char *requested = std::getenv("FASTLLM_EXECUTION_MODE");
         executionMode = ResolveExecutionMode(requested, placements);
