@@ -489,6 +489,15 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
             reinterpret_cast<const float *>(base + metaOffset + scoreOffset), glm5, swigluLimit,
             (glm5 || nativeV41) ? reinterpret_cast<const int32_t *>(base + metaOffset + indexOffset) : nullptr, nativeV41),
             "Streamed GGUF prefill failed.");
+        {
+            const cudaError_t diagState = cudaStreamSynchronize(stream);
+            if (diagState != cudaSuccess) {
+                printf("[diag-stream3d] phase=%d rows=%d capacity=%d exp=%d err=%d %s\n",
+                    int(phase), batch.rows, capacity, batch.experts, int(diagState),
+                    cudaGetErrorString(diagState));
+                fflush(stdout);
+            }
+        }
     };
     run(StreamedMoePhase::Prepare, {});
     const int maxBlocks = std::max(gu->dims[0] * (hidden / int(ggml_blck_size((ggml_type)gt))),

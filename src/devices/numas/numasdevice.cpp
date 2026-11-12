@@ -11861,6 +11861,14 @@ namespace fastllm {
                             sharedScale, true, gpuExpertSets[i], true,
                             MoeGateSwiglu, deepSeekV4Mode, swigluLimit, activationQuantBlock, quantizeSharedExpert,
                             workerDevice == cudaDeviceId);
+                        {
+                            FastllmCudaSyncCurrentThreadStream();
+                            if (FastllmCudaGetThreadError()) {
+                                printf("[diag-worker-moe] layer=%d device=%d experts=%d\n",
+                                    layer, workerDevice, (int)gpuExpertSets[i].size());
+                                fflush(stdout);
+                            }
+                        }
                         if (speedTracker) {
                             speedTracker->RecordGpu(
                                 workerDevice, (int)gpuExpertSets[i].size(),

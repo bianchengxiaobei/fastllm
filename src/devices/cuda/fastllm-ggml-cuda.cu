@@ -1465,6 +1465,16 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
 
+    // TEMP DIAG: 小 batch 下逐次同步, 出错时打印走的是哪条分支.
+    if (n > 0 && n <= 32) {
+        FastllmCudaSyncCurrentThreadStream();
+        if (FastllmCudaGetThreadError()) {
+            printf("[diag-bmm] n=%d m=%d k=%d type=%d mmq=%d emmvq=%d gemv=%d q8=%d dequant=%d\n",
+                n, m, k, int(ggufType), int(usedMmq), int(usedExtendedMmvq),
+                int(usedDirectGemv), int(q8Input != nullptr), int(dequant != nullptr));
+            fflush(stdout);
+        }
+    }
     return true;
 }
 

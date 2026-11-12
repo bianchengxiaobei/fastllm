@@ -9649,6 +9649,17 @@ namespace fastllm {
         CudaMergeMoeFromCpuWorkspace &workspace =
             GetCudaMergeMoeFromCpuWorkspace(curDeviceId);
         std::lock_guard<std::mutex> workspaceGuard(workspace.mutex);
+        // TEMP DIAG: 只对小 batch(<=32 行, 即 NUMA GPU 辅助 prefill 的那一档)
+        // 逐步骤同步, 用来定位第一个非法访存发生在哪一步.
+        const bool diagMoeSmall = input.dims[0] <= 32;
+        auto diagMoeStep = [&](const char *label, int expert) {
+            if (!diagMoeSmall) return;
+            FastllmCudaSyncCurrentThreadStream();
+            if (FastllmCudaGetThreadError()) {
+                printf("[diag-moe-step] %s expert=%d device=%d\n", label, expert, curDeviceId);
+                fflush(stdout);
+            }
+        };
         // Keep release under the workspace lock, including early grouped-MMQ
         // returns. Every transient belongs to this eager invocation; no
         // captured decode storage, output tensor or weight alias is released.
@@ -10276,10 +10287,12 @@ namespace fastllm {
             if (profileMoeStream) {
                 profilePickIn += profileNow() - pickInStart;
             }
+            diagMoeStep("after-pick-input", i);
             if (deepSeekV41Mode && (i != 0 || quantizeSharedExpert)) {
                 AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(tempInput, tempInput),
                                 "V4.1 GPU prefill input quantization failed.");
             }
+            diagMoeStep("after-input-quantize", i);
             if (accurateFp8Moe) {
                 int expertBatch = (int)expertTasks[i].size();
                 int hidden = tempInput.dims[1];
@@ -10321,7 +10334,15 @@ namespace fastllm {
                     nativeGate = FastllmCudaV41Mxfp4Linear(tempInput, *weights[i * 2],
                         tempMiddle, workspace.mxfp4Scratch);
 #endif
+                if (diagMoeSmall) {
+                    FastllmCudaStreamSynchronize(copyStream);
+                    if (FastllmCudaGetThreadError()) {
+                        printf("[diag-before-gemm-up] expert=%d device=%d\n", i, curDeviceId);
+                        fflush(stdout);
+                    }
+                }
                 if (!nativeGate) DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
+                diagMoeStep("after-gemm-up", i);
                 if (profileMoeStream) {
                     profileGemmUp += profileNow() - gemmUpStart;
                 }
@@ -10344,7 +10365,8 @@ namespace fastllm {
                         profileGate += profileNow() - gateStart;
                     }
                 }
-                const double gemmDownStart = profileMoeStream ? profileNow() : 0.0;
+                diagMoeStep("after-gemm-up-and-activation", i);
+            const double gemmDownStart = profileMoeStream ? profileNow() : 0.0;
                 DoCudaLinearReshape(
                     tempSwiglu, *weights[i * 2 + 1], tempOutput);
                 bool nativeDown = false;
@@ -10358,6 +10380,7 @@ namespace fastllm {
                     profileGemmDown += profileNow() - gemmDownStart;
                 }
             }
+            diagMoeStep("after-gemm-down", i);
 
             if (deepSeekV41Mode) {
                 tempFloatOutput.Resize(tempOutput.dims);
@@ -10391,6 +10414,7 @@ namespace fastllm {
             if (profileMoeStream) {
                 profileCompute += profileNow() - computeStart;
             }
+            diagMoeStep("after-pick-output", i);
 #ifndef USE_ROCM
             if (cachedPrefill) prefillCache.Store(i - 1);
 #endif
