@@ -809,7 +809,16 @@ bool FastllmCudaRunV41GGUFHostStream(
     // against driver-free plus pooled-idle instead of driver-free alone.
     const size_t pooledBytes = FastllmCudaGetPooledIdleBytes(device);
     const size_t usableBytes = freeBytes + pooledBytes;
-    const size_t reserve = 256ull << 20, minArena = 64ull << 20;
+    // arena 之外还有常驻专家缓存、图捕获 workspace 和下一层 attention 的一次性
+    // 缓冲要抢显存。只留 256MB 时 arena 会把驱动空闲压到底, 之后任何换尺寸的
+    // 申请都只能向驱动要, 表现成某个无关的 kernel 报 out of memory。
+    size_t reserve = std::max<size_t>(1ull << 30, totalBytes / 16);
+    if (const char *reserveEnv = std::getenv("FASTLLM_V41_HOST_MOE_RESERVE_MB")) {
+        if (atoi(reserveEnv) > 0) {
+            reserve = (size_t)atoi(reserveEnv) << 20;
+        }
+    }
+    const size_t minArena = 64ull << 20;
     if (usableBytes <= reserve) {
         char extra[128];
         snprintf(extra, sizeof(extra), "free=%.0fMB pooled=%.0fMB reserve=%.0fMB",
