@@ -5518,6 +5518,10 @@ bool FastllmCudaGraphMemoryPoolActive() {
 
 bool FastllmCudaGraphMemoryPoolBegin() {
     FastllmCudaClearGraphError();
+    // 捕获期间不允许 cudaFree, 池里的空闲块到时候一块也还不了。先归还, 否则
+    // 一张被权重/KV 填到只剩一百多 MB 的卡会因为凑不出图 workspace 而把整张图
+    // 判成"不支持", 回退路又要重新分配, 直接 OOM。
+    FastllmCudaReleaseIdleCachedBuffers(-1);
     std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
     if (fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) !=
             FASTLLM_CUDA_GRAPH_POOL_IDLE) {
