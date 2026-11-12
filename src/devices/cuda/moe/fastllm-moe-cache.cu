@@ -5787,6 +5787,22 @@ void FastllmCudaReleaseNativeMoeFullGraph(void *handle) {
 #endif
 }
 
+// 图捕获被拒时只交回一个 nullptr, 拒绝原因全丢, 上层再包成一句
+// "MoE full graph rejected at layer N"。开 FASTLLM_V41_GRAPH_PROBE 打出每条
+// 原因和当时的显存, 免得再靠猜。
+static void V41MoeGraphReject(int layer, const char *why, const fastllm::Data &input) {
+    static const bool enabled = std::getenv("FASTLLM_V41_GRAPH_PROBE") != nullptr;
+    if (!enabled) return;
+    size_t freeBytes = 0, totalBytes = 0;
+    cudaMemGetInfo(&freeBytes, &totalBytes);
+    const int device = FastllmCudaGetDevice();
+    printf("[v41-graph-probe] layer=%d rejected: %s rows=%d hidden=%d device=%d free=%.0fMB pooled=%.0fMB\n",
+        layer, why, input.dims.empty() ? -1 : input.dims[0],
+        input.dims.size() < 2 ? -1 : input.dims[1], device,
+        freeBytes / 1048576.0, FastllmCudaGetPooledIdleBytes(device) / 1048576.0);
+    fflush(stdout);
+}
+
 void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fastllm::Data &index,
         const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
         int layer, const void *sharedGraph, void **graph) {
@@ -5796,7 +5812,10 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
     // An explicit pure-GPU request must retain its refill policy instead of
     // silently switching back to the hybrid CPU/GPU scheduler during capture.
     const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
-    if (mode && std::strcmp(mode, "gpu") == 0) return nullptr;
+    if (mode && std::strcmp(mode, "gpu") == 0) {
+        V41MoeGraphReject(layer, "FASTLLM_DSV41_MOE_CACHE_MODE=gpu", input);
+        return nullptr;
+    }
     const std::vector<int> device{FastllmCudaGetDevice()};
     if (FastllmCudaGraphIsCapturingFast() ||
         !PackedCacheRows(input) || !PackedCacheRows(index) || !PackedCacheRows(score) ||
@@ -5810,17 +5829,27 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
         index.dims[0] != input.dims[0] || index.dataType != fastllm::INT32 ||
         score.dims != index.dims || score.dataType != fastllm::FLOAT32 ||
         !index.cudaData || !score.cudaData ||
-        index.dims.back() < 1 || index.dims.back() > kMaxTopK) return nullptr;
+        index.dims.back() < 1 || index.dims.back() > kMaxTopK) {
+        V41MoeGraphReject(layer, "shape/device/type guard", input);
+        return nullptr;
+    }
     auto *cache = static_cast<DeviceCache *>(FastllmCudaNativeMoeGraphOwner(weights, weightsBatch, input.dims[0]));
-    if (!cache) return nullptr;
+    if (!cache) {
+        V41MoeGraphReject(layer, "no native device cache (rows out of range / not admitted / no VRAM)", input);
+        return nullptr;
+    }
     int table = -1;
     auto *group = FindHybridGroup(weights, weightsBatch, &table);
     if (!group || !cache->frequency || input.dims[1] != group->LayerLayout(table).hidden ||
-        (group->layout.deepSeekV41 && input.dataType != fastllm::BFLOAT16)) return nullptr;
+        (group->layout.deepSeekV41 && input.dataType != fastllm::BFLOAT16)) {
+        V41MoeGraphReject(layer, "no hybrid group or layout mismatch", input);
+        return nullptr;
+    }
     if (!cache->nativeMailbox) cache->nativeMailbox = std::make_shared<NativeMoeMailbox>(*group, *cache);
     auto *handle = cache->nativeMailbox->CreateFull(table, input, index, score, output,
         weights, weightsBatch, layer, reinterpret_cast<cudaGraph_t>(const_cast<void *>(sharedGraph)));
     if (handle) *graph = handle->fullGraph;
+    else V41MoeGraphReject(layer, "NativeMoeMailbox::CreateFull failed", input);
     return handle;
 #else
     return nullptr;
