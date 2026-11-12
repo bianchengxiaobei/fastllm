@@ -42,15 +42,14 @@ namespace fastllm {
 
 #ifdef USE_CUDA
     namespace {
-        // Host (pageable) GGUF experts on the card during prefill, mirroring the
-        // Qwen3.5 switch: -1 means "on when the experts live in host memory",
-        // 0/1 force it. NUMA and disk keep their own registered pipelines.
+        // Host (pageable) GGUF experts on the card during prefill. This is the
+        // locally added fast path; it produced a long tail of residency,
+        // arena and graph-capture problems, so it is off unless explicitly
+        // requested. Upstream keeps experts in the native device cache.
         bool V41PrefillMoeGpuFromHostEnabled(const std::string &moeDevice) {
-            const int configured = GetFastllmEnv().prefillMoeGpu;
-            if (configured >= 0) {
-                return configured != 0;
-            }
-            return moeDevice.find("cpu") != std::string::npos;
+            (void)moeDevice;
+            const char *env = std::getenv("FASTLLM_PREFILL_MOE_GPU");
+            return env != nullptr && atoi(env) != 0;
         }
 
         // Below this many tokens the fixed upload costs more than the CPU pass.

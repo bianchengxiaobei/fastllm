@@ -2751,15 +2751,6 @@ namespace fastllm {
             placements.push_back(main);
             placements.push_back(moe);
             v41MoeCudaGraphCompatible &= !V41DeviceSpecUsesType(moe, "disk");
-            // 专家在主机(numa/cpu)上时, 原生 MoE 全图要求它们先落户 native
-            // device cache; 只要有一层没落户(显存不够/缓存被关掉), 图就必然被拒,
-            // 而拒绝点落在捕获体内, 会把流留在捕获态, 后面全是级联错误。
-            // 默认不建全图, FASTLLM_DSV41_MOE_GRAPH=1 可强行打开。
-            const char *forceMoeGraph = std::getenv("FASTLLM_DSV41_MOE_GRAPH");
-            const bool allowMoeGraph = forceMoeGraph != nullptr && atoi(forceMoeGraph) != 0;
-            if (!allowMoeGraph && (V41DeviceSpecUsesType(moe, "numa") || moe == "cpu")) {
-                v41MoeCudaGraphCompatible = false;
-            }
         }
         const char *requested = std::getenv("FASTLLM_EXECUTION_MODE");
         executionMode = ResolveExecutionMode(requested, placements);
