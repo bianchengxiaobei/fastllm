@@ -435,13 +435,9 @@ def test_reasoning_effort_resolution():
     # chat_template_kwargs 作为兜底
     assert _resolve_effort(None, {"reasoning_effort": 30}) == 30
     assert _resolve_effort(None, {"thinking_effort": "max"}) == "max"
-    # 越界数值 / 其它模型的档位名都必须被拒绝（非法字符串在请求校验阶段就被挡掉）
-    for bad in (0, 101, -3, "medium", "xhigh", "abc"):
-        try:
-            _resolve_effort(bad)
-        except Exception:
-            continue
-        raise AssertionError(f"reasoning_effort={bad!r} 应当被拒绝")
+    # 越界数值 / 其它模型的档位名都回退到 high，避免客户端因此拿到 400
+    for bad in (0, 101, -3, "medium", "xhigh", "minimal"):
+        assert _resolve_effort(bad) == "high", bad
 
 
 def test_reasoning_effort_reaches_encode_messages():

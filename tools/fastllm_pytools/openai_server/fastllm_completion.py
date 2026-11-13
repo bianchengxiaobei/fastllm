@@ -471,7 +471,9 @@ class FastLLmCompletion:
 
       ``encoding_dsv41.render_reasoning_effort`` accepts an int in [1, 100] or
       one of the ``low``/``high``/``max`` aliases (50/75/100) and defaults to
-      ``high``.  Returning None keeps that default.
+      ``high``.  Returning None keeps that default.  Unsupported values (for
+      example OpenAI's ``medium``/``minimal``) fall back to ``high`` instead of
+      rejecting the whole request.
       """
       if not self._is_deepseek_v41_model():
           return None
@@ -487,9 +489,7 @@ class FastLLmCompletion:
           # rendered at all, so there is nothing left to resolve.
           return None
       if isinstance(effort, bool):
-          raise ValueError(
-              "DeepSeek-V4.1 reasoning_effort must be an integer in [1, 100] "
-              "or one of: none, low, high, max")
+          return "high"
       if isinstance(effort, str):
           stripped = effort.strip()
           if stripped in REASONING_EFFORT_MAPPINGS:
@@ -497,13 +497,9 @@ class FastLLmCompletion:
           try:
               effort = int(stripped, 10)
           except ValueError:
-              raise ValueError(
-                  "DeepSeek-V4.1 reasoning_effort must be an integer in "
-                  "[1, 100] or one of: none, low, high, max")
+              return "high"
       if not isinstance(effort, int) or not 1 <= effort <= 100:
-          raise ValueError(
-              "DeepSeek-V4.1 reasoning_effort must be an integer in [1, 100] "
-              "or one of: none, low, high, max")
+          return "high"
       return effort
 
   def _resolve_qwen3_5_reasoning_effort(
