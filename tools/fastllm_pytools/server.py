@@ -10,8 +10,9 @@ import sys
 import threading
 import time
 import uvicorn
+from urllib.parse import urlparse
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .openai_server.protocal.openai_protocol import *
@@ -21,6 +22,7 @@ from .openai_server.streaming_response import SSEStreamingResponse
 from .openai_server.fastllm_embed import FastLLmEmbed
 from .openai_server.fastllm_reranker import FastLLmReranker
 from .openai_server.fastllm_model import FastLLmModel
+from .op_trace_ui import PAGE_HTML
 from .util import make_normal_parser
 from .util import add_server_args
 from .util import apply_page_size_default
@@ -295,6 +297,86 @@ async def get_active_conversations():
         return JSONResponse(content = {"error": f"Internal server error: {str(e)}"},
                             status_code = 500)
 
+class _OpTraceAccessLogFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            args = record.args
+            if args and len(args) >= 3:
+                path = str(args[2])
+                if path.startswith("/api/op-trace") or path.startswith("/debug/op-trace"):
+                    return False
+        except Exception:
+            pass
+        return True
+
+def _install_op_trace_access_log_filter():
+    logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, _OpTraceAccessLogFilter) for item in logger.filters):
+        logger.addFilter(_OpTraceAccessLogFilter())
+
+def _op_trace_allowed(raw_request: Request) -> bool:
+    if dev_mode_enabled:
+        return True
+    origin = raw_request.headers.get("origin", "")
+    if origin:
+        origin_host = urlparse(origin).hostname or ""
+        if origin_host not in ("127.0.0.1", "::1", "localhost"):
+            return False
+    client = getattr(raw_request, "client", None)
+    host = getattr(client, "host", "") if client is not None else ""
+    return host in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+
+def _op_trace_forbidden() -> JSONResponse:
+    return JSONResponse(
+        content = {"error": "Operator trace is only available from localhost or with --dev_mode"},
+        status_code = 403)
+
+@app.get("/debug/op-trace", response_class = HTMLResponse)
+def op_trace_page(raw_request: Request):
+    if not _op_trace_allowed(raw_request):
+        return HTMLResponse(
+            "<h1>403</h1><p>Open this page from localhost or start the server with --dev_mode.</p>",
+            status_code = 403)
+    return HTMLResponse(PAGE_HTML)
+
+@app.get("/api/op-trace/status")
+def op_trace_status(raw_request: Request):
+    if not _op_trace_allowed(raw_request):
+        return _op_trace_forbidden()
+    from .llm import get_op_trace_enabled, op_trace_supported
+    return JSONResponse(content = {
+        "supported": op_trace_supported(),
+        "enabled": get_op_trace_enabled(),
+    })
+
+@app.get("/api/op-trace/snapshot")
+def op_trace_snapshot(raw_request: Request, after_seq: int = 0, max_events: int = 4096):
+    if not _op_trace_allowed(raw_request):
+        return _op_trace_forbidden()
+    from .llm import get_op_trace_snapshot
+    return JSONResponse(content = get_op_trace_snapshot(
+        max(0, int(after_seq)), max(1, min(int(max_events), 8192))))
+
+@app.post("/api/op-trace/enabled")
+async def set_op_trace(payload: dict, raw_request: Request):
+    if not _op_trace_allowed(raw_request):
+        return _op_trace_forbidden()
+    from .llm import get_op_trace_enabled, op_trace_supported, set_op_trace_enabled
+    if not op_trace_supported():
+        return JSONResponse(content = {"supported": False, "enabled": False})
+    requested = bool(payload.get("enabled", False)) if isinstance(payload, dict) else False
+    supported = set_op_trace_enabled(requested)
+    enabled = get_op_trace_enabled()
+    logging.info("Operator trace %s", "enabled" if enabled else "disabled")
+    return JSONResponse(content = {"supported": bool(supported), "enabled": enabled})
+
+@app.post("/api/op-trace/clear")
+async def clear_op_trace(raw_request: Request):
+    if not _op_trace_allowed(raw_request):
+        return _op_trace_forbidden()
+    from .llm import clear_op_trace as clear_native_op_trace
+    return JSONResponse(content = {"supported": bool(clear_native_op_trace())})
+
 def init_logging(log_level = logging.INFO, log_file:str = None):
     logging_format = '%(asctime)s %(process)d %(filename)s[line:%(lineno)d] %(levelname)s: %(message)s'
     root = logging.getLogger()
@@ -390,7 +472,16 @@ def _fastllm_server(args, startup_progress):
         api_thread_pool_workers = default_workers
     api_thread_pool_workers = max(1, min(256, api_thread_pool_workers))
     set_ulimit()
+    if getattr(args, "op_trace", False):
+        from .llm import op_trace_supported, set_op_trace_enabled
+        if op_trace_supported() and set_op_trace_enabled(True):
+            display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+            logging.info("Operator trace enabled: http://%s:%d/debug/op-trace",
+                         display_host, args.port)
+        else:
+            logging.warning("Operator trace requested, but the native runtime does not support it")
     config = uvicorn.Config(app, host = args.host, port = args.port)
+    _install_op_trace_access_log_filter()
     startup_progress.progress("server_starting", 1, 1)
     try:
         FastLLMUvicornServer(config, startup_progress = startup_progress).run()

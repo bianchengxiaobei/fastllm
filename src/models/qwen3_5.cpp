@@ -3,6 +3,7 @@
 //
 
 #include "utils/recurrent_prefix_cache.h"
+#include "utils/op_trace.h"
 #include "utils.h"
 
 #include "qwen3_5.h"
@@ -25783,6 +25784,17 @@ namespace fastllm {
 
             if (!seqLens.empty()) {
                 ResponseContext *singleContext = tokenContexts.empty() ? nullptr : tokenContexts[0];
+                op_trace::PhaseKind tracePhaseKind = selectedIsPrompt
+                    ? op_trace::PhaseKind::Prefill : op_trace::PhaseKind::Decode;
+                int traceToken = -1;
+                int traceRequest = -1;
+                if (seqLens.size() == 1 && singleContext != nullptr) {
+                    traceRequest = handles.empty() ? -1 : handles[0];
+                    if (!selectedIsPrompt) {
+                        traceToken = (int)singleContext->curTokens;
+                    }
+                }
+                op_trace::PhaseScope tracePhase(tracePhaseKind, traceToken, traceRequest);
                 dictLocker.unlock();
                 forwardLocker.lock();
 

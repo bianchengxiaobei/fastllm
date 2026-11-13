@@ -6,6 +6,7 @@
 
 #include "executor.h"
 #include "utils/autotune.h"
+#include "utils/op_trace_utils.h"
 
 #include "devices/cpu/cpudevice.h"
 #include "devices/disk/diskdevice.h"
@@ -598,6 +599,9 @@ namespace fastllm {
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
+        const bool opTraceEnabled = fastllm::op_trace::Enabled();
+        const uint64_t opTraceStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
+        std::string opTraceDevice;
         {
             auto positionIt = datas.find("positionIds");
             if (positionIt != datas.end() && positionIt->second != nullptr &&
@@ -733,6 +737,9 @@ namespace fastllm {
 #ifdef USE_CUDA
                 SyncCudaDeviceForProfiler(device);
 #endif
+                if (opTraceEnabled) {
+                    opTraceDevice = device->deviceType;
+                }
                 run = true;
                 break;
             }
@@ -741,6 +748,11 @@ namespace fastllm {
             ErrorInFastLLM("Can't run " + opType + " in any device.");
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
+        if (opTraceEnabled) {
+            fastllm::op_trace::RecordOp(
+                opType, opTraceDevice, datas, intParams,
+                opTraceStartNs, fastllm::op_trace::NowNs());
+        }
         if (phaseStat != nullptr) {
             phaseStat->total += spend;
         }
@@ -765,6 +777,9 @@ namespace fastllm {
                                const fastllm::FloatDict &floatParams,
                                const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
+        const bool opTraceEnabled = fastllm::op_trace::Enabled();
+        const uint64_t opTraceStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
+        std::string opTraceDevice;
         static const bool profileExecPhases =
             std::getenv("FASTLLM_PROFILE_EXEC_PHASES") != nullptr;
         ExecPhaseStat *phaseStat = nullptr;
@@ -843,6 +858,9 @@ namespace fastllm {
 #ifdef USE_CUDA
             SyncCudaDeviceForProfiler(device);
 #endif
+            if (opTraceEnabled) {
+                opTraceDevice = device->deviceType;
+            }
             run = true;
             break;
         }
@@ -850,6 +868,11 @@ namespace fastllm {
             ErrorInFastLLM("Can't run " + opType + " on device " + deviceType + ".");
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
+        if (opTraceEnabled) {
+            fastllm::op_trace::RecordOp(
+                opType, opTraceDevice, datas, intParams,
+                opTraceStartNs, fastllm::op_trace::NowNs());
+        }
         if (phaseStat != nullptr) {
             phaseStat->total += spend;
         }

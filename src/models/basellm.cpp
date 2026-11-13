@@ -8,6 +8,7 @@
 #include "utils/cuda_cache_budget.h"
 #include "utils/fastllm_int128.h"
 #include "utils/inference_trace.h"
+#include "utils/op_trace.h"
 #include "utils/dense_id_set.h"
 #include "utils/paged_prefix_preview.h"
 #include <sstream>
@@ -3141,6 +3142,23 @@ namespace fastllm {
                         isSingleMultimodal = !singleContext->multimodalInput.empty();
                     }
                 }
+                op_trace::PhaseKind tracePhaseKind = op_trace::PhaseKind::None;
+                if (selectedHasPrompt && selectedHasDecode) {
+                    tracePhaseKind = op_trace::PhaseKind::Mixed;
+                } else if (selectedHasPrompt) {
+                    tracePhaseKind = op_trace::PhaseKind::Prefill;
+                } else {
+                    tracePhaseKind = op_trace::PhaseKind::Decode;
+                }
+                int traceToken = -1;
+                int traceRequest = -1;
+                if (handles.size() == 1 && singleContext != nullptr) {
+                    traceRequest = handles[0];
+                    if (!selectedHasPrompt) {
+                        traceToken = (int)singleContext->curTokens;
+                    }
+                }
+                op_trace::PhaseScope tracePhase(tracePhaseKind, traceToken, traceRequest);
                 dictLocker.unlock();
                 forwardLocker.lock();
 #ifdef USE_CUDA
@@ -4061,6 +4079,17 @@ namespace fastllm {
                                 pastKeyValue1 = &singleContext->pastKeyValues;
                                 isSingleText = singleContext->multimodalInput.empty();
                             }
+                            op_trace::PhaseKind tracePhaseKind = prefillTokens > 0
+                                ? op_trace::PhaseKind::Prefill : op_trace::PhaseKind::Decode;
+                            int traceToken = -1;
+                            int traceRequest = -1;
+                            if (seqLens.size() == 1 && singleContext != nullptr) {
+                                traceRequest = handles[0];
+                                if (prefillTokens == 0) {
+                                    traceToken = (int)singleContext->curTokens;
+                                }
+                            }
+                            op_trace::PhaseScope tracePhase(tracePhaseKind, traceToken, traceRequest);
                             if (trace) trace->Mark("batch_finalize_ms");
                             dictLocker.unlock();
                             forwardLocker.lock();

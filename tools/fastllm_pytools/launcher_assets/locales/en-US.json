@@ -70,6 +70,7 @@
     "服务未启动": "Service not started",
     "选择启动项目后即可启动服务": "Choose a launch item to start a service",
     "打开服务": "Open service",
+    "算子 Trace": "Operator Trace",
     "■ 停止": "■ Stop",
     "启动项目": "Launch items",
     "管理已保存的模型服务与聊天 WebUI。": "Manage saved model services and chat WebUIs.",

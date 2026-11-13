@@ -1176,6 +1176,7 @@ def add_server_args(parser):
     parser.add_argument("--think", type = str, default = "false", help="if <think> lost")
     parser.add_argument("--hide_input", action = 'store_true', help = "不显示请求信息")
     parser.add_argument("--dev_mode", action = 'store_true', help = "开发模式, 启用后能够获取对话列表并主动停止")
+    parser.add_argument("--op_trace", action = 'store_true', help = "开启算子级 trace，并启用 /debug/op-trace 页面")
     parser.add_argument(
         "--startup-progress",
         choices = ["off", "ndjson"],

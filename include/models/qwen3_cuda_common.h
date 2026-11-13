@@ -18,6 +18,7 @@
 #include "devices/cuda/cudadevice.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "devices/multicuda/tp2prefill.h"
+#include "op_trace_utils.h"
 #endif
 
 namespace fastllm {
@@ -126,12 +127,20 @@ namespace fastllm {
     public:
         explicit Qwen3CudaSubmitDirectScope(const char *name) :
                 name(name), enabled(Qwen3CudaSubmitProfile().enabled) {
+            traceEnabled = op_trace::Enabled();
+            if (traceEnabled) {
+                traceStartNs = op_trace::NowNs();
+            }
             if (this->enabled) {
                 this->beginMs = Qwen3CudaSubmitNowMs();
             }
         }
 
         ~Qwen3CudaSubmitDirectScope() {
+            if (traceEnabled) {
+                op_trace::Record(-1, name, "cuda", "", "",
+                                 traceStartNs, op_trace::NowNs());
+            }
             if (this->enabled) {
                 Qwen3CudaSubmitProfileAddDirect(
                     this->name, Qwen3CudaSubmitNowMs() - this->beginMs);
@@ -145,6 +154,8 @@ namespace fastllm {
         const char *name;
         bool enabled;
         double beginMs = 0.0;
+        bool traceEnabled = false;
+        uint64_t traceStartNs = 0;
     };
 
     inline void Qwen3CudaSubmitProfileFlush() {
@@ -200,6 +211,8 @@ namespace fastllm {
                  const std::vector<std::string> &outputs = std::vector<std::string>(),
                  bool checkCanRun = true,
                  bool preserveFakeOutputs = false) {
+            const bool traceOp = op_trace::Enabled();
+            const uint64_t traceStartNs = traceOp ? op_trace::NowNs() : 0;
             FastllmCudaSetDevice(deviceId);
             Qwen3CudaSubmitProfileState &submitProfile = Qwen3CudaSubmitProfile();
             double submitBeginMs = submitProfile.enabled ? Qwen3CudaSubmitNowMs() : 0.0;
@@ -227,6 +240,10 @@ namespace fastllm {
                 Qwen3CudaSubmitNowMs() : 0.0;
             device->Reshape(opType, datas, floatParams, intParams);
             device->Run(opType, datas, floatParams, intParams);
+            if (traceOp) {
+                op_trace::RecordOp(opType, "cuda", datas, intParams,
+                                   traceStartNs, op_trace::NowNs());
+            }
             if (submitProfile.enabled) {
                 double nowMs = Qwen3CudaSubmitNowMs();
                 double spendMs = nowMs - submitBeginMs;

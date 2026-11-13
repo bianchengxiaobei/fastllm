@@ -10,6 +10,7 @@
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
 #include "utils/autotune.h"
+#include "utils/op_trace.h"
 #include "cpu_thread_bench.h"
 
 #include <cstring>
@@ -374,6 +375,27 @@ extern "C" {
         memcpy(svalue, s.data(), s.size());
         svalue[s.size()] = 0;
         return svalue;
+    }
+
+    DLL_EXPORT void set_op_trace_enabled(bool enabled) {
+        fastllm::op_trace::SetEnabled(enabled);
+    }
+
+    DLL_EXPORT bool op_trace_enabled() {
+        return fastllm::op_trace::Enabled();
+    }
+
+    DLL_EXPORT void clear_op_trace() {
+        fastllm::op_trace::Clear();
+    }
+
+    DLL_EXPORT char *op_trace_snapshot_json(unsigned long long after_seq, int max_events) {
+        return string_to_chars(fastllm::op_trace::SnapshotJson(
+            (uint64_t)after_seq, max_events > 0 ? (size_t)max_events : 4096));
+    }
+
+    DLL_EXPORT void free_op_trace_string(char *value) {
+        delete[] value;
     }
 
     // Request-scoped KVMem prefix pin. Staged by the caller and consumed by the

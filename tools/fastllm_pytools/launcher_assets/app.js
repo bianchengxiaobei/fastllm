@@ -150,7 +150,7 @@ function cacheElements() {
     "app-version", "shutdown-launcher", "status-dot", "status-title", "status-message",
     "inference-status-bar", "prefill-speed", "decode-speed",
     "context-window-metric", "context-window",
-    "open-endpoint", "open-api-info", "api-info-dialog", "api-info-close", "api-info-url",
+    "open-endpoint", "open-api-info", "open-op-trace", "api-info-dialog", "api-info-close", "api-info-url",
     "api-info-model", "api-info-key", "api-info-reveal", "api-info-copy",
     "stop-runtime", "profile-count", "profile-list", "new-profile",
     "current-view-title", "profile-search", "profile-results",
@@ -592,6 +592,7 @@ function bindEvents() {
   elements.saveProfile.addEventListener("click", saveProfileAndClose);
   elements.stopRuntime.addEventListener("click", stopRuntime);
   elements.openEndpoint.addEventListener("click", openEndpoint);
+  elements.openOpTrace.addEventListener("click", openOpTrace);
   elements.openApiInfo.addEventListener("click", openApiInfo);
   elements.apiInfoClose.addEventListener("click", () => elements.apiInfoDialog.close());
   elements.apiInfoDialog.addEventListener("close", () => {
@@ -774,6 +775,7 @@ function renderRuntime() {
   elements.stopRuntime.disabled = phase === "stopping";
   elements.openEndpoint.disabled = !runtime.ready;
   elements.openApiInfo.disabled = !runtime.ready || isWebui;
+  elements.openOpTrace.disabled = !runtime.ready || isWebui;
   if (elements.apiInfoDialog.open && (!runtime.ready || isWebui
       || elements.apiInfoDialog.dataset.sessionId !== runtime.sessionId)) elements.apiInfoDialog.close();
   elements.openEndpoint.textContent = runtime.kind === "video" ? t("Video demo") : isWebui ? t("Open WebUI") : t("Open API documentation");
@@ -878,6 +880,13 @@ function openEndpoint() {
   const endpoint = state.runtime.endpoint.replace(/\/$/, "");
   const url = state.runtime.command === "webui" ? endpoint : `${endpoint}/docs`;
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function openOpTrace() {
+  if (!state.runtime?.endpoint || !state.runtime.ready) return;
+  if (state.runtime.command === "webui" || state.runtime.kind === "video") return;
+  const endpoint = state.runtime.endpoint.replace(/\/$/, "");
+  window.open(`${endpoint}/debug/op-trace`, "_blank", "noopener,noreferrer");
 }
 
 async function openApiInfo() {

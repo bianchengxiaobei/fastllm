@@ -335,6 +335,22 @@ if hasattr(fastllm_lib, "set_model_load_progress_callback"):
     fastllm_lib.set_model_load_progress_callback.argtypes = [ctypes.c_void_p]
     fastllm_lib.set_model_load_progress_callback.restype = None
 
+if hasattr(fastllm_lib, "set_op_trace_enabled"):
+    fastllm_lib.set_op_trace_enabled.argtypes = [ctypes.c_bool]
+    fastllm_lib.set_op_trace_enabled.restype = None
+if hasattr(fastllm_lib, "op_trace_enabled"):
+    fastllm_lib.op_trace_enabled.argtypes = []
+    fastllm_lib.op_trace_enabled.restype = ctypes.c_bool
+if hasattr(fastllm_lib, "clear_op_trace"):
+    fastllm_lib.clear_op_trace.argtypes = []
+    fastllm_lib.clear_op_trace.restype = None
+if hasattr(fastllm_lib, "op_trace_snapshot_json"):
+    fastllm_lib.op_trace_snapshot_json.argtypes = [ctypes.c_ulonglong, ctypes.c_int]
+    fastllm_lib.op_trace_snapshot_json.restype = ctypes.c_void_p
+if hasattr(fastllm_lib, "free_op_trace_string"):
+    fastllm_lib.free_op_trace_string.argtypes = [ctypes.c_void_p]
+    fastllm_lib.free_op_trace_string.restype = None
+
 def _dispatch_model_load_progress(stage, current, total, completed_bytes, total_bytes):
     handler = _model_load_progress_handler
     if handler is None:
@@ -724,6 +740,47 @@ def set_cuda_graph(cuda_graph):
         return False
     native_setter(ctypes.c_bool(cuda_graph))
     return True
+
+def op_trace_supported() -> bool:
+    return hasattr(fastllm_lib, "op_trace_snapshot_json")
+
+def set_op_trace_enabled(enabled) -> bool:
+    native_setter = getattr(fastllm_lib, "set_op_trace_enabled", None)
+    if native_setter is None:
+        return False
+    native_setter(ctypes.c_bool(bool(enabled)))
+    return True
+
+def get_op_trace_enabled() -> bool:
+    native_getter = getattr(fastllm_lib, "op_trace_enabled", None)
+    if native_getter is None:
+        return False
+    return bool(native_getter())
+
+def clear_op_trace() -> bool:
+    native_clear = getattr(fastllm_lib, "clear_op_trace", None)
+    if native_clear is None:
+        return False
+    native_clear()
+    return True
+
+def get_op_trace_snapshot(after_seq: int = 0, max_events: int = 4096) -> dict:
+    native_getter = getattr(fastllm_lib, "op_trace_snapshot_json", None)
+    if native_getter is None:
+        return {"schema": 1, "supported": False, "enabled": False, "events": []}
+    ptr = native_getter(ctypes.c_ulonglong(int(after_seq)),
+                        ctypes.c_int(int(max_events)))
+    if not ptr:
+        return {"schema": 1, "supported": True, "enabled": False, "events": []}
+    try:
+        text = ctypes.string_at(ptr).decode("utf-8", errors="replace")
+    finally:
+        native_free = getattr(fastllm_lib, "free_op_trace_string", None)
+        if native_free is not None:
+            native_free(ptr)
+    snapshot = json.loads(text)
+    snapshot["supported"] = True
+    return snapshot
 
 def set_moe_pinned_staging(slots, slot_mb):
     native_setter = getattr(fastllm_lib, "set_moe_pinned_staging", None)

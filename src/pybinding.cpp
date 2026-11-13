@@ -1,5 +1,6 @@
 #include "model.h"
 #include "factoryllm.h"
+#include "utils/op_trace.h"
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -433,7 +434,15 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("set_kv_cache", &fastllm::SetKVCacheInCPU)
     .def("get_kv_cache", &fastllm::GetKVCacheInCPU)
     .def("set_device_map", &fastllm::SetDeviceMap)
-    .def("create_llm", &fastllm::CreateLLMModelFromFile);
+    .def("create_llm", &fastllm::CreateLLMModelFromFile)
+    .def("op_trace_enabled", []() { return fastllm::op_trace::Enabled(); })
+    .def("set_op_trace_enabled", [](bool enabled) {
+        fastllm::op_trace::SetEnabled(enabled);
+    }, py::arg("enabled"))
+    .def("op_trace_snapshot", [](uint64_t afterSeq, size_t maxEvents) {
+        return fastllm::op_trace::SnapshotJson(afterSeq, maxEvents);
+    }, py::arg("after_seq") = 0, py::arg("max_events") = 4096)
+    .def("clear_op_trace", []() { fastllm::op_trace::Clear(); });
 #ifdef USE_CUDA
   m.def("disable_cuda_malloc", &DisableCudaMalloc);
 #endif

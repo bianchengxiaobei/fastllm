@@ -86,6 +86,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .status-dot.failed { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-soft); }
 @keyframes spin { to { transform: rotate(360deg); } }
 .topbar-actions, .form-actions { display: flex; align-items: center; gap: 9px; }
+.topbar-actions { flex-wrap: wrap; justify-content: flex-end; }
 .primary-button, .secondary-button, .small-button, .hero-secondary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 33px; padding: 0 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: background .15s, border-color .15s; }
 .primary-button { border: 1px solid var(--primary); background: var(--primary); color: white; }
 .primary-button:hover:not(:disabled) { border-color: var(--primary-dark); background: var(--primary-dark); }

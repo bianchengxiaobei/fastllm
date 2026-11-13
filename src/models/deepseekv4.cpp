@@ -21,6 +21,7 @@
 #include "baseblock.h"
 #include "devices/cpu/computeutils.h"
 #include "executor.h"
+#include "utils/op_trace.h"
 #include "utils.h"
 
 #include <sstream>
@@ -6908,6 +6909,8 @@ namespace fastllm {
                 for (int seqLen : seqLens) {
                     allDecodeTokens &= (seqLen == 1);
                 }
+                op_trace::PhaseScope tracePhase(allDecodeTokens
+                    ? op_trace::PhaseKind::Decode : op_trace::PhaseKind::Prefill);
 #ifdef USE_CUDA
                 // DSpark decode has fixed graph shapes and request-persistent
                 // workspaces. Purging its idle big-buffer pool here performs
@@ -6943,6 +6946,11 @@ namespace fastllm {
                     std::vector<std::pair<Data, Data> > *pastKeyValue = ctx == nullptr ? nullptr : &ctx->pastKeyValues;
                     bool isMultimodal = ctx != nullptr && !ctx->multimodalInput.empty();
                     dictLocker.unlock();
+                    op_trace::PhaseScope traceSingle(
+                        allDecodeTokens ? op_trace::PhaseKind::Decode
+                                        : op_trace::PhaseKind::Prefill,
+                        (allDecodeTokens && ctx != nullptr) ? (int)ctx->curTokens : -1,
+                        handles.empty() ? -1 : handles[0]);
 
                     if (ctx == nullptr || pastKeyValue == nullptr) {
                         ret.push_back(model->eos_token_id);
