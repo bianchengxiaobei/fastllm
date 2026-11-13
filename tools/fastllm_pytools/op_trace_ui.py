@@ -429,10 +429,11 @@ PAGE_HTML = r"""<!doctype html>
     <button id="clear">清空</button>
     <span id="status" class="pill off">连接中</span>
     <label>窗口
-      <select id="window">
+      <select id="window" title="时间线和表格的时间范围">
+        <option value="token" selected>单 Token</option>
         <option value="200000">200 ms</option>
         <option value="500000">500 ms</option>
-        <option value="1000000" selected>1 s</option>
+        <option value="1000000">1 s</option>
         <option value="2000000">2 s</option>
         <option value="5000000">5 s</option>
         <option value="8000000">8 s</option>
@@ -476,7 +477,7 @@ PAGE_HTML = r"""<!doctype html>
   <span class="stat"><i>dropped</i><b id="dropped">0</b></span>
   <span class="stat"><i>latest seq</i><b id="latest">-</b></span>
   <span class="stat"><i>窗口事件</i><b id="winEvents">0</b></span>
-  <span class="stat"><i>窗口累计</i><b id="winTotal">-</b></span>
+  <span class="stat"><i>算子累计</i><b id="winTotal">-</b></span>
   <span class="stat"><i>最慢</i><b id="winMax">-</b></span>
   <span class="stat"><i>格式转换</i><b id="convCount">0</b></span>
   <span class="stat"><i>rows</i><b id="rowCount">0</b></span>
@@ -488,13 +489,15 @@ PAGE_HTML = r"""<!doctype html>
     <section class="card">
       <div class="card-head">
         <div>
-          <h2>耗时趋势</h2>
+          <h2>Token 耗时趋势</h2>
           <span class="muted" id="trendNote">-</span>
         </div>
         <div class="head-actions">
-          <select id="trendMode">
-            <option value="time">累计耗时</option>
-            <option value="count">事件数</option>
+          <select id="trendMode" title="趋势统计口径">
+            <option value="token" selected>按 Token 耗时</option>
+            <option value="tokenCount">按 Token 事件数</option>
+            <option value="time">按时间累计</option>
+            <option value="count">按时间事件数</option>
           </select>
         </div>
       </div>
@@ -508,7 +511,7 @@ PAGE_HTML = r"""<!doctype html>
       <div class="card-head">
         <div>
           <h2>算子时间线</h2>
-          <span class="muted">横轴时间 · 纵轴设备 / 线程或层 · 点击可查看数据流</span>
+          <span class="muted" id="timelineNote">单 Token · 等待 Decode 数据</span>
         </div>
         <div class="legend">
           <span><i style="background:#4ea1ff"></i>GEMM</span>
@@ -565,7 +568,7 @@ PAGE_HTML = r"""<!doctype html>
         <span class="muted" id="tokenNote">-</span>
       </div>
       <div id="tokenList" class="token-list"></div>
-      <div class="hint">按 decode step 统计；MTP/DFlash 一步可能生成多个 token。CUDA Graph replay 不产生逐算子事件。</div>
+      <div class="hint">时间线和表格只显示当前 token；趋势按 token 聚合。MTP/DFlash 一步可能生成多个 token；CUDA Graph replay 不产生逐算子事件。</div>
     </section>
 
     <section class="card">
@@ -628,7 +631,9 @@ PAGE_HTML = r"""<!doctype html>
     tokenFilter: null,
     tokenFilterReq: null,
     minDurUs: 0,
+    windowMode: "token",
     windowUs: 1000000,
+    frozenTokenKey: null,
     view: "device",
     follow: true,
     paused: false,
@@ -646,7 +651,7 @@ PAGE_HTML = r"""<!doctype html>
     lastData: null,
     hotTab: "op",
     focus: null,
-    trendMode: "time",
+    trendMode: "token",
     trendGeom: null,
     trendHover: -1,
     lastAgg: null,
@@ -749,6 +754,36 @@ PAGE_HTML = r"""<!doctype html>
     return event.req == null ? -1 : Number(event.req);
   }
 
+  function tokenKey(req, token) {
+    return Number(req) + ":" + Number(token);
+  }
+
+  function tokenKeyOf(event) {
+    return tokenKey(requestOf(event), event.token);
+  }
+
+  function tokenLabel(token) {
+    const base = "T" + token.token;
+    return token.req >= 0 ? "R" + token.req + "·" + base : base;
+  }
+
+  function activeTokenKey() {
+    if (state.tokenFilter != null) {
+      return tokenKey(state.tokenFilterReq, state.tokenFilter);
+    }
+    if (state.windowMode === "token" &&
+        (!state.phaseFilter || state.phaseFilter === "decode") &&
+        state.lastView && state.lastView.tokenKey) {
+      return state.lastView.tokenKey;
+    }
+    return null;
+  }
+
+  function latestToken() {
+    const tokens = buildPhaseTokenStats().tokens;
+    return tokens.length ? tokens[0] : null;
+  }
+
   function eventPhaseText(event) {
     const phase = phaseOf(event);
     if (phase === "prefill") return "Prefill";
@@ -791,6 +826,9 @@ PAGE_HTML = r"""<!doctype html>
       if (state.deviceFilter && event.dev !== state.deviceFilter) return false;
       if (!opts.ignorePhase && state.phaseFilter) {
         if (phaseOf(event) !== state.phaseFilter) return false;
+      }
+      if (!opts.ignoreToken && opts.viewToken != null) {
+        if (tokenKeyOf(event) !== opts.viewToken) return false;
       }
       if (!opts.ignoreToken && state.tokenFilter != null) {
         if (Number(event.token) !== state.tokenFilter ||
@@ -996,9 +1034,68 @@ PAGE_HTML = r"""<!doctype html>
     return state.events[state.events.length - 1].t_us;
   }
 
+  function paddedSpan(startUs, endUs) {
+    const span = Math.max(1, endUs - startUs);
+    const pad = Math.max(100, span * 0.02);
+    return {
+      start: Math.max(0, startUs - pad),
+      end: endUs + pad,
+      contentSpan: span,
+    };
+  }
+
+  function phaseSpanView(kind, latest, freeze) {
+    const events = filterEvents(state.events, 0, Number.MAX_SAFE_INTEGER,
+      { ignoreTime: true, ignoreToken: true })
+      .filter((event) => phaseOf(event) === kind);
+    if (!events.length) return null;
+    let startUs = Infinity;
+    let endUs = 0;
+    for (const event of events) {
+      startUs = Math.min(startUs, event.t_us);
+      endUs = Math.max(endUs, event.t_us + (event.dur_us || 0));
+    }
+    const range = paddedSpan(startUs, endUs);
+    const label = (kind === "prefill" ? "Prefill" : "Mixed") +
+      " · " + formatUs(range.contentSpan);
+    return {
+      ...range, latest, freeze, kind, tokenKey: null, token: null, label,
+    };
+  }
+
   function computeView() {
     const latest = latestTime();
     const freeze = state.paused || !state.follow;
+
+    if (state.windowMode === "token") {
+      const canUseToken = state.phaseFilter !== "prefill" && state.phaseFilter !== "mixed";
+      if (canUseToken) {
+        const tokens = buildPhaseTokenStats().tokens;
+        let token = null;
+        if (state.tokenFilter != null) {
+          const wanted = tokenKey(state.tokenFilterReq, state.tokenFilter);
+          token = tokens.find((item) => item.key === wanted) || null;
+        }
+        if (!token && state.frozenTokenKey) {
+          token = tokens.find((item) => item.key === state.frozenTokenKey) || null;
+        }
+        if (!token) token = tokens[0] || null;
+        if (token) {
+          const range = paddedSpan(token.startUs, token.endUs);
+          return {
+            ...range, latest, freeze,
+            kind: "token", tokenKey: token.key, token,
+            label: "Token " + tokenLabel(token) + " · " + formatUs(range.contentSpan) +
+              " · 算子累计 " + formatUs(token.totalUs),
+          };
+        }
+      }
+      const prefill = phaseSpanView("prefill", latest, freeze);
+      if (prefill) return prefill;
+      const mixed = phaseSpanView("mixed", latest, freeze);
+      if (mixed) return mixed;
+    }
+
     if (freeze) {
       if (!state.frozenEnd && latest) state.frozenEnd = latest;
     } else {
@@ -1008,7 +1105,11 @@ PAGE_HTML = r"""<!doctype html>
     const start = state.windowUs > 0
       ? Math.max(0, end - state.windowUs)
       : (state.events.length ? state.events[0].t_us : 0);
-    return { start, end, latest, freeze };
+    return {
+      start, end, latest, freeze,
+      kind: "time", tokenKey: null, token: null,
+      label: "窗口 " + formatUs(end - start),
+    };
   }
 
   function addAgg(map, key, event) {
@@ -1085,10 +1186,10 @@ PAGE_HTML = r"""<!doctype html>
     const base = filterEvents(state.events, 0, Number.MAX_SAFE_INTEGER,
       { ignoreTime: true, ignorePhase: true, ignoreToken: true });
     const phases = {
-      prefill: { events: 0, us: 0, tokens: new Set(), tokenUs: 0 },
-      decode: { events: 0, us: 0, tokens: new Set(), tokenUs: 0 },
-      mixed: { events: 0, us: 0, tokens: new Set(), tokenUs: 0 },
-      none: { events: 0, us: 0, tokens: new Set(), tokenUs: 0 },
+      prefill: { events: 0, us: 0, tokens: new Set(), tokenUs: 0, tokenLatencyUs: 0 },
+      decode: { events: 0, us: 0, tokens: new Set(), tokenUs: 0, tokenLatencyUs: 0 },
+      mixed: { events: 0, us: 0, tokens: new Set(), tokenUs: 0, tokenLatencyUs: 0 },
+      none: { events: 0, us: 0, tokens: new Set(), tokenUs: 0, tokenLatencyUs: 0 },
     };
     const tokenMap = new Map();
     let grandUs = 0;
@@ -1108,9 +1209,10 @@ PAGE_HTML = r"""<!doctype html>
       let token = tokenMap.get(key);
       if (!token) {
         token = {
-          req, token: Number(event.token), totalUs: 0, count: 0,
+          req, token: Number(event.token), key,
+          totalUs: 0, count: 0,
           cudaUs: 0, cpuUs: 0, otherUs: 0, ops: new Map(),
-          slowest: null, endUs: 0,
+          slowest: null, startUs: event.t_us, endUs: 0,
         };
         tokenMap.set(key, token);
       }
@@ -1119,6 +1221,7 @@ PAGE_HTML = r"""<!doctype html>
       if (event.dev === "cuda") token.cudaUs += event.dur_us;
       else if (event.dev === "cpu") token.cpuUs += event.dur_us;
       else token.otherUs += event.dur_us;
+      token.startUs = Math.min(token.startUs, event.t_us);
       token.endUs = Math.max(token.endUs, event.t_us + (event.dur_us || 0));
       let op = token.ops.get(event.op);
       if (!op) {
@@ -1134,6 +1237,10 @@ PAGE_HTML = r"""<!doctype html>
     }
     const tokens = Array.from(tokenMap.values())
       .sort((a, b) => b.endUs - a.endUs);
+    for (const token of tokens) {
+      token.latencyUs = Math.max(1, token.endUs - token.startUs);
+      phases.decode.tokenLatencyUs += token.latencyUs;
+    }
     return { phases, tokens, grandUs };
   }
 
@@ -1152,7 +1259,7 @@ PAGE_HTML = r"""<!doctype html>
       phaseBox("prefill", "Prefill", formatUs(phases.prefill.us),
         formatCount(phases.prefill.events) + " events · " + pct(phases.prefill.us).toFixed(1) + "%") +
       phaseBox("decode", "Decode", formatUs(phases.decode.us),
-        formatCount(decodeTokens) + " tokens · avg " +
+        formatCount(decodeTokens) + " tokens · avg ops " +
         (decodeTokens ? formatUs(decodeAvg) : "-") + " · " +
         pct(phases.decode.us).toFixed(1) + "%") +
       "</div>";
@@ -1178,29 +1285,35 @@ PAGE_HTML = r"""<!doctype html>
       $("tokenList").innerHTML = "<div class='empty'>" + message + "</div>";
       return;
     }
-    const top = stats.tokens.slice(0, 40);
-    const maxTotal = Math.max(1, ...top.map((token) => token.totalUs));
+    const activeKey = activeTokenKey();
+    let top = stats.tokens.slice(0, 40);
+    if (activeKey && !top.some((token) => token.key === activeKey)) {
+      const selected = stats.tokens.find((token) => token.key === activeKey);
+      if (selected) top = [selected, ...top.slice(0, 39)];
+    }
+    const maxTotal = Math.max(1, ...top.map((token) => token.latencyUs));
     $("tokenList").innerHTML = top.map((token) => {
-      const focused = state.tokenFilter != null &&
-        state.tokenFilter === token.token && state.tokenFilterReq === token.req;
+      const focused = activeKey === token.key;
       const reqLabel = token.req >= 0 ? "R" + token.req + " · " : "";
       const ops = Array.from(token.ops.values())
         .sort((a, b) => b.totalUs - a.totalUs)
         .slice(0, 3)
         .map((op) => op.op + " " + formatUs(op.totalUs))
         .join(" · ");
-      const title = token.req >= 0
+      const title = "点击查看该 token 时间线 · " + (token.req >= 0
         ? "request " + token.req + " · decode step " + token.token
-        : "decode step " + token.token;
+        : "decode step " + token.token) +
+        " · 耗时 " + formatUs(token.latencyUs) + " · 算子累计 " + formatUs(token.totalUs);
       return "<div class='token-row" + (focused ? " selected" : "") +
         "' data-token='" + token.token + "' data-req='" + token.req +
         "' title='" + esc(title) + "'>" +
         "<div class='token-top'><span class='token-id'>" + esc(reqLabel + "T" + token.token) +
         "</span><span class='token-meta'>" + token.count + " ops</span>" +
-        "<span class='token-total'>" + formatUs(token.totalUs) + "</span></div>" +
+        "<span class='token-total'>" + formatUs(token.latencyUs) + "</span></div>" +
         "<div class='token-bar'><i style='width:" +
-        (token.totalUs / maxTotal * 100).toFixed(2) + "%'></i></div>" +
-        "<div class='token-sub'>cuda " + formatUs(token.cudaUs) + " · cpu " +
+        (token.latencyUs / maxTotal * 100).toFixed(2) + "%'></i></div>" +
+        "<div class='token-sub'>ops 累计 " + formatUs(token.totalUs) + " · cuda " +
+        formatUs(token.cudaUs) + " · cpu " +
         formatUs(token.cpuUs) + (token.otherUs ? " · other " + formatUs(token.otherUs) : "") +
         (ops ? " · " + esc(ops) : "") + "</div></div>";
     }).join("");
@@ -1400,7 +1513,83 @@ PAGE_HTML = r"""<!doctype html>
     };
   }
 
+  const TREND_TOKEN_LIMIT = 72;
+
+  function drawTokenTrend() {
+    const wrap = $("trendWrap");
+    const canvas = $("trend");
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(320, wrap.clientWidth - 2);
+    const height = Math.max(160, wrap.clientHeight - 2);
+    const pad = { l: 52, r: 14, t: 12, b: 24 };
+    const plotWidth = Math.max(40, width - pad.l - pad.r);
+    const plotHeight = Math.max(60, height - pad.t - pad.b);
+    const stats = buildPhaseTokenStats();
+    const selectedKey = activeTokenKey();
+    const phaseBlocksTokens = !!state.phaseFilter && state.phaseFilter !== "decode";
+    let tokens = phaseBlocksTokens ? [] : stats.tokens.slice(0, TREND_TOKEN_LIMIT);
+    if (selectedKey && !tokens.some((token) => token.key === selectedKey)) {
+      const selected = stats.tokens.find((token) => token.key === selectedKey);
+      if (selected) {
+        tokens = [selected, ...tokens.slice(0, TREND_TOKEN_LIMIT - 1)];
+      }
+    }
+    tokens.reverse();
+    const mode = state.trendMode === "tokenCount" ? "count" : "total";
+    const slot = plotWidth / Math.max(1, tokens.length);
+    const barWidth = Math.max(2, Math.min(26, slot * 0.62));
+    const bars = tokens.map((token, index) => {
+      const center = pad.l + (index + 0.5) * slot;
+      return {
+        token, index, center,
+        x: center - barWidth / 2,
+        w: barWidth,
+        total: token.latencyUs || 0,
+        opUs: token.totalUs || 0,
+        count: token.count || 0,
+        cudaUs: token.cudaUs || 0,
+        cpuUs: token.cpuUs || 0,
+        otherUs: token.otherUs || 0,
+      };
+    });
+    const maxTotal = Math.max(1, ...tokens.map((token) => token.latencyUs));
+    const maxCount = Math.max(1, ...tokens.map((token) => token.count));
+    const total = tokens.reduce((sum, token) => sum + token.latencyUs, 0);
+    state.trendGeom = {
+      type: "token", width, height, dpr, pad, plotWidth, plotHeight,
+      slot, tokens, bars, mode, maxTotal, maxCount, selectedKey,
+      empty: tokens.length === 0, total,
+    };
+    if (state.trendHover < 0 || state.trendHover >= tokens.length) {
+      state.trendHover = -1;
+    }
+    canvas.style.width = width + "px";
+    canvas.style.height = height + "px";
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    if (!tokens.length) {
+      $("trendNote").textContent = phaseBlocksTokens
+        ? "当前阶段 " + phaseLabel(state.phaseFilter) + " 没有 Decode token 趋势 · 可切到按时间"
+        : "没有 Decode token · 可切到按时间，或查看 Prefill 时间线";
+    } else {
+      const selected = tokens.find((token) => token.key === selectedKey);
+      const average = mode === "count"
+        ? formatCount(tokens.reduce((sum, token) => sum + token.count, 0) / tokens.length) + " ops"
+        : "平均耗时 " + formatUs(total / tokens.length);
+      const peak = mode === "count" ? formatCount(maxCount) + " ops" : formatUs(maxTotal);
+      $("trendNote").textContent =
+        "最近 " + tokens.length + " 个 token · " + average +
+        " · 最高 " + peak +
+        (selected ? " · 已选 " + tokenLabel(selected) : "");
+    }
+    paintTrend();
+  }
+
   function drawTrend(visible, view) {
+    if (state.trendMode === "token" || state.trendMode === "tokenCount") {
+      drawTokenTrend();
+      return;
+    }
     const wrap = $("trendWrap");
     const canvas = $("trend");
     const ctx = canvas.getContext("2d");
@@ -1462,11 +1651,128 @@ PAGE_HTML = r"""<!doctype html>
     paintTrend();
   }
 
+  function paintTokenTrend() {
+    const canvas = $("trend");
+    const ctx = canvas.getContext("2d");
+    const g = state.trendGeom;
+    if (!g || g.type !== "token") return;
+    const { width, height, pad, plotWidth, plotHeight, bars, mode, slot } = g;
+    ctx.setTransform(g.dpr, 0, 0, g.dpr, 0, 0);
+    ctx.fillStyle = "#0f161e";
+    ctx.fillRect(0, 0, width, height);
+
+    const yMax = Math.max(1, mode === "count" ? g.maxCount : g.maxTotal);
+    const yOf = (value) => pad.t + plotHeight - (value / yMax) * plotHeight;
+
+    ctx.strokeStyle = "#1b2632";
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const x = pad.l + (plotWidth * i) / 4;
+      ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + plotHeight); ctx.stroke();
+    }
+    for (let i = 0; i <= 2; i++) {
+      const y = pad.t + (plotHeight * i) / 2;
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + plotWidth, y); ctx.stroke();
+    }
+
+    if (g.empty) {
+      ctx.fillStyle = "#7f8b9d";
+      ctx.font = "12px Segoe UI, Microsoft YaHei, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("没有 Decode token", pad.l + plotWidth / 2, pad.t + plotHeight / 2);
+      return;
+    }
+
+    ctx.font = "10px Segoe UI, Microsoft YaHei, sans-serif";
+    ctx.fillStyle = "#6f7e91";
+    ctx.textAlign = "right";
+    for (let i = 0; i <= 2; i++) {
+      const value = yMax * (1 - i / 2);
+      ctx.fillText(mode === "count" ? formatCount(value) : formatUs(value),
+        pad.l - 7, pad.t + (plotHeight * i) / 2 + 3);
+    }
+
+    if (g.selectedKey) {
+      const selected = bars.find((bar) => bar.token.key === g.selectedKey);
+      if (selected) {
+        ctx.fillStyle = "rgba(78,161,255,.14)";
+        ctx.fillRect(selected.x - 4, pad.t, selected.w + 8, plotHeight);
+      }
+    }
+
+    const segments = [
+      { key: "cudaUs", color: COLORS.gemm },
+      { key: "cpuUs", color: COLORS.norm },
+      { key: "otherUs", color: COLORS.other },
+    ];
+    for (let index = 0; index < bars.length; index++) {
+      const bar = bars[index];
+      const selected = bar.token.key === g.selectedKey;
+      const hovered = index === state.trendHover;
+      if (mode === "count") {
+        const y = yOf(bar.count);
+        ctx.fillStyle = selected ? "#8cc6ff" : "#4ea1ff";
+        ctx.fillRect(bar.x, y, bar.w, pad.t + plotHeight - y);
+      } else {
+        const opTotal = bar.cudaUs + bar.cpuUs + bar.otherUs;
+        const targetHeight = (bar.total / yMax) * plotHeight;
+        let base = pad.t + plotHeight;
+        if (opTotal > 0) {
+          for (const segment of segments) {
+            const value = bar[segment.key];
+            if (!value) continue;
+            const h = targetHeight * (value / opTotal);
+            ctx.fillStyle = segment.color;
+            ctx.fillRect(bar.x, base - h, bar.w, h);
+            base -= h;
+          }
+        } else {
+          ctx.fillStyle = COLORS.other;
+          ctx.fillRect(bar.x, base - targetHeight, bar.w, targetHeight);
+        }
+      }
+      if (selected || hovered) {
+        ctx.strokeStyle = selected ? "#eaf5ff" : "rgba(190,220,255,.7)";
+        ctx.lineWidth = selected ? 2 : 1;
+        ctx.strokeRect(bar.x - 1, pad.t, bar.w + 2, plotHeight);
+        if (selected) {
+          ctx.fillStyle = "#eaf5ff";
+          ctx.fillRect(bar.center - 1, pad.t - 4, 2, 4);
+        }
+      }
+    }
+
+    const labelEvery = Math.max(1, Math.ceil(bars.length / 8));
+    ctx.textAlign = "center";
+    for (let index = 0; index < bars.length; index++) {
+      const bar = bars[index];
+      const selected = bar.token.key === g.selectedKey;
+      if (index % labelEvery !== 0 && !selected) continue;
+      ctx.fillStyle = selected ? "#8cc6ff" : "#6f7e91";
+      ctx.fillText(tokenLabel(bar.token), bar.center, height - 6);
+    }
+
+    if (state.trendHover >= 0 && state.trendHover < bars.length) {
+      const bar = bars[state.trendHover];
+      ctx.strokeStyle = "rgba(190,220,255,.55)";
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(bar.center, pad.t);
+      ctx.lineTo(bar.center, pad.t + plotHeight);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
   function paintTrend() {
     const canvas = $("trend");
     const ctx = canvas.getContext("2d");
     const g = state.trendGeom;
     if (!g) return;
+    if (g.type === "token") {
+      paintTokenTrend();
+      return;
+    }
     const { width, height, pad, plotWidth, plotHeight, bucketCount } = g;
     ctx.setTransform(g.dpr, 0, 0, g.dpr, 0, 0);
     ctx.fillStyle = "#0f161e";
@@ -1805,7 +2111,8 @@ PAGE_HTML = r"""<!doctype html>
   function selectEvent(event) {
     state.selectedSeq = event.seq;
     const view = computeView();
-    const visible = filterEvents(state.events, view.start, view.end);
+    const visible = filterEvents(state.events, view.start, view.end,
+      { viewToken: view.tokenKey });
     state.lastView = view;
     state.lastAgg = aggregate(visible);
     renderDetail(event);
@@ -1815,11 +2122,12 @@ PAGE_HTML = r"""<!doctype html>
 
   function draw() {
     const view = computeView();
-    const visible = filterEvents(state.events, view.start, view.end);
+    const visible = filterEvents(state.events, view.start, view.end,
+      { viewToken: view.tokenKey });
     const agg = aggregate(visible);
     state.lastView = view;
     state.lastAgg = agg;
-
+    $("timelineNote").textContent = view.label;
     const emptyHint = $("emptyHint");
     const jump = $("jumpMatch");
     let showHint = false;
@@ -1872,7 +2180,8 @@ PAGE_HTML = r"""<!doctype html>
 
   function drawTable() {
     const view = computeView();
-    const visible = filterEvents(state.events, view.start, view.end);
+    const visible = filterEvents(state.events, view.start, view.end,
+      { viewToken: view.tokenKey });
     const maxDur = visible.reduce((max, event) => Math.max(max, event.dur_us), 1);
     const rows = visible.slice(-300).reverse();
     $("tableNote").textContent =
@@ -1964,7 +2273,38 @@ PAGE_HTML = r"""<!doctype html>
   function showTrendTip(index, clientX, clientY) {
     const tip = $("trendTip");
     const g = state.trendGeom;
-    if (!g || g.empty || index < 0 || index >= g.buckets.length) {
+    if (!g || g.empty || index < 0) {
+      tip.style.display = "none";
+      return;
+    }
+    if (g.type === "token") {
+      if (index >= g.bars.length) {
+        tip.style.display = "none";
+        return;
+      }
+      const token = g.bars[index].token;
+      tip.innerHTML =
+        "<b>" + esc(tokenLabel(token)) + "</b><br>" +
+        "耗时 " + formatUs(token.latencyUs) + " · " + formatCount(token.count) + " ops<br>" +
+        "算子累计 " + formatUs(token.totalUs) + "<br>" +
+        "<span style='color:" + COLORS.gemm + "'>cuda " + formatUs(token.cudaUs) + "</span>" +
+        " · <span style='color:" + COLORS.norm + "'>cpu " + formatUs(token.cpuUs) + "</span>" +
+        (token.otherUs ? " · other " + formatUs(token.otherUs) : "") +
+        "<br><span style='color:#8190a3'>点击定位到该 token</span>";
+      const wrap = $("trendWrap");
+      const rect = wrap.getBoundingClientRect();
+      tip.style.display = "block";
+      const width = tip.offsetWidth;
+      const height = tip.offsetHeight;
+      let left = clientX - rect.left + 12;
+      let top = clientY - rect.top + 12;
+      if (left + width > wrap.clientWidth - 8) left = clientX - rect.left - width - 12;
+      if (top + height > wrap.clientHeight - 8) top = clientY - rect.top - height - 12;
+      tip.style.left = Math.max(4, left) + "px";
+      tip.style.top = Math.max(4, top) + "px";
+      return;
+    }
+    if (!g.buckets || index >= g.buckets.length) {
       tip.style.display = "none";
       return;
     }
@@ -2015,11 +2355,13 @@ PAGE_HTML = r"""<!doctype html>
     if (reveal || phase !== "decode") {
       state.tokenFilter = null;
       state.tokenFilterReq = null;
+      state.frozenTokenKey = null;
     }
     $("phaseFilter").value = phase;
     updateTokenChip();
     state.lastSideDraw = 0;
     if (reveal) {
+      state.windowMode = "time";
       state.windowUs = 0;
       $("window").value = "0";
       state.follow = true;
@@ -2027,10 +2369,12 @@ PAGE_HTML = r"""<!doctype html>
       state.paused = false;
       $("pause").checked = false;
       state.frozenEnd = 0;
+      state.frozenTokenKey = null;
       state.lastSideDraw = 0;
     } else if (phase) {
       const currentView = computeView();
-      const visible = filterEvents(state.events, currentView.start, currentView.end);
+      const visible = filterEvents(state.events, currentView.start, currentView.end,
+        { viewToken: currentView.tokenKey });
       if (!visible.length) {
         const matched = filterEvents(state.events, 0, Number.MAX_SAFE_INTEGER);
         if (matched.length) {
@@ -2063,8 +2407,11 @@ PAGE_HTML = r"""<!doctype html>
     }
     state.phaseFilter = "decode";
     $("phaseFilter").value = "decode";
+    state.windowMode = "token";
+    $("window").value = "token";
     state.tokenFilter = token;
     state.tokenFilterReq = req;
+    state.frozenTokenKey = tokenKey(req, token);
     state.follow = false;
     $("follow").checked = false;
     state.paused = false;
@@ -2095,6 +2442,7 @@ PAGE_HTML = r"""<!doctype html>
     state.phaseFilter = "";
     state.tokenFilter = null;
     state.tokenFilterReq = null;
+    state.frozenTokenKey = null;
     state.minDurUs = 0;
     state.focus = null;
     state.lastSideDraw = 0;
@@ -2116,6 +2464,13 @@ PAGE_HTML = r"""<!doctype html>
       return;
     }
     const last = matched[matched.length - 1];
+    if (state.windowMode === "token" && phaseOf(last) === "decode" &&
+        Number(last.token) >= 0) {
+      state.tokenFilter = Number(last.token);
+      state.tokenFilterReq = requestOf(last);
+      state.frozenTokenKey = tokenKeyOf(last);
+      updateTokenChip();
+    }
     state.follow = false;
     $("follow").checked = false;
     state.paused = false;
@@ -2174,6 +2529,7 @@ PAGE_HTML = r"""<!doctype html>
       state.phaseFilter = "";
       state.tokenFilter = null;
       state.tokenFilterReq = null;
+      state.frozenTokenKey = null;
       state.trendHover = -1;
       state.lastAgg = null;
       state.lastSideDraw = 0;
@@ -2195,8 +2551,23 @@ PAGE_HTML = r"""<!doctype html>
   $("locateMatch").addEventListener("click", locateMatch);
   $("jumpMatch").addEventListener("click", locateMatch);
   $("window").addEventListener("change", (event) => {
-    state.windowUs = Number(event.target.value);
+    const value = event.target.value;
     state.lastSideDraw = 0;
+    if (value === "token") {
+      state.windowMode = "token";
+      state.frozenTokenKey = state.tokenFilter != null
+        ? tokenKey(state.tokenFilterReq, state.tokenFilter)
+        : (state.follow ? null : (latestToken()?.key || null));
+      state.frozenEnd = 0;
+    } else {
+      state.windowMode = "time";
+      state.windowUs = Number(value);
+      state.tokenFilter = null;
+      state.tokenFilterReq = null;
+      state.frozenTokenKey = null;
+      state.frozenEnd = state.follow ? 0 : latestTime();
+      updateTokenChip();
+    }
     scheduleDraw();
     drawTable();
   });
@@ -2220,6 +2591,15 @@ PAGE_HTML = r"""<!doctype html>
   $("clearToken").addEventListener("click", () => {
     state.tokenFilter = null;
     state.tokenFilterReq = null;
+    state.frozenTokenKey = null;
+    if (state.windowMode === "token") {
+      state.follow = true;
+      $("follow").checked = true;
+      state.paused = false;
+      $("pause").checked = false;
+      state.frozenEnd = 0;
+      schedulePoll();
+    }
     state.lastSideDraw = 0;
     updateTokenChip();
     scheduleDraw();
@@ -2250,7 +2630,19 @@ PAGE_HTML = r"""<!doctype html>
   });
   $("follow").addEventListener("change", (event) => {
     state.follow = event.target.checked;
-    if (!state.follow) state.frozenEnd = latestTime();
+    if (!state.follow) {
+      state.frozenEnd = latestTime();
+      if (state.windowMode === "token") {
+        state.frozenTokenKey = latestToken()?.key || null;
+      }
+    } else {
+      state.tokenFilter = null;
+      state.tokenFilterReq = null;
+      state.frozenTokenKey = null;
+      state.frozenEnd = 0;
+      updateTokenChip();
+      schedulePoll();
+    }
     state.lastSideDraw = 0;
     scheduleDraw();
     drawTable();
@@ -2259,8 +2651,12 @@ PAGE_HTML = r"""<!doctype html>
     state.paused = event.target.checked;
     if (state.paused) {
       state.frozenEnd = latestTime();
+      if (state.windowMode === "token") {
+        state.frozenTokenKey = latestToken()?.key || null;
+      }
     } else {
       state.frozenEnd = 0;
+      if (state.follow) state.frozenTokenKey = null;
       schedulePoll();
     }
     state.lastSideDraw = 0;
@@ -2336,13 +2732,24 @@ PAGE_HTML = r"""<!doctype html>
       $("trendTip").style.display = "none";
       return;
     }
-    const index = Math.max(0, Math.min(g.bucketCount - 1,
-      Math.floor(((x - g.pad.l) / g.plotWidth) * g.bucketCount)));
+    const count = g.type === "token" ? g.bars.length : g.bucketCount;
+    const index = Math.max(0, Math.min(count - 1,
+      Math.floor(((x - g.pad.l) / g.plotWidth) * count)));
     if (index !== state.trendHover) {
       state.trendHover = index;
       paintTrend();
     }
     showTrendTip(index, event.clientX, event.clientY);
+  });
+  trendCanvas.addEventListener("click", (event) => {
+    const g = state.trendGeom;
+    if (!g || g.type !== "token" || g.empty) return;
+    const rect = trendCanvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    if (x < g.pad.l || x > g.pad.l + g.plotWidth) return;
+    const index = Math.floor(((x - g.pad.l) / g.plotWidth) * g.bars.length);
+    const bar = g.bars[Math.max(0, Math.min(g.bars.length - 1, index))];
+    if (bar) selectToken(bar.token.token, bar.token.req);
   });
   trendCanvas.addEventListener("mouseleave", () => {
     state.trendHover = -1;
