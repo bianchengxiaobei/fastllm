@@ -503,7 +503,7 @@ PAGE_HTML = r"""<!doctype html>
   <span class="stat"><i>最慢</i><b id="winMax">-</b></span>
   <span class="stat"><i>格式转换</i><b id="convCount">0</b></span>
   <span class="stat"><i>rows</i><b id="rowCount">0</b></span>
-  <span class="warn">耗时拆分需同步；未开 FASTLLM_CUDA_SYNC=1 时等待可能为 0 或落入空隙；开启采集有额外开销</span>
+  <span id="syncState" class="warn">耗时拆分需同步；未开 FASTLLM_CUDA_SYNC=1 时等待可能为 0 或落入空隙；开启采集有额外开销</span>
 </section>
 
 <main class="dashboard">
@@ -658,6 +658,9 @@ PAGE_HTML = r"""<!doctype html>
     capacity: 0,
     size: 0,
     dropped: 0,
+    cudaSync: null,
+    cudaSyncRaw: null,
+    cudaGraphRaw: null,
     rate: 0,
     idlePolls: 0,
     filter: "",
@@ -775,6 +778,18 @@ PAGE_HTML = r"""<!doctype html>
     return Object.prototype.hasOwnProperty.call(event, "run_us") ||
       Object.prototype.hasOwnProperty.call(event, "xfer_us") ||
       Object.prototype.hasOwnProperty.call(event, "sync_us");
+  }
+
+  function eventTiming(event) {
+    if (!hasTimingBreakdown(event)) return null;
+    const runUs = Number(event.run_us) || 0;
+    const xferUs = Number(event.xfer_us) || 0;
+    const waitUs = Number(event.sync_us) || 0;
+    const durUs = Number(event.dur_us) || 0;
+    return {
+      runUs, xferUs, waitUs,
+      otherUs: Math.max(0, durUs - runUs - xferUs - waitUs),
+    };
   }
 
   function phaseLabel(phase) {
@@ -945,12 +960,31 @@ PAGE_HTML = r"""<!doctype html>
     }
   }
 
+  function updateSyncNotice() {
+    const el = $("syncState");
+    if (!el) return;
+    const graph = state.cudaGraphRaw == null
+      ? "未显式设置（模型可能自动开启）" : state.cudaGraphRaw;
+    if (state.cudaSync) {
+      el.textContent = "已检测到 FASTLLM_CUDA_SYNC=1；等待=显式同步时间；CUDA_GRAPH=" +
+        graph + "；开启采集有额外开销";
+    } else {
+      const raw = state.cudaSyncRaw == null ? "未设置" : "'" + state.cudaSyncRaw + "'";
+      el.textContent = "未检测到 FASTLLM_CUDA_SYNC=1（服务端值 " + raw +
+        "）；等待可能为 0，GPU 执行/传输会落入空隙；CUDA_GRAPH=" + graph;
+    }
+  }
+
   function appendSnapshot(data) {
     state.supported = data.supported !== false;
     state.enabled = !!data.enabled;
     state.capacity = Number(data.capacity || 0);
     state.size = Number(data.size || 0);
     state.dropped = Number(data.dropped || 0);
+    state.cudaSync = data.cuda_sync === true;
+    state.cudaSyncRaw = data.cuda_sync_raw == null ? null : String(data.cuda_sync_raw);
+    state.cudaGraphRaw = data.cuda_graph_raw == null ? null : String(data.cuda_graph_raw);
+    updateSyncNotice();
     state.lastSeq = Number(data.last_seq || 0);
     const events = Array.isArray(data.events) ? data.events : [];
     if (events.length) {
@@ -1410,9 +1444,17 @@ PAGE_HTML = r"""<!doctype html>
         "</span><span class='val'>" + formatUs(item.value) +
         "</span><span class='pct'>" + pct.toFixed(1) + "%</span></div>";
     }).join("");
-    $("splitNote").textContent =
-      tokenLabel(token) + " · " + formatUs(token.latencyUs) +
+    const gapPct = token.latencyUs ? (token.gapUs / token.latencyUs) * 100 : 0;
+    let note = tokenLabel(token) + " · " + formatUs(token.latencyUs) +
       (token.hasSplit ? "" : " · 未拆分");
+    if (token.hasSplit && gapPct >= 30) {
+      if (!token.waitUs) {
+        note += " · 等待=0，确认 FASTLLM_CUDA_SYNC=1 已生效";
+      } else if (state.cudaSync) {
+        note += " · 同步已开，空隙多为未埋点/CPU 时间";
+      }
+    }
+    $("splitNote").textContent = note;
     $("timeSplit").innerHTML =
       "<div class='split-stack'>" + bar + "</div>" +
       "<div class='split-rows'>" + rows + "</div>";
@@ -2175,6 +2217,13 @@ PAGE_HTML = r"""<!doctype html>
     const opAvg = opAgg ? opAgg.totalUs / opAgg.count : 0;
     const opMax = opAgg ? opAgg.maxUs : 0;
     const opCount = opAgg ? opAgg.count : 0;
+    const timing = eventTiming(event);
+    const timingMetrics = timing
+      ? "<div class='metric'><i>运行</i><b>" + formatUs(timing.runUs) + "</b></div>" +
+        "<div class='metric'><i>传输</i><b>" + formatUs(timing.xferUs) + "</b></div>" +
+        "<div class='metric'><i>同步等待</i><b>" + formatUs(timing.waitUs) + "</b></div>" +
+        "<div class='metric'><i>其他</i><b>" + formatUs(timing.otherUs) + "</b></div>"
+      : "";
     detail.innerHTML =
       "<div class='hero'><span class='dot' style='background:" + opColor(event.op) + "'></span>" +
       "<b>" + esc(event.op) + "</b><span class='muted'>#" + esc(event.seq) + "</span></div>" +
@@ -2182,6 +2231,7 @@ PAGE_HTML = r"""<!doctype html>
       "<div class='metric'><i>耗时</i><b>" + formatUs(event.dur_us) + "</b></div>" +
       "<div class='metric'><i>占窗口</i><b>" + share.toFixed(1) + "%</b></div>" +
       "<div class='metric'><i>同算子平均</i><b>" + (opCount ? formatUs(opAvg) : "-") + "</b></div>" +
+      timingMetrics +
       "</div>" +
       "<div class='durbar'><i style='width:" +
       Math.min(100, maxUs ? (event.dur_us / maxUs) * 100 : 0).toFixed(2) +

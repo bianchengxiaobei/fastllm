@@ -354,8 +354,13 @@ def op_trace_snapshot(raw_request: Request, after_seq: int = 0, max_events: int 
     if not _op_trace_allowed(raw_request):
         return _op_trace_forbidden()
     from .llm import get_op_trace_snapshot
-    return JSONResponse(content = get_op_trace_snapshot(
-        max(0, int(after_seq)), max(1, min(int(max_events), 8192))))
+    snapshot = get_op_trace_snapshot(
+        max(0, int(after_seq)), max(1, min(int(max_events), 8192)))
+    sync_value = os.environ.get("FASTLLM_CUDA_SYNC")
+    snapshot["cuda_sync"] = sync_value == "1"
+    snapshot["cuda_sync_raw"] = sync_value
+    snapshot["cuda_graph_raw"] = os.environ.get("FASTLLM_CUDA_GRAPH")
+    return JSONResponse(content = snapshot)
 
 @app.post("/api/op-trace/enabled")
 async def set_op_trace(payload: dict, raw_request: Request):
