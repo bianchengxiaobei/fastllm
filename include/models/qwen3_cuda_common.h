@@ -138,8 +138,10 @@ namespace fastllm {
 
         ~Qwen3CudaSubmitDirectScope() {
             if (traceEnabled) {
+                const uint64_t endNs = op_trace::NowNs();
                 op_trace::Record(-1, name, "cuda", "", "",
-                                 traceStartNs, op_trace::NowNs());
+                                 traceStartNs, endNs,
+                                 op_trace::Timing{0, 0, endNs - traceStartNs, 0});
             }
             if (this->enabled) {
                 Qwen3CudaSubmitProfileAddDirect(
@@ -238,11 +240,28 @@ namespace fastllm {
             }
             double runBeginMs = Qwen3CudaSubmitProfileDetailEnabled() ?
                 Qwen3CudaSubmitNowMs() : 0.0;
+            const uint64_t directReshapeStartNs = traceOp ? op_trace::NowNs() : 0;
             device->Reshape(opType, datas, floatParams, intParams);
+            const uint64_t directReshapeNs = traceOp
+                ? op_trace::NowNs() - directReshapeStartNs : 0;
+            const uint64_t directRunStartNs = traceOp ? op_trace::NowNs() : 0;
             device->Run(opType, datas, floatParams, intParams);
+            const uint64_t directRunEndNs = traceOp ? op_trace::NowNs() : 0;
+            const char *syncEnv = std::getenv("FASTLLM_CUDA_SYNC");
+            const bool directSync = traceOp &&
+                (GetFastllmEnv().cudaSync ||
+                 (syncEnv != nullptr && std::strcmp(syncEnv, "1") == 0));
+            const uint64_t directSyncStartNs = directSync ? op_trace::NowNs() : 0;
+            if (directSync) {
+                ForceDeviceSync();
+            }
             if (traceOp) {
+                const uint64_t endNs = op_trace::NowNs();
                 op_trace::RecordOp(opType, "cuda", datas, intParams,
-                                   traceStartNs, op_trace::NowNs());
+                                   traceStartNs, endNs,
+                                   op_trace::Timing{0, directReshapeNs,
+                                                    directRunEndNs - directRunStartNs,
+                                                    directSync ? endNs - directSyncStartNs : 0});
             }
             if (submitProfile.enabled) {
                 double nowMs = Qwen3CudaSubmitNowMs();

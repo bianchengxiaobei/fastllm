@@ -33,6 +33,17 @@ struct Event {
     std::string device;
     std::string weight;
     std::string io;
+    uint64_t transferNs = 0;
+    uint64_t reshapeNs = 0;
+    uint64_t runNs = 0;
+    uint64_t syncNs = 0;
+};
+
+struct Timing {
+    uint64_t transferNs = 0;
+    uint64_t reshapeNs = 0;
+    uint64_t runNs = 0;
+    uint64_t syncNs = 0;
 };
 
 enum class PhaseKind : uint8_t {
@@ -182,7 +193,8 @@ public:
                 const std::string &weight,
                 const std::string &io,
                 uint64_t startNs,
-                uint64_t durationNs) noexcept {
+                uint64_t durationNs,
+                const Timing &timing = Timing()) noexcept {
         if (!Enabled()) {
             return;
         }
@@ -201,6 +213,10 @@ public:
             event.device = device;
             event.weight = weight;
             event.io = io;
+            event.transferNs = timing.transferNs;
+            event.reshapeNs = timing.reshapeNs;
+            event.runNs = timing.runNs;
+            event.syncNs = timing.syncNs;
 
             std::lock_guard<std::mutex> guard(mutex);
             if (events.size() >= capacity) {
@@ -303,6 +319,14 @@ private:
             AppendJsonString(out, event.weight);
             out += ",\"io\":";
             AppendJsonString(out, event.io);
+            out += ",\"xfer_us\":";
+            out += std::to_string(event.transferNs / 1000);
+            out += ",\"reshape_us\":";
+            out += std::to_string(event.reshapeNs / 1000);
+            out += ",\"run_us\":";
+            out += std::to_string(event.runNs / 1000);
+            out += ",\"sync_us\":";
+            out += std::to_string(event.syncNs / 1000);
             out += '}';
         }
         out += "]}";
@@ -365,10 +389,11 @@ inline void Record(int layer,
                    const std::string &weight,
                    const std::string &io,
                    uint64_t startNs,
-                   uint64_t endNs) noexcept {
+                   uint64_t endNs,
+                   const Timing &timing = Timing()) noexcept {
     try {
         Instance().Record(layer, op, device, weight, io, startNs,
-                          endNs > startNs ? endNs - startNs : 0);
+                          endNs > startNs ? endNs - startNs : 0, timing);
     } catch (...) {
     }
 }

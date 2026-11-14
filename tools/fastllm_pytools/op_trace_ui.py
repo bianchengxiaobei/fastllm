@@ -171,6 +171,12 @@ PAGE_HTML = r"""<!doctype html>
   .legend { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 10px; color: var(--muted); }
   .legend span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
   .legend i { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
+  .trend-legend {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    padding: 0 17px 12px; color: var(--muted); font-size: 10px;
+  }
+  .trend-legend span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .trend-legend i { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
   .tabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 10px 2px; }
   .tab {
     background: transparent; border: 1px solid transparent; color: var(--muted);
@@ -264,6 +270,22 @@ PAGE_HTML = r"""<!doctype html>
     color: #728196; font-size: 10px; font-variant-numeric: tabular-nums;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .time-split { padding: 0 12px 10px; }
+  .split-stack {
+    display: flex; height: 12px; border-radius: 6px; overflow: hidden;
+    background: #1b2735; box-shadow: inset 0 0 0 1px rgba(255,255,255,.03);
+  }
+  .split-stack i { display: block; height: 100%; min-width: 1px; transition: width .2s; }
+  .split-rows { display: flex; flex-direction: column; gap: 4px; margin-top: 9px; }
+  .split-row {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: #b7c5d6; min-width: 0;
+  }
+  .split-dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .split-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .split-row .val { margin-left: auto; color: var(--text); font-variant-numeric: tabular-nums; }
+  .split-row .pct { width: 48px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .split-note { color: #728196; font-size: 10px; padding: 0 12px 8px; }
   .empty {
     color: var(--muted); padding: 18px 10px; text-align: center;
     border: 1px dashed #26384c; border-radius: 8px; margin: 10px; font-size: 11px;
@@ -481,7 +503,7 @@ PAGE_HTML = r"""<!doctype html>
   <span class="stat"><i>最慢</i><b id="winMax">-</b></span>
   <span class="stat"><i>格式转换</i><b id="convCount">0</b></span>
   <span class="stat"><i>rows</i><b id="rowCount">0</b></span>
-  <span class="warn">CUDA 异步下为 host launch 时间；精确耗时需 FASTLLM_CUDA_SYNC=1；开启采集有额外开销</span>
+  <span class="warn">耗时拆分需同步；未开 FASTLLM_CUDA_SYNC=1 时等待可能为 0 或落入空隙；开启采集有额外开销</span>
 </section>
 
 <main class="dashboard">
@@ -494,7 +516,8 @@ PAGE_HTML = r"""<!doctype html>
         </div>
         <div class="head-actions">
           <select id="trendMode" title="趋势统计口径">
-            <option value="token" selected>按 Token 耗时</option>
+            <option value="tokenSplit" selected>按耗时去向</option>
+            <option value="token">按 Token 耗时</option>
             <option value="tokenCount">按 Token 事件数</option>
             <option value="time">按时间累计</option>
             <option value="count">按时间事件数</option>
@@ -505,6 +528,7 @@ PAGE_HTML = r"""<!doctype html>
         <canvas id="trend"></canvas>
         <div class="tooltip" id="trendTip"></div>
       </div>
+      <div id="trendLegend" class="trend-legend" hidden></div>
     </section>
 
     <section class="card">
@@ -569,6 +593,17 @@ PAGE_HTML = r"""<!doctype html>
       </div>
       <div id="tokenList" class="token-list"></div>
       <div class="hint">时间线和表格只显示当前 token；趋势按 token 聚合。MTP/DFlash 一步可能生成多个 token；CUDA Graph replay 不产生逐算子事件。</div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>Token 时间去向</h2>
+          <span class="muted" id="splitNote">-</span>
+        </div>
+      </div>
+      <div id="timeSplit" class="time-split"></div>
+      <div class="hint">算子=host 调用；传输=输入 ToDevice；等待=显式 CUDA 同步；空隙=墙钟未被事件覆盖。op 内部 D2H/拷贝仍算在算子；直接 CUDA 路径可能没有独立传输阶段；异步下 GPU 执行/传输等待可能落到空隙。</div>
     </section>
 
     <section class="card">
@@ -651,7 +686,7 @@ PAGE_HTML = r"""<!doctype html>
     lastData: null,
     hotTab: "op",
     focus: null,
-    trendMode: "token",
+    trendMode: "tokenSplit",
     trendGeom: null,
     trendHover: -1,
     lastAgg: null,
@@ -734,6 +769,12 @@ PAGE_HTML = r"""<!doctype html>
 
   function phaseOf(event) {
     return event.phase || "none";
+  }
+
+  function hasTimingBreakdown(event) {
+    return Object.prototype.hasOwnProperty.call(event, "run_us") ||
+      Object.prototype.hasOwnProperty.call(event, "xfer_us") ||
+      Object.prototype.hasOwnProperty.call(event, "sync_us");
   }
 
   function phaseLabel(phase) {
@@ -1212,12 +1253,26 @@ PAGE_HTML = r"""<!doctype html>
           req, token: Number(event.token), key,
           totalUs: 0, count: 0,
           cudaUs: 0, cpuUs: 0, otherUs: 0, ops: new Map(),
+          runUs: 0, xferUs: 0, waitUs: 0, otherOpUs: 0,
+          hasSplit: false,
           slowest: null, startUs: event.t_us, endUs: 0,
         };
         tokenMap.set(key, token);
       }
       token.totalUs += event.dur_us;
       token.count += 1;
+      if (hasTimingBreakdown(event)) {
+        const runUs = Number(event.run_us) || 0;
+        const xferUs = Number(event.xfer_us) || 0;
+        const waitUs = Number(event.sync_us) || 0;
+        token.hasSplit = true;
+        token.runUs += runUs;
+        token.xferUs += xferUs;
+        token.waitUs += waitUs;
+        token.otherOpUs += Math.max(0, event.dur_us - runUs - xferUs - waitUs);
+      } else {
+        token.runUs += event.dur_us;
+      }
       if (event.dev === "cuda") token.cudaUs += event.dur_us;
       else if (event.dev === "cpu") token.cpuUs += event.dur_us;
       else token.otherUs += event.dur_us;
@@ -1239,6 +1294,7 @@ PAGE_HTML = r"""<!doctype html>
       .sort((a, b) => b.endUs - a.endUs);
     for (const token of tokens) {
       token.latencyUs = Math.max(1, token.endUs - token.startUs);
+      token.gapUs = Math.max(0, token.latencyUs - token.totalUs);
       phases.decode.tokenLatencyUs += token.latencyUs;
     }
     return { phases, tokens, grandUs };
@@ -1295,15 +1351,14 @@ PAGE_HTML = r"""<!doctype html>
     $("tokenList").innerHTML = top.map((token) => {
       const focused = activeKey === token.key;
       const reqLabel = token.req >= 0 ? "R" + token.req + " · " : "";
-      const ops = Array.from(token.ops.values())
-        .sort((a, b) => b.totalUs - a.totalUs)
-        .slice(0, 3)
-        .map((op) => op.op + " " + formatUs(op.totalUs))
-        .join(" · ");
+      const splitText = token.hasSplit
+        ? "算子 " + formatUs(token.runUs) + " · 传输 " + formatUs(token.xferUs) +
+          " · 等待 " + formatUs(token.waitUs) + " · 空隙 " + formatUs(token.gapUs)
+        : "未拆分 · 算子累计 " + formatUs(token.totalUs);
       const title = "点击查看该 token 时间线 · " + (token.req >= 0
         ? "request " + token.req + " · decode step " + token.token
         : "decode step " + token.token) +
-        " · 耗时 " + formatUs(token.latencyUs) + " · 算子累计 " + formatUs(token.totalUs);
+        " · 耗时 " + formatUs(token.latencyUs) + " · " + splitText;
       return "<div class='token-row" + (focused ? " selected" : "") +
         "' data-token='" + token.token + "' data-req='" + token.req +
         "' title='" + esc(title) + "'>" +
@@ -1312,11 +1367,55 @@ PAGE_HTML = r"""<!doctype html>
         "<span class='token-total'>" + formatUs(token.latencyUs) + "</span></div>" +
         "<div class='token-bar'><i style='width:" +
         (token.latencyUs / maxTotal * 100).toFixed(2) + "%'></i></div>" +
-        "<div class='token-sub'>ops 累计 " + formatUs(token.totalUs) + " · cuda " +
-        formatUs(token.cudaUs) + " · cpu " +
-        formatUs(token.cpuUs) + (token.otherUs ? " · other " + formatUs(token.otherUs) : "") +
-        (ops ? " · " + esc(ops) : "") + "</div></div>";
+        "<div class='token-sub'>" + esc(splitText) + "</div></div>";
     }).join("");
+  }
+
+  function renderTimeSplit() {
+    const stats = buildPhaseTokenStats();
+    const key = activeTokenKey();
+    const token = (key && stats.tokens.find((item) => item.key === key)) ||
+      stats.tokens[0] || null;
+    if (!token) {
+      $("splitNote").textContent = "-";
+      $("timeSplit").innerHTML = "<div class='empty'>还没有 Decode token</div>";
+      return;
+    }
+    let components;
+    if (token.hasSplit) {
+      components = [
+        { key: "runUs", label: "算子", color: "#4ea1ff" },
+        { key: "xferUs", label: "传输", color: "#38c7c7" },
+        { key: "waitUs", label: "等待", color: "#ffb454" },
+        { key: "otherOpUs", label: "其他", color: "#8a93a6" },
+        { key: "gapUs", label: "空隙", color: "#3b4b60" },
+      ].map((item) => ({ ...item, value: token[item.key] || 0 }));
+    } else {
+      components = [
+        { label: "未拆分", color: "#6f7e91", value: token.totalUs || 0 },
+        { label: "空隙", color: "#3b4b60", value: token.gapUs || 0 },
+      ];
+    }
+    const sum = Math.max(1, components.reduce((total, item) => total + item.value, 0));
+    const bar = components.map((item) => {
+      const width = Math.max(0, (item.value / sum) * 100);
+      return "<i style='width:" + width.toFixed(3) + "%;background:" + item.color +
+        "' title='" + esc(item.label + " " + formatUs(item.value) + " · " +
+        width.toFixed(1) + "%") + "'></i>";
+    }).join("");
+    const rows = components.map((item) => {
+      const pct = (item.value / sum) * 100;
+      return "<div class='split-row'><span class='split-dot' style='background:" +
+        item.color + "'></span><span class='name'>" + esc(item.label) +
+        "</span><span class='val'>" + formatUs(item.value) +
+        "</span><span class='pct'>" + pct.toFixed(1) + "%</span></div>";
+    }).join("");
+    $("splitNote").textContent =
+      tokenLabel(token) + " · " + formatUs(token.latencyUs) +
+      (token.hasSplit ? "" : " · 未拆分");
+    $("timeSplit").innerHTML =
+      "<div class='split-stack'>" + bar + "</div>" +
+      "<div class='split-rows'>" + rows + "</div>";
   }
 
   function renderStats(agg) {
@@ -1535,6 +1634,7 @@ PAGE_HTML = r"""<!doctype html>
       }
     }
     tokens.reverse();
+    const split = state.trendMode === "tokenSplit";
     const mode = state.trendMode === "tokenCount" ? "count" : "total";
     const slot = plotWidth / Math.max(1, tokens.length);
     const barWidth = Math.max(2, Math.min(26, slot * 0.62));
@@ -1550,6 +1650,11 @@ PAGE_HTML = r"""<!doctype html>
         cudaUs: token.cudaUs || 0,
         cpuUs: token.cpuUs || 0,
         otherUs: token.otherUs || 0,
+        runUs: token.runUs || 0,
+        xferUs: token.xferUs || 0,
+        waitUs: token.waitUs || 0,
+        otherOpUs: token.otherOpUs || 0,
+        gapUs: token.gapUs || 0,
       };
     });
     const maxTotal = Math.max(1, ...tokens.map((token) => token.latencyUs));
@@ -1557,7 +1662,7 @@ PAGE_HTML = r"""<!doctype html>
     const total = tokens.reduce((sum, token) => sum + token.latencyUs, 0);
     state.trendGeom = {
       type: "token", width, height, dpr, pad, plotWidth, plotHeight,
-      slot, tokens, bars, mode, maxTotal, maxCount, selectedKey,
+      slot, tokens, bars, mode, split, maxTotal, maxCount, selectedKey,
       empty: tokens.length === 0, total,
     };
     if (state.trendHover < 0 || state.trendHover >= tokens.length) {
@@ -1580,13 +1685,27 @@ PAGE_HTML = r"""<!doctype html>
       $("trendNote").textContent =
         "最近 " + tokens.length + " 个 token · " + average +
         " · 最高 " + peak +
-        (selected ? " · 已选 " + tokenLabel(selected) : "");
+        (selected ? " · 已选 " + tokenLabel(selected) : "") +
+        (split && !tokens.some((token) => token.hasSplit) ? " · 当前数据未拆分" : "");
+    }
+    const legend = $("trendLegend");
+    if (split) {
+      legend.hidden = false;
+      legend.innerHTML =
+        "<span><i style='background:#4ea1ff'></i>算子</span>" +
+        "<span><i style='background:#38c7c7'></i>传输</span>" +
+        "<span><i style='background:#ffb454'></i>等待</span>" +
+        "<span><i style='background:#8a93a6'></i>其他</span>" +
+        "<span><i style='background:#3b4b60'></i>空隙</span>";
+    } else {
+      legend.hidden = true;
     }
     paintTrend();
   }
 
   function drawTrend(visible, view) {
-    if (state.trendMode === "token" || state.trendMode === "tokenCount") {
+    if (state.trendMode === "token" || state.trendMode === "tokenCount" ||
+        state.trendMode === "tokenSplit") {
       drawTokenTrend();
       return;
     }
@@ -1700,7 +1819,13 @@ PAGE_HTML = r"""<!doctype html>
       }
     }
 
-    const segments = [
+    const segments = g.split ? [
+      { key: "runUs", color: "#4ea1ff" },
+      { key: "xferUs", color: "#38c7c7" },
+      { key: "waitUs", color: "#ffb454" },
+      { key: "otherOpUs", color: "#8a93a6" },
+      { key: "gapUs", color: "#3b4b60" },
+    ] : [
       { key: "cudaUs", color: COLORS.gemm },
       { key: "cpuUs", color: COLORS.norm },
       { key: "otherUs", color: COLORS.other },
@@ -1714,14 +1839,14 @@ PAGE_HTML = r"""<!doctype html>
         ctx.fillStyle = selected ? "#8cc6ff" : "#4ea1ff";
         ctx.fillRect(bar.x, y, bar.w, pad.t + plotHeight - y);
       } else {
-        const opTotal = bar.cudaUs + bar.cpuUs + bar.otherUs;
+        const stackTotal = segments.reduce((sum, segment) => sum + (bar[segment.key] || 0), 0);
         const targetHeight = (bar.total / yMax) * plotHeight;
         let base = pad.t + plotHeight;
-        if (opTotal > 0) {
+        if (stackTotal > 0) {
           for (const segment of segments) {
             const value = bar[segment.key];
             if (!value) continue;
-            const h = targetHeight * (value / opTotal);
+            const h = targetHeight * (value / stackTotal);
             ctx.fillStyle = segment.color;
             ctx.fillRect(bar.x, base - h, bar.w, h);
             base -= h;
@@ -2166,6 +2291,7 @@ PAGE_HTML = r"""<!doctype html>
       renderComposition(agg);
       renderFormats(agg);
       renderPhaseTokens();
+      renderTimeSplit();
     }
   }
 
@@ -2283,13 +2409,19 @@ PAGE_HTML = r"""<!doctype html>
         return;
       }
       const token = g.bars[index].token;
+      const splitText = token.hasSplit
+        ? "<span style='color:#4ea1ff'>算子 " + formatUs(token.runUs) + "</span>" +
+          " · <span style='color:#38c7c7'>传输 " + formatUs(token.xferUs) + "</span><br>" +
+          "<span style='color:#ffb454'>等待 " + formatUs(token.waitUs) + "</span>" +
+          " · 其他 " + formatUs(token.otherOpUs) +
+          " · 空隙 " + formatUs(token.gapUs)
+        : "算子累计 " + formatUs(token.totalUs) +
+          " · cuda " + formatUs(token.cudaUs) +
+          " · cpu " + formatUs(token.cpuUs);
       tip.innerHTML =
         "<b>" + esc(tokenLabel(token)) + "</b><br>" +
         "耗时 " + formatUs(token.latencyUs) + " · " + formatCount(token.count) + " ops<br>" +
-        "算子累计 " + formatUs(token.totalUs) + "<br>" +
-        "<span style='color:" + COLORS.gemm + "'>cuda " + formatUs(token.cudaUs) + "</span>" +
-        " · <span style='color:" + COLORS.norm + "'>cpu " + formatUs(token.cpuUs) + "</span>" +
-        (token.otherUs ? " · other " + formatUs(token.otherUs) : "") +
+        splitText +
         "<br><span style='color:#8190a3'>点击定位到该 token</span>";
       const wrap = $("trendWrap");
       const rect = wrap.getBoundingClientRect();

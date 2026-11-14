@@ -601,6 +601,10 @@ namespace fastllm {
         auto st = std::chrono::system_clock::now();
         const bool opTraceEnabled = fastllm::op_trace::Enabled();
         const uint64_t opTraceStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
+        uint64_t opTraceTransferNs = 0;
+        uint64_t opTraceReshapeNs = 0;
+        uint64_t opTraceRunNs = 0;
+        uint64_t opTraceSyncNs = 0;
         std::string opTraceDevice;
         {
             auto positionIt = datas.find("positionIds");
@@ -646,6 +650,7 @@ namespace fastllm {
                 const bool sharedHostMoe = opType == "MergeMOE" && UsesSharedHostMoe(device, datas, intParams);
                 phaseTimer.Split(&ExecPhaseStat::canRun);
                 bool intParamsSize = intParams.size();
+                const uint64_t transferStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
                 for (auto &it: datas) {
                     ToDeviceTensorTimer tensorTimer(opType, it.first);
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
@@ -728,14 +733,29 @@ namespace fastllm {
                             device->deviceType.c_str(), wName);
                     fflush(stderr);
                 }
+                if (opTraceEnabled) {
+                    opTraceTransferNs = fastllm::op_trace::NowNs() - transferStartNs;
+                }
                 phaseTimer.Split(&ExecPhaseStat::toDevice);
+                const uint64_t reshapeStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
                 device->Reshape(opType, datas, floatParams, intParams);
+                if (opTraceEnabled) {
+                    opTraceReshapeNs = fastllm::op_trace::NowNs() - reshapeStartNs;
+                }
                 phaseTimer.Split(&ExecPhaseStat::reshape);
                 AutotuneOpScope tuning(opType, sharedHostMoe ? "numa" : device->deviceType, datas, intParams);
+                const uint64_t runStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
                 device->Run(opType, datas, floatParams, intParams);
+                if (opTraceEnabled) {
+                    opTraceRunNs = fastllm::op_trace::NowNs() - runStartNs;
+                }
                 phaseTimer.Split(&ExecPhaseStat::run);
 #ifdef USE_CUDA
+                const uint64_t syncStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
                 SyncCudaDeviceForProfiler(device);
+                if (opTraceEnabled) {
+                    opTraceSyncNs = fastllm::op_trace::NowNs() - syncStartNs;
+                }
 #endif
                 if (opTraceEnabled) {
                     opTraceDevice = device->deviceType;
@@ -751,7 +771,10 @@ namespace fastllm {
         if (opTraceEnabled) {
             fastllm::op_trace::RecordOp(
                 opType, opTraceDevice, datas, intParams,
-                opTraceStartNs, fastllm::op_trace::NowNs());
+                opTraceStartNs, fastllm::op_trace::NowNs(),
+                fastllm::op_trace::Timing{
+                    opTraceTransferNs, opTraceReshapeNs,
+                    opTraceRunNs, opTraceSyncNs});
         }
         if (phaseStat != nullptr) {
             phaseStat->total += spend;
@@ -779,6 +802,10 @@ namespace fastllm {
         auto st = std::chrono::system_clock::now();
         const bool opTraceEnabled = fastllm::op_trace::Enabled();
         const uint64_t opTraceStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
+        uint64_t opTraceTransferNs = 0;
+        uint64_t opTraceReshapeNs = 0;
+        uint64_t opTraceRunNs = 0;
+        uint64_t opTraceSyncNs = 0;
         std::string opTraceDevice;
         static const bool profileExecPhases =
             std::getenv("FASTLLM_PROFILE_EXEC_PHASES") != nullptr;
@@ -804,6 +831,7 @@ namespace fastllm {
             const bool sharedHostMoe = opType == "MergeMOE" && UsesSharedHostMoe(device, datas, intParams);
             phaseTimer.Split(&ExecPhaseStat::canRun);
             bool intParamsSize = intParams.size();
+            const uint64_t transferStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
             for (auto &it: datas) {
                 ToDeviceTensorTimer tensorTimer(opType, it.first);
                 if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
@@ -849,14 +877,29 @@ namespace fastllm {
                     }
                 }
             }
+            if (opTraceEnabled) {
+                opTraceTransferNs = fastllm::op_trace::NowNs() - transferStartNs;
+            }
             phaseTimer.Split(&ExecPhaseStat::toDevice);
+            const uint64_t reshapeStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
             device->Reshape(opType, datas, floatParams, intParams);
+            if (opTraceEnabled) {
+                opTraceReshapeNs = fastllm::op_trace::NowNs() - reshapeStartNs;
+            }
             phaseTimer.Split(&ExecPhaseStat::reshape);
             AutotuneOpScope tuning(opType, sharedHostMoe ? "numa" : device->deviceType, datas, intParams);
+            const uint64_t runStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
             device->Run(opType, datas, floatParams, intParams);
+            if (opTraceEnabled) {
+                opTraceRunNs = fastllm::op_trace::NowNs() - runStartNs;
+            }
             phaseTimer.Split(&ExecPhaseStat::run);
 #ifdef USE_CUDA
+            const uint64_t syncStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
             SyncCudaDeviceForProfiler(device);
+            if (opTraceEnabled) {
+                opTraceSyncNs = fastllm::op_trace::NowNs() - syncStartNs;
+            }
 #endif
             if (opTraceEnabled) {
                 opTraceDevice = device->deviceType;
@@ -871,7 +914,10 @@ namespace fastllm {
         if (opTraceEnabled) {
             fastllm::op_trace::RecordOp(
                 opType, opTraceDevice, datas, intParams,
-                opTraceStartNs, fastllm::op_trace::NowNs());
+                opTraceStartNs, fastllm::op_trace::NowNs(),
+                fastllm::op_trace::Timing{
+                    opTraceTransferNs, opTraceReshapeNs,
+                    opTraceRunNs, opTraceSyncNs});
         }
         if (phaseStat != nullptr) {
             phaseStat->total += spend;

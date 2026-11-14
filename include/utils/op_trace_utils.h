@@ -115,10 +115,11 @@ inline void RecordOp(const std::string &opType,
                      const DataDict &datas,
                      const IntDict &intParams,
                      uint64_t startNs,
-                     uint64_t endNs) {
+                     uint64_t endNs,
+                     const Timing &timing = Timing()) {
     Record(LayerIndex(datas, intParams), opType, deviceType,
            WeightName(datas, intParams), TensorSummary(datas, intParams),
-           startNs, endNs);
+           startNs, endNs, timing);
 }
 
 } // namespace op_trace
