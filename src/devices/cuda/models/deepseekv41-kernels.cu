@@ -26,6 +26,7 @@ SOFTWARE.
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #include "fastllm-v41-decode.cuh"
+#include "utils/op_trace.h"
 //
 // DeepSeek-V4.1 专用 CUDA kernel。
 //
@@ -142,12 +143,19 @@ namespace {
     // Keep host descriptors alive until the asynchronous upload completes.
     // A bounded ring prevents per-layer pinned allocations and never reuses a
     // slot whose copy is still in flight. Payload lifetime remains with callers.
+    // Superseded pinned buffers are retained until teardown: unmapping a
+    // page-locked range makes the driver wait for device work that may still
+    // reference it, which once stalled a verify round for 230 ms.
     struct V41DescriptorUploads {
         struct Slot { void *host = nullptr; size_t capacity = 0; cudaEvent_t copied = nullptr; bool pending = false; };
-        std::array<Slot, 16> slots{};
+        std::vector<Slot> slots;
+        std::vector<void *> retired;
         size_t next = 0;
+        size_t maxSlots = 256;
+        size_t pinCap = 0;     // fixed byte capacity of a fresh slot; 0 grows by request
         int device;
-        explicit V41DescriptorUploads(int device) : device(device) {}
+        V41DescriptorUploads(int device, size_t maxSlots, size_t pinCap)
+            : maxSlots(maxSlots), pinCap(pinCap), device(device) { slots.reserve(maxSlots); }
         ~V41DescriptorUploads() {
             int previous = 0;
             cudaGetDevice(&previous); cudaSetDevice(device);
@@ -156,12 +164,14 @@ namespace {
                 if (slot.copied) cudaEventDestroy(slot.copied);
                 if (slot.host) cudaFreeHost(slot.host);
             }
+            for (void *buffer : retired) cudaFreeHost(buffer);
             cudaSetDevice(previous);
         }
     };
 
     bool V41UploadCopies(const FastllmV41HostCopy &first,
-                         const FastllmV41HostCopy *extra, size_t extraCount) {
+                         const FastllmV41HostCopy *extra, size_t extraCount,
+                         bool decodeMetadata = false) {
         if (extraCount == SIZE_MAX || (extraCount && !extra)) return false;
         const size_t count = extraCount + 1;
         auto copyAt = [&](size_t i) -> const FastllmV41HostCopy & {
@@ -182,60 +192,121 @@ namespace {
             }
             return true;
         };
-        if (bytes > 128 * 1024 || FastllmCudaGraphIsCapturingFast()) return synchronous();
-        static thread_local std::map<int, std::unique_ptr<V41DescriptorUploads>> pools;
+        // Larger decode metadata (Engram gather, verify rows) still fits the
+        // bounded pinned pool; keeping it asynchronous prevents the host from
+        // blocking behind graph work queued earlier on the legacy stream.
+        // Capture keeps the synchronous path so replay setup never allocates.
+        // Per-operator descriptors keep their original 128KB cutoff.
+        constexpr size_t maxAsyncUploadBytes = 8 * 1024 * 1024;
+        const bool metadata = decodeMetadata;
+        if ((!metadata && bytes > 128 * 1024) || bytes > maxAsyncUploadBytes ||
+            FastllmCudaGraphIsCapturingFast()) {
+            fastllm::op_trace::RegionScope traceSync(metadata ? "upload.sync" : nullptr);
+            return synchronous();
+        }
+        // Per-round metadata is issued only a handful of times, while
+        // per-operator descriptors churn the ring during the draft stage.
+        // Sharing one ring let a metadata copy wait for a descriptor copy
+        // whose event was still queued, stalling the host for the whole
+        // draft slice; keep the two reuse patterns in separate pools.
+        static thread_local std::map<int, std::unique_ptr<V41DescriptorUploads>> descriptorPools;
+        static thread_local std::map<int, std::unique_ptr<V41DescriptorUploads>> metadataPools;
+        auto &pools = metadata ? metadataPools : descriptorPools;
         const int device = FastllmCudaGetDevice();
         auto &pool = pools[device];
-        if (!pool) pool.reset(new V41DescriptorUploads(device));
-        auto &slot = pool->slots[pool->next++ % pool->slots.size()];
-        if (slot.pending) {
-            const auto ready = cudaEventQuery(slot.copied);
-            if (ready == cudaErrorNotReady) {
-                if (cudaEventSynchronize(slot.copied) != cudaSuccess) return false;
-            } else if (ready != cudaSuccess) return false;
-            slot.pending = false;
-        }
-        if (!slot.copied && cudaEventCreateWithFlags(&slot.copied, cudaEventDisableTiming) != cudaSuccess)
-            return false;
-        if (slot.capacity < bytes) {
-            void *replacement = nullptr;
-            const size_t capacity = (bytes + 4095) & ~size_t(4095);
-            if (cudaHostAlloc(&replacement, capacity, cudaHostAllocDefault) != cudaSuccess) {
-                cudaGetLastError();
-                return synchronous();
+        // Metadata copies are a few tens of KiB per round, so every slot pins
+        // that much once and never re-registers. Per-operator descriptors keep
+        // growing by request and stay bounded by the 128KB synchronous cutoff.
+        if (!pool) pool.reset(new V41DescriptorUploads(device,
+            metadata ? 32 : 256, metadata ? size_t(1) << 20 : size_t(0)));
+        size_t slotIndex = SIZE_MAX;
+        {
+            fastllm::op_trace::RegionScope tracePick(metadata ? "upload.pool.pick" : nullptr);
+            const size_t slotCount = pool->slots.size();
+            for (size_t k = 0; k < slotCount; ++k) {
+                const size_t candidate = (pool->next + k) % slotCount;
+                auto &candidateSlot = pool->slots[candidate];
+                if (candidateSlot.pending) {
+                    const auto ready = cudaEventQuery(candidateSlot.copied);
+                    if (ready == cudaErrorNotReady) continue;
+                    if (ready != cudaSuccess) return false;
+                    candidateSlot.pending = false;
+                }
+                slotIndex = candidate;
+                break;
             }
-            if (slot.host) cudaFreeHost(slot.host);
-            slot.host = replacement; slot.capacity = capacity;
+            // Every slot is still in flight: grow instead of synchronizing the
+            // host. The cap keeps pinned memory bounded; past it the oldest
+            // slot is joined as a last resort.
+            if (slotIndex == SIZE_MAX) {
+                if (pool->slots.size() < pool->maxSlots) {
+                    slotIndex = pool->slots.size();
+                    pool->slots.push_back(V41DescriptorUploads::Slot{});
+                } else {
+                    slotIndex = pool->next % pool->slots.size();
+                    auto &oldest = pool->slots[slotIndex];
+                    if (oldest.pending && cudaEventSynchronize(oldest.copied) != cudaSuccess) return false;
+                    oldest.pending = false;
+                }
+            }
+            pool->next = (slotIndex + 1) % pool->slots.size();
+        }
+        auto &slot = pool->slots[slotIndex];
+        {
+            fastllm::op_trace::RegionScope traceAlloc(metadata ? "upload.pool.alloc" : nullptr);
+            if (!slot.copied && cudaEventCreateWithFlags(&slot.copied, cudaEventDisableTiming) != cudaSuccess)
+                return false;
+            const size_t want = pool->pinCap > bytes ? pool->pinCap : bytes;
+            if (slot.capacity < want) {
+                fastllm::op_trace::RegionScope tracePin(metadata ? "upload.pool.pin" : nullptr);
+                void *replacement = nullptr;
+                const size_t capacity = (want + 4095) & ~size_t(4095);
+                if (cudaHostAlloc(&replacement, capacity, cudaHostAllocDefault) != cudaSuccess) {
+                    cudaGetLastError();
+                    return synchronous();
+                }
+                if (slot.host) pool->retired.push_back(slot.host);
+                slot.host = replacement; slot.capacity = capacity;
+            }
         }
         size_t offset = 0;
         bool contiguous = true;
-        for (size_t i = 0; i < count; ++i) {
-            const auto &copy = copyAt(i);
-            std::memcpy(static_cast<char *>(slot.host) + offset, copy.src, copy.bytes);
-            contiguous &= reinterpret_cast<uintptr_t>(copy.dst) ==
-                          reinterpret_cast<uintptr_t>(first.dst) + offset;
-            offset += copy.bytes;
+        {
+            fastllm::op_trace::RegionScope traceCopy(metadata ? "upload.copy" : nullptr);
+            for (size_t i = 0; i < count; ++i) {
+                const auto &copy = copyAt(i);
+                std::memcpy(static_cast<char *>(slot.host) + offset, copy.src, copy.bytes);
+                contiguous &= reinterpret_cast<uintptr_t>(copy.dst) ==
+                              reinterpret_cast<uintptr_t>(first.dst) + offset;
+                offset += copy.bytes;
+            }
         }
         // Adjacent pointers may belong to separate allocations. Only merge
         // when the entire destination range belongs to one device allocation.
-        contiguous = contiguous && count > 1 &&
-                     FastllmCudaValidatePointerRange(first.dst, bytes, device);
+        {
+            fastllm::op_trace::RegionScope traceValidate(metadata ? "upload.validate" : nullptr);
+            contiguous = contiguous && count > 1 &&
+                         FastllmCudaValidatePointerRange(first.dst, bytes, device);
+        }
         offset = 0;
-        for (size_t i = 0; i < (contiguous ? 1 : count); ++i) {
-            const auto &copy = copyAt(i);
-            char *host = static_cast<char *>(slot.host) + offset;
-            if (cudaMemcpyAsync(copy.dst, host, contiguous ? bytes : copy.bytes,
-                    cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess) {
-                // Earlier copies may already read this slot. Do not recycle it
-                // before they have finished, including on the failure path.
+        {
+            fastllm::op_trace::RegionScope traceAsync(metadata ? "upload.async" : nullptr);
+            for (size_t i = 0; i < (contiguous ? 1 : count); ++i) {
+                const auto &copy = copyAt(i);
+                char *host = static_cast<char *>(slot.host) + offset;
+                if (cudaMemcpyAsync(copy.dst, host, contiguous ? bytes : copy.bytes,
+                        cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess) {
+                    // Earlier copies may already read this slot. Do not recycle it
+                    // before they have finished, including on the failure path.
+                    cudaStreamSynchronize(cudaStreamPerThread);
+                    return false;
+                }
+                offset += copy.bytes;
+            }
+            if (cudaEventRecord(slot.copied, cudaStreamPerThread) != cudaSuccess) {
                 cudaStreamSynchronize(cudaStreamPerThread);
                 return false;
             }
-            offset += copy.bytes;
-        }
-        if (cudaEventRecord(slot.copied, cudaStreamPerThread) != cudaSuccess) {
-            cudaStreamSynchronize(cudaStreamPerThread);
-            return false;
         }
         slot.pending = true;
         return true;
@@ -7367,7 +7438,8 @@ bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, siz
     }
     // The bounded pinned staging pool retains each source until its copy event
     // completes. The upload and graph replay use the same worker stream.
-    return V41UploadCopies({storage, requests, layers * batch * sizeof(*requests)}, extra, extraCount);
+    return V41UploadCopies({storage, requests, layers * batch * sizeof(*requests)}, extra, extraCount,
+                            true);
 }
 
 bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size_t layers,
