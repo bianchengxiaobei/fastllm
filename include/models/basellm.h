@@ -250,6 +250,11 @@ namespace fastllm {
 
         struct ToolCallConstraintCache;
         std::shared_ptr<ToolCallConstraintCache> toolCallConstraintCache;
+        // Decoded token table for the CPU-side constraint matcher. It only depends on
+        // the tokenizer, so it is shared by every execution mode; the GPU-only state
+        // cache above stays gated on UseGpuToolCallConstraints().
+        struct ToolCallDecodedVocabulary;
+        std::shared_ptr<ToolCallDecodedVocabulary> toolCallDecodedVocabulary;
         std::mutex toolCallConstraintCacheMutex;
 
     public:

@@ -378,30 +378,53 @@ namespace fastllm {
             return true;
         }
 
-        static bool IsToolCallEnumTokenAllowed(const std::string &partial,
-                                               const std::string &tokenText,
-                                               const std::vector<std::string> &allowedValues,
-                                               const std::string &terminator) {
-            if (tokenText.empty()) {
-                return false;
+        // 工具名约束每步都要在整张词表(12 万条)上判定"这个 token 能否接在当前已生成
+        // 前缀之后"。逐条拼 partial+tokenText 会产生十几万次字符串分配，所以把随步变化
+        // 的部分先算成"剩余后缀"，逐 token 只做前缀比较，并用首字节预筛挡掉绝大多数
+        // 词表项。名字里不会出现 terminator，判定结果与逐条拼接等价。
+        struct ToolCallEnumMatcher {
+            std::vector<std::string> remaining;
+            std::vector<std::string> completed;
+            bool opens[256] = {false};
+
+            ToolCallEnumMatcher(const std::string &partial,
+                                const std::vector<std::string> &allowedValues,
+                                const std::string &terminator) {
+                if (terminator.empty()) {
+                    return;
+                }
+                for (const auto &name : allowedValues) {
+                    if (!ToolCallConstraintStartsWith(name, partial)) {
+                        continue;
+                    }
+                    remaining.push_back(name.substr(partial.size()));
+                    completed.push_back(remaining.back() + terminator);
+                }
+                for (const auto &text : remaining) {
+                    if (!text.empty()) opens[(uint8_t) text[0]] = true;
+                }
+                for (const auto &text : completed) {
+                    if (!text.empty()) opens[(uint8_t) text[0]] = true;
+                }
             }
-            std::string combined = partial + tokenText;
-            auto terminatorPos = combined.find(terminator);
-            std::string namePart = terminatorPos == std::string::npos ?
-                                   combined : combined.substr(0, terminatorPos);
-            for (const auto &name : allowedValues) {
-                if (terminatorPos != std::string::npos) {
-                    if (namePart == name) {
+
+            bool Allows(const std::string &tokenText) const {
+                if (tokenText.empty() || !opens[(uint8_t) tokenText[0]]) {
+                    return false;
+                }
+                for (const auto &text : remaining) {
+                    if (ToolCallConstraintStartsWith(text, tokenText)) {
                         return true;
                     }
-                    continue;
                 }
-                if (ToolCallConstraintStartsWith(name, namePart)) {
-                    return true;
+                for (const auto &text : completed) {
+                    if (ToolCallConstraintStartsWith(tokenText, text)) {
+                        return true;
+                    }
                 }
+                return false;
             }
-            return false;
-        }
+        };
 
         static bool IsPureGpuDeviceSpec(const std::string &device) {
 #ifndef USE_CUDA
@@ -594,6 +617,13 @@ namespace fastllm {
         size_t stateBytes = 0;
     };
 
+    struct basellm::ToolCallDecodedVocabulary {
+        uint64_t vocabularyRevision = 0;
+        bool byteAsChar = false;
+        std::string preTokenizer;
+        std::vector<std::pair<int, std::string>> tokens;
+    };
+
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
         if (context) generationConfig.tool_call_grammar_state = context->generationConfig.tool_call_grammar_state;
         generationConfig.tool_call_generated_text = context ? context->toolCallConstraintGeneratedText : "";
@@ -653,12 +683,11 @@ namespace fastllm {
         const std::string terminator =
                 generationConfig.tool_call_name_terminator.empty()
                 ? "\"" : generationConfig.tool_call_name_terminator;
-        std::unique_lock<std::mutex> lock(toolCallConstraintCacheMutex, std::defer_lock);
+        std::unique_lock<std::mutex> lock(toolCallConstraintCacheMutex);
+        auto &tokenizer = weight.tokenizer;
         ToolCallConstraintCache *cache = nullptr;
         ToolCallConstraintCache::Key key;
         if (UseGpuToolCallConstraints()) {
-            lock.lock();
-            auto &tokenizer = weight.tokenizer;
             if (!toolCallConstraintCache || toolCallConstraintCache->decodedTokens.size() !=
                     tokenizer.tokenToStringDict.size() ||
                 toolCallConstraintCache->vocabularyRevision != tokenizer.GetVocabularyRevision() ||
@@ -681,24 +710,36 @@ namespace fastllm {
                 return;
             }
         }
+        // 约束步要扫整张词表；解码结果只随 tokenizer 变化，与执行模式无关。不缓存的话
+        // Hybrid 模式下每个约束步都要重解码 12 万条（实测 ~160ms/步）。
+        if (!cache && (!toolCallDecodedVocabulary || toolCallDecodedVocabulary->tokens.size() !=
+                tokenizer.tokenToStringDict.size() ||
+            toolCallDecodedVocabulary->vocabularyRevision != tokenizer.GetVocabularyRevision() ||
+            toolCallDecodedVocabulary->byteAsChar != tokenizer.byteAsChar ||
+            toolCallDecodedVocabulary->preTokenizer != tokenizer.preTokenizer)) {
+            auto decoded = std::make_shared<ToolCallDecodedVocabulary>();
+            decoded->vocabularyRevision = tokenizer.GetVocabularyRevision();
+            decoded->byteAsChar = tokenizer.byteAsChar;
+            decoded->preTokenizer = tokenizer.preTokenizer;
+            decoded->tokens.reserve(tokenizer.tokenToStringDict.size());
+            for (const auto &item : tokenizer.tokenToStringDict)
+                decoded->tokens.emplace_back(item.first,
+                    tokenizer.DecodeTokens(std::vector<int>{item.first}));
+            toolCallDecodedVocabulary = std::move(decoded);
+        }
+        const std::vector<std::pair<int, std::string>> &vocabulary =
+                cache ? cache->decodedTokens : toolCallDecodedVocabulary->tokens;
         std::vector<int> allowedIds;
         allowedIds.reserve(allowedValues.size() * 4);
-        auto consider = [&](int tokenId, const std::string &tokenText) {
-            if (IsToolCallEnumTokenAllowed(partial, tokenText, allowedValues, terminator))
-                allowedIds.push_back(tokenId);
-        };
-        if (cache) {
-            for (const auto &item : cache->decodedTokens) consider(item.first, item.second);
-        } else {
-            for (const auto &item : weight.tokenizer.tokenToStringDict)
-                consider(item.first, weight.tokenizer.DecodeTokens(std::vector<int>{item.first}));
-        }
+        const ToolCallEnumMatcher matcher(partial, allowedValues, terminator);
+        for (const auto &item : vocabulary)
+            if (matcher.Allows(item.second)) allowedIds.push_back(item.first);
         std::sort(allowedIds.begin(), allowedIds.end());
         allowedIds.erase(std::unique(allowedIds.begin(), allowedIds.end()), allowedIds.end());
         if (cache) {
             size_t bytes = partial.size() + terminator.size() + allowedIds.size() * sizeof(int);
             for (const auto &name : allowedValues) bytes += name.size() + sizeof(std::string);
-            // Bound request-defined schemas/states; a miss always uses the original matcher.
+            // Bound request-defined schemas/states; a miss rebuilds the matcher.
             constexpr size_t maxBytes = 8 * 1024 * 1024;
             if (cache->states.size() >= 512 || cache->stateBytes + bytes > maxBytes) {
                 cache->states.clear();
