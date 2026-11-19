@@ -326,6 +326,9 @@ bool FastllmCudaGraphGetAllocationFailurePlaceholder(void **ptr);
 void FastllmCudaClearThreadError();
 void FastllmCudaSetThreadError();
 bool FastllmCudaGetThreadError();
+// 捕获期分配失败（池里凑不出块，且捕获中禁止 cudaMalloc）。调用方据此把
+// "捕获期内存不够" 和真正的算子错误区分开：前者应当停用整张图并回退逐算子。
+bool FastllmCudaGetGraphCaptureAllocationFailure();
 void FastllmCudaClearGraphError();
 bool FastllmCudaGetGraphError();
 

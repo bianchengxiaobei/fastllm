@@ -1660,24 +1660,61 @@ void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const 
     // A cached output-channel shard can reserve the auxiliary vector before
     // this owner runs a GEMV. Reserved slots do not imply initialized scales.
     if (weight.extraCudaData.size() < 2) weight.extraCudaData.resize(2, nullptr);
+    if (weight.extraCudaData[0] != nullptr && weight.extraCudaData[1] != nullptr) {
+        return;
+    }
+    // 捕获体内 cudaMalloc / 同步 cudaMemcpy 一律 900。这种情况没有任何补救办法,
+    // 只能如实记一次捕获失败: 调用方随后会 reject 掉这个算子, 整段图被丢掉,
+    // 回落到逐算子执行时再初始化。以前这里硬做分配, 报出来的 900 还会把真正的
+    // 第一条错误盖住。
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus) != cudaSuccess) {
+        cudaGetLastError();
+        captureStatus = cudaStreamCaptureStatusNone;
+    }
+    if (captureStatus != cudaStreamCaptureStatusNone) {
+        printf("[fastllm] FP8 scales/bias not initialized before capture: %s\n",
+               weight.name.empty() ? "<unnamed>" : weight.name.c_str());
+        fflush(stdout);
+        FastllmCudaSetThreadError();
+        cudaGetLastError();
+        return;
+    }
     if (weight.extraCudaData[0] == nullptr) {
-        float *cudaScales;
-        cudaError_t state = cudaSuccess;
-        state = cudaMalloc(&cudaScales, weight.scales.size() * sizeof(float));
-        state = cudaMemcpy(cudaScales, weight.scales.data(), weight.scales.size() * sizeof(float), cudaMemcpyHostToDevice);
-        checkCudaErrors("Error: CUDA error when moving FP8 scales to device!", state);
-        weight.extraCudaData[0] = cudaScales;
+        float *cudaScales = nullptr;
+        cudaError_t state = cudaMalloc((void **) &cudaScales, weight.scales.size() * sizeof(float));
+        if (state == cudaSuccess) {
+            state = cudaMemcpy(cudaScales, weight.scales.data(), weight.scales.size() * sizeof(float),
+                               cudaMemcpyHostToDevice);
+        }
+        if (state != cudaSuccess) {
+            // 失败时绝不能把未初始化的指针写进缓存槽, 否则下一次调用会拿它当设备地址。
+            if (cudaScales != nullptr) {
+                cudaFree(cudaScales);
+            }
+            checkCudaErrors("Error: CUDA error when moving FP8 scales to device!", state);
+            return;
+        }
+        weight.extraCudaData[0] = (void *) cudaScales;
     }
     if (weight.extraCudaData[1] == nullptr) {
-        float *cudaBiasData;
-        cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(float));
-        if (bias.dims.size() > 0) {
-            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
-        } else {
-            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
+        float *cudaBiasData = nullptr;
+        cudaError_t state = cudaMalloc((void **) &cudaBiasData, k * sizeof(float));
+        if (state == cudaSuccess) {
+            if (bias.dims.size() > 0) {
+                state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            } else {
+                state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            }
         }
-        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaData[1] = cudaBiasData;
+        if (state != cudaSuccess) {
+            if (cudaBiasData != nullptr) {
+                cudaFree(cudaBiasData);
+            }
+            checkCudaErrors("Error: CUDA error when moving bias to device!", state);
+            return;
+        }
+        weight.extraCudaData[1] = (void *) cudaBiasData;
     }
 }
 
@@ -2679,7 +2716,9 @@ extern "C" bool FastllmCudaBFloat16FP8LinearPair(const fastllm::Data &input,
         const size_t scaleCount = size_t((w->dims[0] - 1) / w->blockK + 1) *
                                   ((inner - 1) / w->blockM + 1);
         if (w->scales.size() < scaleCount && w->extraCudaData.empty()) return false;
-        if (w->extraCudaData.empty() && FastllmCudaGraphIsCapturingFast()) return false;
+        if (FastllmCudaGraphIsCapturingFast() &&
+            (w->extraCudaData.size() < 2 || w->extraCudaData[0] == nullptr ||
+             w->extraCudaData[1] == nullptr)) return false;
     }
     for (const auto &item : {std::make_pair(&out0, &w0), std::make_pair(&out1, &w1)}) {
         const Data &out = *item.first;
@@ -2763,6 +2802,11 @@ extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(
         weight.blockM <= 0 || weight.dims[1] % weight.blockM ||
         !input.cudaData || !weight.cudaData || output.dataDevice != fastllm::DataDevice::CUDA ||
         FastllmCudaFp8E4M3HasSm70Layout(weight)) return false;
+    if (FastllmCudaGraphIsCapturingFast() &&
+        (weight.extraCudaData.size() < 2 || weight.extraCudaData[0] == nullptr)) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
     const int m = weight.dims[1], k = weight.dims[0];
     const int rows = input.Count(0) / m;
     fastllm::Data emptyBias;
@@ -2788,6 +2832,15 @@ extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(
 }
 
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    // 捕获体内补不了 scales/bias 的设备副本, 拿空指针启核只会写坏显存。
+    // 标一次线程错误, 让捕获方丢掉这张图回落到逐算子执行。
+    if (FastllmCudaGraphIsCapturingFast() &&
+        (weight.extraCudaData.size() < 2 || weight.extraCudaData[0] == nullptr ||
+         weight.extraCudaData[1] == nullptr ||
+         (bias.dims.size() > 0 && weight.extraCudaHalfData.empty()))) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);
     FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(weight, bias, k);
 

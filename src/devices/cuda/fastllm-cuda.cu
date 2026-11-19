@@ -65,6 +65,12 @@ static bool FastllmCudaDataCanShareDevice(const fastllm::Data &reference,
 // 线程级 CUDA 错误标志：showError 报错时置位。CUDA graph 捕获路径在捕获体前清零、
 // 捕获体后检查，任何算子报错都能被感知并中止捕获，避免带着坏状态继续运行。
 static thread_local bool fastllmCudaThreadErrorFlag = false;
+// 捕获期分配失败（池里凑不出块且 cudaMalloc 被禁止）单独记一笔：调用方据此判断
+// 挨的这次失败是不是"捕获期拿不到内存"，从而回退到逐算子执行而不是把进程带走。
+static thread_local bool fastllmCudaGraphCaptureAllocationFailed = false;
+// TP 的整段捕获会在 worker 线程里分配内存，thread_local 收不到那些失败，
+// 因此再留一个捕获期聚合标志（与 fastllmCudaGraphErrorFlag 同一思路）。
+static std::atomic<bool> fastllmCudaGraphCaptureAllocationFailedAny(false);
 // Whole-step capture spans the scheduler thread plus one persistent worker per
 // GPU.  A thread-local flag alone loses failures raised by worker-side cuBLAS,
 // NCCL, or custom kernels, so retain a capture-epoch aggregate as well.
@@ -109,6 +115,8 @@ namespace {
 
 void FastllmCudaClearThreadError() {
     fastllmCudaThreadErrorFlag = false;
+    fastllmCudaGraphCaptureAllocationFailed = false;
+    fastllmCudaGraphCaptureAllocationFailedAny.store(false, std::memory_order_release);
 }
 
 void FastllmCudaSetThreadError() {
@@ -118,6 +126,11 @@ void FastllmCudaSetThreadError() {
 
 bool FastllmCudaGetThreadError() {
     return fastllmCudaThreadErrorFlag;
+}
+
+bool FastllmCudaGetGraphCaptureAllocationFailure() {
+    return fastllmCudaGraphCaptureAllocationFailed ||
+           fastllmCudaGraphCaptureAllocationFailedAny.load(std::memory_order_acquire);
 }
 
 void FastllmCudaClearGraphError() {
@@ -152,7 +165,28 @@ void showError(cudaError_t result, char const* const message, const char* const 
     fastllmCudaGraphErrorFlag.store(true, std::memory_order_release);
     printf("%s\n  CUDA error = %d, %s at %s:%d\n  '%s'\n",
         message, result, cudaGetErrorName(result), file, line, cudaGetErrorString(result));
+    // 有些运行时的错误信息（"synchronizing event" 之类）本身定位不到调用方，开启
+    // FASTLLM_CUDA_ERROR_STACK=1 时把出错处的调用栈一起打出来。
+    static const bool printCallStack = [] {
+        const char *value = std::getenv("FASTLLM_CUDA_ERROR_STACK");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (printCallStack) {
+#if defined(__linux__) || defined(__APPLE__)
+        void *frames[64];
+        const int frameCount = backtrace(frames, 64);
+        char **symbols = backtrace_symbols(frames, frameCount);
+        if (symbols != nullptr) {
+            for (int i = 0; i < frameCount; ++i) printf("  [cuda error] #%d %s\n", i, symbols[i]);
+            free(symbols);
+        }
+#endif
+    }
     fflush(stdout);
+    // 这条错误已经报过了，把它从运行时的 sticky 状态里取走：否则后面任何一个用
+    // cudaGetLastError() 自检的 kernel（V41CheckLaunch 等）都会替这次失败背锅，
+    // 日志里就会出现"某个根本没失败的 kernel failed: invalid argument"。
+    cudaGetLastError();
 }
 
 static std::atomic<bool> fastllmCudaMallocDisabled(false);
@@ -5518,10 +5552,6 @@ bool FastllmCudaGraphMemoryPoolActive() {
 
 bool FastllmCudaGraphMemoryPoolBegin() {
     FastllmCudaClearGraphError();
-    // 捕获期间不允许 cudaFree, 池里的空闲块到时候一块也还不了。先归还, 否则
-    // 一张被权重/KV 填到只剩一百多 MB 的卡会因为凑不出图 workspace 而把整张图
-    // 判成"不支持", 回退路又要重新分配, 直接 OOM。
-    FastllmCudaReleaseIdleCachedBuffers(-1);
     std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
     if (fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) !=
             FASTLLM_CUDA_GRAPH_POOL_IDLE) {
@@ -5708,6 +5738,29 @@ static void *FastllmCudaMallocImpl(
     }
     const bool useAnyFittingPooledBuffer = capturePoolOnly ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
+    // 捕获期不允许 cudaMalloc, 池里凑不出块就只能判失败。以前这条路径完全静默,
+    // 结果第一条可见错误变成后面往 256 字节占位地址里搬数据时的 invalid argument,
+    // 看起来像拷贝写错了。调用方(Data::MallocSpace)拿不到内存时会打印张量身份,
+    // 这里补上申请大小和池内可用量, 至少能一眼看出是"捕获期分配失败"而不是别的问题。
+    auto reportCaptureAllocationMiss = [&](std::vector<CudaMemoryBuffer> *buffers) {
+        size_t reusable = 0, largest = 0;
+        if (buffers != nullptr) {
+            for (const auto &buffer : *buffers) {
+                if (!buffer.busy && buffer.graphPins == 0) {
+                    reusable += buffer.size;
+                    largest = std::max(largest, (size_t)buffer.size);
+                }
+            }
+        }
+        printf("[fastllm] graph capture allocation failed: need %.2f MB on device %d, "
+               "reusable pooled bytes = %.2f MB (largest %.2f MB); "
+               "cudaMalloc/free are forbidden while capturing.\n",
+               size / 1048576.0, id, reusable / 1048576.0, largest / 1048576.0);
+        fflush(stdout);
+        fastllmCudaGraphCaptureAllocationFailed = true;
+        fastllmCudaGraphCaptureAllocationFailedAny.store(true, std::memory_order_release);
+        FastllmCudaSetThreadError();
+    };
     std::lock_guard<std::mutex> lock(*view.lock);
     if (size > 1024 * 1024) {
         auto &bigBuffers = *view.bigBuffers;
@@ -5768,7 +5821,7 @@ static void *FastllmCudaMallocImpl(
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
         }
         if (capturePoolOnly) {
-            FastllmCudaSetThreadError();
+            reportCaptureAllocationMiss(view.bigBuffers);
             return nullptr;
         }
         state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
@@ -5869,7 +5922,7 @@ static void *FastllmCudaMallocImpl(
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
     }
     if (capturePoolOnly) {
-        FastllmCudaSetThreadError();
+        reportCaptureAllocationMiss(view.smallBuffers);
         return nullptr;
     }
     state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
@@ -6821,6 +6874,48 @@ void FastllmCudaHostUnregister(void *ptr) {
     }
 }
 
+// 捕获期失败的拷贝只打印指针没法定位调用方, 这里把调用栈一起带出来。
+static void FastllmCudaPrintCopyCallStack(const char *tag) {
+#if defined(__linux__) || defined(__APPLE__)
+    const int maxFrames = 64;
+    void *frames[maxFrames];
+    const int numFrames = backtrace(frames, maxFrames);
+    char **symbols = backtrace_symbols(frames, numFrames);
+    if (symbols == nullptr) {
+        return;
+    }
+    for (int i = 0; i < numFrames; i++) {
+        printf("  %s #%d %s\n", tag, i, symbols[i]);
+    }
+    free(symbols);
+#else
+    (void)tag;
+#endif
+}
+
+// 捕获期拷贝失败时把两个指针的真实种类打出来: "指针是主机内存/占位地址"
+// 和 "指针没问题、纯粹是捕获限制" 的排查路径完全不同。
+static const char *FastllmCudaClassifyPointer(const void *ptr, int *device) {
+    *device = -1;
+    cudaPointerAttributes attributes;
+    cudaError_t state = cudaPointerGetAttributes(&attributes, ptr);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return "unregistered";
+    }
+    *device = attributes.device;
+    if (attributes.type == cudaMemoryTypeHost) {
+        return "host";
+    }
+    if (attributes.type == cudaMemoryTypeManaged) {
+        return "managed";
+    }
+    if (attributes.type == cudaMemoryTypeDevice) {
+        return "device";
+    }
+    return "unregistered";
+}
+
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     if (size == 0 || dst == src) {
         return;
@@ -6843,9 +6938,31 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
         state = cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice,
                                 cudaStreamPerThread);
         if (state != cudaSuccess) {
-            printf("[fastllm] D2D capture copy failed dst=%p src=%p size=%zu err=%d(%s)\n",
-                   dst, src, size, (int)state, cudaGetErrorString(state));
+            // 捕获期分配失败时 Data::MallocSpace 会拿到 256 字节的占位地址, 往它里面
+            // 搬任何真实张量都会被运行时判成 invalid argument。别让这条把真正的
+            // "捕获期分配失败" 盖掉 —— 那条现在由 FastllmCudaMalloc / Data::MallocSpace 打印。
+            void *placeholder = nullptr;
+            const bool placeholderOperand =
+                FastllmCudaGraphGetAllocationFailurePlaceholder(&placeholder) &&
+                (dst == placeholder || src == placeholder);
+            if (placeholderOperand) {
+                printf("[fastllm] D2D capture copy touched the allocation-failure placeholder "
+                       "dst=%p src=%p size=%zu: the capture-time allocation failed, "
+                       "graph will be discarded.\n", dst, src, size);
+            } else {
+                int dstDevice = -1, srcDevice = -1;
+                const char *dstKind = FastllmCudaClassifyPointer(dst, &dstDevice);
+                const char *srcKind = FastllmCudaClassifyPointer(src, &srcDevice);
+                printf("[fastllm] D2D capture copy failed dst=%p(%s,%d) src=%p(%s,%d) size=%zu err=%d(%s)\n",
+                       dst, dstKind, dstDevice, src, srcKind, srcDevice, size,
+                       (int)state, cudaGetErrorString(state));
+                FastllmCudaPrintCopyCallStack("[fastllm]");
+            }
             fflush(stdout);
+            FastllmCudaGraphSetError("cudaMemcpyAsync (capture)", state);
+            // 捕获体里这个错必须让捕获方看见; 但也不能把 sticky 错误留给后面的
+            // cudaGetLastError() 检查, 否则下一个无关 kernel 会替它背锅。
+            cudaGetLastError();
         }
         checkCudaErrors("Error: CUDA error when async copy on GPU!", state);
         return;
@@ -25778,3 +25895,27 @@ void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab) {
         logits, (const uint32_t *)storage.cudaData, vocab);
     checkCudaErrors("Error applying tool token mask", cudaGetLastError());
 }
+
+namespace {
+// 捕获期任何算子放弃时都会走到 ErrorInFastLLM。只要池处于捕获阶段, 就把它降级成
+// 一次捕获失败: 标线程错误 + 图错误, 由捕获方结束捕获、丢掉这张图并回落到逐算子
+// 执行。没有这一步, 捕获体内第一次算子拒绝就会 getchar()+exit(0) 把进程带走。
+bool FastllmCudaCaptureErrorIntercept(const char *error) {
+    if (!FastllmCudaGraphIsCapturingFast() && !FastllmCudaGraphMemoryPoolActive()) {
+        return false;
+    }
+    FastllmCudaGraphSetError(error == nullptr ? "operator failed during capture" : error,
+                             cudaErrorInvalidValue);
+    FastllmCudaSetThreadError();
+    cudaGetLastError();
+    fprintf(stderr, "[fastllm] graph capture aborted by operator failure: %s\n",
+            error == nullptr ? "unknown" : error);
+    return true;
+}
+
+struct FastllmCudaCaptureErrorHook {
+    FastllmCudaCaptureErrorHook() {
+        fastllm::fastllmErrorIntercept = FastllmCudaCaptureErrorIntercept;
+    }
+} fastllmCudaCaptureErrorHook;
+} // namespace

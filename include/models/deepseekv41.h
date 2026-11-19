@@ -576,6 +576,12 @@ namespace fastllm {
         std::atomic<long long> v41DsparkAcceptedTokens{0};
         std::atomic<long long> v41DsparkVerifyRounds{0};
 
+        // 捕获体内严禁 cudaMalloc。FP8 权重的 scales/bias 设备副本如果拖到捕获体里
+        // 第一次用到才创建, 整张图会被判失败并回落到逐算子执行(慢很多), 所以第一次
+        // 建图之前先把模型里所有 FP8 权重的辅助数据补齐。
+        bool v41Fp8GraphAuxWarmed = false;
+        void WarmupFp8GraphAuxiliary();
+
         void InitDsparkParams();
         void ApplyDsparkDevice(bool targetComplete = false);
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);

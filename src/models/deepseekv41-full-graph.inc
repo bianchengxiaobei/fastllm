@@ -442,6 +442,7 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
 
 void DeepSeekV41Model::BuildFullDecodeGraph(
     int batch, const std::vector<DeepSeekV41Segment> &segments, int firstLayer, int endLayer) {
+    WarmupFp8GraphAuxiliary();
     const bool distributedAttention = v41AttentionDP > 1;
     const bool attentionOnly = v41AttentionRankRuntime != nullptr;
     if (firstLayer < 0 && executionMode == ExecutionMode::Hybrid &&
@@ -1184,6 +1185,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 "per rank/step, layers=[%d,%d), maxKeys=%d\n",
                 distributedAttention ? (verifying ? "DP verify" : "DP decode") : verifying ? "verify" : "decode",
                 verifying ? "tokens" : "batch", batch, g->devices.size(), firstLayer, endLayer, g->maxKeys);
+        else fprintf(stderr,
+                "[Fastllm] DeepSeek-V4.1 attention-only graph ready: %s=%d, ranks=%zu, layers=[%d,%d)\n",
+                verifying ? "tokens" : "batch", batch, g->devices.size(), firstLayer, endLayer);
     } catch (const std::exception &error) {
         if (poolOpen)
             FastllmCudaGraphMemoryPoolAbort();

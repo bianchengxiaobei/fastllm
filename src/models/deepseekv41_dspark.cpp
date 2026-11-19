@@ -219,6 +219,7 @@ namespace fastllm {
             ok = pool;
             int begun = 0;
             bool joined = false;
+            bool captureAllocationFailed = false;
             std::exception_ptr error;
             if (pool) {
                 FastllmCudaClearThreadError();
@@ -240,6 +241,7 @@ namespace fastllm {
                     dsparkCapturing = true;
                     try { body(); } catch (...) { error = std::current_exception(); }
                     dsparkCapturing = false;
+                    captureAllocationFailed = FastllmCudaGetGraphCaptureAllocationFailure();
                     ok = !error && !state.disabled && !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
                 }
                 if (joined) {
@@ -277,11 +279,18 @@ namespace fastllm {
                 const std::string reason = FastllmCudaGraphLastError();
                 state.ClearGraphs(); state.disabled = true;
                 FastllmCudaClearLastError(); FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
-                if (error) std::rethrow_exception(error);
-                fprintf(stderr, "[Fastllm] DeepSeekV41 DSpark graph capture failed (%s); using eager.\n", reason.c_str());
+                // 捕获期分配失败（池里凑不出块、捕获中又不许 cudaMalloc）会让后面的
+                // 算子拿到 256 字节占位地址并 assert 抛异常。这种失败只在捕获体内出现,
+                // 逐算子路径刚刚已经完整跑通过两次, 所以停用图直接走 eager 即可;
+                // 真正的算子错误仍然原样抛出, 不掩盖。
+                if (error && !captureAllocationFailed) std::rethrow_exception(error);
+                fprintf(stderr, "[Fastllm] DeepSeekV41 DSpark graph capture failed (%s%s); using eager.\n",
+                        reason.c_str(),
+                        captureAllocationFailed ? ", capture-time allocation failed" : "");
                 return false;
             }
             launch();
+            fprintf(stderr, "[Fastllm] DeepSeekV41 DSpark graph captured: %d device(s).\n", count);
             return true;
         }
 #endif

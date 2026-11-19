@@ -5405,6 +5405,10 @@ namespace fastllm {
                 if (!captureOk) {
                     segment = state.segments.back();
                     state.segments.pop_back();
+                } else if (state.segments.size() == 1) {
+                    fprintf(stderr, "[Fastllm] DeepSeek-V4.1 segmented graph capture started (%d device(s)).\n",
+                            deviceCount);
+                    fflush(stderr);
                 }
             }
 
@@ -5419,6 +5423,12 @@ namespace fastllm {
                     }
                 }
                 state.captureFailed = true;
+                const std::string reason = FastllmCudaGraphLastError();
+                fprintf(stderr,
+                        "[Fastllm] DeepSeek-V4.1 segmented graph capture failed (%s%s); falling back to eager.\n",
+                        reason.empty() ? "unknown" : reason.c_str(),
+                        FastllmCudaGetThreadError() ? ", thread error set" : "");
+                fflush(stderr);
             }
             state.capturing = false;
             FastllmCudaSetDevice(originalDevice);
@@ -8265,6 +8275,43 @@ namespace fastllm {
 #include "deepseekv41-full-graph.inc"
 #endif
 
+    void DeepSeekV41Model::WarmupFp8GraphAuxiliary() {
+        if (v41Fp8GraphAuxWarmed) {
+            return;
+        }
+        v41Fp8GraphAuxWarmed = true;
+#ifdef USE_CUDA
+        // 捕获期 cudaMalloc 一律报 cudaErrorStreamCaptureUnsupported, 所以这里必须在
+        // 开始捕获之前把每个 FP8 权重的 scales/bias 设备副本补齐。多卡复制的权重按
+        // 每个 replica 各自处理, 并切到它所在的卡上分配。
+        const int previousDevice = FastllmCudaGetDevice();
+        Data emptyBias;
+        int prepared = 0;
+        auto prepare = [&](Data &w) {
+            if (w.dataType != DataType::FP8_E4M3 || w.isFake || !w.cudaData ||
+                w.scales.empty() || w.dims.size() != 2 || w.dims[0] <= 0 ||
+                w.dataDevice != DataDevice::CUDA || w.dataDeviceIds.size() != 1) return;
+            FastllmCudaSetDevice(w.dataDeviceIds[0]);
+            FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(w, emptyBias, w.dims[0]);
+            ++prepared;
+        };
+        for (auto &entry : this->weight.weight) {
+            Data &w = entry.second;
+            if (w.multiDeviceData) {
+                for (auto &replica : w.multiDeviceDatas) {
+                    if (replica.second != nullptr) prepare(*replica.second);
+                }
+            } else {
+                prepare(w);
+            }
+        }
+        FastllmCudaSetDevice(previousDevice);
+        fprintf(stderr, "[Fastllm] warmed FP8 scales/bias for %d weight replica(s) before graph capture.\n",
+                prepared);
+        fflush(stderr);
+#endif
+    }
+
     void DeepSeekV41Model::WarmUp() {
         PrepareAttentionParallel();
         printf("Warmup...\n");
@@ -8285,6 +8332,10 @@ namespace fastllm {
         const bool cudaWarmup = V41DeviceMapUsesCuda(this->deviceMap) &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr;
         if (cudaWarmup) {
+            // 首次前向已经把各层权重搬上卡, 这里在任何一个捕获开始之前把 FP8 的
+            // scales/bias 设备副本补齐 —— 捕获期不允许 cudaMalloc, 拖到捕获体里
+            // 第一次用到就会让整张图作废, 只能回落逐算子执行(明显变慢)。
+            WarmupFp8GraphAuxiliary();
             // A single token does not exercise GGUF prefill kernels or the
             // CPU/GPU expert cost curves. Pay their first-use cost before ready,
             // with the same chunk/context bounds as ordinary requests.
@@ -8439,6 +8490,11 @@ namespace fastllm {
                 throw;
             }
             v41CudaGraphWarmingUp = false;
+        } else {
+            fprintf(stderr,
+                    "[Fastllm] DeepSeek-V4.1 full graph warmup skipped: cudaWarmup=%d cudaGraph=%d moeGraph=%d\n",
+                    (int)cudaWarmup, (int)GetFastllmEnv().cudaGraph, (int)v41MoeCudaGraphCompatible);
+            fflush(stderr);
         }
 #endif
         this->kvCacheId = 0;

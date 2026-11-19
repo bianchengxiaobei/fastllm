@@ -85,7 +85,16 @@ namespace fastllm {
         std::this_thread::sleep_for(std::chrono::seconds(t));
     }
 
+    // 图捕获期间算子失败不应该直接 exit(): 捕获本来就是可以放弃的优化, 记一次
+    // 图错误 + 线程错误, 让捕获方丢掉这张图回落逐算子执行即可。CUDA 后端在
+    // fastllm-cuda.cu 里注册处理器; 未注册时保持原来的行为(打印并退出)。
+    typedef bool (*FastllmErrorInterceptFunc)(const char *error);
+    inline FastllmErrorInterceptFunc fastllmErrorIntercept = nullptr;
+
     static void ErrorInFastLLM(const std::string &error) {
+        if (fastllmErrorIntercept != nullptr && fastllmErrorIntercept(error.c_str())) {
+            return;
+        }
         printf("FastLLM Error: %s\n", error.c_str());
         printf("Press any key to exit...\n");
         getchar();

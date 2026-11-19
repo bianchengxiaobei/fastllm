@@ -153,10 +153,6 @@ namespace fastllm {
             if (ptr != nullptr) {
                 return true;
             }
-            if (allowGraphCapturePlaceholder &&
-                FastllmCudaGraphGetAllocationFailurePlaceholder(&ptr)) {
-                return false;
-            }
             std::string msg = "Error: cuda malloc failed in " + std::string(context) +
                               ". requestBytes = " + std::to_string(bytes) +
                               ", dataType = " + GetDataTypeName(data.dataType) + ", dims = [";
@@ -168,6 +164,16 @@ namespace fastllm {
                 msg += ", name = " + data.name;
             }
             msg += ".\n";
+            if (allowGraphCapturePlaceholder &&
+                FastllmCudaGraphGetAllocationFailurePlaceholder(&ptr)) {
+                // 捕获期分配失败只能用 256 字节占位地址把 host 侧流程走完。这里必须
+                // 报出申请方: 否则后面第一次往占位地址搬数据会以 "invalid argument"
+                // 报出来, 把真正的捕获期分配失败彻底盖掉。
+                printf("[fastllm] graph capture allocation failed (graph will be discarded): %s",
+                       msg.c_str());
+                fflush(stdout);
+                return false;
+            }
             // Tensor-parallel ranks are worker threads in one process.  Waiting
             // for stdin here leaves peer ranks blocked in NCCL and makes an API
             // server look healthy while every request hangs.  Allocation
