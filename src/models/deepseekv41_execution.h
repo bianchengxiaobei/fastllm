@@ -3,6 +3,7 @@
 
 #include "deepseekv41.h"
 #include "utils/hybrid_moe.h"
+#include "utils/op_trace.h"
 #include <functional>
 
 namespace fastllm {
@@ -96,6 +97,7 @@ struct DeepSeekV41Model::HybridDecodeStage {
 };
 struct DeepSeekV41Model::ForwardState {
     std::unique_ptr<ForwardWorkspace> work;
+    std::unique_ptr<op_trace::LayerScope> traceLayer;
     ForwardState(DeepSeekV41Model &model, const std::vector<DeepSeekV41Segment> &inputSegments,
                                                        const Data &inputIds,
                                                        const Data *inputEmbeds,

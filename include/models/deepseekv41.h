@@ -501,7 +501,8 @@ namespace fastllm {
         void ReleaseForwardPrefill(ForwardWorkspace &, std::initializer_list<Data *> tensors);
         void RunForwardGraphSegment(ForwardWorkspace &, const std::function<void()> &body, int index, bool capturable,
             const std::function<void(DeepSeekV41GraphSegmentMeta&)> &record,
-            const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore);
+            const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore,
+            const char *traceRegion = nullptr);
         std::vector<int> ForwardGpu(const std::vector<DeepSeekV41Segment> &inputSegments,
                                                        const Data &inputIds,
                                                        const Data *inputEmbeds,

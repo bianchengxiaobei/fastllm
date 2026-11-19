@@ -37,6 +37,7 @@
 #endif
 #include "utils.h"
 #include "utils/hybrid_moe.h"
+#include "utils/op_trace.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #endif
@@ -1798,9 +1799,13 @@ namespace fastllm {
                     "DeepSeekV41 DSpark: drain accepted tokens before a batched forward.");
                 seg.state->dspark.reset();
             }
-            std::vector<int> plain = ForwardSegments(segments, inputIds, inputEmbeds, imageMask,
-                                                     generationConfigs, lastTokens, retLogits,
-                                                     samplingPastKeyValues);
+            std::vector<int> plain;
+            {
+                op_trace::RegionScope traceTarget("dspark.target");
+                plain = ForwardSegments(segments, inputIds, inputEmbeds, imageMask,
+                                        generationConfigs, lastTokens, retLogits,
+                                        samplingPastKeyValues);
+            }
             for (auto &seg : segments) {
                 DsparkDebugDumpState(*seg.state, "plain");
             }
@@ -1831,6 +1836,7 @@ namespace fastllm {
         // must retain their original row count through the target forward.
         const bool textOnly = inputEmbeds == nullptr && imageMask == nullptr;
         if (allowSpeculate && textOnly && numSegments == 1 && active[0] && seqlen == 1 && startPos > 0) {
+            op_trace::RegionScope tracePropose("dspark.propose");
             drafts = DsparkBuildVerifyInput(*segments[0].state, inputIds, startPos, verifyIds, draftTokens);
             const GenerationConfig &config = generationConfigs[0];
             if (config.output_token_limit > 0 && config.input_token_length > 0) {
@@ -1862,24 +1868,47 @@ namespace fastllm {
         }
 
         const double forwardStart = DsTick();
-        std::vector<int> ret = ForwardSegments(segments, *idsPtr, inputEmbeds, imageMask, generationConfigs,
-                                               lastTokens, retLogits, samplingPastKeyValues);
+        std::vector<int> ret;
+        {
+            op_trace::RegionScope traceTarget("dspark.target");
+            ret = ForwardSegments(segments, *idsPtr, inputEmbeds, imageMask, generationConfigs,
+                                  lastTokens, retLogits, samplingPastKeyValues);
+        }
         const double forwardMs = DsElapsed(forwardStart);
         // 单请求单 token 的普通前向：与校验前向对照，差值就是多校验 N 个候选的边际代价
         if (drafts == 0 && numSegments == 1 && seqlen == 1 && active[0]) {
             DsProfiler().AddPlainForward(forwardMs);
         }
 
+        // 下一轮（verify 或普通 decode）还会查同一批 Engram 表。趁着调度器
+        // 和 GPU 还在收尾，把预测到的行提前读进行缓存/页缓存；预测错了只是
+        // 多读几行，不参与任何计算。
+        auto prefetchNextEngram = [&](DeepSeekV41RequestState &state, int anchor) {
+            if (engram_layer_ids.empty() || anchor < 0) return;
+            std::vector<int> nextIds{anchor};
+            if (state.dspark && !state.dspark->drafts.empty()) {
+                const int cap = std::min((int)state.dspark->drafts.size(),
+                                         std::max(0, v41DsparkTokens));
+                nextIds.insert(nextIds.end(), state.dspark->drafts.begin(),
+                               state.dspark->drafts.begin() + cap);
+            }
+            PrefetchEngramRows(state.engramHistory, (int)state.engramHistory.size(), nextIds);
+        };
+
         if (drafts > 0) {
             DeepSeekV41RequestState &state = *segments[0].state;
             DeepSeekV41SpecScratch &scratch = scratches[0];
             AssertInFastLLM((int)scratch.tokens.size() == drafts + 1,
                             "DeepSeekV41 DSpark: the verifier did not return per-position tokens.");
-            const int accepted = DsparkAcceptedDraftCount(scratch, generationConfigs[0]);
-            scratch.acceptedDrafts = accepted;
-            const int commitCount = accepted + 1;
             const double commitStart = DsTick();
-            DsparkCommitPrefix(state, scratch, startPos, commitCount, drafts + 1);
+            int accepted = 0, commitCount = 0;
+            {
+                op_trace::RegionScope traceCommit("dspark.commit");
+                accepted = DsparkAcceptedDraftCount(scratch, generationConfigs[0]);
+                scratch.acceptedDrafts = accepted;
+                commitCount = accepted + 1;
+                DsparkCommitPrefix(state, scratch, startPos, commitCount, drafts + 1);
+            }
             const double commitMs = DsElapsed(commitStart);
             DsProfiler().AddVerify(drafts, accepted, forwardMs, commitMs);
             ret.assign(1, scratch.tokens[0]);
@@ -1897,7 +1926,12 @@ namespace fastllm {
             const int anchor = scratch.tokens[accepted];
             const bool stopped = anchor == eos_token_id || eos_token_ids.count(anchor) ||
                 generationConfigs[0].stop_token_ids.count(anchor);
-            DsparkAdvance(state, scratch, startPos, startPos + commitCount, stopped ? -1 : anchor, generationConfigs[0]);
+            {
+                op_trace::RegionScope traceAdvance("dspark.advance");
+                DsparkAdvance(state, scratch, startPos, startPos + commitCount, stopped ? -1 : anchor,
+                              generationConfigs[0]);
+            }
+            if (!stopped) prefetchNextEngram(state, anchor);
             segments[0].seqlen = 1;
             return ret;
         }
@@ -1920,8 +1954,12 @@ namespace fastllm {
                     segments[i].startPos + segments[i].seqlen - window_size;
             }
             DsparkDebugDumpState(*segments[i].state, "plain");
-            DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
-                          segments[i].startPos + segments[i].seqlen, anchor, generationConfigs[i]);
+            {
+                op_trace::RegionScope traceAdvance("dspark.advance");
+                DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
+                              segments[i].startPos + segments[i].seqlen, anchor, generationConfigs[i]);
+            }
+            if (anchor >= 0) prefetchNextEngram(*segments[i].state, anchor);
         }
         return ret;
     }
@@ -2157,6 +2195,9 @@ namespace fastllm {
 #endif
 
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
+        // The draft tail (candidate generation) is labelled separately below;
+        // this region covers the committed-span projection and ring stores.
+        op_trace::RegionScope traceMain("dspark.main");
         Data combined, tmp;
         std::vector<const Data *> inputs;
         inputs.reserve(scratch.mainHidden.size());
@@ -2293,7 +2334,11 @@ namespace fastllm {
         std::vector<float> confidence;
         DsDraftTimingSlot().Reset();
         const double draftStart = DsTick();
-        DsparkRunDraft(dspark, anchorToken, tokens, confidence, DsparkDraftConfig(config, scratch, anchorToken));
+        {
+            op_trace::RegionScope traceDraft("dspark.draft");
+            DsparkRunDraft(dspark, anchorToken, tokens, confidence,
+                           DsparkDraftConfig(config, scratch, anchorToken));
+        }
         const double draftMs = DsElapsed(draftStart);
         if (DsProfiler().On()) {
             DsProfiler().AddDraft(mainMs + draftMs, mainMs, DsDraftTimingSlot());
@@ -2332,6 +2377,7 @@ namespace fastllm {
         bool inputsPrepared = false;
         auto prepareInputs = [&]() {
             if (inputsPrepared) return;
+            op_trace::RegionScope tracePrepare("mtp.prepare");
             inputsPrepared = true;
             // ---- 输入：[anchor, noise, noise, ...] ----
             std::vector<float> idValues((uint64_t)block, (float)v41DsparkNoiseTokenId);
@@ -2715,6 +2761,7 @@ namespace fastllm {
                 }
 
                 {
+                    op_trace::RegionScope traceMoe("mtp.moe");
                     std::vector<Data*> moeWeights = v41DsparkMoeWeights[stage];
 #ifdef USE_NUMAS
                     HostMoePlacementScope placement(moeWeights.size() > 2 ? moeWeights[2] : nullptr);
@@ -2849,6 +2896,7 @@ namespace fastllm {
                              rms_norm_eps, headHidden, normed, confidenceWeight != nullptr);
             // ---- head：mtp.<last>.norm + 共享 lm_head ----
             const double headStart = DsTick();
+            op_trace::RegionScope traceHead("mtp.head");
             bool headProjected = false, shardedMarkov = false;
 #ifdef USE_CUDA
             // Sharded sampling retains an unfiltered proposal distribution.
@@ -2902,7 +2950,13 @@ namespace fastllm {
 #endif
         };
 #ifdef USE_CUDA
-        if (!graphState || !DsRunDraftGraph(*graphState, backbone)) backbone();
+        // 捕获前把 FP8 辅助数据补齐(首次调用后为空操作), 否则捕获体里第一次用到
+        // scales 时补分配会被运行时拒绝, 草稿图只能永久回落逐算子执行。
+        if (graphState && graphState->execs.empty() && !graphState->disabled) WarmupFp8GraphAuxiliary();
+        {
+            op_trace::RegionScope traceBackbone("mtp.backbone");
+            if (!graphState || !DsRunDraftGraph(*graphState, backbone)) backbone();
+        }
 #else
         backbone();
 #endif
@@ -2912,6 +2966,7 @@ namespace fastllm {
         // CUDA 融合路径把串行 token 依赖留在设备上，每轮只回读一次。
         // 截断采样、工具约束及不支持的 dtype / 布局继续使用通用实现。
         const double markovStart = DsTick();
+        op_trace::RegionScope traceMarkov("mtp.markov");
         dspark.sampledProposal = randomDraft;
         const int markovRank = markovEmbedWeight.dims.size() == 2 ? markovEmbedWeight.dims[1]
                                                                   : v41DsparkMarkovRank;
@@ -3014,6 +3069,7 @@ namespace fastllm {
 
         // ---- confidence head：sigmoid(proj(cat(hidden, markov_embed))) ----
         const double confStart = DsTick();
+        op_trace::RegionScope traceConfidence("mtp.confidence");
         confidence.assign(block, 1.0f);
         if (confidenceWeight && markovAll.dims.size() == 3) {
             Data hiddenFloat, markovFloat, features, confLogits;
@@ -3030,6 +3086,15 @@ namespace fastllm {
             }
         }
         DsDraftTimingSlot().conf = DsElapsed(confStart);
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        {
+            // The decode step keeps CPU experts running through all draft
+            // layers and joins them at the end of its lifetime. Close it here
+            // under a name so the join is not folded into "host".
+            op_trace::RegionScope traceWait("mtp.wait_cpu");
+            draftStep.Finish();
+        }
+#endif
     }
 
     void DeepSeekV41Model::DsparkReportStats() {

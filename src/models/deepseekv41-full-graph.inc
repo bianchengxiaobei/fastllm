@@ -190,8 +190,7 @@ struct V41FullGraph {
 };
 
 // Match the captured row counts, but not request identities or their order.
-// KV pointers and positions are uploaded anew; the persistent permutation is
-// updated when requests move within the batch. Unknown layouts stay eager.
+// KV pointers and positions are uploaded anew; the persistent permutation is// updated when requests move within the batch. Unknown layouts stay eager.
 bool V41FullPartition(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segments,
                       std::vector<std::vector<DeepSeekV41Segment>> &local,
                       parallel::RowPartition &rows) {
@@ -1369,6 +1368,10 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         if (std::find(reserved.begin(), reserved.end(), 0) != reserved.end()) return false;
         g->rowTransfer->Reset(std::move(rows));
     } else if (!V41FullReserve(*g, f.inputSegments)) return false;
+    // Everything below prepares and launches one replay. Child regions name
+    // the engram gather, per-rank upload and the launch itself; the remainder
+    // stays "graph.prepare".
+    op_trace::RegionScope tracePrepare("graph.prepare");
     const auto snapshots = V41SnapshotSegments(f.inputSegments, engram_max_ngram_size);
     for (auto &entry : g->engrams) {
         auto &e = *entry.second;
@@ -1389,10 +1392,13 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         ~JoinEngram() { try { Finish(); } catch (...) {} }
     } joinEngram{g->engramWorker.get()};
     if (g->engramWorker) g->engramWorker->Start();
-    for (auto &entry : g->engrams) {
-        auto &e = *entry.second;
-        if (!e.table->gpuTable && !e.asyncGraph)
-            GatherEngramRows(entry.first, e.hostRows, g->batch, e.hostGathered);
+    {
+        op_trace::RegionScope traceGather("graph.engram");
+        for (auto &entry : g->engrams) {
+            auto &e = *entry.second;
+            if (!e.table->gpuTable && !e.asyncGraph)
+                GatherEngramRows(entry.first, e.hostRows, g->batch, e.hostGathered);
+        }
     }
     // Recalibrate initially and periodically without putting timing nodes on
     // every replay. CPU cost observations continue on every token.
@@ -1400,9 +1406,12 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     std::vector<int> uploaded(g->devices.size(), 0), ok(g->devices.size(), 0);
     std::atomic<int> ready{0};
     auto dispatchReplay = [&] { return V41FullDispatch(*g, [&](int rank, int device) {
-        uploaded[rank] = V41FullUploadRank(*g, f.inputSegments, rank, device) ? 1 : 0;
-        if (g->attentionRuntime && g->attentionGraphs[rank])
-            uploaded[rank] &= V41FullUploadRank(*g->attentionGraphs[rank], attentionSegments[rank], 0, device);
+        {
+            op_trace::RegionScope traceUpload("graph.upload");
+            uploaded[rank] = V41FullUploadRank(*g, f.inputSegments, rank, device) ? 1 : 0;
+            if (g->attentionRuntime && g->attentionGraphs[rank])
+                uploaded[rank] &= V41FullUploadRank(*g->attentionGraphs[rank], attentionSegments[rank], 0, device);
+        }
         ready.fetch_add(1, std::memory_order_release);
         while (ready.load(std::memory_order_acquire) < (int)g->devices.size())
             std::this_thread::yield();
@@ -1419,6 +1428,10 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
                 ? (rankTimed ? g->execs[rank] : g->rankUntimedExecs[rank])
                 : (timed ? g->execs[rank] : g->untimedExec);
             auto replay = [&] {
+                // The native MoE mailbox joins the previous replay before
+                // launching this one, so graph launch time can dominate a
+                // verify stage. Keep it under its own name.
+                op_trace::RegionScope traceReplay("graph.replay");
                 if (!handles.empty()) return FastllmCudaLaunchNativeMoeFullGraph(
                     exec, handles.data(), handles.size(), rankTimed);
                 return !g->moeHandles.empty()
@@ -1431,7 +1444,12 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         }
     }); };
     const bool launched = g->diskMoe ? g->diskMoe->Launch(dispatchReplay) : dispatchReplay();
-    joinEngram.Finish();
+    {
+        // The asynchronous engram reader is joined after the launch; keep its
+        // wall time separate from graph.prepare.
+        op_trace::RegionScope traceJoinEngram("graph.engram_join");
+        joinEngram.Finish();
+    }
     AssertInFastLLM(launched && std::all_of(ok.begin(), ok.end(), [](int v) { return v == 1; }),
                     "full decode graph replay failed");
     if (g->verifying) {

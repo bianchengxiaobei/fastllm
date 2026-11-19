@@ -118,7 +118,8 @@ inline void RecordOp(const std::string &opType,
                      uint64_t endNs,
                      const Timing &timing = Timing()) {
     Record(LayerIndex(datas, intParams), opType, deviceType,
-           WeightName(datas, intParams), TensorSummary(datas, intParams),
+           WeightName(datas, intParams),
+           TensorIoEnabled() ? TensorSummary(datas, intParams) : std::string(),
            startNs, endNs, timing);
 }
 

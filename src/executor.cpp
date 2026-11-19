@@ -601,6 +601,7 @@ namespace fastllm {
         auto st = std::chrono::system_clock::now();
         const bool opTraceEnabled = fastllm::op_trace::Enabled();
         const uint64_t opTraceStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
+        fastllm::op_trace::HostOpScope opTraceHostOp(opTraceStartNs);
         uint64_t opTraceTransferNs = 0;
         uint64_t opTraceReshapeNs = 0;
         uint64_t opTraceRunNs = 0;
@@ -769,9 +770,10 @@ namespace fastllm {
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
         if (opTraceEnabled) {
+            const uint64_t opTraceEndNs = fastllm::op_trace::NowNs();
             fastllm::op_trace::RecordOp(
                 opType, opTraceDevice, datas, intParams,
-                opTraceStartNs, fastllm::op_trace::NowNs(),
+                opTraceStartNs, opTraceEndNs,
                 fastllm::op_trace::Timing{
                     opTraceTransferNs, opTraceReshapeNs,
                     opTraceRunNs, opTraceSyncNs});
@@ -802,6 +804,7 @@ namespace fastllm {
         auto st = std::chrono::system_clock::now();
         const bool opTraceEnabled = fastllm::op_trace::Enabled();
         const uint64_t opTraceStartNs = opTraceEnabled ? fastllm::op_trace::NowNs() : 0;
+        fastllm::op_trace::HostOpScope opTraceHostOp(opTraceStartNs);
         uint64_t opTraceTransferNs = 0;
         uint64_t opTraceReshapeNs = 0;
         uint64_t opTraceRunNs = 0;
@@ -912,9 +915,10 @@ namespace fastllm {
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
         if (opTraceEnabled) {
+            const uint64_t opTraceEndNs = fastllm::op_trace::NowNs();
             fastllm::op_trace::RecordOp(
                 opType, opTraceDevice, datas, intParams,
-                opTraceStartNs, fastllm::op_trace::NowNs(),
+                opTraceStartNs, opTraceEndNs,
                 fastllm::op_trace::Timing{
                     opTraceTransferNs, opTraceReshapeNs,
                     opTraceRunNs, opTraceSyncNs});

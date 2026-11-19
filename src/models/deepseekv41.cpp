@@ -26,6 +26,7 @@
 
 #include "baseblock.h"
 #include "executor.h"
+#include "utils/op_trace.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "devices/disk/diskdevice.h"
 #include "deepseekv41-engram-prefetch.h"
@@ -823,18 +824,24 @@ namespace fastllm {
                     V41AllocLike(output, DataType::BFLOAT16,
                         {input.dims[0], input.dims[1], input.dims[3]}, input, devices);
                     std::vector<int> ok(devices.size(), 0);
-                    const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
-                        ok[rank] = FastllmCudaDeepSeekV41HcPreNorm(*input.multiDeviceDatas.at(device),
-                            *pre.multiDeviceDatas.at(device), *normWeight.multiDeviceDatas.at(device),
-                            eps, *output.multiDeviceDatas.at(device));
-                    });
+                    bool submitted = false;
+                    {
+                        op_trace::RegionScope traceFused("hc.apply_pre_norm");
+                        submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                            ok[rank] = FastllmCudaDeepSeekV41HcPreNorm(*input.multiDeviceDatas.at(device),
+                                *pre.multiDeviceDatas.at(device), *normWeight.multiDeviceDatas.at(device),
+                                eps, *output.multiDeviceDatas.at(device));
+                        });
+                    }
                     if (submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; })) return;
                 }
             }
             if (!disableFused && input.dataDevice == DataDevice::CUDA && !input.multiDeviceData &&
-                V41FusedPreNormSameDevice(input, pre, normWeight) &&
-                FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) {
-                return;
+                V41FusedPreNormSameDevice(input, pre, normWeight)) {
+                op_trace::RegionScope traceFused("hc.apply_pre_norm");
+                if (FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) {
+                    return;
+                }
             }
 #endif
             V41HcApplyPre(input, pre, tmp);
@@ -884,24 +891,30 @@ namespace fastllm {
                     if (quantizedOutput != nullptr)
                         V41AllocLike(*quantizedOutput, DataType::BFLOAT16, {b, n, input.dims[3]}, input, devices);
                     std::vector<int> ok(devices.size(), 0);
-                    const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
-                        ok[rank] = FastllmCudaDeepSeekV41HcMixPreNorm(*input.multiDeviceDatas.at(device),
-                            *previousPre.multiDeviceDatas.at(device), *fn.multiDeviceDatas.at(device),
-                            *scale.multiDeviceDatas.at(device), *base.multiDeviceDatas.at(device),
-                            *normWeight.multiDeviceDatas.at(device), iters, mixEps, normEps,
-                            *pre.multiDeviceDatas.at(device), *post.multiDeviceDatas.at(device),
-                            *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device),
-                            quantizedOutput != nullptr ? quantizedOutput->multiDeviceDatas.at(device) : nullptr);
-                    });
+                    bool submitted = false;
+                    {
+                        op_trace::RegionScope traceFused("hc.mix_pre_norm");
+                        submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                            ok[rank] = FastllmCudaDeepSeekV41HcMixPreNorm(*input.multiDeviceDatas.at(device),
+                                *previousPre.multiDeviceDatas.at(device), *fn.multiDeviceDatas.at(device),
+                                *scale.multiDeviceDatas.at(device), *base.multiDeviceDatas.at(device),
+                                *normWeight.multiDeviceDatas.at(device), iters, mixEps, normEps,
+                                *pre.multiDeviceDatas.at(device), *post.multiDeviceDatas.at(device),
+                                *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device),
+                                quantizedOutput != nullptr ? quantizedOutput->multiDeviceDatas.at(device) : nullptr);
+                        });
+                    }
                     if (submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }))
                         return quantizedOutput != nullptr;
                 }
             }
             if (eligible && !input.multiDeviceData &&
-                V41FusedPreNormSameDevice(input, previousPre, normWeight) &&
-                FastllmCudaDeepSeekV41HcMixPreNorm(input, previousPre, fn, scale, base, normWeight,
+                V41FusedPreNormSameDevice(input, previousPre, normWeight)) {
+                op_trace::RegionScope traceFused("hc.mix_pre_norm");
+                if (FastllmCudaDeepSeekV41HcMixPreNorm(input, previousPre, fn, scale, base, normWeight,
                     iters, mixEps, normEps, pre, post, comb, output, quantizedOutput))
-                return quantizedOutput != nullptr;
+                    return quantizedOutput != nullptr;
+            }
 #endif
             V41HcMix(input, fn, scale, base, hcMult, iters, mixEps, normEps, pre, post, comb);
             V41HcApplyPreNorm(input, previousPre, normWeight, normEps, tmp, output);
@@ -982,8 +995,11 @@ namespace fastllm {
                         local(comb, device), local(output, device));
                 }
             };
-            if (devices.empty()) run(0, ranks[0]);
-            else if (!MultiCudaRunDeviceCallbacks(devices, run)) return false;
+            {
+                op_trace::RegionScope traceFused("hc.post_mix_pre_norm");
+                if (devices.empty()) run(0, ranks[0]);
+                else if (!MultiCudaRunDeviceCallbacks(devices, run)) return false;
+            }
             return std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
         }
 
@@ -3959,6 +3975,7 @@ namespace fastllm {
 
     void DeepSeekV41Model::RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,
                                      Data &hiddenStates, EngramPrefetch *prefetch) {
+        op_trace::RegionScope traceRegion("engram");
         AssertInFastLLM(engramMeta.loaded,
                         "DeepSeekV41: engram meta is not loaded. Generate engram_meta.json with "
                         "`python -m ftllm.deepseek_v41_engram <model_dir>`.");
@@ -3980,6 +3997,7 @@ namespace fastllm {
 
         bool tookPrefetched = false;
         if (job != nullptr && job->engramLayerIndex == engramLayerIndex) {
+            op_trace::RegionScope traceWait("engram.prefetch_wait");
             mark = profiling ? V41NowMs() : 0.0;
             job->Join();
             if (job->error) std::rethrow_exception(job->error);
@@ -3996,6 +4014,7 @@ namespace fastllm {
             job->Reset();
         }
         if (!tookPrefetched) {
+            op_trace::RegionScope traceHash("engram.hash");
             mark = profiling ? V41NowMs() : 0.0;
             V41BuildEngramInputs(engramMeta, engramLayerIndex, engram_max_ngram_size, engram_n_heads,
                                  V41SnapshotSegments(segments, engram_max_ngram_size),
@@ -4046,6 +4065,7 @@ namespace fastllm {
         mark = profiling ? V41NowMs() : 0.0;
         Data localGather;
         if (!prefetchedGather) {
+            op_trace::RegionScope traceGather("engram.gather");
             GatherEngramRows(layer, rows, total, localGather, profiling ? &tPrep : nullptr);
         }
         Data &gathered = prefetchedGather ? *prefetchedGather : localGather;
@@ -4065,6 +4085,7 @@ namespace fastllm {
         Data kv;
 #ifdef USE_CUDA
         if (tp && !gathered.multiDeviceData) {
+            op_trace::RegionScope traceBroadcast("engram.broadcast");
             // Large CPU Engram rows need one PCIe upload, not one complete
             // host copy/upload per rank. NCCL preserves the original BF16 bits.
             if (gathered.GetBytes() < 1024 * 1024 ||
@@ -5599,14 +5620,19 @@ namespace fastllm {
             work->prefill ? std::min(end, work->prefill->endLayer) : end;
     }
     void DeepSeekV41Model::ForwardState::BeginLayer(int layer) {
+        op_trace::RegionScope traceBegin("layer.begin");
+        traceLayer.reset(new op_trace::LayerScope(layer));
         work->model.BeginForwardLayer(*work, layer);
         V41CheckHeap("layer-begin", layer);
     }
     void DeepSeekV41Model::ForwardState::EndLayer(int layer) {
+        op_trace::RegionScope traceEnd("layer.end");
         if (work->endedLayerInGraph != layer) work->model.EndForwardLayer(*work, layer);
         V41CheckHeap("layer-end", layer);
+        traceLayer.reset();
     }
     void DeepSeekV41Model::ForwardState::BeginHybridStep() {
+        op_trace::RegionScope traceStep("moe.begin_step");
         if (work->model.executionMode == ExecutionMode::Hybrid) {
             work->moeStep.emplace();
             work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen,
@@ -5782,8 +5808,12 @@ namespace fastllm {
 #endif
         work->combineFfnPostDispatch=work->model.RunHybridMoe(ctx, work->moeStep ? &*work->moeStep : nullptr);
     }
-    std::vector<int> DeepSeekV41Model::ForwardState::Finish() { return work->model.FinishForward(*work); }
+    std::vector<int> DeepSeekV41Model::ForwardState::Finish() {
+        op_trace::RegionScope traceRegion("finish");
+        return work->model.FinishForward(*work);
+    }
     void DeepSeekV41Model::PrepareForward(ForwardWorkspace &f) {
+        op_trace::RegionScope traceRegion("prepare.forward");
         PrepareAttentionParallel();
         auto &inputSegments = f.inputSegments;
         auto &inputIds = f.inputIds;
@@ -6160,6 +6190,7 @@ namespace fastllm {
 
     }
     void DeepSeekV41Model::PrepareForwardInputs(ForwardWorkspace &f) {
+        op_trace::RegionScope traceRegion("prepare.inputs");
         const auto &segments = f.boundedPrefill ? f.tailSegments : f.inputSegments;
         auto &inputIds = f.inputIds;
         auto &inputEmbeds = f.inputEmbeds;
@@ -6581,14 +6612,19 @@ namespace fastllm {
 
             TrimForwardPrefill(f, layer);
 
-            if (layer == 0 && !tp && !f.prefill && this->deviceMap.size() == 1)
+            if (layer == 0 && !tp && !f.prefill && this->deviceMap.size() == 1) {
+                op_trace::RegionScope tracePrefetch("moe.prefetch");
                 PrefetchDiskMoeV41(weights[layer], seqlen);
+            }
 
             // ---- Engram ----
             for (size_t l = 0; l < engram_layer_ids.size(); l++) {
                 if (engram_layer_ids[l] == layer) {
                     // Engram gather and NUMA MoE share the global CPU worker pool.
-                    if (f.moeStep) f.moeStep->WaitCpu();
+                    if (f.moeStep) {
+                        op_trace::RegionScope traceWaitCpu("moe.wait_cpu");
+                        f.moeStep->WaitCpu();
+                    }
                     std::unique_lock<std::mutex> hostLock;
                     if (f.prefill) hostLock = std::unique_lock<std::mutex>(*f.prefill->hostExperts);
                     RunEngram(layer, (int)l, segments, *curHidden, f.engramPrefetch.get());
@@ -6597,6 +6633,7 @@ namespace fastllm {
 
             // ---- DSpark：目标层的 main hidden（attention 的输入，对 hc 份取均值）----
             if (v41DsparkEnabled && (int)v41IsDsparkTarget.size() == block_cnt && v41IsDsparkTarget[layer]) {
+                op_trace::RegionScope traceCapture("dspark.capture");
                 int slot = 0;
                 for (size_t k = 0; k < v41DsparkTargetLayerIds.size(); k++) {
                     if (v41DsparkTargetLayerIds[k] == layer) {
@@ -6810,7 +6847,7 @@ namespace fastllm {
                     if (!meta.qIdxDims.empty() && qIdxAll.dims != meta.qIdxDims) {
                         qIdxAll.Reshape(meta.qIdxDims);
                     }
-                });
+                }, "attn.pre");
 
             ReleaseForwardPrefill(f, {&x, &qr, &qNorm, &ws->attnInputFloat, &ws->idxWeights});
             // Batch independent decode requests without changing their QK /
@@ -7413,7 +7450,7 @@ namespace fastllm {
                     if (meta.swapHidden) {
                         std::swap(curHidden, nextHidden);
                     }
-                });
+                }, "attn.post");
 
 #ifdef USE_CUDA
             if (v41AttentionRankRuntime) {
@@ -7564,7 +7601,7 @@ namespace fastllm {
                     if (expertScore.dims != meta.expertScoreDims) {
                         expertScore.Reshape(meta.expertScoreDims);
                     }
-                });
+                }, "route");
 
     }
     void DeepSeekV41Model::EndForwardLayer(ForwardWorkspace &f, int layer) {
@@ -7594,9 +7631,11 @@ namespace fastllm {
 
             // Start the next layer's bounded reads before HcPost/attention.
             // Pipelined PP owns concurrent workspaces; retain its own ordering.
-            if (layer + 1 < block_cnt && !f.tp && !f.prefill && this->deviceMap.size() == 1)
+            if (layer + 1 < block_cnt && !f.tp && !f.prefill && this->deviceMap.size() == 1) {
+                op_trace::RegionScope tracePrefetch("moe.prefetch");
                 PrefetchDiskMoeV41(weights[layer + 1], f.boundedPrefill && layer + 1 >= decoderSwaTailLayer
                     ? std::min(f.seqlen, window_size) : f.seqlen);
+            }
 
             // HcPost uses residual's shape and input's element count. Keep the
             // CPU MoE output flat so next layer's MergeMOEBlock does not discard
@@ -7617,6 +7656,7 @@ namespace fastllm {
             bool ffnPostDone = false;
 #ifdef USE_CUDA
             if (combineFfnPostDispatch) {
+                op_trace::RegionScope tracePost("hc.moe_post");
                 ffnPostDone = f.tp ? MultiCudaDeepSeekV41AddHcPost(
                     ffnOut, sharedExpertOut, *curHidden, ffnPost, ffnComb, *nextHidden) :
                     FastllmCudaDeepSeekV41MoeHcPost(
@@ -7654,6 +7694,7 @@ namespace fastllm {
             }
     }
     std::vector<int> DeepSeekV41Model::FinishForward(ForwardWorkspace &f) {
+        op_trace::RegionScope traceRegion("finish.forward");
         auto &inputSegments = f.inputSegments;
         auto &generationConfigsIn = f.generationConfigsIn;
         auto &lastTokens = f.lastTokens;
@@ -7689,7 +7730,10 @@ namespace fastllm {
         if (moeStep && f.pipeline) {
             f.pipeline->step = std::make_unique<HybridMoeDecodeStep>(std::move(*moeStep));
             moeStep.reset();
-        } else if (moeStep) moeStep->Finish();
+        } else if (moeStep) {
+            op_trace::RegionScope traceMoe("moe.finish");
+            moeStep->Finish();
+        }
 #ifdef USE_CUDA
         if (f.prefill && !f.prefill->sampleOutput) {
             auto &payload = *f.prefill->payload;
@@ -7740,6 +7784,7 @@ namespace fastllm {
         // Greedy uses argmax; sampling uses the same target filtering as
         // LLMSamplingBlock and the shared Qwen chain-rejection implementation.
         if (dsparkVerify) {
+            op_trace::RegionScope traceDspark("dspark.verify");
             Data allHidden, normed, allLogits, topk;
             Data *verifyLogits = &allLogits;
 #ifdef USE_CUDA
@@ -7755,17 +7800,23 @@ namespace fastllm {
             }
             segments[0].spec->tokens.resize(seqlen);
             const GenerationConfig sampling = DsparkSamplingConfig(generationConfigsIn[0]);
-            if (sampling.top_k > 1) {
-                DsparkSampleVerify(*verifyLogits, *segments[0].state->dspark,
-                                    *segments[0].spec, sampling);
-            } else {
-                DsparkMaskToolLogits(*verifyLogits, sampling, segments[0].spec->draftTokens);
-                TopK(*verifyLogits, topk, 1);
-                topk.ToDevice(DataDevice::CPU);
-                const int stride = topk.dims[topk.dims.size() - 1];
-                const float *topkData = (const float*)topk.cpuData;
-                for (int i = 0; i < seqlen; i++) {
-                    segments[0].spec->tokens[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+            {
+                // Both samplers end in a blocking readback. The target graph
+                // was only enqueued, so this region usually holds the GPU
+                // completion wait rather than host-side code.
+                op_trace::RegionScope traceSample("dspark.verify.sample");
+                if (sampling.top_k > 1) {
+                    DsparkSampleVerify(*verifyLogits, *segments[0].state->dspark,
+                                        *segments[0].spec, sampling);
+                } else {
+                    DsparkMaskToolLogits(*verifyLogits, sampling, segments[0].spec->draftTokens);
+                    TopK(*verifyLogits, topk, 1);
+                    topk.ToDevice(DataDevice::CPU);
+                    const int stride = topk.dims[topk.dims.size() - 1];
+                    const float *topkData = (const float*)topk.cpuData;
+                    for (int i = 0; i < seqlen; i++) {
+                        segments[0].spec->tokens[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+                    }
                 }
             }
 #ifdef USE_CUDA
@@ -7784,6 +7835,7 @@ namespace fastllm {
         }
 
         // ---- head（每个片段只取最后一个 token）----
+        op_trace::RegionScope traceHead("sample.head");
         Data headInput;
         Data *samplingInput = &headInput;
 #ifdef USE_CUDA
@@ -8015,7 +8067,7 @@ namespace fastllm {
                 ws->sharedExpertPartition = meta.sharedExpertPartition;
                 if (ws->sharedExpertPartition == V41SharedExpertPartition::Intermediate)
                     ws->ffnOut.Reshape(ffnInput.dims);
-            });
+            }, "ffn");
     }
     DeepSeekV41MoeContext DeepSeekV41Model::MakeForwardMoeContext(ForwardWorkspace &f, int layer) {
         auto &inputSegments = f.inputSegments;
@@ -8047,6 +8099,7 @@ namespace fastllm {
     }
     void DeepSeekV41Model::FinishForwardGraphs(ForwardWorkspace &f) {
 #ifdef USE_CUDA
+        op_trace::RegionScope traceRegion("graph.finish");
         auto &graphState = f.graphState;
         auto &graphCapture = f.graphCapture;
         auto &graphReplay = f.graphReplay;
@@ -8235,7 +8288,9 @@ namespace fastllm {
     void DeepSeekV41Model::RunForwardGraphSegment(
             ForwardWorkspace &f, const std::function<void()> &body, int index, bool capturable,
             const std::function<void(DeepSeekV41GraphSegmentMeta&)> &record,
-            const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore) {
+            const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore,
+            const char *traceRegion) {
+        op_trace::RegionScope traceSegment(traceRegion != nullptr ? traceRegion : "");
 #ifdef USE_CUDA
         auto &graphState = f.graphState;
         auto &graphReplay = f.graphReplay;
@@ -8249,10 +8304,12 @@ namespace fastllm {
                 body();
                 return;
             }
-            if (index < (int)graphState->segments.size() &&
-                V41LaunchGraphSegment(*graphState, index, f.workerOrderedGraphReplay)) {
-                restore(graphState->segments[index]);
-                return;
+            if (index < (int)graphState->segments.size()) {
+                op_trace::RegionScope traceReplay("graph.replay");
+                if (V41LaunchGraphSegment(*graphState, index, f.workerOrderedGraphReplay)) {
+                    restore(graphState->segments[index]);
+                    return;
+                }
             }
             GiveUpForwardGraph(f, "replay");
             body();

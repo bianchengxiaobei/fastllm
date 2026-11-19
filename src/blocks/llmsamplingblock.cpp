@@ -1,5 +1,6 @@
 #include "baseblock.h"
 #include "models/basellm.h"
+#include "utils/op_trace.h"
 
 #include <cstdlib>
 #include <algorithm>
@@ -685,6 +686,7 @@ namespace fastllm {
         const std::map<int, void*> *precomputedReadyEvents,
         bool preservePrecomputedLogits
     ) {
+        op_trace::RegionScope traceSample("sample");
         Data ownedLogits;
         Data &sourceLogits = precomputedLogits == nullptr ? ownedLogits : *precomputedLogits;
         std::vector<Data> curLogits;
@@ -720,16 +722,19 @@ namespace fastllm {
                 generationConfigs[b].output_token_least <= 0 &&
                 !generationConfigs[b].output_logits;
         }
-        if (canUseShardedGreedy &&
-            SampleTensorParallelGreedyLogits(
-                sourceLogits, batch, lastRet,
-                precomputedGreedyIds, precomputedGreedyScores,
-                precomputedReadyEvents)) {
-            return;
+        if (canUseShardedGreedy) {
+            op_trace::RegionScope traceGreedy("sample.tp_greedy");
+            if (SampleTensorParallelGreedyLogits(
+                    sourceLogits, batch, lastRet,
+                    precomputedGreedyIds, precomputedGreedyScores,
+                    precomputedReadyEvents)) {
+                return;
+            }
         }
 #endif
         Data *mutableLogits = &sourceLogits;
         if (preservePrecomputedLogits && precomputedLogits != nullptr) {
+            op_trace::RegionScope traceCopy("sample.logits_copy");
 #ifdef USE_CUDA
             if (sourceLogits.multiDeviceData && sourceLogits.IsTensorParallelSharded()) {
                 std::vector<int> devices;
@@ -745,7 +750,10 @@ namespace fastllm {
         }
         Data &logits = *mutableLogits;
 #ifdef USE_CUDA
-        GatherTensorParallelLogitsToRoot(logits);
+        {
+            op_trace::RegionScope traceGather("sample.gather_logits");
+            GatherTensorParallelLogitsToRoot(logits);
+        }
 #endif
 
         bool allSimple = true, needLogits = false, needRepeatPenalty = false, needToolNameMask = false;
@@ -771,16 +779,22 @@ namespace fastllm {
         }
 
 #ifdef USE_CUDA
-        if (needToolNameMask && !needLogits && model->UseGpuToolCallConstraints() &&
-            SampleToolConstrainedCuda(logits, batch, generationConfigs, lastTokens, lastRet)) {
-            return;
+        if (needToolNameMask && !needLogits && model->UseGpuToolCallConstraints()) {
+            op_trace::RegionScope traceTool("sample.gpu_tool");
+            if (SampleToolConstrainedCuda(logits, batch, generationConfigs, lastTokens, lastRet)) {
+                return;
+            }
         }
 #endif
 
         if (allSimple && !needLogits) {
+            op_trace::RegionScope traceGreedy("sample.greedy");
             Data topk;
             TopK(logits, topk, 1);
-            topk.ToDevice(DataDevice::CPU);
+            {
+                op_trace::RegionScope traceReadback("sample.readback");
+                topk.ToDevice(DataDevice::CPU);
+            }
             float *topkData = (float*)topk.cpuData;
             for (int b = 0; b < batch; b++) {
                 lastRet.push_back((int) (topkData[0] + 1e-3));
@@ -818,20 +832,27 @@ namespace fastllm {
                     topPArr[b] = generationConfigs[b].top_p;
                     tempArr[b] = generationConfigs[b].temperature;
                 }
-                FastllmCudaTopKTopPSampling(
-                    (float *)logits.cudaData, tempArr.data(),
-                    topKArr.data(), topPArr.data(),
-                    outputIds.data(),
-                    batch, vocabSize);
+                {
+                    op_trace::RegionScope traceSampler("sample.gpu_sampler");
+                    FastllmCudaTopKTopPSampling(
+                        (float *)logits.cudaData, tempArr.data(),
+                        topKArr.data(), topPArr.data(),
+                        outputIds.data(),
+                        batch, vocabSize);
+                }
                 for (int b = 0; b < batch; b++) {
                     lastRet.push_back(outputIds[b]);
                 }
             } else
 #endif
             {
+                op_trace::RegionScope traceTopK("sample.cpu_topk");
                 Data topk;
                 TopK(logits, topk, maxTopK);
-                topk.ToDevice(DataDevice::CPU);
+                {
+                    op_trace::RegionScope traceReadback("sample.readback");
+                    topk.ToDevice(DataDevice::CPU);
+                }
                 for (int b = 0; b < batch; b++) {
                     lastRet.push_back(LLMSamplingOnly(topk, b, generationConfigs[b]));
                 }
@@ -846,6 +867,7 @@ namespace fastllm {
             for (int b = 0; b < batch; b++) {
                 Data &curLogit = curLogits[b];
                 if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
+                    op_trace::RegionScope traceReadback("sample.readback");
                     curLogit.ToDevice(DataDevice::CPU);
                     (*retLogits)[b]->resize(curLogit.Count(0));
                     memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
@@ -853,7 +875,10 @@ namespace fastllm {
                 if (generationConfigs[b].IsSimpleGreedy()) {
                     Data topk;
                     TopK(curLogit, topk, 1);
-                    topk.ToDevice(DataDevice::CPU);
+                    {
+                        op_trace::RegionScope traceReadback("sample.readback");
+                        topk.ToDevice(DataDevice::CPU);
+                    }
                     lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
                 } else {
                     LastTokensUnit emptyUnit;

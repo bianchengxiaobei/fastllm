@@ -3200,6 +3200,9 @@ namespace fastllm {
                     }
                 }
                 op_trace::PhaseScope tracePhase(tracePhaseKind, traceToken, traceRequest);
+                // Lock wait plus pre-forward staging. Child regions inside the
+                // model and the scheduler tail override this label.
+                op_trace::RegionScope traceForward("loop.forward");
                 dictLocker.unlock();
                 forwardLocker.lock();
 #ifdef USE_CUDA
@@ -3369,6 +3372,8 @@ namespace fastllm {
                 forwardLocker.unlock();
                 dictLocker.lock();
 
+                {
+                op_trace::RegionScope tracePost("loop.post");
                 // Prefill完成后立即Record，使其他请求可以尽早命中Prefix Cache
                 for (int i = 0; i < (int)handles.size(); i++) {
                     if (seqLens[i] > 1) {
@@ -3437,6 +3442,7 @@ namespace fastllm {
                 }
                 model->dictCV.notify_all();
                 ReleasePendingResultLogits(logits);
+                }
             } else {
                 // 没有任何请求可以调度时，等待新请求
             }

@@ -6922,6 +6922,7 @@ namespace fastllm {
                     model->dsparkEnabled && seqLens.size() == 1 &&
                     allDecodeTokens;
                 if (!persistentDsparkDecode) {
+                    op_trace::RegionScope traceClear("alloc.clear_big");
                     FastllmCudaClearBigBuffer();
                 }
 #endif

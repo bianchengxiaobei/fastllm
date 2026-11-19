@@ -503,7 +503,7 @@ PAGE_HTML = r"""<!doctype html>
   <span class="stat"><i>最慢</i><b id="winMax">-</b></span>
   <span class="stat"><i>格式转换</i><b id="convCount">0</b></span>
   <span class="stat"><i>rows</i><b id="rowCount">0</b></span>
-  <span id="syncState" class="warn">耗时拆分需同步；未开 FASTLLM_CUDA_SYNC=1 时等待可能为 0 或落入空隙；开启采集有额外开销</span>
+  <span id="syncState" class="warn">耗时拆分需同步；未开 FASTLLM_CUDA_SYNC=1 时等待可能为 0 或落入空隙；空隙默认按 host 区域记成 [gap] 事件；开启采集有额外开销</span>
 </section>
 
 <main class="dashboard">
@@ -544,6 +544,7 @@ PAGE_HTML = r"""<!doctype html>
           <span><i style="background:#ffb454"></i>Norm/Act</span>
           <span><i style="background:#38c7c7"></i>Data</span>
           <span><i style="background:#ff6b8a"></i>Sample</span>
+          <span><i style="background:#5b6b7f"></i>空隙归因</span>
           <span><i style="background:#ff4d6d"></i>慢算子标记</span>
         </div>
       </div>
@@ -603,7 +604,7 @@ PAGE_HTML = r"""<!doctype html>
         </div>
       </div>
       <div id="timeSplit" class="time-split"></div>
-      <div class="hint">算子=host 调用；传输=输入 ToDevice；等待=显式 CUDA 同步；空隙=墙钟未被事件覆盖。op 内部 D2H/拷贝仍算在算子；直接 CUDA 路径可能没有独立传输阶段；异步下 GPU 执行/传输等待可能落到空隙。</div>
+      <div class="hint">算子=host 调用；传输=输入 ToDevice；等待=显式 CUDA 同步；空隙=墙钟未被事件覆盖。op 内部 D2H/拷贝仍算在算子；直接 CUDA 路径可能没有独立传输阶段；异步下 GPU 执行/传输等待可能落到空隙。开启 <b>FASTLLM_OP_TRACE_GAPS</b>（默认开）后，空隙会按 host 侧代码区域记成 <b>[gap]</b> 事件，显示在时间线和空隙明细里；<b>FASTLLM_OP_TRACE_GAP_US</b> 控制最小记录粒度（默认 20 µs）。如空隙仍大且包含大量小段，可设 <b>FASTLLM_OP_TRACE_IO=0</b> 关闭逐算子输入输出摘要，降低采集自身开销。</div>
     </section>
 
     <section class="card">
@@ -704,10 +705,12 @@ PAGE_HTML = r"""<!doctype html>
     norm: "#ffb454",
     move: "#38c7c7",
     sample: "#ff6b8a",
+    gap: "#5b6b7f",
     other: "#8a93a6",
     hot: "#ff4d6d",
   };
   const CATEGORIES = [
+    { key: "gap", label: "空隙归因", color: COLORS.gap, test: /^\[(gap|span)\]/i },
     { key: "moe", label: "MoE", color: COLORS.moe, test: /moe|expert/i },
     { key: "gemm", label: "GEMM", color: COLORS.gemm, test: /linear|matmul|gemm|gemv|fc\b/i },
     { key: "attn", label: "Attn", color: COLORS.attn, test: /attention|flash|wkv|mla|indexer/i },
@@ -1288,6 +1291,7 @@ PAGE_HTML = r"""<!doctype html>
           totalUs: 0, count: 0,
           cudaUs: 0, cpuUs: 0, otherUs: 0, ops: new Map(),
           runUs: 0, xferUs: 0, waitUs: 0, otherOpUs: 0,
+          gapAttrUs: 0, gapLabels: new Map(),
           hasSplit: false,
           slowest: null, startUs: event.t_us, endUs: 0,
         };
@@ -1295,7 +1299,16 @@ PAGE_HTML = r"""<!doctype html>
       }
       token.totalUs += event.dur_us;
       token.count += 1;
-      if (hasTimingBreakdown(event)) {
+      if (event.gap) {
+        token.gapAttrUs += event.dur_us;
+        let gap = token.gapLabels.get(event.op);
+        if (!gap) {
+          gap = { op: event.op, totalUs: 0, count: 0 };
+          token.gapLabels.set(event.op, gap);
+        }
+        gap.totalUs += event.dur_us;
+        gap.count += 1;
+      } else if (hasTimingBreakdown(event)) {
         const runUs = Number(event.run_us) || 0;
         const xferUs = Number(event.xfer_us) || 0;
         const waitUs = Number(event.sync_us) || 0;
@@ -1307,9 +1320,11 @@ PAGE_HTML = r"""<!doctype html>
       } else {
         token.runUs += event.dur_us;
       }
-      if (event.dev === "cuda") token.cudaUs += event.dur_us;
-      else if (event.dev === "cpu") token.cpuUs += event.dur_us;
-      else token.otherUs += event.dur_us;
+      if (!event.gap) {
+        if (event.dev === "cuda") token.cudaUs += event.dur_us;
+        else if (event.dev === "cpu") token.cpuUs += event.dur_us;
+        else token.otherUs += event.dur_us;
+      }
       token.startUs = Math.min(token.startUs, event.t_us);
       token.endUs = Math.max(token.endUs, event.t_us + (event.dur_us || 0));
       let op = token.ops.get(event.op);
@@ -1320,7 +1335,7 @@ PAGE_HTML = r"""<!doctype html>
       op.totalUs += event.dur_us;
       op.count += 1;
       if (event.dur_us > op.maxUs) op.maxUs = event.dur_us;
-      if (!token.slowest || event.dur_us > token.slowest.dur_us) {
+      if (!event.gap && (!token.slowest || event.dur_us > token.slowest.dur_us)) {
         token.slowest = event;
       }
     }
@@ -1387,7 +1402,9 @@ PAGE_HTML = r"""<!doctype html>
       const reqLabel = token.req >= 0 ? "R" + token.req + " · " : "";
       const splitText = token.hasSplit
         ? "算子 " + formatUs(token.runUs) + " · 传输 " + formatUs(token.xferUs) +
-          " · 等待 " + formatUs(token.waitUs) + " · 空隙 " + formatUs(token.gapUs)
+          " · 等待 " + formatUs(token.waitUs) +
+          (token.gapAttrUs ? " · 归因 " + formatUs(token.gapAttrUs) : "") +
+          " · 空隙 " + formatUs(token.gapUs)
         : "未拆分 · 算子累计 " + formatUs(token.totalUs);
       const title = "点击查看该 token 时间线 · " + (token.req >= 0
         ? "request " + token.req + " · decode step " + token.token
@@ -1422,7 +1439,8 @@ PAGE_HTML = r"""<!doctype html>
         { key: "xferUs", label: "传输", color: "#38c7c7" },
         { key: "waitUs", label: "等待", color: "#ffb454" },
         { key: "otherOpUs", label: "其他", color: "#8a93a6" },
-        { key: "gapUs", label: "空隙", color: "#3b4b60" },
+        { key: "gapAttrUs", label: "空隙归因", color: "#5b6b7f" },
+        { key: "gapUs", label: "未归因空隙", color: "#3b4b60" },
       ].map((item) => ({ ...item, value: token[item.key] || 0 }));
     } else {
       components = [
@@ -1444,9 +1462,23 @@ PAGE_HTML = r"""<!doctype html>
         "</span><span class='val'>" + formatUs(item.value) +
         "</span><span class='pct'>" + pct.toFixed(1) + "%</span></div>";
     }).join("");
+    const gapEntries = Array.from(token.gapLabels ? token.gapLabels.values() : [])
+      .sort((a, b) => b.totalUs - a.totalUs);
+    const gapRows = gapEntries.slice(0, 8).map((item) => {
+      const label = String(item.op || "").replace(/^\[(gap|span)\]\s*/i, "");
+      const pct = (item.totalUs / Math.max(1, token.latencyUs)) * 100;
+      return "<div class='split-row'><span class='split-dot' style='background:#5b6b7f'></span>" +
+        "<span class='name' title='" + esc(item.op) + "'>" + esc(label) +
+        "</span><span class='val'>" + formatUs(item.totalUs) +
+        "</span><span class='pct'>" + pct.toFixed(1) + "%</span></div>";
+    }).join("");
+    const gapNote = gapEntries.length
+      ? "<div class='split-note'>空隙来源（按 host 侧区域；可用 [gap] 过滤）</div>" + gapRows
+      : "";
     const gapPct = token.latencyUs ? (token.gapUs / token.latencyUs) * 100 : 0;
     let note = tokenLabel(token) + " · " + formatUs(token.latencyUs) +
-      (token.hasSplit ? "" : " · 未拆分");
+      (token.hasSplit ? "" : " · 未拆分") +
+      (token.gapAttrUs ? " · 已归因 " + formatUs(token.gapAttrUs) : "");
     if (token.hasSplit && gapPct >= 30) {
       if (!token.waitUs) {
         note += " · 等待=0，确认 FASTLLM_CUDA_SYNC=1 已生效";
@@ -1457,7 +1489,7 @@ PAGE_HTML = r"""<!doctype html>
     $("splitNote").textContent = note;
     $("timeSplit").innerHTML =
       "<div class='split-stack'>" + bar + "</div>" +
-      "<div class='split-rows'>" + rows + "</div>";
+      "<div class='split-rows'>" + rows + "</div>" + gapNote;
   }
 
   function renderStats(agg) {
@@ -1477,7 +1509,7 @@ PAGE_HTML = r"""<!doctype html>
     $("latest").textContent = state.lastSeq || "-";
     $("winEvents").textContent = agg.count || 0;
     $("winTotal").textContent = agg.totalUs ? formatUs(agg.totalUs) : "-";
-    $("winTotal").title = "当前窗口内各算子耗时求和，线程/设备之间可能重叠";
+    $("winTotal").title = "当前窗口内各事件耗时求和（含 [gap] 空隙归因），线程/设备之间可能重叠";
     $("winMax").textContent = agg.maxUs ? formatUs(agg.maxUs) : "-";
     $("winMax").title = agg.slowest
       ? "#" + agg.slowest.seq + " · " + agg.slowest.op + " · " + agg.slowest.dev
@@ -1696,6 +1728,7 @@ PAGE_HTML = r"""<!doctype html>
         xferUs: token.xferUs || 0,
         waitUs: token.waitUs || 0,
         otherOpUs: token.otherOpUs || 0,
+        gapAttrUs: token.gapAttrUs || 0,
         gapUs: token.gapUs || 0,
       };
     });
@@ -1738,7 +1771,8 @@ PAGE_HTML = r"""<!doctype html>
         "<span><i style='background:#38c7c7'></i>传输</span>" +
         "<span><i style='background:#ffb454'></i>等待</span>" +
         "<span><i style='background:#8a93a6'></i>其他</span>" +
-        "<span><i style='background:#3b4b60'></i>空隙</span>";
+        "<span><i style='background:#5b6b7f'></i>空隙归因</span>" +
+        "<span><i style='background:#3b4b60'></i>未归因空隙</span>";
     } else {
       legend.hidden = true;
     }
@@ -1866,6 +1900,7 @@ PAGE_HTML = r"""<!doctype html>
       { key: "xferUs", color: "#38c7c7" },
       { key: "waitUs", color: "#ffb454" },
       { key: "otherOpUs", color: "#8a93a6" },
+      { key: "gapAttrUs", color: "#5b6b7f" },
       { key: "gapUs", color: "#3b4b60" },
     ] : [
       { key: "cudaUs", color: COLORS.gemm },
@@ -2464,6 +2499,7 @@ PAGE_HTML = r"""<!doctype html>
           " · <span style='color:#38c7c7'>传输 " + formatUs(token.xferUs) + "</span><br>" +
           "<span style='color:#ffb454'>等待 " + formatUs(token.waitUs) + "</span>" +
           " · 其他 " + formatUs(token.otherOpUs) +
+          " · <span style='color:#5b6b7f'>归因 " + formatUs(token.gapAttrUs) + "</span>" +
           " · 空隙 " + formatUs(token.gapUs)
         : "算子累计 " + formatUs(token.totalUs) +
           " · cuda " + formatUs(token.cudaUs) +

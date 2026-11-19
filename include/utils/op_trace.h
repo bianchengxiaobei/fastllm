@@ -20,6 +20,11 @@ namespace op_trace {
 
 using Clock = std::chrono::steady_clock;
 
+inline uint64_t NowNs() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Clock::now().time_since_epoch()).count();
+}
+
 struct Event {
     uint64_t seq = 0;
     uint64_t startNs = 0;
@@ -28,6 +33,7 @@ struct Event {
     int layer = -1;
     int request = -1;
     int token = -1;
+    bool gap = false;
     std::string phase;
     std::string op;
     std::string device;
@@ -66,12 +72,116 @@ struct ThreadPhase {
     int phase = (int)PhaseKind::None;
     int request = -1;
     int token = -1;
+    int layer = -1;
+    const char *region = "";
+    uint64_t lastEndNs = 0;
+    int phaseDepth = 0;
+    int opDepth = 0;
 };
 
 inline ThreadPhase &TlsPhase() {
     static thread_local ThreadPhase state;
     return state;
 }
+
+inline bool Enabled() noexcept;
+inline bool GapTrackingEnabled() noexcept;
+inline void FlushGap(uint64_t nowNs) noexcept;
+
+// Host-side code region used to label the wall-clock holes between traced
+// operators.  Entering/leaving a region flushes the current hole so the
+// untraced time is attributed to the block that actually spent it.
+class RegionScope {
+public:
+    explicit RegionScope(const char *name) noexcept {
+        ThreadPhase &state = TlsPhase();
+        previousRegion = state.region;
+        active = name != nullptr && name[0] != '\0' && Enabled() &&
+                 GapTrackingEnabled() &&
+                 state.phase != (int)PhaseKind::None;
+        if (!active) {
+            return;
+        }
+        FlushGap(NowNs());
+        state.region = name;
+    }
+
+    ~RegionScope() {
+        if (!active) {
+            return;
+        }
+        FlushGap(NowNs());
+        TlsPhase().region = previousRegion;
+    }
+
+    RegionScope(const RegionScope &) = delete;
+    RegionScope &operator=(const RegionScope &) = delete;
+
+private:
+    const char *previousRegion = "";
+    bool active = false;
+};
+
+// Keeps the layer field on synthetic gap events in sync with the model loop.
+class LayerScope {
+public:
+    explicit LayerScope(int value) noexcept {
+        ThreadPhase &state = TlsPhase();
+        previousLayer = state.layer;
+        active = Enabled() && GapTrackingEnabled() &&
+                 state.phase != (int)PhaseKind::None;
+        if (!active) {
+            return;
+        }
+        FlushGap(NowNs());
+        state.layer = value;
+    }
+
+    ~LayerScope() {
+        if (!active) {
+            return;
+        }
+        FlushGap(NowNs());
+        TlsPhase().layer = previousLayer;
+    }
+
+    LayerScope(const LayerScope &) = delete;
+    LayerScope &operator=(const LayerScope &) = delete;
+
+private:
+    int previousLayer = -1;
+    bool active = false;
+};
+
+// One Executor::Run call.  Marks the operator interval so region scopes
+// nested inside device code do not emit overlapping gap events.
+class HostOpScope {
+public:
+    explicit HostOpScope(uint64_t startNs) noexcept {
+        if (!Enabled()) {
+            return;
+        }
+        FlushGap(startNs);
+        ++TlsPhase().opDepth;
+        active = true;
+    }
+
+    ~HostOpScope() {
+        if (!active) {
+            return;
+        }
+        ThreadPhase &state = TlsPhase();
+        if (state.opDepth > 0) {
+            --state.opDepth;
+        }
+    }
+
+    HostOpScope(const HostOpScope &) = delete;
+    HostOpScope &operator=(const HostOpScope &) = delete;
+
+private:
+    bool active = false;
+};
 
 class PhaseScope {
 public:
@@ -80,16 +190,37 @@ public:
         previousPhase = state.phase;
         previousRequest = state.request;
         previousToken = state.token;
+        previousLayer = state.layer;
+        previousRegion = state.region;
+        if (state.phaseDepth == 0) {
+            state.lastEndNs = NowNs();
+            state.layer = -1;
+            state.region = "";
+            state.opDepth = 0;
+        }
         state.phase = (int)phase;
         state.request = request;
         state.token = token;
+        ++state.phaseDepth;
     }
 
     ~PhaseScope() {
         ThreadPhase &state = TlsPhase();
+        FlushGap(NowNs());
+        if (state.phaseDepth > 0) {
+            --state.phaseDepth;
+        }
+        if (state.phaseDepth == 0) {
+            state.lastEndNs = 0;
+            state.layer = -1;
+            state.region = "";
+            state.opDepth = 0;
+        }
         state.phase = previousPhase;
         state.request = previousRequest;
         state.token = previousToken;
+        state.layer = previousLayer;
+        state.region = previousRegion;
     }
 
     PhaseScope(const PhaseScope &) = delete;
@@ -99,6 +230,8 @@ private:
     int previousPhase = (int)PhaseKind::None;
     int previousRequest = -1;
     int previousToken = -1;
+    int previousLayer = -1;
+    const char *previousRegion = "";
 };
 
 
@@ -132,6 +265,44 @@ inline size_t ParseEnvCapacity() {
         parsed = 1000000ULL;
     }
     return (size_t)parsed;
+}
+
+inline bool GapTrackingEnabled() noexcept {
+    static const bool enabled = []() {
+        const char *value = std::getenv("FASTLLM_OP_TRACE_GAPS");
+        if (value == nullptr || value[0] == '\0') {
+            return true;
+        }
+        return ParseEnvEnabled(value);
+    }();
+    return enabled;
+}
+
+inline uint64_t GapThresholdNs() noexcept {
+    static const uint64_t threshold = []() -> uint64_t {
+        const char *value = std::getenv("FASTLLM_OP_TRACE_GAP_US");
+        if (value == nullptr || value[0] == '\0') {
+            return 20000ULL;
+        }
+        char *end = nullptr;
+        unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end == value) {
+            return 20000ULL;
+        }
+        return parsed * 1000ULL;
+    }();
+    return threshold;
+}
+
+inline bool TensorIoEnabled() noexcept {
+    static const bool enabled = []() {
+        const char *value = std::getenv("FASTLLM_OP_TRACE_IO");
+        if (value == nullptr || value[0] == '\0') {
+            return true;
+        }
+        return ParseEnvEnabled(value);
+    }();
+    return enabled;
 }
 
 inline void AppendJsonString(std::string &out, const std::string &value) {
@@ -194,7 +365,8 @@ public:
                 const std::string &io,
                 uint64_t startNs,
                 uint64_t durationNs,
-                const Timing &timing = Timing()) noexcept {
+                const Timing &timing = Timing(),
+                bool gap = false) noexcept {
         if (!Enabled()) {
             return;
         }
@@ -204,11 +376,12 @@ public:
             event.durationNs = durationNs;
             event.threadId = (uint64_t)std::hash<std::thread::id>{}(
                 std::this_thread::get_id());
-            const ThreadPhase &phase = TlsPhase();
+            ThreadPhase &phase = TlsPhase();
             event.phase = PhaseName(phase.phase);
             event.request = phase.request;
             event.token = phase.token;
             event.layer = layer;
+            event.gap = gap;
             event.op = op;
             event.device = device;
             event.weight = weight;
@@ -217,6 +390,10 @@ public:
             event.reshapeNs = timing.reshapeNs;
             event.runNs = timing.runNs;
             event.syncNs = timing.syncNs;
+            const uint64_t endNs = startNs + durationNs;
+            if (endNs > phase.lastEndNs) {
+                phase.lastEndNs = endNs;
+            }
 
             std::lock_guard<std::mutex> guard(mutex);
             if (events.size() >= capacity) {
@@ -307,6 +484,9 @@ private:
             out += std::to_string(event.layer);
             out += ",\"phase\":";
             AppendJsonString(out, event.phase);
+            if (event.gap) {
+                out += ",\"gap\":1";
+            }
             out += ",\"req\":";
             out += std::to_string(event.request);
             out += ",\"token\":";
@@ -378,9 +558,44 @@ inline std::string SnapshotJson(uint64_t afterSeq = 0, size_t maxEvents = 4096) 
     }
 }
 
-inline uint64_t NowNs() {
-    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-        Clock::now().time_since_epoch()).count();
+inline void RecordGapEvent(const std::string &name, int layer,
+                           uint64_t startNs, uint64_t endNs) noexcept {
+    try {
+        Instance().Record(layer, name, "host", "", "", startNs,
+                          endNs > startNs ? endNs - startNs : 0,
+                          Timing(), true);
+    } catch (...) {
+    }
+}
+
+// Closes the wall-clock hole since the last traced event.  Small holes are
+// intentionally left open so they accumulate into the next labelled region
+// instead of creating one event per operator.
+inline void FlushGap(uint64_t nowNs) noexcept {
+    try {
+        if (!Enabled() || !GapTrackingEnabled()) {
+            return;
+        }
+        ThreadPhase &state = TlsPhase();
+        if (state.phase == (int)PhaseKind::None || state.phaseDepth <= 0 ||
+            state.opDepth > 0 || state.lastEndNs == 0 ||
+            nowNs <= state.lastEndNs) {
+            return;
+        }
+        const uint64_t holeNs = nowNs - state.lastEndNs;
+        if (holeNs < GapThresholdNs()) {
+            return;
+        }
+        std::string name = "[gap] ";
+        if (state.region != nullptr && state.region[0] != '\0') {
+            name += state.region;
+        } else {
+            name += "host";
+        }
+        RecordGapEvent(name, state.layer, state.lastEndNs, nowNs);
+        state.lastEndNs = nowNs;
+    } catch (...) {
+    }
 }
 
 inline void Record(int layer,
@@ -390,10 +605,11 @@ inline void Record(int layer,
                    const std::string &io,
                    uint64_t startNs,
                    uint64_t endNs,
-                   const Timing &timing = Timing()) noexcept {
+                   const Timing &timing = Timing(),
+                   bool gap = false) noexcept {
     try {
         Instance().Record(layer, op, device, weight, io, startNs,
-                          endNs > startNs ? endNs - startNs : 0, timing);
+                          endNs > startNs ? endNs - startNs : 0, timing, gap);
     } catch (...) {
     }
 }

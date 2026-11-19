@@ -365,6 +365,10 @@ namespace fastllm {
 #endif
 
     bool DeepSeekV41Model::RunHybridMoe(DeepSeekV41MoeContext &ctx, HybridMoeDecodeStep *step) {
+        // Routed experts leave Executor entirely on this path, so without an
+        // explicit region their dispatch and CPU-expert wait show up as an
+        // unlabelled wall-clock hole between the surrounding traced ops.
+        op_trace::RegionScope traceMoeHost("moe.host");
         auto *ws = &ctx.workspace;
         auto &moeWeights = ctx.moeWeights;
 #ifdef USE_NUMAS
@@ -477,6 +481,7 @@ namespace fastllm {
             // The router may return CPU tensors. Stage only its small
             // result, never migrate the input/output of a captured segment.
             auto stageRoute = [&](Data &buffer, Data &source) -> Data & {
+                op_trace::RegionScope traceStage("moe.route_stage");
                 // Graph segments and eager PP routing already own valid CUDA
                 // tensors. Borrow them without changing ownership; the hybrid
                 // backend batches its pinned readback on the producing stream.
@@ -495,14 +500,17 @@ namespace fastllm {
             input.Resize({seqlen, dim});
             input.dataDeviceIds = {device};
             if ((streamingStep || cooperativeMoe || batchCacheCandidate) &&
-                !ctx.pipelineHostExperts && hybridMoeDevices.size() > 1)
+                !ctx.pipelineHostExperts && hybridMoeDevices.size() > 1) {
+                op_trace::RegionScope traceExperts("moe.experts");
                 singleCacheHandled = fastllm::RunHybridMoeOnDevices(
                     input, routeIndex, routeScore, ffnOut, moeWeights.data(),
                     (int)moeWeights.size(), layer, hybridMoeDevices, runSharedSegment);
-            else
+            } else {
+                op_trace::RegionScope traceExperts("moe.experts");
                 singleCacheHandled = fastllm::RunHybridMoe(
                     input, routeIndex, routeScore, ffnOut,
                     moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
+            }
         }
         const bool tpBatchCache = tp && !single && !graphActive && seqlen > 1 && seqlen <= 8;
         if (tp && FastllmCudaMoeCacheRequested() &&
@@ -523,17 +531,24 @@ namespace fastllm {
                 FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
                 if (!ws->hybrid) ws->hybrid.reset(new DeepSeekV41HybridWorkspace());
                 auto &cache = ws->hybrid->moeCache[cacheDevice];
-                V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
-                V41ReplicaToCpu(cache.score, expertScore, tpDevices);
-                cache.index.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
-                cache.score.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
+                {
+                    op_trace::RegionScope traceStage("moe.route_stage");
+                    V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
+                    V41ReplicaToCpu(cache.score, expertScore, tpDevices);
+                    cache.index.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
+                    cache.score.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
+                }
                 Data input;
                 input.FakeFrom(*local->second, 0);
                 input.Resize({seqlen, dim});
                 input.dataDeviceIds = {cacheDevice};
-                tpCacheHandled = fastllm::RunHybridMoe(input, cache.index, cache.score, cache.output,
-                    moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
+                {
+                    op_trace::RegionScope traceExperts("moe.experts");
+                    tpCacheHandled = fastllm::RunHybridMoe(input, cache.index, cache.score, cache.output,
+                        moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
+                }
                 if (tpCacheHandled) {
+                    op_trace::RegionScope traceUpload("moe.upload");
                     // Keep the CPU buffer and its GPU replicas reusable.
                     // This staging copy also completes the
                     // cache producer before the joint AddTo/HcPost dispatch.
@@ -565,14 +580,21 @@ namespace fastllm {
                         cpuMoeInput, cpuMoeIndex, cpuMoeScore);
 #endif
                 if (!diskStaged) {
+                    op_trace::RegionScope traceStage("moe.route_stage");
                     V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
                     V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
                     V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
                 }
             }
-            runSharedSegment();
+            {
+                op_trace::RegionScope traceShared("moe.shared");
+                runSharedSegment();
+            }
         }
-        if (ctx.joinSharedSegment) ctx.joinSharedSegment();
+        if (ctx.joinSharedSegment) {
+            op_trace::RegionScope traceJoin("moe.shared_join");
+            ctx.joinSharedSegment();
+        }
         ctx.releaseSharedScratch();
 
         // Add in the routed result's precision, then round once at the MoE
@@ -629,10 +651,12 @@ namespace fastllm {
             stageMoeInput = stageMoeInput || (!overlapShared && graphActive && !routedExpertOnCuda);
 #endif
             if (stageMoeInput) {
+                op_trace::RegionScope traceStage("moe.route_stage");
                 V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
                 moeInputPtr = &cpuMoeInput;
             }
             if (stageMoeRoute) {
+                op_trace::RegionScope traceStage("moe.route_stage");
                 if (routedExpertParallel) {
                     // 专家并行要的是每卡一份的复制布局，不能拉到 CPU
                     V41Assign(cpuMoeIndex, expertIndex, tpDevices);
@@ -649,6 +673,7 @@ namespace fastllm {
             if (!tp && !graphActive && !dumpDebug && !V41ReferenceMathEnabled() &&
                 hasSharedExpertOut && V41DeviceSpecUsesType(moeDeviceSpec, "disk") &&
                 quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight")) {
+                op_trace::RegionScope traceExperts("moe.experts");
                 DiskMergeMOE disk;
                 cacheHandled = disk.RunGpuPrefill(*moeInputPtr, *moeIndexPtr, *moeScorePtr,
                     ffnOut, moeWeights, swiglu_limit);
@@ -668,6 +693,7 @@ namespace fastllm {
                 // small result before entering the device-cache adapter.
                 moeIndexPtr->ToDevice(DataDevice::CUDA);
                 moeScorePtr->ToDevice(DataDevice::CUDA);
+                op_trace::RegionScope traceExperts("moe.experts");
                 cacheHandled = fastllm::RunHybridMoe(*moeInputPtr, *moeIndexPtr, *moeScorePtr,
                     ffnOut, moeWeights.data(), (int)moeWeights.size(), layer);
             }
@@ -728,6 +754,7 @@ namespace fastllm {
                 std::vector<size_t> allocations;
                 {
                     FastllmCudaAllocationRecorder recorder(capturing ? nullptr : &allocations);
+                    op_trace::RegionScope traceExperts("moe.experts");
                     MergeMOEBlock(&remote.input, &remote.index, &remote.score, &moeWeights, &biass[layer],
                         &remote.w1, &remote.w2, &remote.w3, &remote.tempInput, &remote.tempOutput,
                         1.0f, &remote.output, layer, ffnInput.dataType, ffnInput.dataType,
@@ -749,13 +776,15 @@ namespace fastllm {
 #endif
             const bool profileMoeFallback = V41ProfileHostMoe() && !cacheHandled && !hostGpuHandled;
             const double moeFallbackStarted = profileMoeFallback ? V41HostMoeNowMs() : 0.0;
-            if (!cacheHandled && !hostGpuHandled)
+            if (!cacheHandled && !hostGpuHandled) {
+                op_trace::RegionScope traceExperts("moe.experts");
                 MergeMOEBlock(moeInputPtr, moeIndexPtr, moeScorePtr, &moeWeights, &biass[layer],
                           &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layer,
                           ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
                           MoeGateSwiglu, routedExpertParallel, swiglu_limit, true, nullptr,
                           activationQuantBlock,
                           quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
+            }
             if (profileMoeFallback) {
                 const char *weightDevice = "device";
                 if (moeWeights.size() > 2 && moeWeights[2] != nullptr) {
@@ -771,6 +800,7 @@ namespace fastllm {
                 // CPU / NUMA 上算出的路由专家结果只有一份，广播到两张卡后才能
                 // 与复制布局的共享专家输出、hc 残差相加。
                 // A previous decode may have retained replicas; upload the new CPU payload.
+                op_trace::RegionScope traceUpload("moe.upload");
                 V41ResetMultiDevice(ffnOut);
                 PrepareMultiCudaReplicatedData(ffnOut, tpDevices, true);
             }
@@ -780,7 +810,10 @@ namespace fastllm {
                     ffnOut.ToDevice(sharedExpertOut.dataDevice);
                 }
                 combineFfnPostDispatch = deferLocalPost();
-                if (!combineFfnPostDispatch) addSharedExpert();
+                if (!combineFfnPostDispatch) {
+                    op_trace::RegionScope traceSum("moe.shared_add");
+                    addSharedExpert();
+                }
             }
             if (!combineFfnPostDispatch && ffnOut.dataType != ffnInput.dataType) {
                 ToDataType(ffnOut, ffnInput.dataType);
@@ -797,6 +830,7 @@ namespace fastllm {
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
             combineFfnPostDispatch = deferLocalPost();
             if (!combineFfnPostDispatch) {
+                op_trace::RegionScope traceSum("moe.shared_add");
                 addSharedExpert();
                 if (ffnOut.dataType != ffnInput.dataType) ToDataType(ffnOut, ffnInput.dataType);
             }
@@ -880,7 +914,12 @@ namespace fastllm {
                 inputSegments[0].spec->commitKV = {};
             // Last-stage sampling has joined the whole chain. Only now may
             // cache admissions or CPU result buffers be recycled.
-            for (auto &ctx : contexts) if (ctx.step) ctx.step->Finish();
+            for (auto &ctx : contexts) {
+                if (ctx.step) {
+                    op_trace::RegionScope traceMoe("moe.pipeline_finish");
+                    ctx.step->Finish();
+                }
+            }
             return result;
         }
 #endif
