@@ -389,6 +389,27 @@ extern "C" {
         fastllm::op_trace::Clear();
     }
 
+    DLL_EXPORT void op_trace_flush(bool seal) {
+        fastllm::op_trace::ArchiveFlush(seal);
+    }
+
+    DLL_EXPORT char *op_trace_session_json() {
+        return string_to_chars(fastllm::op_trace::ArchiveSessionJson());
+    }
+
+    DLL_EXPORT char *op_trace_summary_json(int max_tokens) {
+        return string_to_chars(fastllm::op_trace::ArchiveSummaryJson(
+            max_tokens > 0 ? (size_t)max_tokens : 0));
+    }
+
+    DLL_EXPORT void op_trace_archive_shutdown() {
+        fastllm::op_trace::ArchiveShutdown();
+    }
+
+    DLL_EXPORT void set_op_trace_model(const char *model) {
+        fastllm::op_trace::ArchiveSetModel(model != nullptr ? model : "");
+    }
+
     DLL_EXPORT char *op_trace_snapshot_json(unsigned long long after_seq, int max_events) {
         return string_to_chars(fastllm::op_trace::SnapshotJson(
             (uint64_t)after_seq, max_events > 0 ? (size_t)max_events : 4096));

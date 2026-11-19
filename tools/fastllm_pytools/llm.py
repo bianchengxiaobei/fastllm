@@ -350,6 +350,21 @@ if hasattr(fastllm_lib, "op_trace_snapshot_json"):
 if hasattr(fastllm_lib, "free_op_trace_string"):
     fastllm_lib.free_op_trace_string.argtypes = [ctypes.c_void_p]
     fastllm_lib.free_op_trace_string.restype = None
+if hasattr(fastllm_lib, "op_trace_flush"):
+    fastllm_lib.op_trace_flush.argtypes = [ctypes.c_bool]
+    fastllm_lib.op_trace_flush.restype = None
+if hasattr(fastllm_lib, "op_trace_session_json"):
+    fastllm_lib.op_trace_session_json.argtypes = []
+    fastllm_lib.op_trace_session_json.restype = ctypes.c_void_p
+if hasattr(fastllm_lib, "op_trace_summary_json"):
+    fastllm_lib.op_trace_summary_json.argtypes = [ctypes.c_int]
+    fastllm_lib.op_trace_summary_json.restype = ctypes.c_void_p
+if hasattr(fastllm_lib, "op_trace_archive_shutdown"):
+    fastllm_lib.op_trace_archive_shutdown.argtypes = []
+    fastllm_lib.op_trace_archive_shutdown.restype = None
+if hasattr(fastllm_lib, "set_op_trace_model"):
+    fastllm_lib.set_op_trace_model.argtypes = [ctypes.c_char_p]
+    fastllm_lib.set_op_trace_model.restype = None
 
 def _dispatch_model_load_progress(stage, current, total, completed_bytes, total_bytes):
     handler = _model_load_progress_handler
@@ -762,6 +777,51 @@ def clear_op_trace() -> bool:
     if native_clear is None:
         return False
     native_clear()
+    return True
+
+def _read_op_trace_json(native_getter, *args):
+    ptr = native_getter(*args)
+    if not ptr:
+        return {}
+    try:
+        text = ctypes.string_at(ptr).decode("utf-8", errors = "replace")
+    finally:
+        native_free = getattr(fastllm_lib, "free_op_trace_string", None)
+        if native_free is not None:
+            native_free(ptr)
+    return json.loads(text)
+
+def flush_op_trace(seal: bool = True) -> bool:
+    native_flush = getattr(fastllm_lib, "op_trace_flush", None)
+    if native_flush is None:
+        return False
+    native_flush(ctypes.c_bool(bool(seal)))
+    return True
+
+def get_op_trace_session() -> dict:
+    native_getter = getattr(fastllm_lib, "op_trace_session_json", None)
+    if native_getter is None:
+        return {}
+    return _read_op_trace_json(native_getter)
+
+def get_op_trace_summary(max_tokens: int = 8192) -> dict:
+    native_getter = getattr(fastllm_lib, "op_trace_summary_json", None)
+    if native_getter is None:
+        return {}
+    return _read_op_trace_json(native_getter, ctypes.c_int(int(max_tokens)))
+
+def shutdown_op_trace_archive() -> bool:
+    native_shutdown = getattr(fastllm_lib, "op_trace_archive_shutdown", None)
+    if native_shutdown is None:
+        return False
+    native_shutdown()
+    return True
+
+def set_op_trace_model(model) -> bool:
+    native_setter = getattr(fastllm_lib, "set_op_trace_model", None)
+    if native_setter is None:
+        return False
+    native_setter(str(model or "").encode("utf-8"))
     return True
 
 def get_op_trace_snapshot(after_seq: int = 0, max_events: int = 4096) -> dict:

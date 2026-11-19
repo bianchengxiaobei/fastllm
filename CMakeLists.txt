@@ -238,7 +238,7 @@ endif()
 # all CUDA jobs have been queued. Keep them out of FASTLLM_CXX_SOURCES below.
 set(FASTLLM_LARGE_MODEL_SOURCES src/models/qwen3_5.cpp)
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/pd.cpp src/models/naive_n05_pd.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
-        src/devices/disk/diskdevice.cpp src/utils/autotune.cpp
+        src/devices/disk/diskdevice.cpp src/utils/autotune.cpp src/utils/op_trace_archive.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/deepseekv41.cpp src/models/deepseekv41_execution.cpp src/models/deepseekv41_gpu.cpp src/models/deepseekv41_hybrid.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/deepseekv41_prefix_disk.cpp src/models/dots3_note.cpp

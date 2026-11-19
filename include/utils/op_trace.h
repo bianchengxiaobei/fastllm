@@ -15,58 +15,11 @@
 #include <utility>
 #include <vector>
 
+#include "utils/op_trace_archive.h"
+#include "utils/op_trace_types.h"
+
 namespace fastllm {
 namespace op_trace {
-
-using Clock = std::chrono::steady_clock;
-
-inline uint64_t NowNs() {
-    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-        Clock::now().time_since_epoch()).count();
-}
-
-struct Event {
-    uint64_t seq = 0;
-    uint64_t startNs = 0;
-    uint64_t durationNs = 0;
-    uint64_t threadId = 0;
-    int layer = -1;
-    int request = -1;
-    int token = -1;
-    bool gap = false;
-    std::string phase;
-    std::string op;
-    std::string device;
-    std::string weight;
-    std::string io;
-    uint64_t transferNs = 0;
-    uint64_t reshapeNs = 0;
-    uint64_t runNs = 0;
-    uint64_t syncNs = 0;
-};
-
-struct Timing {
-    uint64_t transferNs = 0;
-    uint64_t reshapeNs = 0;
-    uint64_t runNs = 0;
-    uint64_t syncNs = 0;
-};
-
-enum class PhaseKind : uint8_t {
-    None = 0,
-    Prefill = 1,
-    Decode = 2,
-    Mixed = 3,
-};
-
-inline const char *PhaseName(int phase) {
-    switch (phase) {
-        case (int)PhaseKind::Prefill: return "prefill";
-        case (int)PhaseKind::Decode: return "decode";
-        case (int)PhaseKind::Mixed: return "mixed";
-        default: return "";
-    }
-}
 
 struct ThreadPhase {
     int phase = (int)PhaseKind::None;
@@ -235,19 +188,6 @@ private:
 };
 
 
-inline bool ParseEnvEnabled(const char *value) {
-    if (value == nullptr || value[0] == '\0') {
-        return false;
-    }
-    return std::strcmp(value, "1") == 0 ||
-           std::strcmp(value, "true") == 0 ||
-           std::strcmp(value, "TRUE") == 0 ||
-           std::strcmp(value, "on") == 0 ||
-           std::strcmp(value, "ON") == 0 ||
-           std::strcmp(value, "yes") == 0 ||
-           std::strcmp(value, "YES") == 0;
-}
-
 inline size_t ParseEnvCapacity() {
     const char *value = std::getenv("FASTLLM_OP_TRACE_CAPACITY");
     if (value == nullptr || value[0] == '\0') {
@@ -260,6 +200,24 @@ inline size_t ParseEnvCapacity() {
     }
     if (parsed < 64) {
         parsed = 64;
+    }
+    if (parsed > 1000000ULL) {
+        parsed = 1000000ULL;
+    }
+    return (size_t)parsed;
+}
+
+// Prefill events are pinned out of the ring before eviction so a long decode
+// cannot push them out of the live view.  0 disables pinning.
+inline size_t ParseEnvPrefillPin() {
+    const char *value = std::getenv("FASTLLM_OP_TRACE_PREFILL_PIN");
+    if (value == nullptr || value[0] == '\0') {
+        return 131072;
+    }
+    char *end = nullptr;
+    unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value) {
+        return 131072;
     }
     if (parsed > 1000000ULL) {
         parsed = 1000000ULL;
@@ -305,55 +263,52 @@ inline bool TensorIoEnabled() noexcept {
     return enabled;
 }
 
-inline void AppendJsonString(std::string &out, const std::string &value) {
-    out += '"';
-    for (unsigned char c : value) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20) {
-                    char buffer[8];
-                    std::snprintf(buffer, sizeof(buffer), "\\u%04x", c);
-                    out += buffer;
-                } else {
-                    out += (char)c;
-                }
-                break;
-        }
-    }
-    out += '"';
+inline ArchiveConfig MakeArchiveConfig() {
+    return ArchiveConfigFromEnv(TensorIoEnabled(), GapTrackingEnabled(),
+                                GapThresholdNs() / 1000ULL);
 }
 
 class Store {
 public:
     Store() : capacity(ParseEnvCapacity()),
-              enabled(ParseEnvEnabled(std::getenv("FASTLLM_OP_TRACE"))) {}
+              pinnedCapacity(ParseEnvPrefillPin()),
+              enabled(ParseEnvEnabled(std::getenv("FASTLLM_OP_TRACE"))) {
+        ArchiveConfigure(MakeArchiveConfig());
+    }
 
     bool Enabled() const {
         return enabled.load(std::memory_order_relaxed);
     }
 
     void SetEnabled(bool value) {
-        enabled.store(value, std::memory_order_relaxed);
+        bool previous = enabled.exchange(value, std::memory_order_relaxed);
+        if (value) {
+            ArchiveEnsureSession();
+        } else if (previous) {
+            ArchiveFlush(true);
+        }
     }
 
     size_t Capacity() const {
         return capacity;
     }
 
+    size_t PinnedCapacity() const {
+        return pinnedCapacity;
+    }
+
     void Clear() noexcept {
         try {
             std::lock_guard<std::mutex> guard(mutex);
             events.clear();
+            pinned.clear();
             dropped = 0;
             nextSeq = 1;
             ++epoch;
+            AggregateClear();
+            if (enabled.load(std::memory_order_relaxed)) {
+                ArchiveRotateSession();
+            }
         } catch (...) {
         }
     }
@@ -397,11 +352,22 @@ public:
 
             std::lock_guard<std::mutex> guard(mutex);
             if (events.size() >= capacity) {
+                Event &oldest = events.front();
+                if (pinnedCapacity > 0 && pinned.size() < pinnedCapacity &&
+                    oldest.phase == "prefill") {
+                    pinned.push_back(std::move(oldest));
+                } else {
+                    ++dropped;
+                }
                 events.pop_front();
-                ++dropped;
             }
             event.seq = nextSeq++;
             events.push_back(std::move(event));
+            const Event &stored = events.back();
+            if (enabled.load(std::memory_order_relaxed)) {
+                ArchiveAppend(stored);
+                AggregateRecord(stored);
+            }
         } catch (...) {
         }
     }
@@ -418,28 +384,52 @@ private:
     std::string SnapshotJsonImpl(uint64_t afterSeq, size_t maxEvents) {
         std::vector<Event> selected;
         uint64_t firstSeq = 0, lastSeq = 0, currentEpoch = 0;
-        uint64_t currentDropped = 0, currentSize = 0, lost = 0;
+        uint64_t currentDropped = 0, currentSize = 0, currentPinned = 0, lost = 0;
+        std::string sessionId;
+        std::string archiveStatus;
         {
             std::lock_guard<std::mutex> guard(mutex);
             currentEpoch = epoch;
             currentDropped = dropped;
             currentSize = (uint64_t)events.size();
+            currentPinned = (uint64_t)pinned.size();
+            sessionId = ArchiveSessionId();
+            archiveStatus = ArchiveStatusJson();
             lastSeq = nextSeq > 0 ? nextSeq - 1 : 0;
-            firstSeq = events.empty() ? nextSeq : events.front().seq;
-            if (afterSeq > 0 && firstSeq > afterSeq + 1) {
-                lost = 1;
+            if (!pinned.empty()) {
+                firstSeq = pinned.front().seq;
+            } else if (!events.empty()) {
+                firstSeq = events.front().seq;
+            } else {
+                firstSeq = nextSeq;
             }
             if (maxEvents == 0) {
                 maxEvents = 4096;
             }
-            selected.reserve(std::min(maxEvents, events.size()));
-            for (const Event &event : events) {
-                if (event.seq <= afterSeq) {
-                    continue;
-                }
-                selected.push_back(event);
-                if (selected.size() >= maxEvents) {
-                    break;
+            selected.reserve(std::min(maxEvents, pinned.size() + events.size()));
+
+            auto pinnedIt = std::upper_bound(
+                pinned.begin(), pinned.end(), afterSeq,
+                [](uint64_t value, const Event &event) { return value < event.seq; });
+            for (; pinnedIt != pinned.end() && selected.size() < maxEvents;
+                 ++pinnedIt) {
+                selected.push_back(*pinnedIt);
+            }
+            auto eventsIt = std::upper_bound(
+                events.begin(), events.end(), afterSeq,
+                [](uint64_t value, const Event &event) { return value < event.seq; });
+            for (; eventsIt != events.end() && selected.size() < maxEvents;
+                 ++eventsIt) {
+                selected.push_back(*eventsIt);
+            }
+            if (!selected.empty()) {
+                uint64_t expected = afterSeq + 1;
+                for (const Event &event : selected) {
+                    if (event.seq > expected) {
+                        lost = 1;
+                        break;
+                    }
+                    expected = event.seq + 1;
                 }
             }
         }
@@ -454,6 +444,10 @@ private:
         out += std::to_string(capacity);
         out += ",\"size\":";
         out += std::to_string(currentSize);
+        out += ",\"pinned\":";
+        out += std::to_string(currentPinned);
+        out += ",\"pinned_capacity\":";
+        out += std::to_string(pinnedCapacity);
         out += ",\"count\":";
         out += std::to_string((uint64_t)selected.size());
         out += ",\"first_seq\":";
@@ -464,6 +458,10 @@ private:
         out += std::to_string(currentDropped);
         out += ",\"lost\":";
         out += lost ? "true" : "false";
+        out += ",\"session_id\":";
+        AppendJsonString(out, sessionId);
+        out += ",\"archive\":";
+        out += archiveStatus;
         out += ",\"events\":[";
         for (size_t i = 0; i < selected.size(); ++i) {
             const Event &event = selected[i];
@@ -515,9 +513,11 @@ private:
 
 private:
     size_t capacity;
+    size_t pinnedCapacity;
     std::atomic<bool> enabled;
     std::mutex mutex;
     std::deque<Event> events;
+    std::deque<Event> pinned;
     uint64_t nextSeq = 1;
     uint64_t dropped = 0;
     uint64_t epoch = 0;
