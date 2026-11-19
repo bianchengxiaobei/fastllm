@@ -1587,6 +1587,7 @@ namespace fastllm {
         mutable std::mutex mutex;
         std::condition_variable ready;
         std::deque<std::pair<std::shared_ptr<Batch>, size_t>> queue;
+        std::deque<std::pair<std::shared_ptr<Batch>, size_t>> prefetchQueue;
         std::vector<std::thread> workers;
         bool stopping = false;
         Stats stats;
@@ -1658,11 +1659,17 @@ namespace fastllm {
                 size_t index;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
-                    ready.wait(lock, [&] { return stopping || !queue.empty(); });
-                    if (queue.empty()) return;
-                    batch = queue.front().first;
-                    index = queue.front().second;
-                    queue.pop_front();
+                    ready.wait(lock, [&] {
+                        return stopping || !queue.empty() || !prefetchQueue.empty();
+                    });
+                    // Teardown drains step reads but drops speculative warm-ups
+                    // whose futures were already released.
+                    if (queue.empty() && (stopping || prefetchQueue.empty())) return;
+                    // Step-blocking reads always win over speculative warm-ups.
+                    auto &source = queue.empty() ? prefetchQueue : queue;
+                    batch = source.front().first;
+                    index = source.front().second;
+                    source.pop_front();
                 }
                 uint8_t *dst = batch->bytes.data() + index * rowBytes;
                 std::exception_ptr error;
@@ -1693,6 +1700,10 @@ namespace fastllm {
         return impl->stats;
     }
     DiskEmbeddingRowReader::Ticket DiskEmbeddingRowReader::ReadAsync(const std::vector<int32_t> &rows) {
+        return ReadAsyncImpl(rows, false);
+    }
+    DiskEmbeddingRowReader::Ticket DiskEmbeddingRowReader::ReadAsyncImpl(
+            const std::vector<int32_t> &rows, bool lowPriority) {
         auto batch = std::make_shared<Impl::Batch>();
         batch->rows = rows;
         AssertInFastLLM(rows.size() <= std::numeric_limits<size_t>::max() / impl->rowBytes,
@@ -1714,8 +1725,9 @@ namespace fastllm {
                     memcpy(batch->bytes.data() + i * impl->rowBytes,
                            impl->cache.data() + impl->Slot(rows[i]) * impl->rowBytes, impl->rowBytes);
                     ++impl->stats.hits;
-                } else {
-                    impl->queue.emplace_back(batch, i);
+                } else if (!lowPriority || impl->prefetchQueue.size() < 4096) {
+                    auto &target = lowPriority ? impl->prefetchQueue : impl->queue;
+                    target.emplace_back(batch, i);
                     ++batch->remaining;
                 }
             }
@@ -1723,6 +1735,20 @@ namespace fastllm {
         }
         impl->ready.notify_all();
         return ticket;
+    }
+
+    void DiskEmbeddingRowReader::Prefetch(const std::vector<int32_t> &rows) {
+        if (rows.empty()) return;
+        try {
+            // Low-priority: workers only serve these when no step waits on a
+            // row. Dropping the ticket is intentional -- the workers still
+            // populate the row cache, so the next ReadAsync observes these
+            // rows as hits (and without a cache budget the reads at least
+            // warm the page cache).
+            ReadAsyncImpl(rows, true);
+        } catch (...) {
+            // Prefetch is best-effort; a bad row must not affect the step.
+        }
     }
 
     void DiskEmbeddingOp::Reshape(const std::string &opType, const DataDict &datas,

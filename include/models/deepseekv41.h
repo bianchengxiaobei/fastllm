@@ -638,6 +638,11 @@ namespace fastllm {
         void GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens, Data &output,
                               double *prepMs = nullptr);
 
+        // 推测下一轮输入 [history, startPos..] + tokens，提前把 Engram 行读进
+        // 行缓存/页缓存。失败只浪费 I/O，不影响正确性。
+        void PrefetchEngramRows(const std::vector<int> &history, int startPos,
+                                const std::vector<int> &tokens);
+
         // 对一批片段做 Engram：各片段分别算哈希行号，查表 / wkv / 门控按整批执行
         void RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,
                        Data &hiddenStates, EngramPrefetch *prefetch);

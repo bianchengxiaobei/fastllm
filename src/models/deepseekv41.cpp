@@ -3270,11 +3270,13 @@ namespace fastllm {
 
     // FASTLLM_DSV41_ENGRAM_DISK_CACHE_MB：磁盘 Engram 表的行缓存上限（MB）。
     // 常见 n-gram 短语在步与步、请求与请求之间重复哈希到相同行，
-    // 行缓存可以直接吸收这些重复的磁盘读；0（默认）保持原行为。
+    // 行缓存可以直接吸收这些重复的磁盘读；也是下一轮预取的行落地的地方。
+    // 默认 128MB/表：足够覆盖几十轮的预取（每轮约百行），内存占用有界；
+    // 设 0 可关闭缓存回到纯磁盘读。
     static size_t V41EngramDiskCacheBytes() {
         static size_t bytes = []() {
             const char *env = std::getenv("FASTLLM_DSV41_ENGRAM_DISK_CACHE_MB");
-            long long mb = env == nullptr ? 0 : std::atoll(env);
+            long long mb = env == nullptr ? 128 : std::atoll(env);
             return mb > 0 ? (size_t)mb * 1024 * 1024 : (size_t)0;
         }();
         return bytes;
@@ -3807,6 +3809,46 @@ namespace fastllm {
             for (size_t i = 0; i < ops.size(); i++) pool->Wait(threadSt + (int)i);
         }
         V41CheckHeap("engram-gather", layer);
+    }
+
+    void DeepSeekV41Model::PrefetchEngramRows(const std::vector<int> &history, int startPos,
+                                              const std::vector<int> &tokens) {
+        if (tokens.empty() || engram_layer_ids.empty() || !engramMeta.loaded) return;
+        if (startPos < 0 || startPos > (int)history.size()) return;
+        try {
+            // 历史里存的是压缩 id（见 ForwardSegments 的 Engram 历史段），
+            // 预测的 token 也要先过一遍 engram token map，否则哈希行号全错。
+            std::vector<int> source = history;
+            source.reserve(history.size() + tokens.size());
+            for (int tok : tokens) {
+                const bool valid = tok >= 0 && tok != image_token_id;
+                source.push_back(valid && (size_t)tok < engramMeta.tokenMap.size()
+                                     ? engramMeta.tokenMap[tok] : -1);
+            }
+            // startPos 是下一轮第一个 token 的位置；history 已经包含它之前的全部 token。
+            const V41EngramSegSnapshot snapshot(source, startPos, (int)tokens.size(),
+                                                engram_max_ngram_size);
+            const std::vector<V41EngramSegSnapshot> snapshots{snapshot};
+            std::vector<int64_t> rows;
+            std::vector<float> maskValues;
+            bool hasDead = false;
+            for (size_t i = 0; i < engram_layer_ids.size() && i < engramTables.size(); ++i) {
+                auto table = std::static_pointer_cast<V41EngramTable>(engramTables[i]);
+                if (!table || (!table->diskValueReader && !table->diskScaleReader)) continue;
+                V41BuildEngramInputs(engramMeta, (int)i, engram_max_ngram_size, engram_n_heads,
+                                     snapshots, (int)tokens.size(), rows, maskValues, hasDead);
+                std::vector<int32_t> lookup;
+                lookup.reserve(rows.size());
+                for (int64_t row : rows) {
+                    if (row >= 0 && row < table->rows) lookup.push_back((int32_t)row);
+                }
+                if (lookup.empty()) continue;
+                if (table->diskValueReader) table->diskValueReader->Prefetch(lookup);
+                if (table->diskScaleReader) table->diskScaleReader->Prefetch(lookup);
+            }
+        } catch (...) {
+            // 预取只是缓存预热，任何失败都不能影响本轮推理。
+        }
     }
 
     bool DeepSeekV41Model::TryBFloat16HeadLinear(Data &input, Data &output) {

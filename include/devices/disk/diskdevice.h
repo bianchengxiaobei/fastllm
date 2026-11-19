@@ -23,11 +23,15 @@ namespace fastllm {
         DiskEmbeddingRowReader(const DiskEmbeddingRowReader&) = delete;
         DiskEmbeddingRowReader &operator=(const DiskEmbeddingRowReader&) = delete;
         Ticket ReadAsync(const std::vector<int32_t> &rows);
+        // Warm the row cache (or the OS page cache when the budget is zero)
+        // ahead of the next step. The payload is dropped; failures are ignored.
+        void Prefetch(const std::vector<int32_t> &rows);
         size_t RowBytes() const;
         Stats GetStats() const;
     private:
         struct Impl;
         std::unique_ptr<Impl> impl;
+        Ticket ReadAsyncImpl(const std::vector<int32_t> &rows, bool lowPriority);
     };
 
     struct DiskMoeCacheStats {

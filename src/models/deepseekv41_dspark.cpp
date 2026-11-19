@@ -2112,6 +2112,11 @@ namespace fastllm {
             dspark.disabled = true;
             return;
         }
+        // 下一轮的第一个 token 已经确定，草稿 token 要等 DsparkRunDraft 之后才有。
+        // 先把 anchor 的 Engram 行读进缓存，给磁盘 I/O 留出整个草稿前向的时间。
+        if (anchorToken >= 0) {
+            PrefetchEngramRows(state.engramHistory, (int)state.engramHistory.size(), {anchorToken});
+        }
         if (dspark.committed != startPos) {
             // 例如批量前向的某些轮没有采集 main hidden：滑窗与目标缓存已经脱节，
             // 从当前位置重新开始累积（filled 归零，只影响接受率）。
