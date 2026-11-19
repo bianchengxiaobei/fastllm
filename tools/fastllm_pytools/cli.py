@@ -130,6 +130,17 @@ def args_parser():
     export_parser_ = subparsers.add_parser('export', parents = [shared_parser], help = '创建配置文件')
     export_parser_.add_argument('-o', '--output', type = str, required = True, help = '导出路径')
 
+    viewer_parser_ = subparsers.add_parser('op-trace-view', help='打开算子 Trace')
+    viewer_parser_.add_argument('--trace', default='', help='会话目录或 .ftrace 文件')
+    viewer_parser_.add_argument('--host', default='127.0.0.1')
+    viewer_parser_.add_argument('--port', type=int, default=8765)
+    viewer_parser_.add_argument('--root', default='')
+    viewer_parser_.add_argument('--no-browser', action='store_true')
+    viewer_parser_.add_argument('--read-only', action='store_true')
+
+    static_parser_ = subparsers.add_parser('op-trace-static', help='生成纯静态 Trace 查看器')
+    static_parser_.add_argument('--output', default='op_trace_viewer.html', help='输出 HTML 路径')
+
     parser.add_argument('-v', '--version', action='store_true', help='输出版本号并退出')
 
     return parser
@@ -137,6 +148,12 @@ def args_parser():
 
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == 'op-trace-view':
+        from .op_trace_viewer import main as viewer_main
+        raise SystemExit(viewer_main(raw_argv[1:]))
+    if raw_argv and raw_argv[0] == 'op-trace-static':
+        from .op_trace_static import main as static_main
+        raise SystemExit(static_main(raw_argv[1:]))
     # Remote lifecycle control needs only the standard library. Do not import
     # model, download or Web UI dependencies just to manage P/D processes.
     if raw_argv and raw_argv[0] == 'router':

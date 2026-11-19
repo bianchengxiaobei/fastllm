@@ -74,6 +74,17 @@ PAGE_HTML = r"""<!doctype html>
   button.ghost:hover { color: var(--text); background: #15202b; }
   button:disabled { opacity: .45; cursor: not-allowed; }
   button[hidden] { display: none; }
+  label[hidden] { display: none; }
+  .page-bar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+    padding: 8px 12px; border-top: 1px solid var(--line2);
+    color: var(--muted); font-size: 11px;
+  }
+  .page-bar[hidden] { display: none; }
+  .page-bar .spacer { margin-left: auto; }
+  .page-bar input[type="number"] { width: 112px; }
+  .archive-note { color: #8fc1ff; }
+  .archive-note.bad { color: var(--bad); }
   label {
     display: inline-flex; align-items: center; gap: 5px;
     color: var(--muted); font-size: 12px; white-space: nowrap;
@@ -128,6 +139,47 @@ PAGE_HTML = r"""<!doctype html>
   .dashboard {
     display: grid; grid-template-columns: minmax(0, 1fr) 382px;
     gap: 14px; padding: 14px 18px 18px; align-items: start;
+  }
+  .session-panel { margin: 12px 18px 0; }
+  .session-panel[hidden] { display: none; }
+  #sessionRoot {
+    display: inline-block; max-width: 52vw; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+  }
+  .session-list { display: flex; flex-direction: column; }
+  .session-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 62px 76px 132px 146px auto;
+    gap: 10px; align-items: center; padding: 8px 12px;
+    border-top: 1px solid var(--line2);
+  }
+  .session-row:first-child { border-top: 0; }
+  .session-main { min-width: 0; }
+  .session-name {
+    color: var(--text); font-weight: 600; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .session-path {
+    color: #6f7e91; font-size: 10px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; margin-top: 2px;
+  }
+  .session-meta {
+    color: var(--muted); font-size: 10px;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .session-badges { display: flex; flex-wrap: wrap; gap: 3px; }
+  .session-actions { display: flex; gap: 5px; justify-content: flex-end; }
+  .session-actions button { padding: 3px 8px; font-size: 10px; }
+  button.danger { color: var(--bad); border-color: #6b2b3a; }
+  button.danger:hover { color: #fff; background: #35151d; border-color: #a33b50; }
+  .session-empty {
+    color: var(--muted); text-align: center; padding: 18px 10px; font-size: 11px;
+  }
+  @media (max-width: 760px) {
+    .session-panel { margin: 10px 10px 0; }
+    .session-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .session-main { grid-column: 1 / -1; }
+    .session-actions { justify-content: flex-start; }
   }
   .col-main, .col-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
   .card {
@@ -449,6 +501,18 @@ PAGE_HTML = r"""<!doctype html>
   <div class="controls">
     <button id="toggle" class="primary" disabled>启用采集</button>
     <button id="clear">清空</button>
+    <button id="openFile" class="primary" hidden>打开文件</button>
+    <button id="openDir" hidden>打开目录</button>
+    <button id="uploadTrace" class="ghost" hidden>导入 .ftrace</button>
+    <label id="pathWrap" hidden>路径
+      <input id="tracePath" type="search" placeholder=".ftrace 或会话目录" style="width:220px">
+    </label>
+    <button id="openPath" hidden>打开</button>
+    <button id="packTrace" class="ghost" hidden>打包</button>
+    <button id="exportTrace" class="ghost" hidden>导出 Trace</button>
+    <button id="manageTrace" class="ghost" hidden>会话管理</button>
+    <button id="closeTrace" class="ghost" hidden>关闭数据</button>
+    <span id="archivePill" class="pill off" hidden>未打开</span>
     <span id="status" class="pill off">连接中</span>
     <label>窗口
       <select id="window" title="时间线和表格的时间范围">
@@ -487,13 +551,17 @@ PAGE_HTML = r"""<!doctype html>
     <label>过滤 <input id="filter" type="search" placeholder="op / weight / dtype" style="width:160px"></label>
     <button id="resetFilter" class="ghost" title="清空搜索、设备和耗时筛选">重置</button>
     <button id="locateMatch" class="ghost" title="跳到缓冲区里最近一条匹配当前筛选的事件">最近匹配</button>
-    <label><input type="checkbox" id="follow" checked> 跟随最新</label>
-    <label><input type="checkbox" id="pause"> 暂停视图</label>
+    <label id="followWrap"><input type="checkbox" id="follow" checked> 跟随最新</label>
+    <label id="pauseWrap"><input type="checkbox" id="pause"> 暂停视图</label>
   </div>
 </header>
+<input id="uploadFile" type="file" accept=".ftrace,application/zip" hidden>
 <section class="stats">
   <span class="stat"><i>events/s</i><b id="rate">0</b></span>
   <span class="stat"><i>buffer</i><b id="buffered">0</b><em>/</em><b id="capacity">0</b></span>
+  <span class="stat"><i>archive</i><b id="archiveState">-</b></span>
+  <span class="stat"><i>session</i><b id="sessionInfo">-</b></span>
+  <span class="stat"><i>pinned</i><b id="pinned">0</b></span>
   <span class="stat"><i>page</i><b id="loaded">0</b></span>
   <span class="stat"><i>devices</i><b id="deviceCounts">-</b></span>
   <span class="stat"><i>dropped</i><b id="dropped">0</b></span>
@@ -504,6 +572,22 @@ PAGE_HTML = r"""<!doctype html>
   <span class="stat"><i>格式转换</i><b id="convCount">0</b></span>
   <span class="stat"><i>rows</i><b id="rowCount">0</b></span>
   <span id="syncState" class="warn">耗时拆分需同步；未开 FASTLLM_CUDA_SYNC=1 时等待可能为 0 或落入空隙；空隙默认按 host 区域记成 [gap] 事件；开启采集有额外开销</span>
+</section>
+
+<section id="sessionPanel" class="card session-panel" hidden>
+  <div class="card-head">
+    <div>
+      <h2>归档会话</h2>
+      <span class="muted" id="sessionRoot">-</span>
+      <span class="muted" id="sessionStats"></span>
+    </div>
+    <div class="head-actions">
+      <button id="refreshSessions" class="ghost">刷新</button>
+      <button id="closeSessions" class="ghost">收起</button>
+    </div>
+  </div>
+  <div class="hint">保留策略：永久保留，仅手动删除；录制中的会话不可删除。目录和 `.ftrace` 分别计为一条记录。</div>
+  <div id="sessionList" class="session-list"></div>
 </section>
 
 <main class="dashboard">
@@ -575,6 +659,13 @@ PAGE_HTML = r"""<!doctype html>
           <tbody id="rows"></tbody>
         </table>
       </div>
+      <div id="pageBar" class="page-bar" hidden>
+        <button id="prevPage" class="ghost">上一页</button>
+        <button id="nextPage" class="ghost">下一页</button>
+        <label>跳到 seq <input id="jumpSeq" type="number" min="1" step="1"></label>
+        <button id="jumpSeqBtn" class="ghost">跳转</button>
+        <span id="pageNote" class="spacer">-</span>
+      </div>
     </section>
   </section>
 
@@ -583,7 +674,7 @@ PAGE_HTML = r"""<!doctype html>
       <div class="card-head">
         <div>
           <h2>Prefill / Decode</h2>
-          <span class="muted">全部缓冲 · 当前筛选</span>
+          <span class="muted" id="phaseScope">全部缓冲 · 当前筛选</span>
         </div>
         <span class="muted" id="phaseNote">-</span>
       </div>
@@ -650,6 +741,19 @@ PAGE_HTML = r"""<!doctype html>
 
   const $ = (id) => document.getElementById(id);
   const state = {
+    mode: "live",
+    viewerPath: "",
+    viewerSession: null,
+    viewerReadOnly: false,
+    viewerArchive: null,
+    liveArchive: null,
+    viewerPage: null,
+    viewerFilter: null,
+    summary: null,
+    summaryTime: 0,
+    summaryInFlight: false,
+    summaryTimer: null,
+    statusTimer: null,
     supported: true,
     enabled: false,
     epoch: null,
@@ -658,7 +762,10 @@ PAGE_HTML = r"""<!doctype html>
     events: [],
     capacity: 0,
     size: 0,
+    pinned: 0,
+    pinnedCapacity: 0,
     dropped: 0,
+    lost: 0,
     cudaSync: null,
     cudaSyncRaw: null,
     cudaGraphRaw: null,
@@ -697,6 +804,8 @@ PAGE_HTML = r"""<!doctype html>
     lastView: null,
   };
   const MAX_EVENTS = 65536;
+  const MAX_PAGE_EVENTS = 524288;
+  const MAX_PAGE_PREFILL = 262144;
   const KEEP_US = 3600000000;
   const COLORS = {
     moe: "#b07cff",
@@ -942,24 +1051,64 @@ PAGE_HTML = r"""<!doctype html>
   }
 
   function trimEvents() {
-    if (!state.events.length) return;
+    if (isViewer() || !state.events.length) return;
     const newest = state.events[state.events.length - 1].t_us;
     const cutoff = newest - KEEP_US;
-    let drop = 0;
-    while (drop < state.events.length &&
-           (state.events[drop].t_us < cutoff || state.events.length - drop > MAX_EVENTS)) {
-      drop++;
+    const pinEnabled = (Number(state.pinnedCapacity) || 0) > 0;
+    const prefillCap = pinEnabled
+      ? Math.min(Number(state.pinnedCapacity), MAX_PAGE_PREFILL)
+      : 0;
+    const eventCap = Math.max(MAX_EVENTS,
+      Math.min(Number(state.capacity) || MAX_EVENTS, MAX_PAGE_EVENTS));
+    if (state.events[0].t_us >= cutoff &&
+        state.events.length <= eventCap + prefillCap) {
+      if (!state.t0 || state.t0 < state.events[0].t_us - KEEP_US) {
+        state.t0 = state.events[0].t_us;
+      }
+      return;
     }
-    if (drop > 0) {
-      state.events.splice(0, drop);
-      if (state.selectedSeq != null &&
-          !state.events.some((event) => event.seq === state.selectedSeq)) {
-        state.selectedSeq = null;
-        renderDetail(null);
+    let prefillToKeep = 0;
+    let otherCount = 0;
+    for (const event of state.events) {
+      if (event.t_us < cutoff) continue;
+      if (pinEnabled && phaseOf(event) === "prefill") {
+        if (prefillToKeep < prefillCap) prefillToKeep += 1;
+      } else {
+        otherCount += 1;
       }
     }
-    if (!state.t0 || state.t0 < state.events[0].t_us - KEEP_US) {
-      state.t0 = state.events[0].t_us;
+    let skipOther = Math.max(0, otherCount - eventCap);
+    let keptPrefill = 0;
+    const kept = [];
+    for (const event of state.events) {
+      if (event.t_us < cutoff) continue;
+      if (pinEnabled && phaseOf(event) === "prefill") {
+        if (keptPrefill >= prefillCap) continue;
+        keptPrefill += 1;
+        kept.push(event);
+        continue;
+      }
+      if (skipOther > 0) {
+        skipOther -= 1;
+        continue;
+      }
+      kept.push(event);
+    }
+    if (kept.length === state.events.length) {
+      if (!state.t0 || state.t0 < state.events[0].t_us - KEEP_US) {
+        state.t0 = state.events[0].t_us;
+      }
+      return;
+    }
+    state.events = kept;
+    if (state.selectedSeq != null &&
+        !state.events.some((event) => event.seq === state.selectedSeq)) {
+      state.selectedSeq = null;
+      renderDetail(null);
+    }
+    if (!state.t0 || !state.events.length ||
+        state.t0 < state.events[0].t_us - KEEP_US) {
+      state.t0 = state.events.length ? state.events[0].t_us : 0;
     }
   }
 
@@ -983,16 +1132,32 @@ PAGE_HTML = r"""<!doctype html>
     state.enabled = !!data.enabled;
     state.capacity = Number(data.capacity || 0);
     state.size = Number(data.size || 0);
+    state.pinned = Number(data.pinned || 0);
+    state.pinnedCapacity = data.pinned_capacity == null
+      ? 0 : Number(data.pinned_capacity || 0);
     state.dropped = Number(data.dropped || 0);
     state.cudaSync = data.cuda_sync === true;
     state.cudaSyncRaw = data.cuda_sync_raw == null ? null : String(data.cuda_sync_raw);
     state.cudaGraphRaw = data.cuda_graph_raw == null ? null : String(data.cuda_graph_raw);
     updateSyncNotice();
     state.lastSeq = Number(data.last_seq || 0);
+    if (data.lost) {
+      state.lost = (state.lost || 0) + 1;
+    }
     const events = Array.isArray(data.events) ? data.events : [];
     if (events.length) {
-      state.events = state.events.concat(events);
-      state.afterSeq = Number(events[events.length - 1].seq);
+      const last = state.events.length ? state.events[state.events.length - 1].seq : 0;
+      if (!state.events.length || Number(events[0].seq) > Number(last)) {
+        state.events = state.events.concat(events);
+      } else {
+        const merged = new Map();
+        for (const event of state.events) merged.set(event.seq, event);
+        for (const event of events) merged.set(event.seq, event);
+        state.events = Array.from(merged.values())
+          .sort((left, right) => Number(left.seq) - Number(right.seq));
+      }
+      state.afterSeq = Number(events[events.length - 1].seq) ||
+        (Number(state.afterSeq) || 0);
       const now = performance.now();
       if (!state.rateTime) {
         state.rateTime = now;
@@ -1022,7 +1187,640 @@ PAGE_HTML = r"""<!doctype html>
     return await response.json();
   }
 
+  async function fetchJson(url, options) {
+    const response = await fetch(url, options || { cache: "no-store" });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (error) {
+      data = null;
+    }
+    if (!response.ok) {
+      const detail = data && (data.message || data.error || data.hint);
+      throw new Error(detail || ("HTTP " + response.status));
+    }
+    return data || {};
+  }
+
+  function updateUploadState() {
+    const button = $("uploadTrace");
+    button.hidden = !isViewer();
+    button.disabled = !!state.viewerReadOnly;
+    button.title = state.viewerReadOnly
+      ? "只读模式不能导入"
+      : "上传 .ftrace 到归档根目录并打开";
+  }
+
+  function applyMode() {
+    const viewer = isViewer();
+    $("toggle").hidden = viewer;
+    $("clear").hidden = viewer;
+    $("openFile").hidden = !viewer;
+    $("openDir").hidden = !viewer;
+    updateUploadState();
+    $("pathWrap").hidden = !viewer || $("pathWrap").hidden;
+    $("openPath").hidden = !viewer || $("pathWrap").hidden;
+    $("packTrace").hidden = !viewer || !state.viewerSession;
+    $("exportTrace").hidden = !viewer || !state.viewerSession;
+    $("manageTrace").hidden = !viewer;
+    $("closeTrace").hidden = !viewer || !state.viewerSession;
+    if (!viewer) $("sessionPanel").hidden = true;
+    $("archivePill").hidden = !viewer;
+    $("followWrap").hidden = viewer;
+    $("pauseWrap").hidden = viewer;
+    $("locateMatch").hidden = viewer;
+    document.title = viewer
+      ? "FastLLM · 算子 Trace · 离线"
+      : "FastLLM · 算子 Trace";
+    document.querySelector(".subtitle").textContent = viewer
+      ? "归档浏览 · 分页 · 全量摘要"
+      : "实时热点 · 时间线 · 数据格式";
+    setStatus();
+    updateArchiveState(viewer ? {
+      mode: "viewer",
+      session: state.viewerSession && state.viewerSession.session,
+      path: state.viewerPath,
+      sealed: state.viewerSession && state.viewerSession.sealed,
+      archive: state.viewerArchive,
+      packing: state.viewerSession && state.viewerSession.packing,
+      pack_error: state.viewerSession && state.viewerSession.pack_error,
+    } : { archive: state.liveArchive, mode: "live" });
+  }
+
+  function updateArchiveState(data) {
+    data = data || {};
+    const viewer = isViewer();
+    const archive = data.archive || (viewer ? state.viewerArchive : state.liveArchive) || {};
+    const session = data.session || (state.viewerSession && state.viewerSession.session) || "";
+    const path = data.path || state.viewerPath || "";
+    const sealed = data.sealed != null ? !!data.sealed :
+      !!(state.viewerSession && state.viewerSession.sealed);
+    const packing = !!data.packing;
+    const packError = String(data.pack_error || archive.pack_error || "");
+    const packed = data.packed != null ? !!data.packed : !!archive.packed;
+    const readOnly = !!data.read_only;
+    if (viewer) {
+      state.viewerArchive = archive;
+    } else {
+      state.liveArchive = archive;
+    }
+    let label = "未打开";
+    let kind = "off";
+    if (session || path) {
+      if (packing) { label = "打包中"; kind = "on"; }
+      else if (packError) { label = "打包失败"; kind = "bad"; }
+      else if (packed) { label = "已打包"; kind = "on"; }
+      else if (!sealed) { label = "录制中"; kind = "off"; }
+      else { label = "未打包"; kind = "off"; }
+    }
+    const pill = $("archivePill");
+    if (viewer) {
+      pill.hidden = false;
+      pill.textContent = label;
+      pill.className = "pill " + kind;
+      pill.title = packError || (path || "");
+    }
+    const stateText = packed ? "packed" : (packError ? "error" : (archive.state || "-"));
+    $("archiveState").textContent = stateText;
+    $("archiveState").title = packError || (path || "");
+    $("sessionInfo").textContent = session
+      ? session.slice(0, 8) + (session.length > 8 ? "…" : "")
+      : "-";
+    $("sessionInfo").title = path || "";
+    const pack = $("packTrace");
+    pack.hidden = !viewer || !state.viewerSession;
+    pack.disabled = !state.viewerSession || !sealed || packing || packed || readOnly;
+    pack.title = !state.viewerSession ? "先打开数据" :
+      (!sealed ? "会话仍在写入" : packetTitle(packed, packing, readOnly));
+    const exportBtn = $("exportTrace");
+    exportBtn.hidden = !viewer || !state.viewerSession;
+    exportBtn.disabled = !state.viewerSession;
+    exportBtn.title = !state.viewerSession ? "先打开数据" :
+      "下载 Chrome Trace / Perfetto JSON（当前可见事件）";
+    $("closeTrace").hidden = !viewer || !state.viewerSession;
+  }
+
+  function packetTitle(packed, packing, readOnly) {
+    if (packed) return "已打包";
+    if (packing) return "正在打包";
+    if (readOnly) return "只读模式不能打包";
+    return "生成 .ftrace 单文件";
+  }
+
+  async function refreshStatus() {
+    try {
+      const data = await fetchJson("/api/op-trace/status");
+      const mode = data.mode === "viewer" ? "viewer" : "live";
+      state.viewerReadOnly = !!data.read_only;
+      if (mode !== state.mode) {
+        state.mode = mode;
+        applyMode();
+      } else {
+        updateUploadState();
+      }
+      state.supported = data.supported !== false;
+      state.enabled = !!data.enabled;
+      if (mode === "viewer") {
+        if (data.session) {
+          state.viewerSession = {
+            ...(state.viewerSession || {}),
+            session: data.session,
+            path: data.path,
+            sealed: !!data.sealed,
+            archive: data.archive || {},
+            packed: !!data.packed,
+            packing: !!data.packing,
+            pack_error: data.pack_error || "",
+            read_only: !!data.read_only,
+          };
+          state.viewerPath = data.path || state.viewerPath;
+        } else {
+          state.viewerSession = null;
+          state.viewerPath = "";
+        }
+        updateArchiveState(data);
+      } else {
+        updateArchiveState(data);
+      }
+      if (!data.supported) setStatus("原生库不支持", "bad");
+    } catch (error) {
+      if (!state.events.length) setStatus("连接失败: " + error.message, "bad");
+    }
+  }
+
+  async function refreshSummary() {
+    if (state.summaryInFlight) return;
+    if (isViewer() && !state.viewerSession) return;
+    state.summaryInFlight = true;
+    try {
+      const data = await fetchJson("/api/op-trace/summary?max_tokens=8192");
+      if (data && data.phases) {
+        state.summary = data;
+        state.summaryTime = Date.now();
+        state.lastSideDraw = 0;
+        scheduleDraw();
+      }
+    } catch (error) {
+      if (isViewer() && !state.summary) {
+        setStatus("摘要加载失败: " + error.message, "bad");
+      }
+    } finally {
+      state.summaryInFlight = false;
+    }
+  }
+
+  function scheduleStatusPoll(delay) {
+    if (state.statusTimer != null) clearTimeout(state.statusTimer);
+    state.statusTimer = setTimeout(async () => {
+      state.statusTimer = null;
+      await refreshStatus();
+      scheduleStatusPoll(isViewer() ? 1200 : 2500);
+    }, delay == null ? (isViewer() ? 1200 : 2500) : delay);
+  }
+
+  function scheduleSummaryPoll() {
+    if (state.summaryTimer != null) clearTimeout(state.summaryTimer);
+    if (isViewer()) return;
+    state.summaryTimer = setTimeout(async () => {
+      state.summaryTimer = null;
+      await refreshSummary();
+      scheduleSummaryPoll();
+    }, 2000);
+  }
+
+  function hashParams() {
+    return new URLSearchParams(location.hash.replace(/^#/, ""));
+  }
+
+  function writeViewerHash() {
+    if (!isViewer() || !state.viewerPath) return;
+    const params = new URLSearchParams();
+    params.set("trace", state.viewerPath);
+    if (state.phaseFilter) params.set("phase", state.phaseFilter);
+    if (state.tokenFilter != null) {
+      params.set("token", String(state.tokenFilter));
+      if (state.tokenFilterReq != null && state.tokenFilterReq >= 0) {
+        params.set("req", String(state.tokenFilterReq));
+      }
+    } else if (!state.phaseFilter && state.viewerPage && state.viewerPage.fromSeq > 0) {
+      params.set("seq", String(state.viewerPage.fromSeq));
+    } else if (!state.phaseFilter && state.selectedSeq != null) {
+      params.set("seq", String(state.selectedSeq));
+    }
+    const next = "#" + params.toString();
+    if (location.hash !== next) {
+      history.replaceState(null, "", location.pathname + location.search + next);
+    }
+  }
+
+  function resetViewerFilters() {
+    state.phaseFilter = "";
+    state.tokenFilter = null;
+    state.tokenFilterReq = null;
+    state.frozenTokenKey = null;
+    state.frozenEnd = 0;
+    state.windowMode = "time";
+    state.windowUs = 0;
+    $("phaseFilter").value = "";
+    $("window").value = "0";
+    $("follow").checked = false;
+    $("pause").checked = false;
+    updateTokenChip();
+  }
+
+  async function loadViewerPage(fromSeq, filter, options) {
+    if (!state.viewerSession) return;
+    const opts = options || {};
+    const selectedFilter = filter === undefined ? state.viewerFilter : filter;
+    state.viewerFilter = selectedFilter || null;
+    const params = new URLSearchParams();
+    params.set("from_seq", String(Math.max(0, Number(fromSeq) || 0)));
+    params.set("limit", "8192");
+    if (selectedFilter && selectedFilter.phase) params.set("phase", selectedFilter.phase);
+    if (selectedFilter && selectedFilter.req != null && selectedFilter.req >= 0) {
+      params.set("req", String(selectedFilter.req));
+    }
+    if (selectedFilter && selectedFilter.token != null) {
+      params.set("token", String(selectedFilter.token));
+    }
+    const data = await fetchJson("/api/op-trace/archive/page?" + params.toString());
+    const events = Array.isArray(data.events) ? data.events : [];
+    state.events = events;
+    state.afterSeq = Number(data.next_seq || 0);
+    state.lastSeq = Number(data.total_events || 0) > 0
+      ? (events.length ? Number(events[events.length - 1].seq) : 0)
+      : 0;
+    state.t0 = events.length ? Number(events[0].t_us) || 0 : 0;
+    state.size = events.length;
+    state.capacity = 0;
+    state.selectedSeq = null;
+    state.focus = null;
+    state.follow = false;
+    state.paused = false;
+    state.frozenEnd = 0;
+    state.windowMode = "time";
+    state.windowUs = 0;
+    const firstPage = Math.max(0, Number(fromSeq) || 0);
+    const baseSeq = opts.baseSeq != null ? Math.max(0, Number(opts.baseSeq) || 0) :
+      (selectedFilter ? firstPage :
+        (state.viewerPage && state.viewerPage.filter === selectedFilter
+          ? state.viewerPage.baseSeq : 0));
+    state.viewerPage = {
+      fromSeq: firstPage,
+      baseSeq,
+      nextSeq: Number(data.next_seq || 0),
+      hasMore: !!data.has_more,
+      totalEvents: Number(data.total_events || 0),
+      firstSeq: events.length ? Number(events[0].seq) : 0,
+      lastSeq: events.length ? Number(events[events.length - 1].seq) : 0,
+      filter: selectedFilter || null,
+    };
+    $("window").value = "0";
+    $("follow").checked = false;
+    $("pause").checked = false;
+    renderDetail(null);
+    drawTable();
+    scheduleDraw();
+    if (opts.skipHash !== true) writeViewerHash();
+  }
+
+  async function viewerOpenPhase(phase, reveal, options) {
+    const opts = options || {};
+    state.phaseFilter = phase || "";
+    state.tokenFilter = null;
+    state.tokenFilterReq = null;
+    state.frozenTokenKey = null;
+    $("phaseFilter").value = state.phaseFilter;
+    updateTokenChip();
+    state.viewerFilter = state.phaseFilter ? { phase: state.phaseFilter } : null;
+    let fromSeq = 0;
+    if (state.phaseFilter) {
+      try {
+        const found = await fetchJson("/api/op-trace/archive/find?phase=" +
+          encodeURIComponent(state.phaseFilter));
+        fromSeq = Number(found.first_seq || 0);
+      } catch (error) {
+        fromSeq = 0;
+      }
+    }
+    await loadViewerPage(fromSeq, state.viewerFilter,
+      { ...opts, baseSeq: fromSeq });
+  }
+
+  async function viewerOpenToken(token, req, options) {
+    const opts = options || {};
+    const stats = buildPhaseTokenStats();
+    const key = tokenKey(req, token);
+    const item = stats.tokens.find((entry) => entry.key === key) ||
+      stats.tokens.find((entry) => Number(entry.token) === Number(token));
+    let firstSeq = item ? Number(item.firstSeq || 0) : 0;
+    let lastSeq = item ? Number(item.lastSeq || 0) : 0;
+    if (!firstSeq || !lastSeq) {
+      try {
+        const params = new URLSearchParams();
+        params.set("token", String(token));
+        if (req != null && Number(req) >= 0) params.set("req", String(req));
+        const found = await fetchJson("/api/op-trace/archive/find?" + params.toString());
+        firstSeq = Number(found.first_seq || 0);
+        lastSeq = Number(found.last_seq || 0);
+      } catch (error) {
+        firstSeq = 0;
+        lastSeq = 0;
+      }
+    }
+    if (!firstSeq) {
+      setStatus("该 token 不在归档索引中", "bad");
+      return;
+    }
+    state.phaseFilter = "decode";
+    state.tokenFilter = Number(token);
+    state.tokenFilterReq = req == null ? -1 : Number(req);
+    state.frozenTokenKey = key;
+    $("phaseFilter").value = "decode";
+    updateTokenChip();
+    state.viewerFilter = {
+      phase: "decode",
+      token: Number(token),
+      req: state.tokenFilterReq >= 0 ? state.tokenFilterReq : null,
+    };
+    await loadViewerPage(firstSeq, state.viewerFilter,
+      { ...opts, baseSeq: firstSeq });
+    state.windowMode = "token";
+    state.windowUs = 0;
+    $("window").value = "token";
+    state.frozenEnd = 0;
+    scheduleDraw();
+    if (opts.skipHash !== true) writeViewerHash();
+  }
+
+  async function openViewerPath(path, options) {
+    const opts = options || {};
+    setStatus("打开中…", "off");
+    const data = await fetchJson("/api/op-trace/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: String(path || "") }),
+    });
+    state.mode = "viewer";
+    state.viewerPath = data.path || String(path || "");
+    state.viewerSession = data;
+    state.viewerArchive = data.archive || (data.meta && data.meta.archive) || {};
+    state.viewerPage = null;
+    state.summary = null;
+    state.summaryTime = 0;
+    state.events = [];
+    state.selectedSeq = null;
+    resetViewerFilters();
+    $("pathWrap").hidden = true;
+    $("openPath").hidden = true;
+    applyMode();
+    await refreshSummary();
+    const params = opts.params || hashParams();
+    const phase = params.get("phase");
+    const tokenValue = params.get("token");
+    const seqValue = params.get("seq");
+    if (phase) {
+      await viewerOpenPhase(phase, false, { skipHash: true });
+    } else if (tokenValue != null) {
+      const reqValue = params.get("req");
+      await viewerOpenToken(Number(tokenValue),
+        reqValue == null ? -1 : Number(reqValue), { skipHash: true });
+    } else {
+      await loadViewerPage(seqValue ? Number(seqValue) : 0, null, { skipHash: true });
+    }
+    state.sealed = !!data.sealed;
+    updateArchiveState({ ...data, mode: "viewer" });
+    setStatus();
+    writeViewerHash();
+  }
+
+  async function pickTrace(mode) {
+    try {
+      const data = await fetchJson("/api/op-trace/pick", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      if (data.cancelled) return;
+      if (data.path) await openViewerPath(data.path);
+    } catch (error) {
+      $("pathWrap").hidden = false;
+      $("openPath").hidden = false;
+      $("tracePath").focus();
+      setStatus("选择文件失败: " + error.message, "bad");
+    }
+  }
+
+  async function openFromInput() {
+    const value = $("tracePath").value.trim();
+    if (!value) {
+      $("tracePath").focus();
+      return;
+    }
+    try {
+      await openViewerPath(value);
+    } catch (error) {
+      setStatus("打开失败: " + error.message, "bad");
+    }
+  }
+
+  async function uploadViewerTrace(file) {
+    if (!file) return;
+    setStatus("正在导入 " + file.name + "（" + formatBytes(file.size) + "）…", "off");
+    try {
+      const data = await fetchJson(
+        "/api/op-trace/import?name=" + encodeURIComponent(file.name || "uploaded.ftrace"),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: file,
+        });
+      await openViewerPath(data.path);
+      if (!$("sessionPanel").hidden) await loadSessions();
+      setStatus("已导入 " + (data.session || file.name), "off");
+    } catch (error) {
+      setStatus("导入失败: " + error.message, "bad");
+    }
+  }
+
+  async function packViewer() {
+    try {
+      await fetchJson("/api/op-trace/pack", { method: "POST" });
+      await refreshStatus();
+      setStatus("已提交打包", "off");
+    } catch (error) {
+      setStatus("打包失败: " + error.message, "bad");
+    }
+  }
+
+  async function exportViewerTrace() {
+    if (!state.viewerSession) return;
+    setStatus("正在导出 Chrome Trace...", "off");
+    try {
+      const response = await fetch("/api/op-trace/export?format=chrome",
+        { cache: "no-store" });
+      if (!response.ok) {
+        let detail = "";
+        try {
+          const data = await response.json();
+          detail = data && (data.message || data.error || data.hint) || "";
+        } catch (error) {
+          detail = "";
+        }
+        throw new Error(detail || ("HTTP " + response.status));
+      }
+      const disposition = response.headers.get("content-disposition") || "";
+      const match = /filename\*?=(?:UTF-8''|"?)([^";]+)/i.exec(disposition);
+      const filename = match ? decodeURIComponent(match[1]) : "op-trace.chrome.json";
+      const url = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      setStatus("已导出 Chrome Trace", "off");
+    } catch (error) {
+      setStatus("导出失败: " + error.message, "bad");
+    }
+  }
+
+  async function closeViewer() {
+    try {
+      await fetchJson("/api/op-trace/close", { method: "POST" });
+    } catch (error) {
+      setStatus("关闭失败: " + error.message, "bad");
+      return;
+    }
+    state.viewerSession = null;
+    state.viewerPath = "";
+    state.viewerArchive = null;
+    state.viewerPage = null;
+    state.summary = null;
+    state.events = [];
+    state.selectedSeq = null;
+    resetViewerFilters();
+    history.replaceState(null, "", location.pathname + location.search);
+    updateArchiveState({ mode: "viewer" });
+    renderDetail(null);
+    drawTable();
+    scheduleDraw();
+    setStatus();
+  }
+
+  function formatBytes(value) {
+    const n = Number(value || 0);
+    if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+    if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+    if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+    return Math.round(n) + " B";
+  }
+
+  function formatSessionTime(value) {
+    const ns = Number(value || 0);
+    if (!isFinite(ns) || ns <= 0) return "-";
+    const date = new Date(ns / 1e6);
+    return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString();
+  }
+
+  function sessionBadges(item) {
+    const badges = [];
+    if (item.active) badges.push('<span class="badge warn">录制中</span>');
+    else if (!item.sealed) badges.push('<span class="badge">未封</span>');
+    if (item.packed) badges.push('<span class="badge">已打包</span>');
+    return badges.join("");
+  }
+
+  function renderSessions(data, readOnly) {
+    const list = $("sessionList");
+    const sessions = (data.sessions || []).slice();
+    const readOnlyMode = !!readOnly;
+    $("sessionRoot").textContent = data.root ? ("根目录 " + data.root) : "-";
+    $("sessionStats").textContent = sessions.length
+      ? (sessions.length + " 项 · " +
+         formatBytes(sessions.reduce((sum, item) => sum + (Number(item.size_bytes) || 0), 0)))
+      : "";
+    if (!sessions.length) {
+      list.innerHTML = '<div class="session-empty">未找到归档会话</div>';
+      return;
+    }
+    const rootPath = String(data.root || "");
+    list.innerHTML = sessions.map((item) => {
+      const path = String(item.path || "");
+      const name = String(item.session || path);
+      const active = !!item.active;
+      const isRoot = !!rootPath && path === rootPath;
+      const blocked = active || readOnlyMode || isRoot;
+      const blockReason = active ? "录制中，不能删除" :
+        (readOnlyMode ? "只读模式不能删除" : "归档根目录本身不能删除");
+      const kind = item.kind === "ftrace" ? "单文件" : "目录";
+      const time = formatSessionTime(item.ended_at_ns || item.created_at_ns || item.mtime_ns);
+      return '<div class="session-row">' +
+        '<div class="session-main"><div class="session-name" title="' + esc(name) + '">' +
+        esc(name) + '</div><div class="session-path" title="' + esc(path) + '">' +
+        esc(path) + '</div></div>' +
+        '<span class="session-meta">' + kind + '</span>' +
+        '<span class="session-meta">' + formatBytes(item.size_bytes) + '</span>' +
+        '<span class="session-meta" title="' + esc(time) + '">' + esc(time) + '</span>' +
+        '<span class="session-badges">' + sessionBadges(item) + '</span>' +
+        '<span class="session-actions">' +
+        '<button class="ghost" data-session-action="open" data-path="' + esc(path) + '">打开</button>' +
+        '<button class="ghost danger" data-session-action="delete" data-path="' + esc(path) + '"' +
+        (blocked ? ' disabled title="' + esc(blockReason) + '"' : '') +
+        '>删除</button></span></div>';
+    }).join("");
+  }
+
+  async function loadSessions() {
+    $("sessionList").innerHTML = '<div class="session-empty">加载中…</div>';
+    try {
+      const data = await fetchJson("/api/op-trace/sessions");
+      renderSessions(data, data.read_only);
+    } catch (error) {
+      $("sessionList").innerHTML = '<div class="session-empty">加载失败: ' + esc(error.message) + '</div>';
+      $("sessionStats").textContent = "";
+      setStatus("加载会话失败: " + error.message, "bad");
+    }
+  }
+
+  async function toggleSessions(show) {
+    const panel = $("sessionPanel");
+    const next = show == null ? panel.hidden : !!show;
+    panel.hidden = !next;
+    if (next) await loadSessions();
+  }
+
+  async function openViewerSession(path) {
+    try {
+      await openViewerPath(path);
+      $("sessionPanel").hidden = true;
+    } catch (error) {
+      setStatus("打开失败: " + error.message, "bad");
+    }
+  }
+
+  async function deleteViewerSession(path) {
+    if (!path) return;
+    if (!window.confirm("确定删除这个会话记录？\n\n" + path +
+      "\n\n目录和 .ftrace 分开删除，此操作不可撤销。")) return;
+    try {
+      const data = await fetchJson("/api/op-trace/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (data.closed) await closeViewer();
+      await loadSessions();
+      setStatus("已删除 " + (data.session || path), "off");
+    } catch (error) {
+      setStatus("删除失败: " + error.message, "bad");
+      await loadSessions();
+    }
+  }
+
   async function poll() {
+    if (isViewer()) return;
     state.pollTimer = null;
     if (state.pollInFlight) return;
     state.pollInFlight = true;
@@ -1036,22 +1834,13 @@ PAGE_HTML = r"""<!doctype html>
         state.events = [];
         state.afterSeq = 0;
         state.t0 = 0;
+        state.lost = 0;
         state.selectedSeq = null;
         state.focus = null;
         renderDetail(null);
         data = await fetchSnapshot(0);
       }
       state.epoch = data.epoch;
-      if (data.lost) {
-        state.events = [];
-        state.afterSeq = 0;
-        state.t0 = 0;
-        state.selectedSeq = null;
-        state.focus = null;
-        renderDetail(null);
-        data = await fetchSnapshot(0);
-        state.epoch = data.epoch;
-      }
       appendSnapshot(data);
       let gotEvents = (data.events || []).length > 0;
       let more = 8;
@@ -1082,6 +1871,7 @@ PAGE_HTML = r"""<!doctype html>
   }
 
   function schedulePoll() {
+    if (isViewer()) return;
     if (state.pollTimer != null) return;
     const delay = !state.enabled ? 600 :
       (state.idlePolls >= 10 ? 1000 : (state.idlePolls >= 4 ? 400 : 100));
@@ -1093,6 +1883,19 @@ PAGE_HTML = r"""<!doctype html>
     if (message) {
       pill.textContent = message;
       pill.className = "pill " + (kind || "off");
+      return;
+    }
+    if (isViewer()) {
+      if (!state.viewerSession) {
+        pill.textContent = "未打开数据";
+        pill.className = "pill off";
+      } else if (!state.viewerSession.sealed) {
+        pill.textContent = "录制中 · 只读";
+        pill.className = "pill off";
+      } else {
+        pill.textContent = "离线浏览";
+        pill.className = "pill off";
+      }
       return;
     }
     if (!state.supported) {
@@ -1260,7 +2063,76 @@ PAGE_HTML = r"""<!doctype html>
       .slice(0, limit || 10);
   }
 
+  function isViewer() {
+    return state.mode === "viewer";
+  }
+
+  function phaseTokenCount(phase) {
+    if (phase == null) return 0;
+    if (phase.tokenCount != null) return Number(phase.tokenCount) || 0;
+    if (phase.tokens instanceof Set) return phase.tokens.size;
+    return Number(phase.tokens) || 0;
+  }
+
+  function normalizeSummary(raw) {
+    if (!raw || !raw.phases) return null;
+    const phases = {};
+    let grandUs = 0;
+    for (const phase of ["prefill", "decode", "mixed", "none"]) {
+      const item = raw.phases[phase] || {};
+      phases[phase] = {
+        events: Number(item.events) || 0,
+        us: Number(item.us) || 0,
+        tokens: Number(item.tokens) || 0,
+        tokenCount: Number(item.tokens) || 0,
+        tokenUs: 0,
+        tokenLatencyUs: 0,
+      };
+      grandUs += phases[phase].us;
+    }
+    const tokens = (Array.isArray(raw.tokens) ? raw.tokens : []).map((item) => {
+      const req = Number(item.req == null ? -1 : item.req);
+      const token = Number(item.token);
+      return {
+        req, token, key: tokenKey(req, token),
+        totalUs: Number(item.total_us) || 0,
+        count: Number(item.events) || 0,
+        latencyUs: Number(item.latency_us) || Math.max(1,
+          (Number(item.end_us) || 0) - (Number(item.start_us) || 0)),
+        runUs: Number(item.run_us) || 0,
+        xferUs: Number(item.xfer_us) || 0,
+        waitUs: Number(item.sync_us) || 0,
+        otherOpUs: Number(item.other_op_us) || 0,
+        gapUs: Number(item.gap_us) || 0,
+        gapAttrUs: Number(item.gap_attr_us) || 0,
+        cudaUs: Number(item.cuda_us) || 0,
+        cpuUs: Number(item.cpu_us) || 0,
+        otherUs: Number(item.other_us) || 0,
+        startUs: Number(item.start_us) || 0,
+        endUs: Number(item.end_us) || 0,
+        firstSeq: Number(item.first_seq) || 0,
+        lastSeq: Number(item.last_seq) || 0,
+        hasSplit: !!item.has_split,
+        gapLabels: new Map(),
+        ops: new Map(),
+        slowest: null,
+      };
+    });
+    for (const token of tokens) {
+      phases.decode.tokenUs += token.totalUs;
+      phases.decode.tokenLatencyUs += token.latencyUs;
+    }
+    if (!tokens.length && !grandUs &&
+        !phases.prefill.events && !phases.decode.events &&
+        !phases.mixed.events && !phases.none.events) {
+      return null;
+    }
+    return { phases, tokens, grandUs, fromSummary: true };
+  }
+
   function buildPhaseTokenStats() {
+    const summary = normalizeSummary(state.summary);
+    if (summary) return summary;
     const base = filterEvents(state.events, 0, Number.MAX_SAFE_INTEGER,
       { ignoreTime: true, ignorePhase: true, ignoreToken: true });
     const phases = {
@@ -1354,7 +2226,7 @@ PAGE_HTML = r"""<!doctype html>
     const phases = stats.phases;
     const total = stats.grandUs || 1;
     const pct = (us) => total ? (us / total) * 100 : 0;
-    const decodeTokens = phases.decode.tokens.size;
+    const decodeTokens = phaseTokenCount(phases.decode);
     const decodeAvg = decodeTokens ? phases.decode.tokenUs / decodeTokens : 0;
     const phaseBox = (phase, label, main, sub) =>
       "<div class='phase-box " + phase + (state.phaseFilter === phase ? " active" : "") +
@@ -1379,9 +2251,14 @@ PAGE_HTML = r"""<!doctype html>
       html += "<div class='phase-extra'>" + extra.join("　") + "</div>";
     }
     $("phaseStats").innerHTML = html;
+    $("phaseScope").textContent = stats.fromSummary
+      ? (isViewer() ? "全 session 归档摘要" : "全 session 聚合摘要")
+      : "全部缓冲 · 当前筛选";
     $("phaseNote").textContent = decodeTokens ? formatCount(decodeTokens) + " tokens" : "-";
+    const tokenTotal = Number(state.summary && state.summary.tokens_total) ||
+      stats.tokens.length;
     $("tokenNote").textContent = stats.tokens.length
-      ? "共 " + formatCount(stats.tokens.length) + " · 最近 " + Math.min(40, stats.tokens.length)
+      ? "共 " + formatCount(tokenTotal) + " · 最近 " + Math.min(40, stats.tokens.length)
       : "-";
     if (!stats.tokens.length) {
       const message = phases.decode.events
@@ -1499,14 +2376,38 @@ PAGE_HTML = r"""<!doctype html>
     if (state.enabled && state.rateTime && performance.now() - state.rateTime > 2500) {
       state.rate = 0;
     }
-    $("rate").textContent = state.rate;
-    $("buffered").textContent = state.size;
-    $("capacity").textContent = state.capacity || "-";
-    $("buffered").title = "服务端环形缓冲条数；容量 " + (state.capacity || "-") + " 条，超出后旧事件被覆盖";
+    const viewer = isViewer();
+    const archive = (viewer ? state.viewerArchive : state.liveArchive) || {};
+    const pageEventCap = Math.max(MAX_EVENTS,
+      Math.min(Number(state.capacity) || MAX_EVENTS, MAX_PAGE_EVENTS));
+    const pagePrefillCap = (Number(state.pinnedCapacity) || 0) > 0
+      ? Math.min(Number(state.pinnedCapacity), MAX_PAGE_PREFILL) : 0;
+    $("rate").textContent = viewer ? "-" : state.rate;
+    $("buffered").textContent = viewer
+      ? formatCount(state.viewerPage ? state.viewerPage.totalEvents : state.events.length)
+      : state.size;
+    $("capacity").textContent = viewer ? "sess" : (state.capacity || "-");
+    $("buffered").title = viewer
+      ? "当前会话的事件总数；当前页 " + state.events.length + " 条"
+      : "服务端环形缓冲条数；容量 " + (state.capacity || "-") +
+        " 条，超出后旧事件被覆盖；prefill 转存到 pinned";
+    $("pinned").textContent = viewer ? "-" : formatCount(state.pinned || 0);
+    $("pinned").title = viewer ? "离线查看器没有实时 pinned 缓冲" :
+      "固定保留的 prefill 事件数（容量 " +
+      (state.pinnedCapacity || 0) + " 条，0 表示未启用）";
     $("loaded").textContent = formatCount(state.events.length);
-    $("loaded").title = "页面已加载的事件数（上限 " + MAX_EVENTS + " 条）";
-    $("dropped").textContent = state.dropped;
-    $("latest").textContent = state.lastSeq || "-";
+    $("loaded").title = viewer
+      ? "当前页加载的事件数（默认每页 8192 条）"
+      : "页面已加载的事件数（decode/缓冲上限 " + pageEventCap +
+        " 条，prefill 固定保留上限 " + pagePrefillCap + " 条）";
+    $("dropped").textContent = viewer ? (archive.dropped || 0) : state.dropped;
+    $("dropped").title = viewer
+      ? "归档时丢弃的事件数"
+      : "服务端丢弃的事件数（ring 淘汰 + prefill 保留区已满）；" +
+        "页面检测到历史缺口 " + (state.lost || 0) + " 次";
+    $("latest").textContent = viewer
+      ? (state.viewerPage && state.viewerPage.lastSeq || "-")
+      : (state.lastSeq || "-");
     $("winEvents").textContent = agg.count || 0;
     $("winTotal").textContent = agg.totalUs ? formatUs(agg.totalUs) : "-";
     $("winTotal").title = "当前窗口内各事件耗时求和（含 [gap] 空隙归因），线程/设备之间可能重叠";
@@ -2328,6 +3229,7 @@ PAGE_HTML = r"""<!doctype html>
     renderDetail(event);
     drawTable();
     scheduleDraw();
+    if (isViewer()) writeViewerHash();
   }
 
   function draw() {
@@ -2337,11 +3239,18 @@ PAGE_HTML = r"""<!doctype html>
     const agg = aggregate(visible);
     state.lastView = view;
     state.lastAgg = agg;
-    $("timelineNote").textContent = view.label;
+    $("timelineNote").textContent = (isViewer() ? "归档 · " : "") + view.label;
     const emptyHint = $("emptyHint");
     const jump = $("jumpMatch");
     let showHint = false;
-    if (!visible.length && state.events.length) {
+    if (isViewer() && !visible.length) {
+      $("emptyHintText").textContent = state.events.length
+        ? "当前页没有匹配事件，试试上一页/下一页"
+        : "当前页没有事件；可调整阶段/token 筛选或翻页";
+      jump.hidden = true;
+      emptyHint.hidden = false;
+      showHint = true;
+    } else if (!visible.length && state.events.length) {
       const matchedAll = filterEvents(state.events, 0, Number.MAX_SAFE_INTEGER);
       if (matchedAll.length) {
         const last = matchedAll[matchedAll.length - 1];
@@ -2357,8 +3266,9 @@ PAGE_HTML = r"""<!doctype html>
                  state.phaseFilter || state.tokenFilter != null) {
         $("emptyHintText").textContent =
           "当前缓冲区没有匹配事件；可检索历史最多 " +
-          formatCount(Math.min(state.capacity || MAX_EVENTS, MAX_EVENTS)) +
-          " 条，更早的事件可能已被覆盖";
+          formatCount(Math.min(Number(state.capacity) || MAX_EVENTS, MAX_PAGE_EVENTS) +
+            Math.min(Number(state.pinnedCapacity) || 0, MAX_PAGE_PREFILL)) +
+          " 条（decode 缓冲 + prefill 固定保留），更早的事件可能已被覆盖";
         jump.hidden = true;
         emptyHint.hidden = false;
         showHint = true;
@@ -2394,9 +3304,12 @@ PAGE_HTML = r"""<!doctype html>
     const visible = filterEvents(state.events, view.start, view.end,
       { viewToken: view.tokenKey });
     const maxDur = visible.reduce((max, event) => Math.max(max, event.dur_us), 1);
-    const rows = visible.slice(-300).reverse();
-    $("tableNote").textContent =
-      "最近 " + rows.length + " 条 · 窗口 " + visible.length + " 条";
+    const viewer = isViewer();
+    const rows = viewer ? visible.slice() : visible.slice(-300).reverse();
+    $("tableNote").textContent = viewer
+      ? "当前页 " + formatCount(visible.length) + " 条 · 会话 " +
+        formatCount(state.viewerPage ? state.viewerPage.totalEvents : visible.length) + " 条"
+      : "最近 " + rows.length + " 条 · 窗口 " + visible.length + " 条";
     const focus = state.focus;
     $("rows").innerHTML = rows.map((event) => {
       const selected = event.seq === state.selectedSeq ? " selected" : "";
@@ -2425,6 +3338,63 @@ PAGE_HTML = r"""<!doctype html>
         "<td class='io' title='" + esc(event.io || "") + "'>" + esc(event.io || "-") + "</td>" +
         "</tr>";
     }).join("");
+    updatePageBar();
+  }
+
+  function updatePageBar() {
+    const bar = $("pageBar");
+    if (!isViewer()) {
+      bar.hidden = true;
+      return;
+    }
+    bar.hidden = false;
+    const page = state.viewerPage;
+    const prev = $("prevPage");
+    const next = $("nextPage");
+    const jump = $("jumpSeq");
+    if (!page) {
+      $("pageNote").textContent = "尚未打开数据";
+      prev.disabled = true;
+      next.disabled = true;
+      jump.disabled = true;
+      return;
+    }
+    jump.disabled = false;
+    const first = page.firstSeq || 0;
+    const last = page.lastSeq || 0;
+    $("pageNote").textContent = state.events.length
+      ? "seq " + first + "–" + last + " · 当前页 " + formatCount(state.events.length) +
+        " 条" + (page.filter ? "（筛选）" : " / 会话 " + formatCount(page.totalEvents) + " 条")
+      : "当前页无事件" + (page.totalEvents ? " · 会话 " + formatCount(page.totalEvents) + " 条" : "");
+    prev.disabled = page.fromSeq <= page.baseSeq;
+    next.disabled = !page.hasMore || !page.nextSeq;
+    if (document.activeElement !== jump && !jump.value) {
+      jump.placeholder = first ? String(first) : "seq";
+    }
+  }
+
+  async function gotoViewerPage(delta) {
+    if (!isViewer() || !state.viewerPage) return;
+    const page = state.viewerPage;
+    if (delta < 0) {
+      if (page.fromSeq <= page.baseSeq) return;
+      await loadViewerPage(Math.max(page.baseSeq, page.fromSeq - 8192),
+        state.viewerFilter, { baseSeq: page.baseSeq });
+    } else {
+      if (!page.hasMore || !page.nextSeq) return;
+      await loadViewerPage(page.nextSeq, state.viewerFilter,
+        { baseSeq: page.baseSeq });
+    }
+  }
+
+  async function jumpToViewerSeq() {
+    if (!isViewer() || !state.viewerPage) return;
+    const value = Number($("jumpSeq").value);
+    if (!isFinite(value) || value < 0) {
+      $("jumpSeq").focus();
+      return;
+    }
+    await loadViewerPage(Math.floor(value), state.viewerFilter);
   }
 
   function showTooltip(event, clientX, clientY) {
@@ -2569,6 +3539,12 @@ PAGE_HTML = r"""<!doctype html>
   }
 
   function setPhaseFilter(phase, reveal) {
+    if (isViewer()) {
+      viewerOpenPhase(phase || "", reveal).catch((error) => {
+        setStatus("加载阶段失败: " + error.message, "bad");
+      });
+      return;
+    }
     state.phaseFilter = phase;
     if (reveal || phase !== "decode") {
       state.tokenFilter = null;
@@ -2616,11 +3592,18 @@ PAGE_HTML = r"""<!doctype html>
   }
 
   function selectToken(token, req) {
+    if (isViewer()) {
+      viewerOpenToken(token, req).catch((error) => {
+        setStatus("加载 token 失败: " + error.message, "bad");
+      });
+      return;
+    }
     const tokenEvents = filterEvents(state.events, 0, Number.MAX_SAFE_INTEGER,
       { ignoreTime: true, ignorePhase: true, ignoreToken: true })
       .filter((event) => phaseOf(event) === "decode" &&
         Number(event.token) === token && requestOf(event) === req);
     if (!tokenEvents.length) {
+      setStatus("该 token 不在当前实时缓冲；可用离线查看器打开归档", "bad");
       return;
     }
     state.phaseFilter = "decode";
@@ -2669,6 +3652,12 @@ PAGE_HTML = r"""<!doctype html>
     $("phaseFilter").value = "";
     $("minDur").value = 0;
     updateTokenChip();
+    if (isViewer()) {
+      loadViewerPage(0, null).catch((error) => {
+        setStatus("重置失败: " + error.message, "bad");
+      });
+      return;
+    }
     scheduleDraw();
     drawTable();
   }
@@ -2727,6 +3716,8 @@ PAGE_HTML = r"""<!doctype html>
     } finally {
       button.disabled = !state.supported;
       schedulePoll();
+      scheduleSummaryPoll();
+      refreshSummary();
       scheduleDraw();
     }
   }
@@ -2750,6 +3741,8 @@ PAGE_HTML = r"""<!doctype html>
       state.frozenTokenKey = null;
       state.trendHover = -1;
       state.lastAgg = null;
+      state.summary = null;
+      state.liveArchive = null;
       state.lastSideDraw = 0;
       $("deviceFilter").value = "";
       $("phaseFilter").value = "";
@@ -2765,6 +3758,40 @@ PAGE_HTML = r"""<!doctype html>
 
   $("toggle").addEventListener("click", toggleTracing);
   $("clear").addEventListener("click", clearTrace);
+  $("openFile").addEventListener("click", () => pickTrace("file"));
+  $("openDir").addEventListener("click", () => pickTrace("dir"));
+  $("uploadTrace").addEventListener("click", () => $("uploadFile").click());
+  $("uploadFile").addEventListener("change", () => {
+    const file = $("uploadFile").files && $("uploadFile").files[0];
+    $("uploadFile").value = "";
+    if (file) uploadViewerTrace(file);
+  });
+  $("openPath").addEventListener("click", openFromInput);
+  $("tracePath").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") openFromInput();
+  });
+  $("packTrace").addEventListener("click", packViewer);
+  $("exportTrace").addEventListener("click", exportViewerTrace);
+  $("manageTrace").addEventListener("click", () => toggleSessions());
+  $("refreshSessions").addEventListener("click", loadSessions);
+  $("closeSessions").addEventListener("click", () => toggleSessions(false));
+  $("sessionList").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-session-action]");
+    if (!button) return;
+    const path = button.dataset.path || "";
+    if (button.dataset.sessionAction === "open") {
+      openViewerSession(path);
+    } else if (button.dataset.sessionAction === "delete") {
+      deleteViewerSession(path);
+    }
+  });
+  $("closeTrace").addEventListener("click", closeViewer);
+  $("prevPage").addEventListener("click", () => gotoViewerPage(-1));
+  $("nextPage").addEventListener("click", () => gotoViewerPage(1));
+  $("jumpSeqBtn").addEventListener("click", jumpToViewerSeq);
+  $("jumpSeq").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") jumpToViewerSeq();
+  });
   $("resetFilter").addEventListener("click", resetFilters);
   $("locateMatch").addEventListener("click", locateMatch);
   $("jumpMatch").addEventListener("click", locateMatch);
@@ -2810,6 +3837,13 @@ PAGE_HTML = r"""<!doctype html>
     state.tokenFilter = null;
     state.tokenFilterReq = null;
     state.frozenTokenKey = null;
+    if (isViewer()) {
+      updateTokenChip();
+      viewerOpenPhase(state.phaseFilter || "", false).catch((error) => {
+        setStatus("清除 token 失败: " + error.message, "bad");
+      });
+      return;
+    }
     if (state.windowMode === "token") {
       state.follow = true;
       $("follow").checked = true;
@@ -2978,10 +4012,51 @@ PAGE_HTML = r"""<!doctype html>
   new ResizeObserver(() => scheduleDraw()).observe($("timelineWrap"));
   new ResizeObserver(() => scheduleDraw()).observe($("trendWrap"));
 
-  setStatus("连接中");
+  async function bootstrap() {
+    setStatus("连接中");
+    try {
+      const data = await fetchJson("/api/op-trace/status");
+      state.mode = data.mode === "viewer" ? "viewer" : "live";
+      state.viewerReadOnly = !!data.read_only;
+      state.supported = data.supported !== false;
+      state.enabled = !!data.enabled;
+      applyMode();
+      updateArchiveState(data);
+      scheduleStatusPoll();
+      if (isViewer()) {
+        const params = hashParams();
+        const path = params.get("trace") || data.path || "";
+        if (path) {
+          try {
+            await openViewerPath(path, { params });
+          } catch (error) {
+            $("pathWrap").hidden = false;
+            $("openPath").hidden = false;
+            $("tracePath").value = path;
+            setStatus("打开失败: " + error.message, "bad");
+          }
+        } else {
+          resetViewerFilters();
+          setStatus();
+          drawTable();
+          scheduleDraw();
+        }
+      } else {
+        scheduleSummaryPoll();
+        poll();
+        refreshSummary();
+      }
+    } catch (error) {
+      state.mode = "live";
+      applyMode();
+      setStatus("连接失败: " + error.message, "bad");
+      poll();
+    }
+  }
+
   updateTokenChip();
   renderStats(null);
-  poll();
+  bootstrap();
 })();
 </script>
 </body>
