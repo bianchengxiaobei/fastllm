@@ -5096,6 +5096,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
             work.pureBaseHits = counts[0];
             work.pureBaseMisses = counts[1];
             work.pureCalls = work.pureRoutes = 0;
+            work.pureRefillMs = work.pureComputeMs = 0.0;
             work.previousGpu = work.previousMisses = 0;
             work.previousPrefetch = false;
             work.pureActive = true;
