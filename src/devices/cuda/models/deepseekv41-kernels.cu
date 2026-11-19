@@ -5621,6 +5621,8 @@ extern "C" bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fa
     return V41CheckLaunch("Compress");
 }
 
+#include "deepseekv41-indexer-fp16.cuh"
+
 extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const fastllm::Data &weights,
                                                    const fastllm::Data &k, int ratio, int startPos,
                                                    fastllm::Data &output) {
@@ -5645,6 +5647,9 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
         return true;
     }
     const bool legacyIndexer = V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER");
+    if (!legacyIndexer &&
+        V41TryIndexerScoreSm75F16(q, weights, k, ratio, startPos, output)) return true;
+    if (FastllmCudaGetThreadError()) return false;
     if (!legacyIndexer &&
         V41TryIndexerPrefill(q, weights, k, kMode, ratio, startPos, output)) return true;
     if (FastllmCudaGetThreadError()) return false;
