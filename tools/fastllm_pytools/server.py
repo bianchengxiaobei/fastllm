@@ -3,8 +3,10 @@ import asyncio
 import concurrent.futures
 import contextlib
 import fastapi
+import json
 import logging
 import os
+import queue
 import signal
 import sys
 import threading
@@ -182,6 +184,10 @@ class FastLLMUvicornServer(uvicorn.Server):
         if self.started and not self.should_exit:
             from .llm import disable_cuda_malloc
             disable_cuda_malloc()
+            threading.Thread(
+                target = _op_trace_maintenance,
+                name = "fastllm-op-trace-maintenance",
+                daemon = True).start()
             if self.startup_progress is not None:
                 self.startup_progress.ready()
 
@@ -331,6 +337,90 @@ def _op_trace_forbidden() -> JSONResponse:
         content = {"error": "Operator trace is only available from localhost or with --dev_mode"},
         status_code = 403)
 
+_op_trace_pack_queue = queue.Queue()
+_op_trace_pack_lock = threading.Lock()
+_op_trace_pack_pending = set()
+_op_trace_pack_worker = None
+
+def _read_op_trace_meta(path: str) -> dict:
+    if not path:
+        return {}
+    try:
+        with open(os.path.join(path, "meta.json"), "r", encoding="utf-8-sig") as handle:
+            return json.load(handle)
+    except Exception:
+        return {}
+
+def _op_trace_pack_loop():
+    while True:
+        path = _op_trace_pack_queue.get()
+        try:
+            from .op_trace_archive import pack
+            output = pack(path)
+            logging.info("Operator trace packed: %s", output)
+        except Exception:
+            logging.exception("Operator trace pack failed: %s", path)
+        finally:
+            with _op_trace_pack_lock:
+                _op_trace_pack_pending.discard(path)
+            _op_trace_pack_queue.task_done()
+
+def _queue_op_trace_pack(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        path = os.path.abspath(os.path.expanduser(os.fspath(path)))
+    except Exception:
+        return False
+    with _op_trace_pack_lock:
+        global _op_trace_pack_worker
+        if _op_trace_pack_worker is None:
+            _op_trace_pack_worker = threading.Thread(
+                target = _op_trace_pack_loop,
+                name = "fastllm-op-trace-pack",
+                daemon = True)
+            _op_trace_pack_worker.start()
+        if path in _op_trace_pack_pending:
+            return False
+        _op_trace_pack_pending.add(path)
+    _op_trace_pack_queue.put(path)
+    return True
+
+def _op_trace_session_snapshot() -> dict:
+    try:
+        from .llm import get_op_trace_session
+        session = get_op_trace_session()
+    except Exception:
+        return {}
+    if not isinstance(session, dict):
+        return {}
+    path = str(session.get("dir") or "")
+    meta = _read_op_trace_meta(path)
+    archive = dict(session.get("archive") or {})
+    disk_archive = meta.get("archive") or {}
+    if disk_archive:
+        archive.update(disk_archive)
+    session["dir"] = path
+    session["archive"] = archive
+    session["packed"] = bool(archive.get("packed"))
+    session["pack_error"] = str(archive.get("pack_error") or "")
+    return session
+
+def _op_trace_maintenance():
+    try:
+        from .op_trace_archive import default_archive_root, list_sessions, owner_alive
+        for item in list_sessions(default_archive_root()):
+            path = str(item.get("path") or "")
+            if not path or not os.path.isdir(path):
+                continue
+            if item.get("packed"):
+                continue
+            if not item.get("sealed") and owner_alive(item):
+                continue
+            _queue_op_trace_pack(path)
+    except Exception:
+        logging.exception("Operator trace maintenance failed")
+
 @app.get("/debug/op-trace", response_class = HTMLResponse)
 def op_trace_page(raw_request: Request):
     if not _op_trace_allowed(raw_request):
@@ -344,10 +434,27 @@ def op_trace_status(raw_request: Request):
     if not _op_trace_allowed(raw_request):
         return _op_trace_forbidden()
     from .llm import get_op_trace_enabled, op_trace_supported
+    session = _op_trace_session_snapshot()
+    archive = session.get("archive") or {}
     return JSONResponse(content = {
         "supported": op_trace_supported(),
         "enabled": get_op_trace_enabled(),
+        "mode": "live",
+        "session": str(session.get("session") or ""),
+        "path": str(session.get("dir") or ""),
+        "sealed": bool(session.get("sealed")),
+        "archive": archive,
+        "packed": bool(session.get("packed")),
+        "pack_error": str(session.get("pack_error") or ""),
     })
+
+@app.get("/api/op-trace/summary")
+def op_trace_summary(raw_request: Request, max_tokens: int = 8192):
+    if not _op_trace_allowed(raw_request):
+        return _op_trace_forbidden()
+    from .llm import get_op_trace_summary
+    return JSONResponse(content = get_op_trace_summary(
+        max(1, min(int(max_tokens), 8192))))
 
 @app.get("/api/op-trace/snapshot")
 def op_trace_snapshot(raw_request: Request, after_seq: int = 0, max_events: int = 4096):
@@ -370,8 +477,11 @@ async def set_op_trace(payload: dict, raw_request: Request):
     if not op_trace_supported():
         return JSONResponse(content = {"supported": False, "enabled": False})
     requested = bool(payload.get("enabled", False)) if isinstance(payload, dict) else False
+    was_enabled = bool(get_op_trace_enabled())
     supported = set_op_trace_enabled(requested)
     enabled = get_op_trace_enabled()
+    if was_enabled and not enabled:
+        _queue_op_trace_pack(_op_trace_session_snapshot().get("dir", ""))
     logging.info("Operator trace %s", "enabled" if enabled else "disabled")
     return JSONResponse(content = {"supported": bool(supported), "enabled": enabled})
 
@@ -380,7 +490,13 @@ async def clear_op_trace(raw_request: Request):
     if not _op_trace_allowed(raw_request):
         return _op_trace_forbidden()
     from .llm import clear_op_trace as clear_native_op_trace
-    return JSONResponse(content = {"supported": bool(clear_native_op_trace())})
+    from .llm import get_op_trace_enabled
+    was_enabled = bool(get_op_trace_enabled())
+    previous = _op_trace_session_snapshot().get("dir", "") if was_enabled else ""
+    supported = bool(clear_native_op_trace())
+    if was_enabled and previous:
+        _queue_op_trace_pack(previous)
+    return JSONResponse(content = {"supported": supported})
 
 def init_logging(log_level = logging.INFO, log_file:str = None):
     logging_format = '%(asctime)s %(process)d %(filename)s[line:%(lineno)d] %(levelname)s: %(message)s'
@@ -477,6 +593,11 @@ def _fastllm_server(args, startup_progress):
         api_thread_pool_workers = default_workers
     api_thread_pool_workers = max(1, min(256, api_thread_pool_workers))
     set_ulimit()
+    try:
+        from .llm import set_op_trace_model
+        set_op_trace_model(os.path.basename(str(getattr(args, "model_name", "") or "")))
+    except Exception:
+        pass
     if getattr(args, "op_trace", False):
         from .llm import op_trace_supported, set_op_trace_enabled
         if op_trace_supported() and set_op_trace_enabled(True):
