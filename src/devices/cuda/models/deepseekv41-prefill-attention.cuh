@@ -75,9 +75,26 @@ static bool V41TrySm75PrefillAttention(const Data &q, const Data &chunk,
     const size_t keyBytes = size_t(total) * 512 * sizeof(__nv_bfloat16);
     const size_t indexBytes = size_t(rows) * width * sizeof(int32_t);
     const size_t scratchBytes = keyBytes + indexBytes + sizeof(int);
-    // Leave ample room for the generic MMA packer's separate bounded scratch.
-    if (!width || total > std::numeric_limits<int>::max() ||
-        scratchBytes > 64ull * 1024 * 1024) return false;
+    // The gathered-KV kernel below costs O(compressed keys) of scratch: at
+    // 200k context the ratio-1 layers need ~245 MB just for keys+selection.
+    // The packer itself caps at 256 MB; keep the gate aligned with it, or the
+    // whole 20-layer score stack silently drops to the FP32 scalar path.
+    static const size_t scratchLimitBytes = []() {
+        const char *env = std::getenv("FASTLLM_DSV41_SM75_PREFILL_ATTN_MB");
+        long mb = env != nullptr ? std::strtol(env, nullptr, 10) : 256;
+        if (mb < 64) mb = 64;
+        if (mb > 1024) mb = 1024;
+        return size_t(mb) << 20;
+    }();
+    if (!width || total > std::numeric_limits<int>::max()) return false;
+    if (scratchBytes > scratchLimitBytes) {
+        static std::atomic<bool> scratchWarned(false);
+        if (!scratchWarned.exchange(true)) {
+            fprintf(stderr, "[Fastllm] V4.1 SM75 prefill attention scratch %.1f MB > %zu MB; using scalar attention.\n",
+                    double(scratchBytes) / (1024.0 * 1024.0), scratchLimitBytes >> 20);
+        }
+        return false;
+    }
     void *allocation = nullptr;
     if (FastllmCudaTryMalloc(&allocation, scratchBytes) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
     struct Scratch {
