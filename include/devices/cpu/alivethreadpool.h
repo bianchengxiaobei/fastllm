@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -118,6 +119,35 @@ namespace fastllm {
         return std::max(1, threadNum);
     }
 
+    // Idle spinning trades CPU for dispatch latency: every worker runs this
+    // loop even when no op arrives, so a barrier-synchronized pool pays one
+    // spinning core per worker between layers. Both halves are exposed as
+    // environment knobs so a deployment can trade back without recompiling
+    // (lower spin = fewer idle cores, higher spin = shorter dispatch latency).
+    static inline int AliveSpinIters() {
+        static const int iters = [] {
+            const char *value = std::getenv("FASTLLM_ALIVE_SPIN");
+            if (value == nullptr || value[0] == '\0') {
+                return 1 << 16;
+            }
+            const int parsed = std::atoi(value);
+            return parsed > 0 ? parsed : (1 << 16);
+        }();
+        return iters;
+    }
+
+    static inline int AliveSleepUs() {
+        static const int micros = [] {
+            const char *value = std::getenv("FASTLLM_ALIVE_SLEEP_US");
+            if (value == nullptr || value[0] == '\0') {
+                return 2000;
+            }
+            const int parsed = std::atoi(value);
+            return parsed > 0 ? parsed : 2000;
+        }();
+        return micros;
+    }
+
     struct AliveThreadTask {
         std::atomic<uint64_t> publishId;
         std::atomic<uint64_t> doneId;
@@ -147,6 +177,8 @@ namespace fastllm {
 
         void operator()() {
             int cnt = 0;
+            const int spinIters = AliveSpinIters();
+            const int sleepUs = AliveSleepUs();
             uint64_t lastRunId = 0;
             auto lastRunTime = std::chrono::system_clock::now();
             while (true) {
@@ -161,12 +193,12 @@ namespace fastllm {
                 }
                 CPUPause();
 
-                cnt = (cnt + 1) & ((1 << 16) - 1);
-                if (cnt == 0) {
+                if (++cnt >= spinIters) {
+                    cnt = 0;
                     auto duration = std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::system_clock::now() - lastRunTime);
                     double gap = double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
                     if (gap > 3) {
-                        std::this_thread::sleep_for(std::chrono::microseconds(2000));
+                        std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
                     }
                 }
             }
