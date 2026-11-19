@@ -274,6 +274,7 @@ struct HybridWorkspace {
     uint64_t cpuRoutes = 0, gpuRoutes = 0, residentRoutes = 0, allResidentRoutes = 0;
     uint64_t prefetchedExperts = 0;
     uint64_t pureCalls = 0, pureRoutes = 0, pureBaseHits = 0, pureBaseMisses = 0;
+    double pureRefillMs = 0.0, pureComputeMs = 0.0;
     bool pureActive = false;
     bool previousPrefetch = false;
     bool previousFrequency = false;
@@ -5116,13 +5117,21 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         gateOutput.Resize({topk, layout.inter});
         gateOutput.Allocate(false);
         const auto *indices = static_cast<const int32_t *>(index.cudaData);
+        // 诊断：把"等专家搬进来"和"算"分开计时（主机墙钟）。refill 主导说明瓶颈在
+        // PCIe/磁盘，而不是 GEMM。
+        const auto refillStart = std::chrono::steady_clock::now();
         fastllm::AssertInFastLLM(EnsureCachedExperts(group, cache, tableId, indices, topk),
                                "Pure V4.1 cache refill failed.\n");
+        work.pureRefillMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - refillStart).count();
         float *gpuOutput = work.device + kMaxTopK * hidden;
+        const auto computeStart = std::chrono::steady_clock::now();
         fastllm::AssertInFastLLM(FindExpertCacheBackend(layout.weightType)->compute(
             work.quantizedInput, gateOutput, output, layout, *cache,
             static_cast<const float *>(score.cudaData), topk, gpuOutput),
             "Pure V4.1 cache CUDA experts failed.\n");
+        work.pureComputeMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - computeStart).count();
         fastllm::cuda::dsv41_cache::Reduce<<<(hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             work.device, gpuOutput, indices, indices,
             (__nv_bfloat16*)output.cudaData, hidden, topk);
@@ -5135,10 +5144,12 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
             (work.pureCalls == 1 || work.pureCalls % 1024 == 0)) {
             const auto counts = snapshot();
             std::fprintf(stderr, "[Fastllm] V4.1 pure expert cache: %llu layers, %llu GPU routes, "
-                "%llu hits, %llu misses; %d slots; device %d.\n",
+                "%llu hits, %llu misses; %d slots; device %d; refill=%.2fms/call compute=%.2fms/call.\n",
                 (unsigned long long)work.pureCalls, (unsigned long long)work.pureRoutes,
                 (unsigned long long)(counts[0] - work.pureBaseHits),
-                (unsigned long long)(counts[1] - work.pureBaseMisses), cache->slots, cache->device);
+                (unsigned long long)(counts[1] - work.pureBaseMisses), cache->slots, cache->device,
+                work.pureRefillMs / (double)work.pureCalls,
+                work.pureComputeMs / (double)work.pureCalls);
         }
         if (launchParallel) {
             launchParallel();
