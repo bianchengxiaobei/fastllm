@@ -203,8 +203,20 @@ PAGE_HTML = r"""<!doctype html>
   canvas { display: block; }
   .timeline-wrap {
     position: relative; max-height: 56vh;
-    overflow: auto; background: #0f161e;
+    overflow: auto; overscroll-behavior-x: contain;
+    background: #0f161e;
   }
+  .timeline-tools {
+    display: inline-flex; align-items: center; gap: 3px;
+    color: var(--muted); font-size: 10px;
+  }
+  .timeline-tools button {
+    min-width: 24px; padding: 1px 6px; font-size: 11px; line-height: 18px;
+  }
+  .timeline-tools span {
+    min-width: 38px; text-align: center; font-variant-numeric: tabular-nums;
+  }
+  .timeline-head-actions { flex-wrap: wrap; justify-content: flex-end; }
   .empty-hint {
     display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
     padding: 6px 12px; border-bottom: 1px solid #3a2f1c;
@@ -621,15 +633,23 @@ PAGE_HTML = r"""<!doctype html>
           <h2>算子时间线</h2>
           <span class="muted" id="timelineNote">单 Token · 等待 Decode 数据</span>
         </div>
-        <div class="legend">
-          <span><i style="background:#4ea1ff"></i>GEMM</span>
-          <span><i style="background:#b07cff"></i>MoE</span>
-          <span><i style="background:#39c27a"></i>Attn</span>
-          <span><i style="background:#ffb454"></i>Norm/Act</span>
-          <span><i style="background:#38c7c7"></i>Data</span>
-          <span><i style="background:#ff6b8a"></i>Sample</span>
-          <span><i style="background:#5b6b7f"></i>空隙归因</span>
-          <span><i style="background:#ff4d6d"></i>慢算子标记</span>
+        <div class="head-actions timeline-head-actions">
+          <div class="timeline-tools" title="时间线缩放；底部横向滚动条可拖动">
+            <button id="timelineZoomOut" class="ghost" title="缩小时间线">−</button>
+            <span id="timelineZoomLabel">100%</span>
+            <button id="timelineZoomIn" class="ghost" title="放大时间线">+</button>
+            <button id="timelineFit" class="ghost" title="缩放到适合窗口宽度">适应</button>
+          </div>
+          <div class="legend">
+            <span><i style="background:#4ea1ff"></i>GEMM</span>
+            <span><i style="background:#b07cff"></i>MoE</span>
+            <span><i style="background:#39c27a"></i>Attn</span>
+            <span><i style="background:#ffb454"></i>Norm/Act</span>
+            <span><i style="background:#38c7c7"></i>Data</span>
+            <span><i style="background:#ff6b8a"></i>Sample</span>
+            <span><i style="background:#5b6b7f"></i>空隙归因</span>
+            <span><i style="background:#ff4d6d"></i>慢算子标记</span>
+          </div>
         </div>
       </div>
       <div id="emptyHint" class="empty-hint" hidden>
@@ -787,6 +807,11 @@ PAGE_HTML = r"""<!doctype html>
     frozenEnd: 0,
     t0: 0,
     layout: null,
+    timelineAuto: true,
+    timelineFit: false,
+    timelineZoom: 1,
+    timelineEffectiveZoom: 1,
+    timelineScrollAnchor: null,
     rateSeq: 0,
     rateTime: 0,
     lastTableDraw: 0,
@@ -807,6 +832,9 @@ PAGE_HTML = r"""<!doctype html>
   const MAX_PAGE_EVENTS = 524288;
   const MAX_PAGE_PREFILL = 262144;
   const KEEP_US = 3600000000;
+  const MAX_TIMELINE_CANVAS_PX = 30000;
+  const TIMELINE_TARGET_BAR_PX = 8;
+  const TIMELINE_MAX_ZOOM = 24;
   const COLORS = {
     moe: "#b07cff",
     gemm: "#4ea1ff",
@@ -2479,6 +2507,59 @@ PAGE_HTML = r"""<!doctype html>
     }
   }
 
+  function medianDurationUs(events) {
+    const values = [];
+    for (const event of events) {
+      const value = Number(event.dur_us) || 0;
+      if (value > 0) values.push(value);
+    }
+    if (!values.length) return 1;
+    values.sort((a, b) => a - b);
+    return Math.max(1, values[Math.floor(values.length / 2)]);
+  }
+
+  function timelineWidthPlan(visible, view, viewportWidth, dpr) {
+    const fitWidth = Math.max(320, viewportWidth);
+    if (state.timelineFit) {
+      return { width: fitWidth, zoom: 1 };
+    }
+    let zoom = state.timelineZoom;
+    const prefillView = view.kind === "prefill" || state.phaseFilter === "prefill" ||
+      (visible.length > 0 && visible.every((event) => phaseOf(event) === "prefill"));
+    if (state.timelineAuto && prefillView && visible.length > 1) {
+      const gutter = 160;
+      const fitPlot = Math.max(40, fitWidth - gutter - 10);
+      const span = Math.max(1, view.end - view.start);
+      const median = medianDurationUs(visible);
+      const wantedPlot = span / median * TIMELINE_TARGET_BAR_PX;
+      zoom *= Math.max(1, Math.min(TIMELINE_MAX_ZOOM, wantedPlot / fitPlot));
+    }
+    const maxCssWidth = Math.max(fitWidth,
+      Math.floor(MAX_TIMELINE_CANVAS_PX / Math.max(1, dpr)));
+    const width = Math.max(fitWidth, Math.min(maxCssWidth, Math.round(fitWidth * zoom)));
+    return { width, zoom: width / fitWidth };
+  }
+
+  function updateTimelineZoomLabel(effectiveZoom) {
+    const label = $("timelineZoomLabel");
+    if (label) label.textContent = Math.round(effectiveZoom * 100) + "%";
+    const fit = $("timelineFit");
+    if (fit) fit.disabled = !!state.timelineFit;
+    const out = $("timelineZoomOut");
+    if (out) out.disabled = state.timelineFit || effectiveZoom <= 1.001;
+  }
+
+  function restoreTimelineScroll() {
+    const anchor = state.timelineScrollAnchor;
+    if (anchor == null) return;
+    state.timelineScrollAnchor = null;
+    const wrap = $("timelineWrap");
+    if (!wrap) return;
+    const max = Math.max(0, wrap.scrollWidth - wrap.clientWidth);
+    wrap.scrollLeft = Math.max(0, Math.min(max,
+      anchor * wrap.scrollWidth - wrap.clientWidth / 2));
+  }
+
   function drawTimeline(source, view, agg) {
     let visible = source;
     if (source.length > 18000) {
@@ -2489,7 +2570,11 @@ PAGE_HTML = r"""<!doctype html>
     const canvas = $("timeline");
     const ctx = canvas.getContext("2d");
     const dpr = window.devicePixelRatio || 1;
-    const cssWidth = Math.max(320, wrap.clientWidth - 2);
+    const viewportWidth = Math.max(320, wrap.clientWidth - 2);
+    const plan = timelineWidthPlan(visible, view, viewportWidth, dpr);
+    const cssWidth = plan.width;
+    state.timelineEffectiveZoom = plan.zoom;
+    updateTimelineZoomLabel(plan.zoom);
     const start = view.start;
     const end = view.end;
 
@@ -2530,6 +2615,7 @@ PAGE_HTML = r"""<!doctype html>
         start, end, gutter: 0, axis: 0, rowHeight: 0, rowCount: 0,
         keys: [], rowIndex: new Map(), visible: [], width: cssWidth, height,
       };
+      restoreTimelineScroll();
       return;
     }
 
@@ -2548,15 +2634,16 @@ PAGE_HTML = r"""<!doctype html>
     const span = Math.max(1, end - start);
     const xOf = (time) => gutter + ((time - start) / span) * plotWidth;
 
+    const tickCount = Math.max(10, Math.min(30, Math.round(plotWidth / 180)));
     ctx.strokeStyle = "#1b2632";
     ctx.lineWidth = 1;
-    for (let i = 0; i <= 10; i++) {
-      const x = gutter + (plotWidth * i) / 10;
+    for (let i = 0; i <= tickCount; i++) {
+      const x = gutter + (plotWidth * i) / tickCount;
       ctx.beginPath(); ctx.moveTo(x, axis); ctx.lineTo(x, height - 6); ctx.stroke();
       ctx.fillStyle = "#6f7e91";
       ctx.font = "10px Segoe UI, Microsoft YaHei, sans-serif";
-      ctx.textAlign = i === 0 ? "left" : (i === 10 ? "right" : "center");
-      ctx.fillText(formatUs((span * i) / 10), x, 14);
+      ctx.textAlign = i === 0 ? "left" : (i === tickCount ? "right" : "center");
+      ctx.fillText(formatUs((span * i) / tickCount), x, 14);
     }
 
     ctx.textAlign = "left";
@@ -2608,6 +2695,7 @@ PAGE_HTML = r"""<!doctype html>
       start, end, gutter, axis, rowHeight, rowCount, keys, rowIndex, visible,
       width: cssWidth, height,
     };
+    restoreTimelineScroll();
   }
 
   const TREND_TOKEN_LIMIT = 72;
@@ -3981,6 +4069,35 @@ PAGE_HTML = r"""<!doctype html>
     const item = state.events.find((entry) => entry.seq === seq);
     if (item) selectEvent(item);
   });
+
+  function timelineScrollRatio() {
+    const wrap = $("timelineWrap");
+    if (!wrap) return 0;
+    const scrollWidth = Math.max(1, wrap.scrollWidth);
+    if (scrollWidth <= wrap.clientWidth + 1) return 0;
+    return (wrap.scrollLeft + wrap.clientWidth / 2) / scrollWidth;
+  }
+
+  function zoomTimeline(multiplier) {
+    const current = state.timelineEffectiveZoom || 1;
+    state.timelineScrollAnchor = timelineScrollRatio();
+    state.timelineFit = false;
+    state.timelineAuto = false;
+    state.timelineZoom = Math.max(1, Math.min(TIMELINE_MAX_ZOOM, current * multiplier));
+    scheduleDraw();
+  }
+
+  function fitTimeline() {
+    state.timelineScrollAnchor = timelineScrollRatio();
+    state.timelineFit = true;
+    state.timelineAuto = true;
+    state.timelineZoom = 1;
+    scheduleDraw();
+  }
+
+  $("timelineZoomIn").addEventListener("click", () => zoomTimeline(1.5));
+  $("timelineZoomOut").addEventListener("click", () => zoomTimeline(1 / 1.5));
+  $("timelineFit").addEventListener("click", fitTimeline);
 
   const timeline = $("timeline");
   timeline.addEventListener("mousemove", (event) => {
