@@ -2299,6 +2299,30 @@ PAGE_HTML = r"""<!doctype html>
     }).join("");
   }
 
+  function gapEntriesForToken(token) {
+    if (!token) return [];
+    if (token.gapLabels && token.gapLabels.size) {
+      return Array.from(token.gapLabels.values())
+        .sort((a, b) => b.totalUs - a.totalUs);
+    }
+    const key = token.key || tokenKey(token.req, token.token);
+    const labels = new Map();
+    for (const event of state.events || []) {
+      if (!event.gap || event.token == null || event.token < 0) continue;
+      if (tokenKeyOf(event) !== key) continue;
+      const label = String(event.op || "");
+      let item = labels.get(label);
+      if (!item) {
+        item = { op: label, totalUs: 0, count: 0 };
+        labels.set(label, item);
+      }
+      item.totalUs += Number(event.dur_us) || 0;
+      item.count += 1;
+    }
+    return Array.from(labels.values())
+      .sort((a, b) => b.totalUs - a.totalUs);
+  }
+
   function renderTimeSplit() {
     const stats = buildPhaseTokenStats();
     const key = activeTokenKey();
@@ -2339,8 +2363,7 @@ PAGE_HTML = r"""<!doctype html>
         "</span><span class='val'>" + formatUs(item.value) +
         "</span><span class='pct'>" + pct.toFixed(1) + "%</span></div>";
     }).join("");
-    const gapEntries = Array.from(token.gapLabels ? token.gapLabels.values() : [])
-      .sort((a, b) => b.totalUs - a.totalUs);
+    const gapEntries = gapEntriesForToken(token);
     const gapRows = gapEntries.slice(0, 8).map((item) => {
       const label = String(item.op || "").replace(/^\[(gap|span)\]\s*/i, "");
       const pct = (item.totalUs / Math.max(1, token.latencyUs)) * 100;
